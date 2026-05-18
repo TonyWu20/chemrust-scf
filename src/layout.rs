@@ -1,5 +1,10 @@
 use std::marker::PhantomData;
+use std::sync::Arc;
+
+use cudarc::driver::{result::DriverError, CudaStream};
 use num_complex::Complex64;
+
+use crate::device::{DeviceMapped, Gpu};
 
 // ---------------------------------------------------------------------------
 // Sealed layout-marker trait
@@ -80,6 +85,13 @@ impl<T> Cpu<T> {
     }
     pub fn into_inner(self) -> T {
         self.0
+    }
+}
+
+impl<T: DeviceMapped> Cpu<T> {
+    /// Transfer data from host to device.
+    pub fn sync_to_device(&self, stream: &Arc<CudaStream>) -> Result<Gpu<T>, DriverError> {
+        Gpu::from_host(&self.0, stream)
     }
 }
 
