@@ -256,6 +256,60 @@ mod tests {
     use cudarc::driver::CudaContext;
 
     #[test]
+    fn test_zgemm_small() {
+        let ctx = CudaContext::new(0).unwrap();
+        let stream = ctx.default_stream();
+        let blas = BlasHandle::new(stream.clone()).unwrap();
+
+        // A = [[1+i, 0], [0, 1-i]]  (2×2 complex, column-major)
+        let a_data: Vec<CudaComplex> = vec![
+            CudaComplex { x: 1.0, y: 1.0 }, CudaComplex { x: 0.0, y: 0.0 },
+            CudaComplex { x: 0.0, y: 0.0 }, CudaComplex { x: 1.0, y: -1.0 },
+        ];
+        // B = [[1+0i, 2+0i], [3+0i, 4+0i]]  (2×2, column-major)
+        let b_data: Vec<CudaComplex> = vec![
+            CudaComplex { x: 1.0, y: 0.0 }, CudaComplex { x: 3.0, y: 0.0 },
+            CudaComplex { x: 2.0, y: 0.0 }, CudaComplex { x: 4.0, y: 0.0 },
+        ];
+
+        let a_dev = stream.clone_htod(&a_data).unwrap();
+        let b_dev = stream.clone_htod(&b_data).unwrap();
+        let mut c_dev = stream.alloc_zeros::<CudaComplex>(4).unwrap();
+
+        unsafe {
+            blas.gemm_c64(
+                ZgemmConfig {
+                    transa: op::N,
+                    transb: op::N,
+                    m: 2, n: 2, k: 2,
+                    alpha: CudaComplex { x: 1.0, y: 0.0 },
+                    lda: 2, ldb: 2, beta: CudaComplex { x: 0.0, y: 0.0 }, ldc: 2,
+                },
+                &a_dev, &b_dev, &mut c_dev,
+            )
+        }
+        .unwrap();
+
+        let c: Vec<CudaComplex> = stream.clone_dtoh(&c_dev).unwrap();
+        // C = A·B = [[(1+i)*1 + 0*3, (1+i)*2 + 0*4],
+        //            [0*1 + (1-i)*3, 0*2 + (1-i)*4]]
+        //   = [[1+i, 2+2i], [3-3i, 4-4i]]
+        let expected = [
+            (1.0, 1.0), (3.0, -3.0),
+            (2.0, 2.0), (4.0, -4.0),
+        ];
+        for i in 0..4 {
+            let diff_x = (c[i].x - expected[i].0).abs();
+            let diff_y = (c[i].y - expected[i].1).abs();
+            assert!(
+                diff_x < 1e-10 && diff_y < 1e-10,
+                "Mismatch at {i}: got ({},{}), expected ({},{})",
+                c[i].x, c[i].y, expected[i].0, expected[i].1,
+            );
+        }
+    }
+
+    #[test]
     fn test_dgemm() {
         let ctx = CudaContext::new(0).unwrap();
         let stream = ctx.default_stream();

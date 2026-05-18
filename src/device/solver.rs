@@ -9,9 +9,18 @@ use cudarc::cusolver::safe::DnHandle;
 use cudarc::cusolver::sys::{
     self as sys, cublasFillMode_t, cusolverEigMode_t, cusolverEigType_t,
 };
-use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
+use cudarc::driver::{result::DriverError, CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
+use thiserror::Error;
 
 use super::CudaComplex;
+
+#[derive(Error, Debug)]
+pub enum SolverError {
+    #[error("cuSOLVER error: {0}")]
+    Cusolver(#[from] CusolverError),
+    #[error("CUDA driver error: {0}")]
+    Driver(#[from] DriverError),
+}
 
 /// Wrapper around the cuSOLVER dense handle for our SCF eigenvalue problems.
 pub struct SolverHandle {
@@ -20,7 +29,7 @@ pub struct SolverHandle {
 }
 
 impl SolverHandle {
-    pub fn new(stream: Arc<CudaStream>) -> Result<Self, CusolverError> {
+    pub fn new(stream: Arc<CudaStream>) -> Result<Self, SolverError> {
         let inner = DnHandle::new(stream.clone())?;
         Ok(Self { inner, stream })
     }
@@ -44,7 +53,7 @@ impl SolverHandle {
         b: &mut CudaSlice<CudaComplex>,
         eigenvalues: &mut CudaSlice<f64>,
         info: &mut CudaSlice<i32>,
-    ) -> Result<(), CusolverError> {
+    ) -> Result<(), SolverError> {
         let handle = self.inner.cu();
         let itype = cusolverEigType_t::CUSOLVER_EIG_TYPE_1;
 
@@ -67,8 +76,7 @@ impl SolverHandle {
             .result()?;
 
             // Allocate workspace
-            let workspace = self.stream.alloc_zeros::<CudaComplex>(lwork as usize)
-                .unwrap_or_else(|e| panic!("cuSOLVER workspace alloc ({}): {e:?}", lwork));
+            let workspace = self.stream.alloc_zeros::<CudaComplex>(lwork as usize)?;
             let work_raw = workspace.device_ptr(&self.stream).0 as *const sys::cuDoubleComplex;
 
             // Solve
