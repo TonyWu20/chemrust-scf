@@ -138,6 +138,7 @@
             { name = "CUDA_HOME"; value = "${cudaToolkit}"; }
             { name = "CUDA_INCLUDE"; value = "${cudaToolkit}/include"; }
             { name = "CUDA_LIB"; value = "${cudaToolkit}/lib"; }
+            { name = "LD_LIBRARY_PATH"; value = "${cudaToolkit}/lib:/run/opengl-driver/lib"; }
           ];
           commands = [
             {

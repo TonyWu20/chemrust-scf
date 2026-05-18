@@ -67,45 +67,11 @@ impl<L: Layout> WavefunctionSet<L> {
 }
 
 // ---------------------------------------------------------------------------
-// Device-location wrappers
+// CPU-resident wrapper
 // ---------------------------------------------------------------------------
 
-/// GPU-resident data. Phase 1: transparent Deref to T (CPU identity).
-#[derive(Debug, Clone, Copy, Default)]
-pub struct Gpu<T>(pub T);
-
-impl<T> Gpu<T> {
-    pub fn new(inner: T) -> Self {
-        Self(inner)
-    }
-    pub fn into_inner(self) -> T {
-        self.0
-    }
-
-    /// Stub: sync data to host. Phase 1 identity (no-op clone).
-    pub fn sync_to_host(&self) -> Cpu<T>
-    where
-        T: Clone,
-    {
-        Cpu::new(self.0.clone())
-    }
-}
-
-impl<T> std::ops::Deref for Gpu<T> {
-    type Target = T;
-    fn deref(&self) -> &T {
-        &self.0
-    }
-}
-
-impl<T> std::ops::DerefMut for Gpu<T> {
-    fn deref_mut(&mut self) -> &mut T {
-        &mut self.0
-    }
-}
-
-/// CPU-resident data. Phase 1: transparent Deref to T.
-#[derive(Debug, Clone, Copy, Default)]
+/// CPU-resident data. Always accessible via `Deref<Target=T>`.
+#[derive(Debug, Clone, Default)]
 pub struct Cpu<T>(pub T);
 
 impl<T> Cpu<T> {
@@ -114,14 +80,6 @@ impl<T> Cpu<T> {
     }
     pub fn into_inner(self) -> T {
         self.0
-    }
-
-    /// Stub: sync data to device. Phase 1 identity (no-op clone).
-    pub fn sync_to_device(&self) -> Gpu<T>
-    where
-        T: Clone,
-    {
-        Gpu::new(self.0.clone())
     }
 }
 
