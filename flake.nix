@@ -10,7 +10,8 @@
   };
   outputs = { nixpkgs, devshell, fenix, ... }:
     let
-      systems = [ "x86_64-linux" "aarch64-darwin" ];
+      systems = [ "x86_64-linux" ];
+      system = "x86_64-linux";
 
       # Pin claude-code to a specific version from GitHub ahead of nixpkgs.
       # Update the tag here, then rebuild: nix will fail with the correct npmDepsHash.
@@ -42,67 +43,133 @@
         claude-code-overlay
       ];
       };
-      forAllSystems = nixpkgs.lib.genAttrs systems;
+
+      # CUDA overlay: enable parallel building + pin cuDNN for Pascal cc 6.1
+      cudaOverlay = final: prev: {
+        cudaPackages_12_9 = prev.cudaPackages_12_9.overrideScope (cFinal: cPrev:
+          let
+            parallelPkgs = [
+              "cuda_nvcc"
+              "cuda_cudart"
+              "cuda_cccl"
+              "nccl"
+              "libcublas"
+              "libcufft"
+              "libcusolver"
+              "cuda_nvrtc"
+              "cudnn"
+            ];
+            overriddenCudnn = cPrev.cudnn.overrideAttrs (old: rec {
+              version = "9.11.1.4";
+              src = prev.fetchurl {
+                url = "https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/linux-x86_64/cudnn-linux-x86_64-${version}_cuda12-archive.tar.xz";
+                hash = "sha256-YJrEikSORTMoek18YgVr8TD66MOx6yohgIDingAm7Bg=";
+              };
+            });
+            makeParallel = name: {
+              inherit name;
+              value = (if name == "cudnn" then overriddenCudnn else cPrev.${name}).overrideAttrs (_: { enableParallelBuilding = true; });
+            };
+          in
+          cPrev // (builtins.listToAttrs (map makeParallel parallelPkgs))
+        );
+      };
+
+      # CUDA-enabled nixpkgs for GPU build (Pascal cc 6.1)
+      pkgsCuda = import nixpkgs {
+        config = {
+          allowUnfree = true;
+          cudaSupport = true;
+          cudaCapability = [ "6.1" ];
+        };
+        enableCUDA = true;
+        cudaVersion = "12.9";
+        system = "x86_64-linux";
+        overlays = [
+          devshell.overlays.default
+          fenix.overlays.default
+          cudaOverlay
+          claude-code-overlay
+        ];
+      };
+
+      # CUDA toolkit symlinkJoin: one derivation with all needed libs
+      cudaToolkit = pkgsCuda.symlinkJoin {
+        name = "cuda-toolkit-ph2";
+        paths = with pkgsCuda.cudaPackages_12_9; [
+          cuda_nvcc
+          cuda_cudart
+          cuda_cccl
+          (cuda_nvrtc.include or cuda_nvrtc)
+          cuda_nvrtc.lib
+          (libcublas.include or libcublas)
+          libcublas.lib
+          (libcufft.include or libcufft)
+          libcufft.lib
+          (libcusolver.include or libcusolver)
+          libcusolver.lib
+        ];
+      };
+
+      rustPackages = (fenix.packages.${system}.stable.withComponents [
+        "cargo"
+        "clippy"
+        "rust-src"
+        "rustc"
+        "rustfmt"
+        "rust-analyzer"
+      ]);
     in
     {
-      devShells = forAllSystems (
-        system:
-        let
-          pkgs = pkgsFor system;
-          rustPackages = (fenix.packages.${system}.stable.withComponents [
-            "cargo"
-            "clippy"
-            "rust-src"
-            "rustc"
-            "rustfmt"
-            "rust-analyzer"
-          ]);
-        in
-        {
-          default = pkgs.devshell.mkShell {
-            packages = with pkgs; [
-              rustPackages
-              fish
-              uv
-              ty
-              claude-code
-            ];
-            commands = [
-              {
-                name = "claude-qwen3.6-nix";
-                command = ''
-                  ANTHROPIC_BASE_URL=http://127.0.0.1:4000 \
-                  CLAUDE_CODE_ATTRIBUTION_HEADER="0" \
-                  ANTHROPIC_DEFAULT_OPUS_MODEL=qwen3.6-apex-think \
-                  ANTHROPIC_DEFAULT_SONNET_MODEL=qwen3.6-apex-think \
-                  ANTHROPIC_DEFAULT_HAIKU_MODEL=qwen3.6-apex \
-                  claude
-                '';
-              }
-              {
-                name = "claude-deepseek";
-                command = ''
-                  ANTHROPIC_BASE_URL=$DEEPSEEK_BASE_URL \
-                  ANTHROPIC_AUTH_TOKEN=$DEEPSEEK_TOKEN \
-                  CLAUDE_CODE_ATTRIBUTION_HEADER="0" \
-                  ANTHROPIC_DEFAULT_OPUS_MODEL=deepseek-v4-pro[1m] \
-                  ANTHROPIC_DEFAULT_SONNET_MODEL=deepseek-v4-flash[1m] \
-                  ANTHROPIC_DEFAULT_HAIKU_MODEL=deepseek-v4-flash \
-                  claude --model "opusplan"
-                '';
-              }
-              {
-                name = "claude-fox";
-                command = ''
-                  ANTHROPIC_BASE_URL=https://code.newcli.com/claude/ultra \
-                  ANTHROPIC_AUTH_TOKEN=$FOXCODE_TOKEN \
-                  claude
-                '';
-              }
-            ];
-          };
-        }
-      );
+      devShells = {
+        "${system}".default = pkgsCuda.devshell.mkShell {
+          packages = with pkgsCuda; [
+            rustPackages
+            fish
+            uv
+            ty
+            claude-code
+            cudaToolkit
+          ];
+          env = [
+            { name = "CUDA_HOME"; value = "${cudaToolkit}"; }
+            { name = "CUDA_INCLUDE"; value = "${cudaToolkit}/include"; }
+            { name = "CUDA_LIB"; value = "${cudaToolkit}/lib"; }
+          ];
+          commands = [
+            {
+              name = "claude-qwen3.6-nix";
+              command = ''
+                ANTHROPIC_BASE_URL=http://127.0.0.1:4000 \
+                CLAUDE_CODE_ATTRIBUTION_HEADER="0" \
+                ANTHROPIC_DEFAULT_OPUS_MODEL=qwen3.6-apex-think \
+                ANTHROPIC_DEFAULT_SONNET_MODEL=qwen3.6-apex-think \
+                ANTHROPIC_DEFAULT_HAIKU_MODEL=qwen3.6-apex \
+                claude
+              '';
+            }
+            {
+              name = "claude-deepseek";
+              command = ''
+                ANTHROPIC_BASE_URL=$DEEPSEEK_BASE_URL \
+                ANTHROPIC_AUTH_TOKEN=$DEEPSEEK_TOKEN \
+                CLAUDE_CODE_ATTRIBUTION_HEADER="0" \
+                ANTHROPIC_DEFAULT_OPUS_MODEL=deepseek-v4-pro[1m] \
+                ANTHROPIC_DEFAULT_SONNET_MODEL=deepseek-v4-flash[1m] \
+                ANTHROPIC_DEFAULT_HAIKU_MODEL=deepseek-v4-flash \
+                claude --model "opusplan"
+              '';
+            }
+            {
+              name = "claude-fox";
+              command = ''
+                ANTHROPIC_BASE_URL=https://code.newcli.com/claude/ultra \
+                ANTHROPIC_AUTH_TOKEN=$FOXCODE_TOKEN \
+                claude
+              '';
+            }
+          ];
+        };
+      };
     };
 }
-

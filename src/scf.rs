@@ -54,20 +54,22 @@ pub struct ScfIteration<
     State: ScfPhase = Initialized,
 > {
     // --- Immutable across all SCF iterations ---
-    pub cell: CellGeometry,
-    pub pots: PseudopotentialSet,
-    pub wave_grid: GVectorGrid,
-    pub fine_grid: GVectorGrid,
-    pub k_point: KPoint,
-    pub smearing: SmearingParams,
+    pub(crate) cell: CellGeometry,
+    pub(crate) pots: PseudopotentialSet,
+    pub(crate) wave_grid: GVectorGrid,
+    pub(crate) fine_grid: GVectorGrid,
+    pub(crate) k_point: KPoint,
+    pub(crate) smearing: SmearingParams,
 
     // --- Mutable state, governed by phase ---
-    pub density: Density,
-    pub psi: WavefunctionSet<ColumnDistributed>,
-    pub eigenvalues: Vec<f64>,
-    pub v_eff: Option<S::VEff>,
-    pub history: DensityHistory,
-    pub previous_density: Density,
+    pub(crate) density: Density,
+    pub(crate) psi: WavefunctionSet<ColumnDistributed>,
+    pub(crate) eigenvalues: Vec<f64>,
+    pub(crate) v_eff: Option<S::VEff>,
+    pub(crate) history: DensityHistory,
+    /// Will be read by `check()` in Phase 2 Goal 5. Suppressed until then.
+    #[allow(dead_code)]
+    pub(crate) previous_density: Density,
 
     _phase: PhantomData<State>,
 }
@@ -159,8 +161,23 @@ impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated> {
 impl<S: SpinPolicy> ScfIteration<S, DensityUpdated> {
     /// Mix new density with history (Pulay / DIIS in later phases).
     /// Infallible: mixing can always proceed, even if it degrades gracefully.
-    pub fn mix(self) -> ScfIteration<S, Mixed> {
-        todo!()
+    pub fn mix(mut self) -> ScfIteration<S, Mixed> {
+        let (mixed, prev) = self.history.mix(self.density);
+        ScfIteration {
+            cell: self.cell,
+            pots: self.pots,
+            wave_grid: self.wave_grid,
+            fine_grid: self.fine_grid,
+            k_point: self.k_point,
+            smearing: self.smearing,
+            density: mixed,
+            psi: self.psi,
+            eigenvalues: self.eigenvalues,
+            v_eff: self.v_eff,
+            history: self.history,
+            previous_density: prev,
+            _phase: PhantomData,
+        }
     }
 }
 

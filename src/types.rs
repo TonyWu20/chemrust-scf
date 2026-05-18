@@ -1,4 +1,5 @@
 use ndarray::Array3;
+use std::ops::{Add, Mul, Sub};
 
 // ---------------------------------------------------------------------------
 // Grid-level newtypes
@@ -26,6 +27,21 @@ impl WaveGridArray {
     }
 }
 
+// ── Arithmetic ops: delegate to inner Array3<f64> ──
+
+impl Add for WaveGridArray {
+    type Output = Self;
+    fn add(self, rhs: Self) -> Self { Self(self.0 + rhs.0) }
+}
+impl Sub for WaveGridArray {
+    type Output = Self;
+    fn sub(self, rhs: Self) -> Self { Self(self.0 - rhs.0) }
+}
+impl Mul<f64> for WaveGridArray {
+    type Output = Self;
+    fn mul(self, rhs: f64) -> Self { Self(self.0 * rhs) }
+}
+
 /// 3D array on the 2x upsampled fine FFT grid (used for V_eff assembly).
 #[derive(Debug, Clone)]
 pub struct FineGridArray(pub(crate) Array3<f64>);
@@ -46,6 +62,21 @@ impl FineGridArray {
     pub fn shape(&self) -> &[usize] {
         self.0.shape()
     }
+}
+
+// ── Arithmetic ops ──
+
+impl Add for FineGridArray {
+    type Output = Self;
+    fn add(self, rhs: Self) -> Self { Self(self.0 + rhs.0) }
+}
+impl Sub for FineGridArray {
+    type Output = Self;
+    fn sub(self, rhs: Self) -> Self { Self(self.0 - rhs.0) }
+}
+impl Mul<f64> for FineGridArray {
+    type Output = Self;
+    fn mul(self, rhs: f64) -> Self { Self(self.0 * rhs) }
 }
 
 // ---------------------------------------------------------------------------
@@ -71,6 +102,21 @@ impl Density {
     }
 }
 
+// ── Arithmetic ops ──
+
+impl Add for Density {
+    type Output = Self;
+    fn add(self, rhs: Self) -> Self { Self(self.0 + rhs.0) }
+}
+impl Sub for Density {
+    type Output = Self;
+    fn sub(self, rhs: Self) -> Self { Self(self.0 - rhs.0) }
+}
+impl Mul<f64> for Density {
+    type Output = Self;
+    fn mul(self, rhs: f64) -> Self { Self(self.0 * rhs) }
+}
+
 /// Effective potential V_eff[ρ] assembled on the fine grid.
 #[derive(Debug, Clone)]
 pub struct EffectivePotential(pub(crate) FineGridArray);
@@ -90,6 +136,21 @@ impl EffectivePotential {
     }
 }
 
+// ── Arithmetic ops ──
+
+impl Add for EffectivePotential {
+    type Output = Self;
+    fn add(self, rhs: Self) -> Self { Self(self.0 + rhs.0) }
+}
+impl Sub for EffectivePotential {
+    type Output = Self;
+    fn sub(self, rhs: Self) -> Self { Self(self.0 - rhs.0) }
+}
+impl Mul<f64> for EffectivePotential {
+    type Output = Self;
+    fn mul(self, rhs: f64) -> Self { Self(self.0 * rhs) }
+}
+
 /// Intermediate: density upsampled to the fine grid (before V_eff assembly).
 #[derive(Debug, Clone)]
 pub struct DensityUpsampled(pub(crate) FineGridArray);
@@ -107,6 +168,21 @@ impl DensityUpsampled {
     pub fn from_inner(arr: FineGridArray) -> Self {
         Self(arr)
     }
+}
+
+// ── Arithmetic ops ──
+
+impl Add for DensityUpsampled {
+    type Output = Self;
+    fn add(self, rhs: Self) -> Self { Self(self.0 + rhs.0) }
+}
+impl Sub for DensityUpsampled {
+    type Output = Self;
+    fn sub(self, rhs: Self) -> Self { Self(self.0 - rhs.0) }
+}
+impl Mul<f64> for DensityUpsampled {
+    type Output = Self;
+    fn mul(self, rhs: f64) -> Self { Self(self.0 * rhs) }
 }
 
 // ---------------------------------------------------------------------------
