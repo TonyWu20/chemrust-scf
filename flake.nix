@@ -56,6 +56,7 @@
               "libcublas"
               "libcufft"
               "libcusolver"
+              "libcurand"
               "cuda_nvrtc"
               "cudnn"
             ];
@@ -108,6 +109,8 @@
           libcufft.lib
           (libcusolver.include or libcusolver)
           libcusolver.lib
+          (libcurand.include or libcurand)
+          libcurand.lib
         ];
       };
 
