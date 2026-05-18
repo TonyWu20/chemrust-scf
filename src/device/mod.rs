@@ -1,3 +1,7 @@
+pub mod fft;
+pub mod blas;
+pub mod solver;
+
 use std::marker::PhantomData;
 use std::sync::Arc;
 
@@ -13,60 +17,42 @@ use crate::types::{
 };
 
 // ---------------------------------------------------------------------------
-// CUDA-compatible complex wrapper
+// CUDA complex type (re-export from cudarc, same layout as double2 / Complex64)
 // ---------------------------------------------------------------------------
 
-/// GPU-compatible complex f64 type. Same repr as CUDA's `double2` /
-/// `cuDoubleComplex` and `num_complex::Complex64`.
-#[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct CudaF64x2(pub f64, pub f64);
+/// CUDA `double2` — `#[repr(C)] { x: f64, y: f64 }`, same layout as
+/// `num_complex::Complex64`. Re-exported so FFT/cuBLAS wrappers can use
+/// the same type as the underlying CUDA libraries.
+pub use cudarc::cufft::sys::double2 as CudaComplex;
 
-impl From<Complex64> for CudaF64x2 {
-    fn from(c: Complex64) -> Self {
-        Self(c.re, c.im)
-    }
+pub fn complex_to_cuda(c: Complex64) -> CudaComplex {
+    CudaComplex { x: c.re, y: c.im }
 }
 
-impl From<CudaF64x2> for Complex64 {
-    fn from(c: CudaF64x2) -> Self {
-        Self::new(c.0, c.1)
-    }
+pub fn cuda_to_complex(c: CudaComplex) -> Complex64 {
+    Complex64::new(c.x, c.y)
 }
 
-impl From<&Complex64> for CudaF64x2 {
-    fn from(c: &Complex64) -> Self {
-        Self(c.re, c.im)
-    }
+pub fn complex_slice_to_cuda(data: &[Complex64]) -> Vec<CudaComplex> {
+    data.iter().map(|&c| complex_to_cuda(c)).collect()
 }
 
-// Safety: CudaF64x2 is #[repr(C)] with two f64, matching CUDA's double2 layout.
-unsafe impl DeviceRepr for CudaF64x2 {}
-// Safety: Zeroed bytes represent a valid CudaF64x2(0.0, 0.0).
-unsafe impl ValidAsZeroBits for CudaF64x2 {}
+pub fn cuda_vec_to_complex(data: Vec<CudaComplex>) -> Vec<Complex64> {
+    data.into_iter().map(cuda_to_complex).collect()
+}
 
 // ---------------------------------------------------------------------------
 // DeviceMapped trait — element-type safe
 // ---------------------------------------------------------------------------
 
 /// Trait for types that can be transferred between CPU and GPU.
-///
-/// The `Elem` associated type preserves the scalar type: `f64` for
-/// real-valued quantities, `CudaF64x2` for complex-valued.
 pub trait DeviceMapped: Sized {
-    /// CUDA-compatible element type (`f64` for real, `CudaF64x2` for complex).
+    /// CUDA-compatible element type (`f64` for real, `CudaComplex` for complex).
     type Elem: DeviceRepr + ValidAsZeroBits;
 
-    /// Number of scalar elements when flattened.
     fn num_elems(&self) -> usize;
-
-    /// Shape metadata for reconstruction (e.g. `[nx, ny, nz]` for 3-D grids).
     fn shape_metadata(&self) -> Vec<usize>;
-
-    /// Flatten to host vector for H2D transfer.
     fn flatten_host(&self) -> Vec<Self::Elem>;
-
-    /// Reconstruct from host data with given shape metadata.
     fn unflatten_host(data: Vec<Self::Elem>, shape: &[usize]) -> Self;
 }
 
@@ -85,14 +71,6 @@ fn flatten_f64(arr: &Array3<f64>) -> Vec<f64> {
 fn unflatten_f64(data: Vec<f64>, shape: &[usize]) -> Array3<f64> {
     Array3::from_shape_vec(ndarray::Ix3(shape[0], shape[1], shape[2]), data)
         .expect("DeviceMapped: valid 3-D shape")
-}
-
-fn flatten_c64(data: &[Complex64]) -> Vec<CudaF64x2> {
-    data.iter().map(|&c| CudaF64x2::from(c)).collect()
-}
-
-fn unflatten_c64(data: Vec<CudaF64x2>) -> Vec<Complex64> {
-    data.into_iter().map(Complex64::from).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -187,11 +165,11 @@ impl DeviceMapped for DensityUpsampled {
 }
 
 // ---------------------------------------------------------------------------
-// DeviceMapped impls — complex-valued (Elem = CudaF64x2)
+// DeviceMapped impls — complex-valued (Elem = CudaComplex / double2)
 // ---------------------------------------------------------------------------
 
 impl<L: Layout> DeviceMapped for WavefunctionSet<L> {
-    type Elem = CudaF64x2;
+    type Elem = CudaComplex;
 
     fn num_elems(&self) -> usize {
         self.data.len()
@@ -201,14 +179,14 @@ impl<L: Layout> DeviceMapped for WavefunctionSet<L> {
         vec![self.n_bands, self.n_pw]
     }
 
-    fn flatten_host(&self) -> Vec<CudaF64x2> {
-        flatten_c64(&self.data)
+    fn flatten_host(&self) -> Vec<CudaComplex> {
+        complex_slice_to_cuda(&self.data)
     }
 
-    fn unflatten_host(data: Vec<CudaF64x2>, shape: &[usize]) -> Self {
+    fn unflatten_host(data: Vec<CudaComplex>, shape: &[usize]) -> Self {
         let n_bands = shape[0];
         let n_pw = shape.get(1).copied().unwrap_or(1);
-        let complex_data = unflatten_c64(data);
+        let complex_data = cuda_vec_to_complex(data);
         Self::new(complex_data, n_bands, n_pw)
     }
 }
@@ -220,26 +198,21 @@ impl<L: Layout> DeviceMapped for WavefunctionSet<L> {
 /// GPU-resident data.
 ///
 /// `Gpu<Density>` stores `CudaSlice<f64>`, `Gpu<WavefunctionSet>` stores
-/// `CudaSlice<CudaF64x2>` — the element type matches the domain quantity.
+/// `CudaSlice<CudaComplex>` — the element type matches the domain quantity.
 ///
 /// No `Deref<Target=T>` — prevents accidental CPU reads of GPU data.
 #[derive(Debug)]
 pub struct Gpu<T: DeviceMapped> {
-    /// Device buffer, typed by the domain quantity's scalar type.
     slice: CudaSlice<T::Elem>,
-    /// Shape metadata for reconstruction.
     shape: Vec<usize>,
-    /// CUDA context (keeps device alive).
     ctx: Arc<CudaContext>,
     _marker: PhantomData<T>,
 }
 
-// Safety: CudaSlice and Arc<CudaContext> are Send+Sync.
 unsafe impl<T: DeviceMapped> Send for Gpu<T> {}
 unsafe impl<T: DeviceMapped> Sync for Gpu<T> {}
 
 impl<T: DeviceMapped> Gpu<T> {
-    /// H2D: construct from a host value.
     pub fn from_host(value: &T, stream: &Arc<CudaStream>) -> Result<Self, DriverError> {
         let shape = value.shape_metadata();
         let host_data = value.flatten_host();
@@ -255,34 +228,28 @@ impl<T: DeviceMapped> Gpu<T> {
         })
     }
 
-    /// H2D from a `Cpu<T>` wrapper.
     pub fn from_cpu(value: &Cpu<T>, stream: &Arc<CudaStream>) -> Result<Self, DriverError> {
         Self::from_host(&value.0, stream)
     }
 
-    /// D2H: transfer to host, returning `Cpu<T>`.
     pub fn sync_to_host(&self, stream: &Arc<CudaStream>) -> Result<Cpu<T>, DriverError> {
         let data: Vec<T::Elem> = stream.clone_dtoh(&self.slice)?;
         let value = T::unflatten_host(data, &self.shape);
         Ok(Cpu(value))
     }
 
-    /// Read-only access to the device buffer (for cuBLAS/cuFFT ops).
     pub fn as_device_slice(&self) -> &CudaSlice<T::Elem> {
         &self.slice
     }
 
-    /// Mutable access to the device buffer.
     pub fn as_device_slice_mut(&mut self) -> &mut CudaSlice<T::Elem> {
         &mut self.slice
     }
 
-    /// Shape metadata.
     pub fn shape(&self) -> &[usize] {
         &self.shape
     }
 
-    /// Number of elements on device.
     pub fn len(&self) -> usize {
         self.slice.len()
     }
@@ -291,7 +258,6 @@ impl<T: DeviceMapped> Gpu<T> {
         self.slice.is_empty()
     }
 
-    /// Context handle.
     pub fn context(&self) -> &Arc<CudaContext> {
         &self.ctx
     }
@@ -341,7 +307,6 @@ mod tests {
 
     #[test]
     fn test_gpu_element_type_distinction() {
-        // Gpu<Density>::Elem = f64, Gpu<WavefunctionSet>::Elem = CudaF64x2
         let ctx = CudaContext::new(0).unwrap();
         let stream = ctx.default_stream();
 
@@ -356,6 +321,6 @@ mod tests {
         );
         let gpu_w: Gpu<WavefunctionSet<crate::layout::ColumnDistributed>> =
             Gpu::from_host(&wfn, &stream).unwrap();
-        let _c64_slice: &CudaSlice<CudaF64x2> = gpu_w.as_device_slice();
+        let _c64_slice: &CudaSlice<CudaComplex> = gpu_w.as_device_slice();
     }
 }
