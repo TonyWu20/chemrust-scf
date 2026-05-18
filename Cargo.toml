@@ -10,6 +10,7 @@ ndarray = "0.17.2"
 num-complex = "0.4.6"
 thiserror = "2.0.18"
 bon = "3.9.1"
+cudarc = { version = "0.19.7", features = ["cuda-12090", "cufft", "cusolver"] }
 
 [lib]
 name = "chemrust_scf"
