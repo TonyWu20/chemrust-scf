@@ -1,0 +1,16 @@
+[package]
+name = "chemrust-scf"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+chemrust-hamiltonian-core = { path = "../chemrust-hamiltonian/chemrust-hamiltonian-core" }
+ndarray = "0.17.2"
+num-complex = "0.4.6"
+thiserror = "2.0.18"
+bon = "3.9.1"
+
+[lib]
+name = "chemrust_scf"
+crate-type = ["lib"]

@@ -1,0 +1,139 @@
+use std::marker::PhantomData;
+use num_complex::Complex64;
+
+// ---------------------------------------------------------------------------
+// Sealed layout-marker trait
+// ---------------------------------------------------------------------------
+
+mod sealed {
+    pub trait Sealed {}
+}
+
+/// Sealed trait for MPI distribution layout.
+pub trait Layout: sealed::Sealed {
+    fn name() -> &'static str;
+}
+
+/// Row-distributed layout: bands split across MPI processes.
+pub struct RowDistributed;
+
+/// Column-distributed layout: plane-wave coefficients split across MPI processes.
+pub struct ColumnDistributed;
+
+impl sealed::Sealed for RowDistributed {}
+impl sealed::Sealed for ColumnDistributed {}
+
+impl Layout for RowDistributed {
+    fn name() -> &'static str {
+        "row-distributed"
+    }
+}
+impl Layout for ColumnDistributed {
+    fn name() -> &'static str {
+        "column-distributed"
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WavefunctionSet<Layout>
+// ---------------------------------------------------------------------------
+
+/// Complex plane-wave coefficients for all bands, typed by distribution layout.
+#[derive(Debug, Clone)]
+pub struct WavefunctionSet<L: Layout> {
+    pub data: Vec<Complex64>,
+    pub n_bands: usize,
+    pub n_pw: usize,
+    _layout: PhantomData<L>,
+}
+
+impl<L: Layout> WavefunctionSet<L> {
+    pub fn new(data: Vec<Complex64>, n_bands: usize, n_pw: usize) -> Self {
+        debug_assert_eq!(
+            data.len(),
+            n_bands * n_pw,
+            "WavefunctionSet data length {} != n_bands({}) * n_pw({})",
+            data.len(),
+            n_bands,
+            n_pw
+        );
+        Self {
+            data,
+            n_bands,
+            n_pw,
+            _layout: PhantomData,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Device-location wrappers
+// ---------------------------------------------------------------------------
+
+/// GPU-resident data. Phase 1: transparent Deref to T (CPU identity).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Gpu<T>(pub T);
+
+impl<T> Gpu<T> {
+    pub fn new(inner: T) -> Self {
+        Self(inner)
+    }
+    pub fn into_inner(self) -> T {
+        self.0
+    }
+
+    /// Stub: sync data to host. Phase 1 identity (no-op clone).
+    pub fn sync_to_host(&self) -> Cpu<T>
+    where
+        T: Clone,
+    {
+        Cpu::new(self.0.clone())
+    }
+}
+
+impl<T> std::ops::Deref for Gpu<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
+impl<T> std::ops::DerefMut for Gpu<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.0
+    }
+}
+
+/// CPU-resident data. Phase 1: transparent Deref to T.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Cpu<T>(pub T);
+
+impl<T> Cpu<T> {
+    pub fn new(inner: T) -> Self {
+        Self(inner)
+    }
+    pub fn into_inner(self) -> T {
+        self.0
+    }
+
+    /// Stub: sync data to device. Phase 1 identity (no-op clone).
+    pub fn sync_to_device(&self) -> Gpu<T>
+    where
+        T: Clone,
+    {
+        Gpu::new(self.0.clone())
+    }
+}
+
+impl<T> std::ops::Deref for Cpu<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
+impl<T> std::ops::DerefMut for Cpu<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.0
+    }
+}
