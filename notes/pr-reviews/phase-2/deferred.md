@@ -128,7 +128,27 @@ The result `map_err(Error::Cuda)?` is not present.
 
 **Fix:** Add `?` or `map_err(Error::Cuda)?` to the `synchronize()` call.
 
-## 15. Spectral bound formula uses ad-hoc kinetic+potential estimate
+## 15. File location: src/density.rs vs src/scf/density.rs
+
+The Group D spec says `src/scf/density.rs` but the module lives at `src/density.rs`. Moving it to `src/scf/` would require converting `src/scf.rs` from a flat file into a directory with `scf/mod.rs` + `scf/density.rs`. This is a larger refactor than appropriate for a post-review fix pass. Defer to a dedicated module reorganization phase.
+
+## 16. C2C → C2R optimization for density construction
+
+The spec calls for batched C2R transforms (half the output size, no imaginary noise), but the implementation uses C2C. C2C is correct for general k-points and avoids the Hermitian-symmetry constraints of C2R. Revisit for Gamma-point optimization in Phase 3.
+
+## 17. PcieAccount tracking in construct_density
+
+`construct_density()` has H2D (psi, fft_indices, occupations) and D2H (rho) PCI-E transfers that are not tracked by PcieAccount. Adding this requires passing `PcieAccount` through the function. Deferred because the critical monitoring is in `diagonalize()` (where unbounded data flows occur inside the Chebyshev recurrence loop). Density construction transfers are fixed-size, predictable, and unlikely to hide the kind of bug PcieAccount was designed to catch.
+
+## 18. Shared CudaContext/CudaKernelSet across SCF transitions
+
+`diagonalize()` and `construct_density()` each independently create `CudaContext::new(0)` and `CudaKernelSet::new()`, meaning NVRTC recompiles all kernels twice per iteration and two primary contexts are allocated. Fuse into a shared resource struct passed through the state machine. Phase 3 refactor.
+
+## 19. `n_electrons` recomputed per iteration
+
+The species loop for computing total electron count executes every SCF cycle. This is a constant (determined by the pseudopotentials and cell composition). Store once. Trivial fix, negligible perf impact for Phase 2.
+
+## 20. Spectral bound formula uses ad-hoc kinetic+potential estimate
 
 The code at `src/eigensolver/chebyshev.rs:236` computes:
 ```rust

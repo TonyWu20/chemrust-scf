@@ -78,3 +78,112 @@ Note: this requires routing all H2D transfers through `PcieAccount` (currently `
 **Success Criteria:**
 - H2D assertion passes when diagonalize is called
 - All setup H2D transfers are tracked
+
+---
+
+# Group D Fix Tasks
+
+## P5: Fix occupation sign-inversion in compute_occupations
+
+`erfc((μ - ε_b) / width)` at `src/density.rs:43` is the inversion of the correct formula `erfc((ε_b - μ) / width)`. The bisection search in `find_chemical_potential` must also flip its comparison direction.
+
+**Files:** `src/density.rs`
+
+**Guidance:**
+
+1. Change line 43 from:
+   ```rust
+   .map(|&e| libm::erfc((mu - e) / smearing.width))
+   ```
+   to:
+   ```rust
+   .map(|&e| libm::erfc((e - mu) / smearing.width))
+   ```
+
+2. Change line 68 from:
+   ```rust
+   if sum > n_electrons {
+       lo = mid;
+   } else {
+       hi = mid;
+   }
+   ```
+   to:
+   ```rust
+   if sum > n_electrons {
+       hi = mid;
+   } else {
+       lo = mid;
+   }
+   ```
+
+**Rationale:** The correct Gaussian-smearing occupation formula is `erfc((ε_b - μ) / w)` where:
+- States far below μ (ε_b << μ): erfc(-large) ≈ 2 → fully occupied
+- States at μ (ε_b = μ): erfc(0) = 1 → half occupied
+- States far above μ (ε_b >> μ): erfc(large) ≈ 0 → empty
+
+`erfc((μ - ε_b)/w) = 2 - erfc((ε_b - μ)/w)` which inverts the occupation: states below μ get near-zero weight, states above μ get near-full weight.
+
+With the correct formula, `f(μ) = Σ erfc((ε_b - μ)/w)` is **increasing** in μ (positive derivative). So:
+- f(μ) > N → μ is too high → set `hi = mid`
+- f(μ) < N → μ is too low → set `lo = mid`
+
+**Success Criteria:**
+- `cargo check` passes
+- Unit test: for a sorted eigenval array [0.0, 0.1, 0.2], width=0.1, n_electrons=3.0, the computed occupations should be approximately [1.0, 1.0, 1.0], not inverted
+- The bisection should converge to μ ≈ 0.1 (the midpoint) for the above case
+
+---
+
+## P6: Fix `accumulate_density` kernel launch config
+
+The `accumulate_density` kernel at `src/density.rs:169` is launched with `LaunchConfig::for_num_elems(grid_size)` which has two bugs:
+1. Grid dimension: computes `ceil(grid_size/1024)` blocks instead of `grid_size` blocks (kernel uses `blockIdx.x` as grid-point index, expecting one block per point)
+2. Shared memory: `shared_mem_bytes = 0` but kernel uses `extern __shared__ double sdata[]`
+
+**Files:** `src/density.rs`, `src/eigensolver/chebyshev.rs` (kernel might need adjustment)
+
+**Guidance:**
+
+Option A (preferred — minimal change to kernel): Replace the `LaunchConfig::for_num_elems` call with an explicit config that allocates shared memory and uses one block per grid point:
+
+```rust
+let block_size = 256u32;
+let cfg = LaunchConfig {
+    grid_dim: (grid_size as u32, 1, 1),
+    block_dim: (block_size, 1, 1),
+    shared_mem_bytes: block_size * std::mem::size_of::<f64>() as u32,
+};
+```
+
+Then change the launch call to use `cfg` instead of `LaunchConfig::for_num_elems`.
+
+Option B (modern — rewrite kernel with grid-stride loop, avoiding shared memory entirely): Rewrite the kernel to be a simple grid-stride loop without reduction:
+
+```cuda
+extern \"C\" __global__ void accumulate_density(
+    const double2* psi_r, const double* occ,
+    double* rho, int n_bands, int grid_size, double inv_omega
+) {
+    int r = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+    while (r < grid_size) {
+        double sum = 0.0;
+        for (int b = 0; b < n_bands; b++) {
+            double2 psi = psi_r[b * grid_size + r];
+            sum += occ[b] * (psi.x * psi.x + psi.y * psi.y);
+        }
+        rho[r] = sum * inv_omega;
+        r += stride;
+    }
+}
+```
+
+This eliminates the shared memory and reduction logic entirely. Launch with `for_num_elems(grid_size)` after the rewrite (the original launch config works because the grid-stride loop handles the block → element mapping correctly).
+
+**Option B is recommended** — simpler kernel, no shared memory, no reduction bugs, one less thing to track.
+
+**Success Criteria:**
+- `cargo check` passes
+- Small-scale test on CPU: construct a known density from a small set of PW coefficients and verify against an NDArray reference computation
+- The kernel produces correct output when called with actual data on GPU

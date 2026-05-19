@@ -85,3 +85,92 @@ However, 1 critical PcieAccount assertion bug and 1 significant FFT dimension or
 - **CudaKernelSet lives in chebyshev module**: `rayleigh_ritz` imports `CudaKernelSet` from `chebyshev` for the transpose kernel. Better to move to `eigensolver/kernels.rs` or `device/kernels.rs`. Deferred to avoid scope creep.
 - **RowDistributed shape metadata**: The `[n_bands, n_pw]` shape doesn't reflect the transposed memory layout. No current code path syncs RowDistributed to host, so this is latent. Fix when adding RowDistributed host access.
 - See `notes/pr-reviews/phase-2/deferred.md` for all previously deferred items.
+
+---
+
+# Review: Phase 2 Group D — construct_density + build_v_eff
+
+**Tasks**: `notes/plans/phase-2/TASKS.md` (Group D, lines 330-381)
+**Reviewed**: 2026-05-19
+**Review scope**: Group D only (D-1: Batched density construction on GPU, D-2: V_eff assembly wrapper)
+
+## Summary
+
+**Verdict: CHANGES REQUIRED** — 2 critical bugs, 2 moderate issues.
+
+The architectural direction is sound. The `BuildVEff` trait cleanly handles NonSpin/SpinCollinear dispatch. The `into_phase` helper centralizes state transitions. Crate boundaries are respected. However, the density construction has two critical bugs that would produce incorrect physics: an inverted occupation formula (wrong density from wrong bands) and a broken kernel launch (shared memory not allocated + wrong grid dimensions).
+
+Outcome verification: `cargo check` passes. All 10 GPU unit tests pass (Group B tests). `cargo test --workspace` clean. No Group D integration tests exist yet (Group F handles fixture-anchored validation).
+
+## Per-Task Results
+
+### D-1: Batched density construction on GPU
+- **Status**: ✗ Failed — 2 critical bugs
+- **File**: `src/density.rs` (spec says `src/scf/density.rs` — minor drift)
+- **Runtime verification**: No dedicated test (Group F). Compilation passes.
+- **Diff validation**:
+  - Occupation computation with bisection search for μ ✓ (but formula is inverted)
+  - Scatter sparse PW → FFT grid, reusing `scatter_pw_to_grid` kernel ✓
+  - Batched C2C IFFT via `BatchedFftPlan3d` ✓
+  - ρ[r] = 1/Ω · Σ occ_b · |ψ_b[r]|² via `accumulate_density` kernel ✓ (but launch config wrong)
+  - D2H → Density ✓
+  - **Critical — occupation sign inversion**: `erfc((μ - ε)/w)` should be `erfc((ε - μ)/w)`. Bands below μ (physically occupied) get near-zero weight; bands above μ get near-full weight.
+  - **Critical — accumulate_density launch broken**: `LaunchConfig::for_num_elems` gives wrong grid dimension (ceil(grid_size/1024) blocks instead of grid_size blocks) AND `shared_mem_bytes = 0` while kernel uses `extern __shared__`.
+  - C2C rather than spec'd C2R (acceptable for Phase 2; C2C is correct for general k-points)
+  - Function named `construct_density_gpu` not `build_density_from_wavefunctions` (internally consistent)
+
+### D-2: V_eff assembly wrapper
+- **Status**: ✓ Passed
+- **File**: `src/scf.rs`
+- **Runtime verification**: Compiles. No runtime test (needs VEffBuilder + fixtures, Group F).
+- **Diff validation**:
+  - `build_v_eff()` on `ScfIteration<S, Initialized>` implemented ✓
+  - V_eff computed via `VEffBuilder::assemble_on_fine_grid` ✓
+  - `BuildVEff` trait unifies NonSpin and SpinCollinear dispatch ✓
+  - V_eff stored in `self.v_eff` with transition to `VEffBuilt` phase ✓
+  - `into_phase` helper method centralizes struct literal ✓
+  - Spec's D2H/H2D steps not literally present (V_eff/V_eff are CPU-side types — architecturally correct)
+  - SpinCollinear path uses zero-spin placeholder (acceptable for Phase 2)
+
+## Issues Found
+
+### Critical
+
+1. **Occupations formula inverted (`src/density.rs:43`)**
+   - `erfc((μ - ε_b) / width)` should be `erfc((ε_b - μ) / width)`. Bisection comparison at line 68 must also flip.
+   - Effect: bands below μ (occupied) get near-zero weight; bands above μ (empty) get near-full weight. Density built from wrong wavefunctions → wrong total energy.
+   - **Fix**: Change erfc argument order; flip bisection: `if sum > n_electrons { hi = mid; } else { lo = mid; }`.
+   - **Severity**: Physics-correctness blocking.
+
+2. **`accumulate_density` kernel launch broken (`src/density.rs:169`)**
+   - Two compounding bugs in one `LaunchConfig::for_num_elems(grid_size)` call:
+     - **2a — Grid dimension**: Formula computes `grid_dim = (ceil(grid_size/1024), 1, 1)`, but kernel uses `int r = blockIdx.x` as grid-point index, expecting one block per grid point. For a 64³ grid (262,144 points), only 256 blocks launched → 261,888 points uncomputed.
+     - **2b — Shared memory**: `shared_mem_bytes = 0` but kernel uses `extern __shared__ double sdata[]` for block reduction. UB — writes to unmapped shared memory, silent garbage or illegal address error.
+   - **Fix**: Replace with `LaunchConfig { grid_dim: (grid_size, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 256 * 8 }`.
+   - **Severity**: Runtime correctness blocking.
+
+### Moderate
+
+3. **File location drift (`src/density.rs` vs `src/scf/density.rs`)**
+   - Spec says `src/scf/density.rs` but module lives at `src/density.rs`.
+   - **Recommendation**: Move to `src/scf/` for consistency, or document the deviation.
+
+4. **No PcieAccount tracking in `construct_density`**
+   - H2D transfers (psi, fft_indices, occupations) and D2H (rho) are not tracked. `diagonalize()` has PcieAccount tracking; density construction should too for monitoring parity.
+   - **Recommendation**: Add PcieAccount tracking.
+
+### Minor
+
+5. C2C rather than spec'd C2R — functionally correct and works for general k-points; less efficient but acceptable for Phase 2.
+6. Function name `construct_density_gpu` differs from spec's `build_density_from_wavefunctions`.
+7. Smearing changed from Fermi-Dirac (spec) to Gaussian/erfc — intentional correction: CASTEP defaults to Gaussian.
+8. D-2 spec's D2H/H2D steps not literally present — correct by architecture (types are CPU-side).
+9. `BuildVEff` trait + `SpinCollinear` dispatch are scope additions beyond D-2.
+
+## Deferred Items
+
+See `deferred.md` (Group D section).
+
+## Fix Tasks
+
+See `fix-tasks.md` (Group D section).
