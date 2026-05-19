@@ -226,4 +226,23 @@ pub struct FinalResult {
 pub enum Error {
     #[error("not yet implemented")]
     NotImplemented,
+    #[error("Chebyshev filtering diverged: norm grew {growth_factor:.2e}x at iteration {iteration}")]
+    ChebyshevDiverged {
+        iteration: usize,
+        norm_previous: f64,
+        norm_current: f64,
+        growth_factor: f64,
+    },
+    #[error("Rayleigh-Ritz ZHEGVD failed: info={info}")]
+    RayleighRitzFailed { info: i32 },
+    #[error("cuSOLVER error: {0}")]
+    Solver(#[from] crate::device::solver::SolverError),
+    #[error("cuBLAS error: {0}")]
+    Blas(#[from] cudarc::cublas::result::CublasError),
+    #[error("cuFFT error: {0}")]
+    Fft(#[from] cudarc::cufft::result::CufftError),
+    #[error("CUDA driver error: {0}")]
+    Cuda(#[from] cudarc::driver::result::DriverError),
+    #[error("NVRTC compilation error: {0}")]
+    Nvrtc(String),
 }

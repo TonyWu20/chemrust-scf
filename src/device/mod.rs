@@ -203,10 +203,10 @@ impl<L: Layout> DeviceMapped for WavefunctionSet<L> {
 /// No `Deref<Target=T>` — prevents accidental CPU reads of GPU data.
 #[derive(Debug)]
 pub struct Gpu<T: DeviceMapped> {
-    slice: CudaSlice<T::Elem>,
-    shape: Vec<usize>,
-    ctx: Arc<CudaContext>,
-    _marker: PhantomData<T>,
+    pub(crate) slice: CudaSlice<T::Elem>,
+    pub(crate) shape: Vec<usize>,
+    pub(crate) ctx: Arc<CudaContext>,
+    pub(crate) _marker: PhantomData<T>,
 }
 
 unsafe impl<T: DeviceMapped> Send for Gpu<T> {}

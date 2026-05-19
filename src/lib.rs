@@ -3,6 +3,7 @@ pub mod layout;
 pub mod scf;
 pub mod mixing;
 pub mod device;
+pub(crate) mod eigensolver;
 
 pub use types::{
     Density, DensityUpsampled, EffectivePotential, Error, FinalResult, FineGridArray, KPoint,
