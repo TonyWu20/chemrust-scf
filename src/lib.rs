@@ -2,12 +2,13 @@ pub mod types;
 pub mod layout;
 pub mod scf;
 pub mod mixing;
+pub mod density;
 pub mod device;
 pub(crate) mod eigensolver;
 
 pub use types::{
     Density, DensityUpsampled, EffectivePotential, Error, FinalResult, FineGridArray, KPoint,
-    SmearingParams, WaveGridArray,
+    SmearingParams, SmearingScheme, WaveGridArray,
 };
 pub use layout::{Cpu, ColumnDistributed, Layout, RowDistributed, WavefunctionSet};
 pub use device::{DeviceMapped, Gpu};

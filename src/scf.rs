@@ -2,7 +2,9 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 
 use bon::bon;
-use chemrust_hamiltonian_core::{CellGeometry, GVectorGrid, PseudopotentialSet, SpinPolicy, NonSpin};
+use chemrust_hamiltonian_core::{
+    CellGeometry, GVectorGrid, NonSpin, PseudopotentialSet, SpinCollinear, SpinPolicy, VEffBuilder,
+};
 use cudarc::driver::{CudaContext, CudaSlice};
 use ndarray::{Array3, ShapeBuilder};
 use num_complex::Complex64;
@@ -16,7 +18,9 @@ use crate::eigensolver::rayleigh_ritz::rayleigh_ritz;
 use crate::eigensolver::vnl_data::VnlBatchData;
 use crate::layout::{ColumnDistributed, Cpu, WavefunctionSet};
 use crate::mixing::DensityHistory;
-use crate::types::{Density, EffectivePotential, Error, FinalResult, FineGridArray, KPoint, SmearingParams};
+use crate::types::{
+    Density, EffectivePotential, Error, FinalResult, FineGridArray, KPoint, SmearingParams,
+};
 
 // ---------------------------------------------------------------------------
 // Sealed phase trait and markers
@@ -148,14 +152,93 @@ impl<S: SpinPolicy> ScfIteration<S, Initialized> {
 }
 
 // ---------------------------------------------------------------------------
+// Private helper: move all fields into a new phase
+// ---------------------------------------------------------------------------
+// Centralises the struct literal in one place. Adding a field to
+// ScfIteration only requires updating here.
+
+impl<S: SpinPolicy, Phase: ScfPhase> ScfIteration<S, Phase> {
+    fn into_phase<New: ScfPhase>(self) -> ScfIteration<S, New> {
+        ScfIteration {
+            cell: self.cell,
+            pots: self.pots,
+            wave_grid: self.wave_grid,
+            fine_grid: self.fine_grid,
+            k_point: self.k_point,
+            smearing: self.smearing,
+            pw_coords: self.pw_coords,
+            pw_fft_indices: self.pw_fft_indices,
+            density: self.density,
+            psi: self.psi,
+            eigenvalues: self.eigenvalues,
+            v_eff: self.v_eff,
+            history: self.history,
+            previous_density: self.previous_density,
+            _phase: PhantomData,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Transition 1: Initialized → VEffBuilt
 // ---------------------------------------------------------------------------
 
-impl<S: SpinPolicy> ScfIteration<S, Initialized> {
+// --- Private dispatch trait for V_eff assembly ---
+// VEffBuilder::assemble_on_fine_grid has different signatures for
+// NonSpin vs SpinCollinear (different param count, return type).
+// This trait unifies them so build_v_eff stays generic.
+
+pub trait BuildVEff: SpinPolicy {
+    fn build_v_eff_impl(
+        cell: &CellGeometry, pots: &PseudopotentialSet,
+        rho: &chemrust_hamiltonian_core::Density,
+        wave_grid: &GVectorGrid, fine_grid: &GVectorGrid,
+    ) -> Result<Self::VEff, chemrust_hamiltonian_core::Error>;
+}
+
+impl BuildVEff for NonSpin {
+    fn build_v_eff_impl(
+        cell: &CellGeometry, pots: &PseudopotentialSet,
+        rho: &chemrust_hamiltonian_core::Density,
+        wave_grid: &GVectorGrid, fine_grid: &GVectorGrid,
+    ) -> Result<chemrust_hamiltonian_core::EffectivePotential, chemrust_hamiltonian_core::Error> {
+        VEffBuilder::<NonSpin>::new(cell, pots, fine_grid)
+            .assemble_on_fine_grid(rho, wave_grid, fine_grid)
+    }
+}
+
+impl BuildVEff for SpinCollinear {
+    fn build_v_eff_impl(
+        cell: &CellGeometry, pots: &PseudopotentialSet,
+        rho: &chemrust_hamiltonian_core::Density,
+        wave_grid: &GVectorGrid, fine_grid: &GVectorGrid,
+    ) -> Result<(chemrust_hamiltonian_core::EffectivePotential, chemrust_hamiltonian_core::EffectivePotential), chemrust_hamiltonian_core::Error> {
+        // Paramagnetic initial guess: zero spin density.
+        // Phase 3+ will compute proper spin density from wavefunctions.
+        let shape = [wave_grid.grid()[2], wave_grid.grid()[1], wave_grid.grid()[0]];
+        let zero_spin = chemrust_hamiltonian_core::Density::from_inner(
+            Array3::zeros(shape),
+        );
+        VEffBuilder::<SpinCollinear>::new(cell, pots, fine_grid)
+            .assemble_on_fine_grid(rho, &zero_spin, wave_grid, fine_grid)
+    }
+}
+
+impl<S: SpinPolicy + BuildVEff> ScfIteration<S, Initialized> {
     /// Assemble V_eff[ρ] from the current density.
     /// Consumes `self`, returns a state in the `VEffBuilt` phase.
     pub fn build_v_eff(self) -> Result<ScfIteration<S, VEffBuilt>, Error> {
-        todo!()
+        let core_rho = chemrust_hamiltonian_core::Density::from_inner(
+            self.density.as_wave_array().clone(),
+        );
+        let v_eff = S::build_v_eff_impl(
+            &self.cell, &self.pots, &core_rho,
+            &self.wave_grid, &self.fine_grid,
+        )
+        .map_err(|_| Error::NotImplemented)?;
+        let mut next: ScfIteration<S, VEffBuilt> = self.into_phase();
+        next.v_eff = Some(v_eff);
+        Ok(next)
     }
 }
 
@@ -271,11 +354,47 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt> {
 
 impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated> {
     /// Construct new electron density from updated wavefunctions:
-    /// ρ(r) = Σ_i occ_i |ψ_i(r)|².
+    /// ρ(r) = Σ_i occ_i |ψ_i(r)|² on the wave grid.
     pub fn construct_density(
         self,
     ) -> Result<ScfIteration<S, DensityUpdated>, Error> {
-        todo!()
+        // Total number of electrons from pseudopotential ionic charges
+        let n_electrons: f64 = self
+            .cell
+            .species_iter()
+            .map(|info| {
+                self.pots
+                    .get(info.symbol)
+                    .and_then(|p| p.ionic_charge())
+                    .unwrap_or(0.0)
+                    * info.num_ions as f64
+            })
+            .sum();
+
+        let occupations =
+            crate::density::compute_occupations(&self.eigenvalues, &self.smearing, n_electrons)?;
+
+        let ctx = Arc::new(CudaContext::new(0)?);
+        let stream = ctx.default_stream();
+        let kernels = CudaKernelSet::new(&ctx)?;
+
+        let new_density = crate::density::construct_density_gpu()
+            .psi_data(&self.psi.data)
+            .occupations(&occupations)
+            .fft_indices(&self.pw_fft_indices)
+            .wave_grid(&self.wave_grid)
+            .cell_volume(self.cell.volume)
+            .n_bands(self.psi.n_bands)
+            .n_pw(self.psi.n_pw)
+            .kernels(&kernels)
+            .stream(&stream)
+            .call()?;
+
+        stream.synchronize()?;
+
+        let mut next: ScfIteration<S, DensityUpdated> = self.into_phase();
+        next.density = new_density;
+        Ok(next)
     }
 }
 
@@ -355,7 +474,7 @@ impl<S: SpinPolicy> ScfIteration<S, Converged> {
 /// * `state` — Freshly initialized `ScfIteration` (Initialized phase).
 /// * `ndeg` — Chebyshev polynomial degree for diagonalization.
 /// * `tol` — Convergence tolerance (RMS density change in e⁻/Bohr³).
-pub fn run_scf<S: SpinPolicy>(
+pub fn run_scf<S: SpinPolicy + BuildVEff>(
     state: ScfIteration<S, Initialized>,
     ndeg: usize,
     tol: f64,

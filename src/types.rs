@@ -201,13 +201,28 @@ impl Default for KPoint {
     }
 }
 
-/// Fermi-Dirac smearing parameters.
+/// Smearing scheme for occupation-number smearing.
+#[derive(Debug, Clone, Copy, Default)]
+pub enum SmearingScheme {
+    /// Gaussian smearing (CASTEP default): occ = erfc((μ - ε) / width).
+    #[default]
+    Gaussian,
+    // Future: FermiDirac, MethfesselPaxton, MarzariVanderbilt.
+}
+
+/// Smearing parameters for occupation-number smearing.
+///
+/// CASTEP uses Gaussian smearing by default. The smearing width is
+/// `SMEARING_WIDTH` in the `.param` file (default 0.1 eV for CASTEP).
+/// Convert eV to Hartree: divide by 27.2114.
 #[derive(Debug, Clone, Copy)]
 pub struct SmearingParams {
     /// Smearing width in Hartree.
     pub width: f64,
     /// Electron temperature kT in Hartree.
     pub electron_temperature: f64,
+    /// Smearing scheme (default: Gaussian).
+    pub scheme: SmearingScheme,
 }
 
 /// Output of a converged SCF calculation.

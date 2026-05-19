@@ -5,8 +5,8 @@ use chemrust_hamiltonian_core::{
     CellGeometry, GVectorGrid, PseudopotentialSet, RealLattice, RecipLattice,
 };
 use chemrust_scf::{
-    Density, KPoint, ScfIteration, SmearingParams, WaveGridArray, WavefunctionSet,
-    ColumnDistributed, run_scf,
+    Density, KPoint, ScfIteration, SmearingParams, SmearingScheme, WaveGridArray,
+    WavefunctionSet, ColumnDistributed, run_scf,
 };
 
 /// A minimal 1-atom cubic cell at (0,0,0).
@@ -70,7 +70,7 @@ fn dummy_wavefunctions() -> WavefunctionSet<ColumnDistributed> {
 }
 
 #[test]
-#[should_panic(expected = "not yet implemented")]
+#[ignore = "requires GPU; full validation is Group F"]
 fn backbone_compiles() {
     let state: ScfIteration = ScfIteration::builder()
         .cell(dummy_cell())
@@ -104,10 +104,12 @@ fn backbone_compiles() {
         .smearing(SmearingParams {
             width: 0.01,
             electron_temperature: 0.01,
+            scheme: SmearingScheme::Gaussian,
         })
         .max_history(4)
         .build();
 
-    // The first todo!() inside build_v_eff() should fire here.
+    // build_v_eff() is wired to VEffBuilder, then GPU density follows.
+    // Ignored: requires GPU (Group F handles full validation).
     let _ = run_scf(state, 4, 1e-8);
 }

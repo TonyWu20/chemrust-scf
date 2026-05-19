@@ -30,7 +30,7 @@ use crate::eigensolver::vnl_data::VnlBatchData;
 
 /// Call `c2c_inverse` in-place. cuFFT natively supports in-place transforms,
 /// so passing the same `&mut` twice via raw pointer is correct.
-unsafe fn c2c_inverse_inplace(
+pub(crate) unsafe fn c2c_inverse_inplace(
     plan: &BatchedFftPlan3d,
     buf: &mut CudaSlice<CudaComplex>,
 ) -> Result<(), cudarc::cufft::result::CufftError> {
@@ -154,6 +154,28 @@ extern \"C\" __global__ void transpose_col_to_row(
     }
 }
 
+extern \"C\" __global__ void accumulate_density(
+    const double2* psi_r, const double* occ,
+    double* rho, int n_bands, int grid_size, double inv_omega
+) {
+    extern __shared__ double sdata[];
+    int r = blockIdx.x;
+    if (r >= grid_size) return;
+    int tid = threadIdx.x;
+    double sum = 0.0;
+    for (int b = tid; b < n_bands; b += blockDim.x) {
+        double2 psi = psi_r[b * grid_size + r];
+        sum += occ[b] * (psi.x * psi.x + psi.y * psi.y);
+    }
+    sdata[tid] = sum;
+    __syncthreads();
+    for (int s = blockDim.x/2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    if (tid == 0) rho[r] = sdata[0] * inv_omega;
+}
+
 extern \"C\" __global__ void transpose_row_to_col(
     const double2* row, double2* col, int n_bands, int n_pw
 ) {
@@ -174,15 +196,16 @@ extern \"C\" __global__ void transpose_row_to_col(
 
 /// Handles to all compiled CUDA kernels used in the Chebyshev filter.
 pub(crate) struct CudaKernelSet {
-    zero_buffer: CudaFunction,
+    pub(crate) zero_buffer: CudaFunction,
     #[allow(dead_code)]
-    zero_buffer_real: CudaFunction, // reserved for future real-buffer clearing
-    init_kinetic: CudaFunction,
-    scatter_pw_to_grid: CudaFunction,
-    veff_multiply: CudaFunction,
-    gather_add_kinetic: CudaFunction,
-    transpose_col_to_row: CudaFunction,
-    transpose_row_to_col: CudaFunction,
+    pub(crate) zero_buffer_real: CudaFunction, // reserved for future real-buffer clearing
+    pub(crate) init_kinetic: CudaFunction,
+    pub(crate) scatter_pw_to_grid: CudaFunction,
+    pub(crate) accumulate_density: CudaFunction,
+    pub(crate) veff_multiply: CudaFunction,
+    pub(crate) gather_add_kinetic: CudaFunction,
+    pub(crate) transpose_col_to_row: CudaFunction,
+    pub(crate) transpose_row_to_col: CudaFunction,
 }
 
 impl CudaKernelSet {
@@ -197,6 +220,7 @@ impl CudaKernelSet {
             zero_buffer_real: load("zero_buffer_real")?,
             init_kinetic: load("init_kinetic")?,
             scatter_pw_to_grid: load("scatter_pw_to_grid")?,
+            accumulate_density: load("accumulate_density")?,
             veff_multiply: load("veff_multiply")?,
             gather_add_kinetic: load("gather_add_kinetic")?,
             transpose_col_to_row: load("transpose_col_to_row")?,
