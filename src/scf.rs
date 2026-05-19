@@ -284,7 +284,7 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt> {
         let n_pw = self.psi.n_pw;
 
         // H2D psi
-        let psi_gpu = Gpu::from_host_with(&Cpu::new(self.psi).0, &stream, &mut pcie)?;
+        let psi_gpu = Gpu::from_host_with(&self.psi, &stream, &mut pcie)?;
 
         // V_NL precomputation (CPU, uses chemrust-hamiltonian, one-time cost)
         let vnl_data = VnlBatchData::precompute(
@@ -349,18 +349,10 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt> {
             "H2D tracking check failed",
         );
 
-        Ok(ScfIteration {
-            psi: psi_new,
-            eigenvalues,
-            pw_coords,
-            cell: self.cell, pots: self.pots,
-            wave_grid: self.wave_grid, fine_grid: self.fine_grid,
-            k_point: self.k_point, smearing: self.smearing,
-            density: self.density, v_eff: self.v_eff,
-            pw_fft_indices: self.pw_fft_indices,
-            history: self.history, previous_density: self.previous_density,
-            _phase: PhantomData,
-        })
+        let mut next: ScfIteration<S, WavefunctionsUpdated> = self.into_phase();
+        next.psi = psi_new;
+        next.eigenvalues = eigenvalues;
+        Ok(next)
     }
 }
 
