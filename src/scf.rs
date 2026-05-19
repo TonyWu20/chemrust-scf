@@ -315,6 +315,7 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt> {
         let (psi_new_gpu, eigenvalues_cpu) = rayleigh_ritz(
             &psi_filtered_row, &hpsi_row,
             n_bands, n_pw, &kernels,
+            &mut pcie,
             &solver, &blas, &stream, &ctx,
         )?;
 

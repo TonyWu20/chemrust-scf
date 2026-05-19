@@ -1,0 +1,1 @@
+- Grid tag on EffectivePotential: Gpu<EffectivePotential> could carry a phantom WaveGrid/FineGrid marker to catch grid mismatches at compile time instead of runtime assertion. Would require EffectivePotential<Grid = WaveGrid> etc — doable but invasive.

@@ -142,7 +142,7 @@ pub(crate) fn construct_density_gpu(
 
     // 4. Batched C2C IFFT (in-place on grid_dev)
     let fft_plan = BatchedFftPlan3d::plan_batched_c2c(
-        ngx as i32, ngy as i32, ngz as i32,
+        ngz as i32, ngy as i32, ngx as i32,
         n_bands as i32, Arc::clone(stream),
     )?;
     // In-place IFFT: same buffer for input and output via raw pointer

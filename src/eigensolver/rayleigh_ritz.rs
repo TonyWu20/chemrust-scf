@@ -17,6 +17,7 @@ use cudarc::driver::{CudaContext, CudaSlice, CudaStream};
 
 use crate::device::blas::{op, ZgemmConfig};
 use crate::device::blas::BlasHandle;
+use crate::device::pcie::PcieAccount;
 use crate::device::solver::SolverHandle;
 use crate::device::{CudaComplex, Gpu};
 use crate::eigensolver::chebyshev::CudaKernelSet;
@@ -51,6 +52,7 @@ pub(crate) fn rayleigh_ritz(
     n_bands: usize,
     n_pw: usize,
     kernels: &CudaKernelSet,
+    pcie: &mut PcieAccount,
     solver: &SolverHandle,
     blas: &BlasHandle,
     stream: &Arc<CudaStream>,
@@ -204,6 +206,7 @@ pub(crate) fn rayleigh_ritz(
     let eigenvalues: Vec<f64> = stream
         .clone_dtoh(&eigenvalues_dev)
         .map_err(Error::Cuda)?;
+    pcie.d2h_bytes += eigenvalues.len() * 8;
 
     stream.synchronize().map_err(Error::Cuda)?;
 

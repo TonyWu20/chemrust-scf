@@ -234,9 +234,10 @@ impl CudaKernelSet {
 // ---------------------------------------------------------------------------
 
 /// Estimated spectral bounds for the Hamiltonian at this SCF iteration.
-#[allow(dead_code)]
 pub(crate) struct SpectralBounds {
+    #[allow(dead_code)]
     pub lambda_max: f64,
+    #[allow(dead_code)]
     pub eps_cut: f64,
     pub center: f64,
     pub half_width: f64,
@@ -684,7 +685,7 @@ pub(crate) fn chebyshev_filter(
 
     // ---- FFT plan (batched C2C) ----
     let fft_plan = BatchedFftPlan3d::plan_batched_c2c(
-        ngx as i32, ngy as i32, ngz as i32, n_bands_i32, stream.clone(),
+        ngz as i32, ngy as i32, ngx as i32, n_bands_i32, stream.clone(),
     )?;
 
     // ---- GPU workspace buffers ----
