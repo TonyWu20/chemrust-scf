@@ -11,7 +11,7 @@ use crate::device::blas::BlasHandle;
 use crate::device::solver::SolverHandle;
 use crate::device::pcie::PcieAccount;
 use crate::device::Gpu;
-use crate::eigensolver::chebyshev::chebyshev_filter;
+use crate::eigensolver::chebyshev::{chebyshev_filter, CudaKernelSet};
 use crate::eigensolver::rayleigh_ritz::rayleigh_ritz;
 use crate::eigensolver::vnl_data::VnlBatchData;
 use crate::layout::{ColumnDistributed, Cpu, WavefunctionSet};
@@ -174,6 +174,7 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt> {
         let stream = ctx.default_stream();
         let blas = BlasHandle::new(stream.clone())?;
         let solver = SolverHandle::new(stream.clone())?;
+        let kernels = CudaKernelSet::new(&ctx)?;
 
         // Extract V_eff as raw Array3<f64> via SpinPolicy::v_eff_for_spin
         let v_eff_ref = self.v_eff.as_ref().expect("VEffBuilt phase guarantees v_eff is Some");
@@ -185,6 +186,12 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt> {
 
         // Downsample V_eff from fine grid to wave grid
         let v_eff_wave = downsample_array_to_wave_grid(v_eff_arr, &self.fine_grid, &self.wave_grid)?;
+        let (min_veff, max_veff) = {
+            let arr = v_eff_wave.as_fine_array();
+            let min = arr.iter().cloned().fold(f64::INFINITY, f64::min);
+            let max = arr.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            (min, max)
+        };
         let v_eff_gpu = Gpu::from_host_with(&v_eff_wave, &stream, &mut pcie)?;
 
         // Clone host data BEFORE moving self.psi into GPU
@@ -217,13 +224,14 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt> {
         let (psi_filtered_row, hpsi_row) = chebyshev_filter(
             &psi_gpu, &v_eff_gpu, &self.pots,
             &self.wave_grid, &self.k_point, &self.cell,
-            &vnl_data, &fft_idx_dev, eig, ndeg, &blas, &stream, &ctx,
+            &vnl_data, &fft_idx_dev, min_veff, max_veff,
+            &kernels, eig, ndeg, &blas, &stream, &ctx,
         )?;
 
         // Rayleigh-Ritz
         let (psi_new_gpu, eigenvalues_cpu) = rayleigh_ritz(
             &psi_filtered_row, &hpsi_row,
-            n_bands, n_pw,
+            n_bands, n_pw, &kernels,
             &solver, &blas, &stream, &ctx,
         )?;
 

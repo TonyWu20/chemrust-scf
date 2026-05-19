@@ -153,6 +153,19 @@ extern \"C\" __global__ void transpose_col_to_row(
         tid += stride;
     }
 }
+
+extern \"C\" __global__ void transpose_row_to_col(
+    const double2* row, double2* col, int n_bands, int n_pw
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+    while (tid < n_bands * n_pw) {
+        int b = tid / n_pw;
+        int g = tid % n_pw;
+        col[b * n_pw + g] = row[g * n_bands + b];
+        tid += stride;
+    }
+}
 ";
 
 // ---------------------------------------------------------------------------
@@ -160,7 +173,7 @@ extern \"C\" __global__ void transpose_col_to_row(
 // ---------------------------------------------------------------------------
 
 /// Handles to all compiled CUDA kernels used in the Chebyshev filter.
-struct CudaKernelSet {
+pub(crate) struct CudaKernelSet {
     zero_buffer: CudaFunction,
     #[allow(dead_code)]
     zero_buffer_real: CudaFunction, // reserved for future real-buffer clearing
@@ -169,10 +182,11 @@ struct CudaKernelSet {
     veff_multiply: CudaFunction,
     gather_add_kinetic: CudaFunction,
     transpose_col_to_row: CudaFunction,
+    transpose_row_to_col: CudaFunction,
 }
 
 impl CudaKernelSet {
-    fn new(ctx: &Arc<CudaContext>) -> Result<Self, Error> {
+    pub(crate) fn new(ctx: &Arc<CudaContext>) -> Result<Self, Error> {
         let ptx = compile_ptx(CUDA_KERNEL_SRC).map_err(|e| Error::Nvrtc(e.to_string()))?;
         let module: Arc<CudaModule> = ctx.load_module(ptx).map_err(Error::Cuda)?;
         let load = |name: &str| -> Result<CudaFunction, Error> {
@@ -186,6 +200,7 @@ impl CudaKernelSet {
             veff_multiply: load("veff_multiply")?,
             gather_add_kinetic: load("gather_add_kinetic")?,
             transpose_col_to_row: load("transpose_col_to_row")?,
+            transpose_row_to_col: load("transpose_row_to_col")?,
         })
     }
 }
@@ -210,15 +225,11 @@ pub(crate) struct SpectralBounds {
 pub(crate) fn compute_spectral_bounds(
     eigenvalues: Option<&[f64]>,
     wave_grid: &GVectorGrid,
-    v_eff_slice: &CudaSlice<f64>,
-    stream: &Arc<CudaStream>,
+    min_veff: f64,
+    max_veff: f64,
 ) -> Result<SpectralBounds, Error> {
     let gmax = wave_grid.gmax();
     let kinetic_max = 0.5 * gmax * gmax;
-
-    let veff_data: Vec<f64> = stream.clone_dtoh(v_eff_slice).map_err(Error::Cuda)?;
-    let max_veff = veff_data.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    let min_veff = veff_data.iter().cloned().fold(f64::INFINITY, f64::min);
 
     let (lambda_max, eps_cut) = match eigenvalues {
         None | Some([]) => {
@@ -577,6 +588,28 @@ unsafe fn transpose_col_to_row_on_gpu(
     Ok(())
 }
 
+/// Transpose RowDistributed layout -> ColumnDistributed layout on GPU.
+pub(crate) unsafe fn transpose_row_to_col_on_gpu(
+    row_dev: &CudaSlice<CudaComplex>,
+    col_dev: &mut CudaSlice<CudaComplex>,
+    n_bands: i32,
+    n_pw: i32,
+    kernels: &CudaKernelSet,
+    stream: &Arc<CudaStream>,
+) -> Result<(), Error> {
+    unsafe {
+        stream
+            .launch_builder(&kernels.transpose_row_to_col)
+            .arg(row_dev)
+            .arg(&mut *col_dev)
+            .arg(&n_bands)
+            .arg(&n_pw)
+            .launch(LaunchConfig::for_num_elems((n_bands * n_pw) as u32))
+    }
+    .map_err(Error::Cuda)?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Chebyshev filter — main entry point
 // ---------------------------------------------------------------------------
@@ -599,6 +632,9 @@ pub(crate) fn chebyshev_filter(
     _cell: &CellGeometry,
     vnl_data: &VnlBatchData,
     fft_idx_dev: &CudaSlice<i32>,      // PW-to-FFT-grid index map (length = n_pw)
+    min_veff: f64,
+    max_veff: f64,
+    kernels: &CudaKernelSet,            // pre-compiled GPU kernels (shared)
     eigenvalues: Option<&[f64]>,
     ndeg: usize,
     blas: &BlasHandle,
@@ -617,9 +653,6 @@ pub(crate) fn chebyshev_filter(
     let grid_size = ngx * ngy * ngz;
     let inv_ntotal = 1.0 / (grid_size as f64);
     let grid_alloc = n_bands * grid_size;
-
-    // ---- Compile CUDA kernels ----
-    let kernels = CudaKernelSet::new(ctx)?;
 
     // ---- Precompute & upload kinetic energy ----
     let kinetic_cpu = compute_kinetic_energies(wave_grid);
@@ -650,7 +683,7 @@ pub(crate) fn chebyshev_filter(
         stream.alloc_zeros(n_elem).map_err(Error::Cuda)?;
 
     // ---- Spectral bounds ----
-    let bounds = compute_spectral_bounds(eigenvalues, wave_grid, v_eff_dev, stream)?;
+    let bounds = compute_spectral_bounds(eigenvalues, wave_grid, min_veff, max_veff)?;
 
     // ---- Chebyshev recurrence ----
     //
@@ -670,7 +703,7 @@ pub(crate) fn chebyshev_filter(
             apply_full_hamiltonian(
                 &buf_a, v_eff_dev, &kinetic_dev, fft_idx_dev,
                 n_pw, n_bands, grid_size, inv_ntotal,
-                &fft_plan, &mut hpsi_dev, &mut grid_dev, vnl_data, blas, &kernels, stream,
+                &fft_plan, &mut hpsi_dev, &mut grid_dev, vnl_data, blas, kernels, stream,
             )?;
         }
 
@@ -691,7 +724,7 @@ pub(crate) fn chebyshev_filter(
             apply_full_hamiltonian(
                 &buf_b, v_eff_dev, &kinetic_dev, fft_idx_dev,
                 n_pw, n_bands, grid_size, inv_ntotal,
-                &fft_plan, &mut hpsi_dev, &mut grid_dev, vnl_data, blas, &kernels, stream,
+                &fft_plan, &mut hpsi_dev, &mut grid_dev, vnl_data, blas, kernels, stream,
             )?;
         }
 
@@ -751,17 +784,17 @@ pub(crate) fn chebyshev_filter(
         apply_full_hamiltonian(
             final_psi, v_eff_dev, &kinetic_dev, fft_idx_dev,
             n_pw, n_bands, grid_size, inv_ntotal,
-            &fft_plan, &mut hpsi_dev, &mut grid_dev, vnl_data, blas, &kernels, stream,
+            &fft_plan, &mut hpsi_dev, &mut grid_dev, vnl_data, blas, kernels, stream,
         )?;
     }
 
     // Transpose both to RowDistributed
     unsafe {
         transpose_col_to_row_on_gpu(
-            final_psi, &mut psi_row_dev, n_bands_i32, n_pw_i32, &kernels, stream,
+            final_psi, &mut psi_row_dev, n_bands_i32, n_pw_i32, kernels, stream,
         )?;
         transpose_col_to_row_on_gpu(
-            &hpsi_dev, &mut hpsi_row_dev, n_bands_i32, n_pw_i32, &kernels, stream,
+            &hpsi_dev, &mut hpsi_row_dev, n_bands_i32, n_pw_i32, kernels, stream,
         )?;
     }
 

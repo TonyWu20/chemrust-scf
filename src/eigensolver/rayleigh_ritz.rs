@@ -19,6 +19,7 @@ use crate::device::blas::{op, ZgemmConfig};
 use crate::device::blas::BlasHandle;
 use crate::device::solver::SolverHandle;
 use crate::device::{CudaComplex, Gpu};
+use crate::eigensolver::chebyshev::CudaKernelSet;
 use crate::layout::{ColumnDistributed, Cpu, RowDistributed, WavefunctionSet};
 use crate::types::Error;
 
@@ -49,6 +50,7 @@ pub(crate) fn rayleigh_ritz(
     hpsi_row: &Gpu<WavefunctionSet<RowDistributed>>,
     n_bands: usize,
     n_pw: usize,
+    kernels: &CudaKernelSet,
     solver: &SolverHandle,
     blas: &BlasHandle,
     stream: &Arc<CudaStream>,
@@ -150,27 +152,20 @@ pub(crate) fn rayleigh_ritz(
     //
     // psi_col_data[b * n_pw + g] = psi_row_data[g * n_bands + b]
 
-    // For simplicity, do this with a D2H + H2D roundtrip (fine for moderate sizes).
-    // A GPU kernel would be better for large systems; this avoids complexity for Phase 2.
-    let psi_row_host: Vec<CudaComplex> = stream
-        .clone_dtoh(psi_row.as_device_slice())
-        .map_err(Error::Cuda)?;
+    // GPU transpose via kernel (avoids D2H+H2D roundtrip).
+    let n_bands_i32 = n_bands as i32;
+    let n_pw_i32 = n_pw as i32;
+    let mut psi_col_dev: CudaSlice<CudaComplex> =
+        stream.alloc_zeros(n_bands * n_pw).map_err(Error::Cuda)?;
 
-    let mut psi_col_host = vec![
-        CudaComplex { x: 0.0, y: 0.0 };
-        n_bands * n_pw
-    ];
-
-    // Transpose: col-major (n_pw x n_bands) → col-major (n_bands x n_pw)
-    for b in 0..n_bands {
-        for g in 0..n_pw {
-            psi_col_host[b * n_pw + g] = psi_row_host[g * n_bands + b];
-        }
+    unsafe {
+        crate::eigensolver::chebyshev::transpose_row_to_col_on_gpu(
+            psi_row.as_device_slice(),
+            &mut psi_col_dev,
+            n_bands_i32, n_pw_i32,
+            kernels, stream,
+        )?;
     }
-
-    let psi_col_dev: CudaSlice<CudaComplex> = stream
-        .clone_htod(&psi_col_host)
-        .map_err(Error::Cuda)?;
 
     // ---- Step 5: Rotate psi_new = X * psi_col ----
     // psi_col is (n_bands x n_pw), X = eigenvectors is (n_bands x n_bands) in h_sub_dev
