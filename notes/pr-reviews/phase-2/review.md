@@ -1,116 +1,87 @@
-# Review: Phase 2 Group-B — GPU Infrastructure
+# Review: Phase 2 Group-C — diagonalize
 
-**Tasks**: `notes/plans/phase-2/TASKS.md` (Group B: B-1 through B-5)
+**Tasks**: `notes/plans/phase-2/TASKS.md` (Group C: C-1 through C-3)
 **Reviewed**: 2026-05-19
-**Focus mandate**: Violation of newtype pattern, placebo unit tests, cutting corners
+**Focus**: Chebyshev filtering, Rayleigh-Ritz, diagonalize transition
 
 ## Summary
 
-**Conditional Pass — 2 placebo tests, 2 corner-cutting defects.**
+**Changes Required — 1 critical defect, 1 significant defect, 1 minor issue.**
 
-Runtime outcome verification: 8/8 GPU tests pass on CUDA 12.9 hardware. `cargo check` and `cargo clippy` clean. The Gpu/T̵<>/Cpu<> sync architecture, cuFFT, cuBLAS, and cuSOLVER wrappers all execute correctly on real GPU hardware.
+Runtime outcome verification: 10/10 GPU unit tests pass on CUDA 12.9 hardware (c2c identity, batched c2r, gemm, axpy, zhegvd, device roundtrips). All tests from Group B's fix pass were verified. `cargo check` and `cargo test --workspace` both clean.
 
-However, 2 unit tests are placebo-grade (vacuous assertions that pass even with wrong output), and 2 implementation details cut corners against the TASKS.md guidance. 1 newtype encapsulation gap exists in the new Gpu<T> layer.
+The implementation scope is correct and well-structured: `chebyshev.rs` (817 lines), `rayleigh_ritz.rs` (219 lines), `vnl_data.rs` (90 lines). The V_NL via cuBLAS gemm, the Chebyshev three-buffer recurrence, and the Rayleigh-Ritz subspace diagonalization are all implemented correctly in structure.
+
+However, 1 critical PcieAccount assertion bug and 1 significant FFT dimension ordering bug would produce wrong results or runtime panics on non-cubic grids. One minor issue should be fixed before merge.
 
 ## Per-Task Results
 
-### B-1: Add cudarc dependency
-- **Status**: ✓ Passed
-- **Runtime verification**: `cargo check` resolves cudarc v0.19.7 with CUDA 12.9; `nix develop` provides CUDA env vars.
-- **Diff validation**: Cargo.toml adds `cudarc = { version = "0.19.7", features = ["cuda-12090", "cufft", "cusolver"] }`. The `cublas` feature is transitively activated by `cusolver`.
-- **Strategic review**: No issues. Correct version targeting CUDA 12.9.
-
-### B-2: Gpu<T>/Cpu<T> real sync
-- **Status**: ⚠ Minor Issues
-- **Runtime verification**: All 3 device round-trip tests pass (density, wavefunction, type distinction).
+### C-1: Chebyshev filtering on GPU
+- **Status**: ⚠ Significant Issues (1 significant, 1 minor)
+- **Runtime verification**: NVRTC kernels compile, FFT C2C identity test passes on 8³ grid. No integration test against Cu111_CO fixtures (deferred to Group F).
 - **Diff validation**:
-  - `Gpu<T>` moved from `layout.rs` to `device/mod.rs`. Fields are **private** — correct newtype encapsulation. ✓
-  - `Gpu<T>` has no `Deref<Target=T>` ✓
-  - `Cpu<T>` retains Deref/DerefMut to T ✓
-  - `Gpu::from_host()` and `Gpu::from_cpu()` provide H2D construction ✓
-  - `unsafe impl Send/Sync` for `Gpu<T>` ✓
-  - `sync_to_host(&self, stream) -> Result<Cpu<T>>` works correctly ✓
-  - **Corner cut**: No `Cpu<T>::sync_to_device()` method. The TASKS.md specified `Cpu<T>::sync_to_device(...) -> Gpu<T>`. Instead, `Gpu::from_cpu()` provides the equivalent. This is a minor API difference.
-  - **Newtype concern**: `Cpu<T>(pub T)` still uses `pub` field — pre-existing issue, not introduced here.
-- **Strategic review**: Design is sound. The `DeviceMapped` trait cleanly separates element-type dispatch. No Deref on Gpu prevents accidental CPU reads.
+  - `src/eigensolver/chebyshev.rs` created with 817 lines ✓
+  - Spectral bound estimation implemented (`compute_spectral_bounds`) ✓
+  - H_loc = T + V_eff via FFT roundtrip (scatter → IFFT → V_eff multiply → FFT → gather) ✓
+  - V_NL via cuBLAS gemm (beta^H·psi, D·C_proj, beta·C_proj accumulate) ✓
+  - Chebyshev three-buffer recurrence with norm stability check ✓
+  - ColumnDistributed → RowDistributed transpose kernel ✓
+  - **FFT dimension ordering mismatch (Significant)**: `plan_batched_c2c(ngx, ngy, ngz)` passes `[ngx, ngy, ngz]` to cuFFT, but the index formula `ix + ngx * (iy + ngy * iz)` uses ngx as fastest-varying. cuFFT expects `[ngz, ngy, ngx]` to match. Hidden on cubic grids; would produce wrong physics on non-cubic systems.
+  - **Spectral bound uses range (Minor)**: `kinetic_max + (max_veff - min_veff)` overestimates lambda_max vs. guidance's `kinetic_max + max_veff`.
+  - **Flat norm threshold (Minor)**: Uses fixed 10× growth check instead of relative ratio-to-ratio comparison from guidance.
+  - `potts`, `cell`, `k_point` parameters correctly marked `_` (VNL data precomputed).
 
-### B-3: cuFFT wrapper
-- **Status**: ⚠ Minor Issues (1 placebo test, 1 corner cut)
-- **Runtime verification**: `test_c2c_3d_identity` passes (forward+inverse 8³ identity). `test_batched_c2r_4x4x4` passes.
+### C-2: Rayleigh-Ritz on GPU
+- **Status**: ✓ Passed (minor concerns)
+- **Runtime verification**: ZHEGVD unit test passes for 4×4 diagonal system with correct eigenvalues [1,2,3,4].
 - **Diff validation**:
-  - `FftPlan3d` with C2C, D2Z, Z2D plan creation ✓
-  - `BatchedFftPlan3d` struct created ✓
-  - **PLACEBO TEST**: `test_batched_c2r_4x4x4` uses assertion `result.iter().any(|&v| v != 0.0)` — only checks output is not all-zeros. This would pass even with wrong normalization, wrong batch stride, or corrupted data (as long as any byte is non-zero). A proper test would validate each band's IFFT of a DC-only spectrum produces a uniform field `1.0/(nx*ny*nz)` at every grid point.
-  - **Corner cut**: `BatchedFftPlan3d` uses `CudaFft::plan_3d()` (single-plan), NOT `cufftPlanMany` as the guidance specifies. The `batch` parameter is stored but never passed to cuFFT. For density construction, `cufftPlanMany` with proper striding is needed to transform N_bands non-contiguous batches correctly.
-  - `BatchedFftPlan3d::plan_batched_c2c` accepts `batch` parameter but ignores it entirely.
-- **Strategic review**: The batched plan is structurally identical to the non-batched plan — same inner type, same execute methods. This works for contiguous batch layouts but the guidance specifically called for `cufftPlanMany`. If non-contiguous strides are needed later, this will break silently.
+  - `src/eigensolver/rayleigh_ritz.rs` created with 219 lines ✓
+  - H_sub = ψ^dag·H|ψ> via cuBLAS gemm with transa=C ✓
+  - S_sub = ψ^dag·ψ via cuBLAS gemm ✓
+  - ZHEGVD solve with proper CUSOLVER_EIG_MODE_VECTOR and CUBLAS_FILL_MODE_LOWER ✓
+  - Info check with proper error propagation ✓
+  - ψ_new = X·ψ rotation via cuBLAS gemm ✓
+  - GPU transpose via shared NVRTC kernel (avoids 4MB D2H+H2D roundtrip) ✓
+  - **RowDistributed shape metadata mismatch (Minor)**: Shape reported as `[n_bands, n_pw]` but transpose kernel stores data as `[n_pw, n_bands]` in memory. Latent — no code path currently syncs RowDistributed data to host.
 
-### B-4: cuBLAS wrapper
-- **Status**: ⚠ Minor Issues (1 missing test)
-- **Runtime verification**: `test_dgemm` (DGEMM 3×2×4) and `test_daxpy` (scale + add) pass with correct reference values.
+### C-3: Wire diagonalize transition in scf.rs
+- **Status**: ⚠ Critical Issue (1 critical defect)
+- **Runtime verification**: `cargo check` passes — all CUDA types and imports resolve. No integration test exists yet for the full diagonalize pipeline (Group F).
 - **Diff validation**:
-  - `BlasHandle` with stream association ✓
-  - `gemm_f64`, `gemm_c64`, `gemv_f64`, `axpy_f64`, `axpy_c64`, `dot_f64`, `dotc_c64`, `iamax_f64` all implemented ✓
-  - **Missing test**: TASKS.md specifies "Unit test: gemm for small complex matrix multiplication on GPU" — there is no complex GEMM test. Only `test_dgemm` (f64) exists. The `gemm_c64` code path is untested.
-  - **Missing test**: `gemv_f64` is implemented but untested.
-- **Strategic review**: The `ZgemmConfig` struct duplicates `GemmConfig` fields and uses raw sys FFI. This is acceptable if cudarc's safe `GemmConfig` doesn't support complex types — but the duplicate struct is a maintenance burden.
-
-### B-5: cuSOLVER ZHEGVD wrapper
-- **Status**: ⚠ Minor Issues (1 panic path)
-- **Runtime verification**: `test_zhegvd_4x4_diagonal` passes (eigenvalues [1,2,3,4] with info=0).
-- **Diff validation**:
-  - Workspace query via `cusolverDnZhegvd_bufferSize` ✓
-  - Workspace allocation ✓
-  - Proper enum types (`cusolverEigMode_t`, `cublasFillMode_t`) instead of raw i32 ✓
-  - **Corner cut**: Workspace allocation uses `unwrap_or_else(|e| panic!(...))` instead of returning `Result`. This violates the codebase error-handling convention (typed error enums via thiserror, Result propagation).
-  - Test uses only diagonal matrix — simplest possible case. No non-diagonal Hermitian matrix test.
-  - Signature uses proper cuSOLVER types (improvement over TASKS.md's raw i32) ✓
-- **Strategic review**: The solver wrapper is clean and follows cuSOLVER best practices (bufferSize + allocate + solve). The panic path is the only defect.
+  - `diagonalize()` method on `ScfIteration<S, VEffBuilt>` ✓
+  - Chains `chebyshev_filter` → `rayleigh_ritz` correctly ✓
+  - Returns `ScfIteration<S, WavefunctionsUpdated>` with updated psi and eigenvalues ✓
+  - V_eff downsampling utility (`downsample_array_to_wave_grid`) implemented via CPU rustfft ✓
+  - **PcieAccount assertion will panic (Critical)**: The assertion at line 247 expects `psi_bytes + eig_bytes` D2H bytes, but `rayleigh_ritz` downloads eigenvalues via raw `clone_dtoh` (not tracked by PcieAccount). Only `psi_bytes` is tracked. At runtime this assertion fails.
+  - **H2D assertion missing**: ADR-0002 specifies an H2D assertion alongside the D2H one. Neither is implemented.
 
 ## Issues Found
 
-### P1 — Placebo test: `test_batched_c2r_4x4x4`
+### P1 (Critical) — PcieAccount eigenvalue D2H not tracked → assertion panics
 
-**File**: `src/device/fft.rs:274-275`
-**Severity**: Medium
-**Description**: Assertion `result.iter().any(|&v| v != 0.0)` only checks output is non-zero. It does not validate correct values, correct normalization, or correct batch handling. A wrong implementation that produces garbage non-zero output would pass.
-**Recommendation**: Replace with per-band assertion: for DC-only input spectrum, each band's IFFT output should be `1.0/(nx*ny*nz)` at every grid point within FP tolerance.
+**File**: `src/scf.rs:246-251`, `src/eigensolver/rayleigh_ritz.rs:204-206`
+**Description**: The `rayleigh_ritz` function downloads eigenvalues to host via `stream.clone_dtoh(&eigenvalues_dev)` which bypasses `PcieAccount`. The caller's assertion expects `pcie.d2h_bytes == psi_bytes + eig_bytes`, but only `psi_bytes` from the `sync_to_host_with` call is tracked. Runtime assertion failure on any execution path that reaches the assertion.
 
-### P2 — Missing `cufftPlanMany` for batched transforms
+### P2 (Significant) — FFT dimension ordering mismatch
 
-**File**: `src/device/fft.rs:127-136`
-**Severity**: Medium
-**Description**: `BatchedFftPlan3d` calls `CudaFft::plan_3d()` (single-plan API) ignoring the `batch` parameter. The guidance explicitly calls for wrapping `cufftPlanMany` which supports arbitrary batch strides. The current implementation only works for contiguous batch layouts. If density construction requires strided batch access (non-contiguous bands), this will produce wrong results silently.
-**Recommendation**: Implement a separate path using `cufftPlanMany` sys FFI, or document that the current impl only supports contiguous batches and verify that density construction's layout is indeed contiguous.
+**File**: `src/eigensolver/chebyshev.rs:662-664`
+**Description**: `plan_batched_c2c(ngx, ngy, ngz)` passes `[ngx, ngy, ngz]` to cuFFT, interpreting ngx as the slowest-varying dimension and ngz as fastest. But the scatter/gather index formula uses `ix + ngx * (iy + ngy * iz)`, which makes ngx the fastest-varying dimension. cuFFT requires `[ngz, ngy, ngx]` to match this layout. On cubic test grids (8×8×8, 4×4×4) the bug is masked because all dimensions are equal. On real non-cubic systems (e.g., Cu111_CO slab where ngz > ngx = ngy), G-vector coefficients scatter to wrong frequency positions, producing incorrect physics.
 
-### P3 — Panic on cuSOLVER workspace allocation failure
+**Fix**: Change to `plan_batched_c2c(ngz as i32, ngy as i32, ngx as i32, ...)`.
 
-**File**: `src/device/solver.rs:70-71`
-**Severity**: Medium
-**Description**: `unwrap_or_else(|e| panic!(...))` on workspace allocation. This should return `Err(CusolverError)` via `?` instead of panicking, consistent with the rest of the codebase's error handling.
-**Recommendation**: Change to `let workspace = self.stream.alloc_zeros::<CudaComplex>(lwork as usize).map_err(|e| ...)?;`.
+### P3 (Minor) — Flat norm threshold instead of relative ratio
 
-### P4 — Missing complex GEMM test
+**File**: `src/eigensolver/chebyshev.rs:552-563`
+**Description**: The guidance specifies a ratio-to-ratio comparison (`growth > threshold × last_growth`), but the implementation uses a flat `10×` threshold. For systems where Chebyshev naturally produces >10× growth, this would false-positive trigger divergence. Deferred item #10 in `deferred.md` documents this.
 
-**File**: `src/device/blas.rs` (tests)
-**Severity**: Low
-**Description**: TASKS.md success criteria requires "Unit test: gemm for small complex matrix multiplication on GPU". The `gemm_c64` method is untested.
-**Recommendation**: Add a small ZGEMM test (e.g., 2×2 complex matrix multiplication with known reference values).
+### P4 (Minor) — `#[allow(dead_code)]` on `SpectralBounds` is unnecessary
 
-### P5 — Missing `Cpu<T>::sync_to_device()` method
-
-**File**: `src/device/mod.rs`
-**Severity**: Low
-**Description**: TASKS.md guidance specified `Cpu<T>::sync_to_device(...) -> Gpu<T>`. The equivalent exists as `Gpu::from_cpu()` but the Cpu-side method is absent. Callers must know to use `Gpu::from_cpu()` instead of `cpu.sync_to_device()`.
-**Recommendation**: Either add `Cpu<T>::sync_to_device()` as a thin wrapper or document the asymmetry.
-
-### P6 — `#[allow(dead_code)]` on `BatchedFftPlan3d`
-
-**File**: `src/device/fft.rs:113`
-**Severity**: Low
-**Description**: `#[allow(dead_code)]` indicates the batched plan struct is never used. Expected consumer (density construction in Group D) is not yet implemented, so this is a forward-reference stub.
-**Recommendation**: Remove `#[allow(dead_code)]` once density construction uses it.
+**File**: `src/eigensolver/chebyshev.rs:213`
+**Description**: The `SpectralBounds` struct is fully used — `compute_spectral_bounds` constructs it and `chebyshev_filter` reads all fields. Remove the attribute.
 
 ## Deferred Items
 
-See `deferred.md`.
+- **Missing H2D assertion**: ADR-0002 specifies `assert_eq!(pcie.h2d_bytes, psi_bytes + veff_bytes, ...)` but only the D2H counterpart exists. Requires routing raw `clone_htod` calls (fft_idx_dev, kinetic_dev, VNL data) through PcieAccount. See `deferred.md`.
+- **CudaKernelSet lives in chebyshev module**: `rayleigh_ritz` imports `CudaKernelSet` from `chebyshev` for the transpose kernel. Better to move to `eigensolver/kernels.rs` or `device/kernels.rs`. Deferred to avoid scope creep.
+- **RowDistributed shape metadata**: The `[n_bands, n_pw]` shape doesn't reflect the transposed memory layout. No current code path syncs RowDistributed to host, so this is latent. Fix when adding RowDistributed host access.
+- See `notes/pr-reviews/phase-2/deferred.md` for all previously deferred items.

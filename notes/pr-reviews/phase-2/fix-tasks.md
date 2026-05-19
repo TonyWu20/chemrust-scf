@@ -1,89 +1,80 @@
-# Fix Tasks: Phase 2 Group-B — GPU Infrastructure
+# Fix Tasks: Phase 2 Group-C — diagonalize
 
-## P1: Fix placebo test `test_batched_c2r_4x4x4`
+## P1: Fix PcieAccount eigenvalue D2H tracking
 
-Replace the vacuous `any(|&v| v != 0.0)` assertion with a per-grid-point check.
+The `rayleigh_ritz` function downloads eigenvalues via raw `clone_dtoh` which bypasses `PcieAccount`. The caller's D2H assertion expects `psi_bytes + eig_bytes` but only `psi_bytes` is tracked.
 
-**Files:** `src/device/fft.rs`
-
-**Guidance:** For each band in the batched IFFT, the DC-only input spectrum (only the first complex element is `1.0+0i`, rest zero) must produce a uniform real output field. The expected value for each band is `1.0 / (nx*ny*nz)` at every grid point. The test should:
-1. Compute expected value
-2. For each band, verify all `nx*ny*nz` output elements equal the expected value within `1e-10`
-3. Verify inter-band independence (no cross-talk)
-
-**Success Criteria:**
-- Single-band DC-only IFFT on 4³ grid produces uniform `1.0/64.0` everywhere
-- 4-band batched IFFT produces same per-band as single-band (proves batch stride correctness)
-- A band with zero input does not leak into adjacent band's output
-
----
-
-## P2: Fix batched FFT to use `cufftPlanMany` or add batch-stride verification
-
-**Files:** `src/device/fft.rs`
-
-**Guidance:** The current `BatchedFftPlan3d` uses `plan_3d()` which ignores the batch parameter. Two options:
-
-**Option A (preferred):** Replace with proper `cufftPlanMany` wrapper:
-1. Add `cufftPlanMany` sys FFI call to create a plan with proper batch stride parameters
-2. Set `idist`/`odist` for batched C2R with `n[0]*n[1]*(n[2]/2+1)` complex input stride and `n[0]*n[1]*n[2]` real output stride
-3. Set `inembed`/`onembed` to `[nz, ny, nx]` (row-major FFT convention)
-4. Associate stream via `cufftSetStream`
-
-**Option B (minimal):** If contiguous batches are provably correct for density construction, add `#[allow(dead_code)]` removal depends on proper `cufftPlanMany`. Choose Option A.
-
-**Success Criteria:**
-- `test_batched_c2r_4x4x4` from P1 fix passes with `cufftPlanMany`-backed plan
-- Plan works with non-unit batch strides (test with gap between batches)
-
----
-
-## P3: Return `Result` instead of panicking on cuSOLVER workspace allocation failure
-
-**Files:** `src/device/solver.rs`
+**Files:** `src/scf.rs`, `src/eigensolver/rayleigh_ritz.rs`
 
 **Guidance:**
-- Change `unwrap_or_else(|e| panic!(...))` to use `?` operator
-- Map `DriverError` to a new variant on `CusolverError` (or define a `SolverError` that wraps it)
-- The workspace allocation failure should propagate up the call stack, not abort the process
+Option A (preferred): Pass `&mut PcieAccount` into `rayleigh_ritz` and instrument the eigenvalue D2H:
+1. Add `pcie: &mut PcieAccount` parameter to `rayleigh_ritz`
+2. After the `clone_dtoh` on line 204-206, add `pcie.d2h_bytes += eigenvalues.len() * 8;`
+3. Update the call site in `scf.rs` to pass `&mut pcie`
+
+Option B (minimal): Remove `eig_bytes` from the expected D2H count in `scf.rs` and only assert `psi_bytes`. Document why eigenvalues are excluded.
 
 **Success Criteria:**
-- `cargo check` — no panic paths in solver.rs allocation
-- Error propagates as `Result` to caller
+- Assertion `pcie.d2h_bytes == psi_bytes + eig_bytes` passes at runtime
+- Eigenvalues are correctly tracked in PcieAccount
 
 ---
 
-## P4: Add complex GEMM unit test
+## P2: Fix FFT dimension ordering mismatch
 
-**Files:** `src/device/blas.rs` (add to existing `#[cfg(test)] mod tests`)
+`plan_batched_c2c(ngx, ngy, ngz)` passes `[ngx, ngy, ngz]` to cuFFT, but the index formula `ix + ngx * (iy + ngy * iz)` has ngx as fastest-varying. cuFFT expects `[ngz, ngy, ngx]`.
 
-**Guidance:** Add `test_zgemm_small` that:
-1. Creates a 2×2 complex matrix A and a 2×2 complex matrix B on GPU
-2. Computes C = A·B via `gemm_c64`
-3. D2H result and compares against hand-calculated reference
-4. Use known simple values like `A = [[1+i, 0], [0, 1-i]]`, `B = [[1, 0], [0, 1]]`
+**Files:** `src/eigensolver/chebyshev.rs`
 
-**Success Criteria:**
-- Complex GEMM result matches CPU reference within 1e-10
-- Test passes on CUDA GPU
-
----
-
-## P5: Add Cpu<T>::sync_to_device() thin wrapper
-
-**Files:** `src/layout.rs`
-
-**Guidance:** Add a convenience method to `Cpu<T>`:
+**Guidance:**
+Change line 662-664 from:
 ```rust
-pub fn sync_to_device(&self, stream: &Arc<CudaStream>) -> Result<Gpu<T>, DriverError>
-where
-    T: DeviceMapped,
-{
-    Gpu::from_host(&self.0, stream)
-}
+let fft_plan = BatchedFftPlan3d::plan_batched_c2c(
+    ngx as i32, ngy as i32, ngz as i32, n_bands_i32, stream.clone(),
+)?;
 ```
-This requires importing `Gpu` and `DeviceMapped` from `device` module — watch for circular dependency.
+to:
+```rust
+let fft_plan = BatchedFftPlan3d::plan_batched_c2c(
+    ngz as i32, ngy as i32, ngx as i32, n_bands_i32, stream.clone(),
+)?;
+```
+
+Also audit all other `plan_c2c` / `plan_batched_c2c` call sites in the codebase for correct dimension ordering.
 
 **Success Criteria:**
-- `cpu.sync_to_device(&stream)` returns `Gpu<T>`
-- `cargo check` passes
+- FFT identity test (8³ cubic) still passes after ordering change
+- For non-cubic grids (e.g., 8×8×16), a non-uniform test pattern confirms correct frequency placement
+
+## P3: Remove unnecessary `#[allow(dead_code)]` on `SpectralBounds`
+
+**Files:** `src/eigensolver/chebyshev.rs`
+
+**Guidance:**
+Remove `#[allow(dead_code)]` from line 213. The `SpectralBounds` struct is fully used — `compute_spectral_bounds` constructs it and `chebyshev_filter` reads all fields.
+
+**Success Criteria:**
+- `cargo check` — no dead_code warning on `SpectralBounds`
+- No dead_code warning on `lambda_max` or `eps_cut` fields
+
+---
+
+## P4: Add H2D assertion (optional, from strategic review)
+
+**Files:** `src/scf.rs`
+
+**Guidance:**
+Add H2D assertion after D2H assertion, tracking PCI-E uploads:
+```rust
+assert_eq!(
+    pcie.h2d_bytes,
+    psi_bytes + veff_bytes + fft_idx_bytes + kinetic_bytes + vnl_bytes,
+    "H2D tracking check failed",
+);
+```
+
+Note: this requires routing all H2D transfers through `PcieAccount` (currently `clone_htod` calls for fft_idx, kinetic, VNL beta/D matrices bypass tracking). Add `pcie.h2d_bytes += ...` after each setup transfer, or route them through `Gpu::from_host_with`.
+
+**Success Criteria:**
+- H2D assertion passes when diagonalize is called
+- All setup H2D transfers are tracked
