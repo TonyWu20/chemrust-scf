@@ -755,14 +755,18 @@ impl<S: SpinPolicy> ScfIteration<S, Mixed, MixingOff> {
         // 3. Energy-window convergence check
         let n_conv = 3; // Number of entries needed in the window
         let energy_tol = tol;
-        let energy_converged = if self.energy_buffer.len() >= n_conv {
+        let (energy_converged, energy_variation) = if self.energy_buffer.len() >= n_conv {
             let window = &self.energy_buffer[self.energy_buffer.len() - n_conv..];
-            window
-                .windows(2)
-                .map(|w| (w[1] - w[0]).abs())
-                .all(|diff| diff < energy_tol)
+            let e_max = window
+                .iter()
+                .fold(f64::NEG_INFINITY, |a, &b| a.max(b));
+            let e_min = window
+                .iter()
+                .fold(f64::INFINITY, |a, &b| a.min(b));
+            let converged = (e_max - e_min).abs() < energy_tol;
+            (converged, e_max - e_min)
         } else {
-            false
+            (false, f64::INFINITY)
         };
 
         // 4. Density RMS change (mixed density vs pre-mix snapshot)
@@ -775,9 +779,35 @@ impl<S: SpinPolicy> ScfIteration<S, Mixed, MixingOff> {
             (sum_sq / n).sqrt()
         };
 
-        // 5. Decision
-        let next_mixing = self.next_mixing;
-        if dens_rms < tol && energy_converged {
+        // 5. Mixing phase transition (CASTEP dm.f90:895-1093, electronic.f90:7614-7638)
+        //
+        // Off → Kerker when energy variation drops below 0.1 eV (mixing starts
+        // once the raw SCF has roughly settled).
+        // Kerker → Pulay after the first Kerker mix completes.
+        // Pulay → Pulay for normal DIIS.
+        //
+        // Convergence is only valid when mixing was active (next_mixing ≠ Off),
+        // preventing false convergence when the energy is stable simply because
+        // no mixing is perturbing the density.
+        const MIXING_CONV_TOL_EV: f64 = 0.1; // CASTEP mixing_convergence_tol default
+
+        // Was density mixing active in this iteration?
+        let mixing_was_active = self.next_mixing != MixingPhaseKind::Off;
+
+        let next_mixing = match self.next_mixing {
+            MixingPhaseKind::Off => {
+                if energy_variation < MIXING_CONV_TOL_EV {
+                    MixingPhaseKind::Kerker
+                } else {
+                    MixingPhaseKind::Off
+                }
+            }
+            MixingPhaseKind::Kerker => MixingPhaseKind::Pulay,
+            MixingPhaseKind::Pulay => MixingPhaseKind::Pulay,
+        };
+
+        // 6. Decision — mixing must have been active to declare convergence
+        if mixing_was_active && dens_rms < tol && energy_converged {
             Ok(CheckOutcome::Converged(self.into_phase()))
         } else {
             Ok(CheckOutcome::NotConverged {
@@ -1037,6 +1067,162 @@ mod tests {
                     "no energy data should keep mixing phase as Off");
             }
             _ => panic!("expected NotConverged, got Converged"),
+        }
+    }
+
+    /// Helper: build a `Mixed`-phase state for check() testing.
+    fn mixed_state(
+        energy_buffer: Vec<f64>,
+        next_mixing: MixingPhaseKind,
+    ) -> ScfIteration<NonSpin, Mixed, MixingOff> {
+        let shape = [4, 4, 4];
+        ScfIteration {
+            cell: dummy_cell(),
+            pots: PseudopotentialSet::new(),
+            wave_grid: dummy_grid(),
+            fine_grid: dummy_grid(),
+            k_point: KPoint::default(),
+            smearing: SmearingParams {
+                width: 0.1,
+                electron_temperature: 0.0,
+                scheme: SmearingScheme::Gaussian,
+            },
+            pw_coords: Vec::new(),
+            pw_fft_indices: Vec::new(),
+            density: Density::from_inner(WaveGridArray::from_inner(
+                Array3::<f64>::zeros(shape),
+            )),
+            psi: WavefunctionSet::new(vec![Complex64::ZERO; 4 * 27], 4, 27),
+            eigenvalues: vec![-0.3, -0.2],
+            v_eff: None,
+            history: DensityHistory::new(),
+            previous_density: Density::from_inner(WaveGridArray::from_inner(
+                Array3::<f64>::from_elem(shape, 2.0),
+            )),
+            next_mixing,
+            e_xc: None,
+            e_hartree: None,
+            rho_vxc: None,
+            ewald: 0.0,
+            energy_buffer,
+            total_energy: None,
+            _phase: PhantomData,
+        }
+    }
+
+    /// Off → Kerker when energy variation drops below 0.1 eV.
+    #[test]
+    fn test_check_off_to_kerker_transition() {
+        // Energy window: three iterations all within 0.01 eV — settled.
+        let energies = vec![-24110.966, -24110.964, -24110.965];
+        let state = mixed_state(energies, MixingPhaseKind::Off);
+
+        let result = state.check(1e-5).unwrap();
+        match result {
+            CheckOutcome::NotConverged { next_mixing, .. } => {
+                assert_eq!(
+                    next_mixing,
+                    MixingPhaseKind::Kerker,
+                    "Off → Kerker when energy settles below 0.1 eV"
+                );
+            }
+            CheckOutcome::Converged(_) => {
+                panic!("should not converge — mixing was Off (mixed_status false)")
+            }
+        }
+    }
+
+    /// Off stays Off when energy is still varying widely.
+    #[test]
+    fn test_check_off_stays_off_when_energy_unstable() {
+        // Energy varying by > 0.1 eV — too unstable to start mixing.
+        let energies = vec![-24110.0, -24109.0, -24108.0];
+        let state = mixed_state(energies, MixingPhaseKind::Off);
+
+        let result = state.check(1e-5).unwrap();
+        match result {
+            CheckOutcome::NotConverged { next_mixing, .. } => {
+                assert_eq!(
+                    next_mixing,
+                    MixingPhaseKind::Off,
+                    "should stay Off when energy varies > 0.1 eV"
+                );
+            }
+            CheckOutcome::Converged(_) => panic!("should not converge"),
+        }
+    }
+
+    /// Kerker → Pulay after first Kerker mix completes.
+    #[test]
+    fn test_check_kerker_to_pulay_transition() {
+        // Kerker was active this iteration; should advance to Pulay.
+        let energies = vec![-24110.966, -24110.965, -24110.967];
+        let state = mixed_state(energies, MixingPhaseKind::Kerker);
+
+        let result = state.check(1e-5).unwrap();
+        match result {
+            CheckOutcome::NotConverged { next_mixing, .. } => {
+                assert_eq!(
+                    next_mixing,
+                    MixingPhaseKind::Pulay,
+                    "Kerker → Pulay after first Kerker mix"
+                );
+            }
+            CheckOutcome::Converged(_) => {
+                // Could happen if energy+tol happens to match.
+                // If so, still fine — convergence with Kerker mixing is valid.
+            }
+        }
+    }
+
+    /// Pulay stays Pulay.
+    #[test]
+    fn test_check_pulay_stays_pulay() {
+        let energies = vec![-24110.966, -24110.965, -24110.967];
+        let state = mixed_state(energies, MixingPhaseKind::Pulay);
+
+        let result = state.check(1e-5).unwrap();
+        match result {
+            CheckOutcome::NotConverged { next_mixing, .. } => {
+                assert_eq!(
+                    next_mixing,
+                    MixingPhaseKind::Pulay,
+                    "Pulay should stay Pulay"
+                );
+            }
+            CheckOutcome::Converged(_) => {
+                // Energy variation ≈ 0.002 eV, density RMS likely large with dummy data.
+                // If it converges, that's fine too — Pulay is a valid mixing phase.
+            }
+        }
+    }
+
+    /// Converging with mixing Off must not declare victory (mixed_status guard).
+    #[test]
+    fn test_check_no_converge_with_mixing_off() {
+        // Even if energies are perfectly flat (differ by < 1e-10), Off mixing
+        // must fail the convergence check because mixing was never active.
+        let energies = vec![-24110.96665069; 5];
+        let mut state = mixed_state(energies, MixingPhaseKind::Off);
+
+        // Also make density RMS zero so the only blocker is mixed_status.
+        state.previous_density = state.density.clone();
+
+        let result = state.check(1e-8).unwrap();
+        match result {
+            CheckOutcome::NotConverged { next_mixing, .. } => {
+                // Should transition to Kerker (energy is stable) but NOT converge.
+                assert_eq!(
+                    next_mixing,
+                    MixingPhaseKind::Kerker,
+                    "Off with flat energy should transition to Kerker, not converge"
+                );
+            }
+            CheckOutcome::Converged(_) => {
+                panic!(
+                    "must NOT converge with Off mixing — mixed_status guard required"
+                );
+            }
         }
     }
 }

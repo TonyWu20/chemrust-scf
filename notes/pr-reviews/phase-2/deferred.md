@@ -179,3 +179,17 @@ sufficient (proved in Theorem 1-2 of the paper).
   (3) CPU tridiagonal solve for T_k eigenvalues, (4) safeguard computation.
   This is scope increase for Phase 2.
 - The practical impact on Cu111_CO (~50 bands, modest system) is negligible.
+
+## Group E Deferred Items
+
+### 21. Kerker `current_density_in` storage via D2H/H2D roundtrip
+
+`Kerker::mix()` and `Pulay::mix()` save the mixed reciprocal density for the next iteration via `clone_dtoh` → `clone_htod` roundtrip. This wastes a PCI-E roundtrip per mix call. Use `stream.alloc_clone()` or similar GPU-side copy instead. Defer to Phase 3 — negligible for Phase 2 correctness validation.
+
+### 22. cuFFT plan created per mix() call
+
+`FftPlan3d::plan_c2c(...)` is called inside every `mix()`. cuFFT plan creation is expensive. Cache in `DensityHistory`. Defer to Phase 3 — correctness-first for Phase 2.
+
+### 23. Ewald α parameter differs from TASKS.md specification
+
+Spec says `α = √π / V^(1/3)`. Code uses `α = (π/V)^(1/3)`. Ewald energy converges to the same value with adequate cutoffs regardless of α choice. Not a physics error. Verify against CASTEP reference in Group F; adjust if discrepancy exceeds 1e-6 eV.

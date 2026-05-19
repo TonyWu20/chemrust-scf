@@ -174,3 +174,150 @@ See `deferred.md` (Group D section).
 ## Fix Tasks
 
 See `fix-tasks.md` (Group D section).
+
+---
+
+# Review: Phase 2 Group E — mix + check
+
+**Tasks**: `notes/plans/phase-2/TASKS.md` (Group E, lines 384-573)
+**Reviewed**: 2026-05-19
+**Post-hoc tests**: `notes/plans/phase-2/POST_GroupE_TASKS.md`
+**Review scope**: Group E (E-1 through E-5, plus E-6 unit tests)
+
+## Summary
+
+**Verdict: CHANGES REQUIRED — 1 blocking gap (now fixed), 2 deferred items, 1 observation.**
+
+The architecture is sound: type-state `DensityHistory<M>` correctly encodes the three mixing phases, the Kerker formula matches CASTEP, the DIIS solve matches the source-audited algorithm in `dm.f90:895-1093`, and the Ewald+total-energy assembly follows the KS-DFT formula. 22 unit tests all pass, with 5 new phase-transition tests added during this review.
+
+The blocking gap was that `check()` never advanced `next_mixing` from `Off` — the SCF loop always used pass-through density construction.  This has been fixed in this review session.
+
+Outcome verification: `cargo test --lib` → 27/27 pass (was 22). `cargo clippy --workspace -- -D warnings` → clean. No fixture-anchored tests exist yet (Group F).
+
+## Per-Task Results
+
+### E-1: Kerker preconditioner setup
+- **Status**: ✓ Passed
+- **File**: `src/mixing/kerker.rs` (146 lines)
+- **Runtime verification**: 4 CPU unit tests pass (G=0 zero, monotonic, high-G asymptote, q² gives 0.5). GPU allocation not tested at unit level (deferred to Group F).
+- **Diff validation**:
+  - K(G) = G²/(G²+q²) with q² = 2.25 (q=1.5 a.u.) ✓
+  - K(G=0) = 0.0 (no DC mixing) ✓
+  - Kernel computed on CPU from `GVectorGrid::g2()`, then H2D ✓
+  - Fortran layout matches cuFFT C2C plan ordering ✓
+  - **Tests are formula-only**: validate Kerker math, not GPU allocation or mixing behaviour. Acceptable for CPU-only testing.
+
+### E-2: Reciprocal-space DIIS + Kerker mixing
+- **Status**: ✓ Passed
+- **Files**: `src/mixing.rs` (768 lines), `src/mixing/cuda_kernels.rs` (100 lines), `src/mixing/reciprocal_density.rs` (45 lines)
+- **Runtime verification**: 5 DIIS solve tests pass (2×2, 3×3 identity, singular fallback, near-singular fallback, empty). No GPU-resident mixing test (deferred to Group F).
+- **Diff validation**:
+  - Type-state `DensityHistory<M>` with `MixingOff`, `Kerker`, `Pulay` markers ✓
+  - Sealed trait prevents external implementations ✓
+  - `MixingOff::mix()` pass-through ✓
+  - `Kerker::mix()`: density → C2C FFT → R=n_out−n_in → K·R → C2C-IFFT → real ✓
+  - `Pulay::mix()`: full DIIS with delta history, dgesv solve, Kerker preconditioned update ✓
+  - cuBLAS `axpy_c64` for accumulating Σc_i·ΔR_i, Σc_i·Δn_i ✓
+  - NVRTC-compiled `cpx_sub`, `cpx_full_update` kernels ✓
+  - `build_and_solve_diis` builds M_ij = Re[zdotc(ΔR_j, ΔR_i)] on GPU, solves on CPU ✓
+  - DIIS fallback to Kerker on singular matrix ✓
+  - Ring-buffer history eviction at DIIS_MAX_HISTORY=7 ✓
+  - **Mixing is in reciprocal space** as specified ✓
+  - **Residual is R = n_out − n_in** (not ρ_new − ρ_old) ✓
+  - **History stores deltas** (Δn, ΔR), not absolutes ✓
+  - **DIIS is unconstrained** (no Lagrange multiplier) ✓
+  - **Kerker preconditioning is mandatory** (applied per PW coefficient) ✓
+  - `cpx_full_update` implements n_new = n_in + Σc_i·Δn_i + K·(R + Σc_i·ΔR_i) ✓
+  - First-call pass-through for both Kerker and Pulay (no n_in to compare against) ✓
+
+### E-3: Total energy computation
+- **Status**: ✓ Passed (minor spec deviation)
+- **Files**: `src/energy.rs` (323 lines)
+- **Runtime verification**: 2 CPU tests pass. `test_ewald_is_finite` tests zero-charge case (E=0). `test_assemble_total_energy_basic` verifies arithmetic.
+- **Diff validation**:
+  - Ewald summation: real-space + reciprocal-space + self-energy ✓
+  - Real-space sum with erfc screening, cutoff=8 Bohr ✓
+  - Reciprocal sum with exp(−G²/4α²) factor, cutoff G_max=7α ✓
+  - Structure factor S(G) = Σ Z_I exp(iG·r_I) ✓
+  - Self-energy: −α/√π · Σ Z_I² ✓
+  - `assemble_total_energy`: E_band − E_H + E_xc − ∫ρV_xc + E_ewald ✓
+  - chemrust-hamiltonian `VEffWithEnergy` provides e_xc, e_hartree, rho_vxc from `assemble_with_energy()` ✓
+  - Hartree and ∫ρV_xc use valence density (NLCC core is frozen/non-variational) ✓
+  - **Ewald α parameter**: code uses `(π/V)^(1/3)`, TASKS.md specifies `√π/V^(1/3)`. Both converge to the same Ewald energy with adequate cutoffs — not a physics error. Deferred.
+  - **test_ewald_is_finite is borderline placebo**: tests Ewald with Z_I=0 (no pseudopotential charges), so all three Ewald terms are zero. Validates the code doesn't panic but doesn't test any of the Ewald sub-terms. Not blocking — real-charge testing requires fixture pseudopotentials (Group F).
+
+### E-4: Energy-window convergence check
+- **Status**: ⚠ Fixed during review — was ✗ Failed
+- **File**: `src/scf.rs` (check() method, lines 720-807)
+- **Original state**: `check()` copied `self.next_mixing` through unchanged — no phase transitions. Convergence did not require mixing to be active.
+- **Fixed state**:
+  - Energy convergence uses max−min over 3-entry window (matches CASTEP `electronic_store_energy`) ✓
+  - Off → Kerker when energy variation < 0.1 eV (`MIXING_CONV_TOL_EV`) ✓
+  - Kerker → Pulay unconditionally (first DIIS step after one Kerker mix) ✓
+  - Pulay → Pulay (stay in DIIS) ✓
+  - Convergence requires `mixing_was_active` (next_mixing ≠ Off at entry) ✓
+  - Mixed-status guard prevents false convergence when mixing is off ✓
+- **Tests added**: 5 new tests exercise all transitions and the mixed-status guard:
+  - `test_check_off_to_kerker_transition` — energy settled → Kerker
+  - `test_check_off_stays_off_when_energy_unstable` — energy varying → stays Off
+  - `test_check_kerker_to_pulay_transition` — Kerker → Pulay
+  - `test_check_pulay_stays_pulay` — Pulay → Pulay
+  - `test_check_no_converge_with_mixing_off` — flat energy + zero RMS but Off → NOT converged
+
+### E-5: Wire mixing phase into run_scf loop
+- **Status**: ✓ Passed
+- **File**: `src/scf.rs` (run_scf, lines 828-890)
+- **Runtime verification**: `cargo check` passes. Phase transition tests validate the dispatch indirectly.
+- **Diff validation**:
+  - `MixingPhaseKind` runtime enum (Off, Kerker, Pulay) ✓
+  - `run_scf` matches on `wfn.next_mixing` to dispatch ✓
+  - `construct_density_off/kerker/pulay` methods on `WavefunctionsUpdated` ✓
+  - Each `construct_density_*` correctly wires the history type: Off→MixingOff, Kerker→Kerker, Pulay→(Off→)Kerker→Pulay ✓
+  - After `mix()`, history normalized back to `MixingOff` via `into_off()` ✓
+  - `run_scf_with_energy` variant uses `build_v_eff_with_energy` for total energy ✓
+  - `CheckOutcome::NotConverged` carries `next_mixing` to next iteration ✓
+
+### E-6: CPU unit tests
+- **Status**: ✓ Passed (now 27 tests, was 22)
+- **Coverage**: 5 DIIS solve + 4 Kerker formula + 1 check (original) + 5 phase transition (added) + 3 device + 3 FFT + 3 BLAS + 1 solver + 2 energy = 27
+
+## Issues Found
+
+### Fixed during review
+
+1. **Mixing phase never transitions (P1 — was Critical)**
+   - `check()` at `src/scf.rs:779` (old) copied `self.next_mixing` through, never advancing from Off.
+   - Effect: SCF loop always called `construct_density_off()?.mix()` — pass-through, no Kerker or DIIS mixing ever engaged.
+   - Fix: Implemented phase transition logic with `MIXING_CONV_TOL_EV = 0.1 eV`. Off→Kerker→Pulay state machine now advances correctly. Mixed-status guard (`mixing_was_active`) prevents false convergence when mixing is off.
+   - Verified: 5 new tests pass, all 27 tests green.
+
+### Deferred
+
+2. **Kerker mix() D2H/H2D roundtrip for current_density_in storage (P3 — Performance)**
+   - `Kerker::mix()` and `Pulay::mix()` save `current_density_in` via `clone_dtoh` → `clone_htod` roundtrip.
+   - Wastes a PCI-E roundtrip per mix call. Should use `stream.alloc_clone(&result_dev)` or similar GPU-side copy.
+   - **Defer to Phase 3**: negligible for Phase 2 correctness validation.
+
+3. **New cuFFT plan allocated per mix() call (P3 — Performance)**
+   - `FftPlan3d::plan_c2c(...)` is called inside every `mix()`. cuFFT plan creation is expensive.
+   - Should be cached in `DensityHistory`.
+   - **Defer to Phase 3**: correctness-first for Phase 2.
+
+4. **Ewald α parameter differs from TASKS.md (P3 — Minor spec deviation)**
+   - Spec: `α = √π / V^(1/3)`. Code: `α = (π/V)^(1/3)`.
+   - Ewald energy converges to same value with adequate cutoffs. Not a physics error.
+   - **Defer**: verify against CASTEP reference in Group F; adjust if discrepancy exceeds 1e-6 eV.
+
+### Observations (no fix needed)
+
+5. **test_ewald_is_finite tests Z_I=0 case only**: Validates code structure, not physics. Acceptable for CPU-only testing — real-charge testing needs fixture pseudopotentials (Group F). Not placebo per se, but low signal.
+
+6. **check() convergence formula uses max−min instead of pairwise diffs**: This was changed during the review fix and actually aligns BETTER with CASTEP's `electronic_store_energy` which uses `max_E − min_E`. The old pairwise approach was stricter but not wrong.
+
+## Deferred Items
+
+See `deferred.md` (Group E section) for the 3 deferred items listed above.
+
+## Fix Tasks
+
+See `fix-tasks.md` (Group E section).

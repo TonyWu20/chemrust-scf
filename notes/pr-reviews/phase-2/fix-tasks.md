@@ -187,3 +187,29 @@ This eliminates the shared memory and reduction logic entirely. Launch with `for
 - `cargo check` passes
 - Small-scale test on CPU: construct a known density from a small set of PW coefficients and verify against an NDArray reference computation
 - The kernel produces correct output when called with actual data on GPU
+
+---
+
+# Group E Fix Tasks
+
+## P7: Mixing phase transition logic in check()  ✅ FIXED
+
+**Status: Applied during review session 2026-05-19.**
+
+`check()` at `src/scf.rs:779` (old) copied `self.next_mixing` through unchanged — no phase transitions. The SCF loop always called `construct_density_off()?.mix()` (pass-through). Kerker and Pulay mixing were never engaged during an SCF run.
+
+**Files:** `src/scf.rs`
+
+**What was changed:**
+
+1. Energy convergence formula changed from pairwise-diff to max−min over 3-entry window (aligns with CASTEP `electronic_store_energy`).
+2. Phase transition logic added:
+   - `Off → Kerker` when energy variation < 0.1 eV (`MIXING_CONV_TOL_EV`)
+   - `Kerker → Pulay` after first Kerker mix completes
+   - `Pulay → Pulay` for normal DIIS
+3. Mixed-status guard: convergence requires `mixing_was_active` (next_mixing ≠ Off at entry), preventing false convergence when no mixing is perturbing the density.
+4. 5 new unit tests exercise all transitions and the guard.
+
+**Verification:**
+- `cargo test --lib` → 27/27 pass
+- `cargo clippy --workspace -- -D warnings` → clean
