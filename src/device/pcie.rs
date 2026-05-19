@@ -1,3 +1,12 @@
+#![allow(dead_code)]
+use std::marker::PhantomData;
+use std::sync::Arc;
+
+use cudarc::driver::{result::DriverError, CudaSlice, CudaStream};
+
+use crate::device::{DeviceMapped, Gpu};
+use crate::layout::Cpu;
+
 // ---------------------------------------------------------------------------
 // PcieAccount — tracks GPU ↔ CPU data transfers
 // ---------------------------------------------------------------------------
@@ -15,6 +24,7 @@ pub(crate) struct PcieAccount {
 }
 
 impl PcieAccount {
+    #[allow(dead_code)]
     pub fn record_h2d<T>(&mut self, slice: &CudaSlice<T>) {
         self.h2d_bytes += slice.len() * size_of::<T>();
     }
@@ -32,22 +42,22 @@ impl PcieAccount {
 // ---------------------------------------------------------------------------
 
 impl<T: DeviceMapped> Gpu<T> {
-    pub fn from_host_with(
+    pub(crate) fn from_host_with(
         value: &T,
         stream: &Arc<CudaStream>,
-        acc: &mut PcieAccount,          // ← new parameter
+        acc: &mut PcieAccount,
     ) -> Result<Self, DriverError> {
         let shape = value.shape_metadata();
         let host_data = value.flatten_host();
         let n = host_data.len();
-        acc.h2d_bytes += n * size_of::<T::Elem>();   // ← record
+        acc.h2d_bytes += n * size_of::<T::Elem>();
         let mut slice = stream.alloc_zeros::<T::Elem>(n)?;
         stream.memcpy_htod(&host_data, &mut slice)?;
         let ctx = stream.context();
         Ok(Self { slice, shape, ctx: ctx.clone(), _marker: PhantomData })
     }
 
-    pub fn sync_to_host_with(
+    pub(crate) fn sync_to_host_with(
         &self,
         stream: &Arc<CudaStream>,
         acc: &mut PcieAccount,          // ← new parameter

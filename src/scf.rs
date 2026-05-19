@@ -9,6 +9,7 @@ use num_complex::Complex64;
 
 use crate::device::blas::BlasHandle;
 use crate::device::solver::SolverHandle;
+use crate::device::pcie::PcieAccount;
 use crate::device::Gpu;
 use crate::eigensolver::chebyshev::chebyshev_filter;
 use crate::eigensolver::rayleigh_ritz::rayleigh_ritz;
@@ -179,9 +180,12 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt> {
         let v_eff_spin = S::v_eff_for_spin(v_eff_ref, 0);
         let v_eff_arr = v_eff_spin.as_array();
 
+        // PCI-E transfer tracker (catches unexpected H2D/D2H in the hot path)
+        let mut pcie = PcieAccount::default();
+
         // Downsample V_eff from fine grid to wave grid
         let v_eff_wave = downsample_array_to_wave_grid(v_eff_arr, &self.fine_grid, &self.wave_grid)?;
-        let v_eff_gpu = Gpu::from_host(&v_eff_wave, &stream)?;
+        let v_eff_gpu = Gpu::from_host_with(&v_eff_wave, &stream, &mut pcie)?;
 
         // Clone host data BEFORE moving self.psi into GPU
         let pw_coords = self.pw_coords.clone();
@@ -190,7 +194,7 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt> {
         let n_pw = self.psi.n_pw;
 
         // H2D psi
-        let psi_gpu = Gpu::from_cpu(&Cpu::new(self.psi), &stream)?;
+        let psi_gpu = Gpu::from_host_with(&Cpu::new(self.psi).0, &stream, &mut pcie)?;
 
         // V_NL precomputation (CPU, uses chemrust-hamiltonian, one-time cost)
         let vnl_data = VnlBatchData::precompute(
@@ -224,8 +228,19 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt> {
         )?;
 
         stream.synchronize()?;
-        let Cpu(psi_new) = psi_new_gpu.sync_to_host(&stream)?;
+        let psi_bytes = n_bands * n_pw * 16;            // complex double
+        let eig_bytes = n_bands * 8;
+        let Cpu(psi_new) = psi_new_gpu.sync_to_host_with(&stream, &mut pcie)?;
         let eigenvalues = eigenvalues_cpu.into_inner();
+
+        // Assert: hot path should only have setup H2D + final D2H.
+        // Any additional transfer (e.g. D2H inside the Chebyshev loop) is a bug.
+        assert_eq!(
+            pcie.d2h_bytes,
+            psi_bytes + eig_bytes,
+            "D2H: expected psi({psi_bytes}) + eigenvalues({eig_bytes}) = {}",
+            psi_bytes + eig_bytes,
+        );
 
         Ok(ScfIteration {
             psi: psi_new,

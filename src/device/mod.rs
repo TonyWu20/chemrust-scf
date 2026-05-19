@@ -1,6 +1,7 @@
 pub mod fft;
 pub mod blas;
 pub mod solver;
+pub(crate) mod pcie;
 
 use std::marker::PhantomData;
 use std::sync::Arc;

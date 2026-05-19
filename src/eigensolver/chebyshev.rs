@@ -124,7 +124,7 @@ extern \"C\" __global__ void veff_multiply(
 }
 
 extern \"C\" __global__ void gather_add_kinetic(
-    const double2* grid, const int* fft_idx, const double* kinetic,
+    const double2* grid, const int* fft_idx,
     double2* result, int n_pw, int n_bands, int grid_size, double inv_ntotal
 ) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -160,9 +160,9 @@ extern \"C\" __global__ void transpose_col_to_row(
 // ---------------------------------------------------------------------------
 
 /// Handles to all compiled CUDA kernels used in the Chebyshev filter.
-#[allow(dead_code)]
 struct CudaKernelSet {
     zero_buffer: CudaFunction,
+    #[allow(dead_code)]
     zero_buffer_real: CudaFunction, // reserved for future real-buffer clearing
     init_kinetic: CudaFunction,
     scatter_pw_to_grid: CudaFunction,
@@ -341,7 +341,6 @@ unsafe fn apply_v_loc_hamiltonian(
             .launch_builder(&kernels.gather_add_kinetic)
             .arg(&*grid_dev)
             .arg(fft_idx_dev)
-            .arg(kinetic_dev)
             .arg(&mut *hpsi_dev)
             .arg(&n_pw)
             .arg(&n_bands)
@@ -765,8 +764,6 @@ pub(crate) fn chebyshev_filter(
             &hpsi_dev, &mut hpsi_row_dev, n_bands_i32, n_pw_i32, &kernels, stream,
         )?;
     }
-
-    stream.synchronize().map_err(Error::Cuda)?;
 
     // Wrap into Gpu<WavefunctionSet<L>>
     let psi_row = Gpu::<WavefunctionSet<RowDistributed>> {
