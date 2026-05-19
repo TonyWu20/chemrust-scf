@@ -291,7 +291,7 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt> {
             &pw_coords, &self.pots, &self.cell,
             &self.wave_grid, &self.k_point,
             &psi_host, n_bands, n_pw,
-            &stream,
+            &stream, &mut pcie,
         )?;
 
         // Clone eigenvalues before moving self
@@ -302,13 +302,14 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt> {
         let fft_idx_dev: CudaSlice<i32> = stream
             .clone_htod(&self.pw_fft_indices)
             .map_err(Error::Cuda)?;
+        pcie.h2d_bytes += self.pw_fft_indices.len() * std::mem::size_of::<i32>();
 
         // Chebyshev filter (pipeline: T+V_loc via FFT, V_NL via gemm)
         let (psi_filtered_row, hpsi_row) = chebyshev_filter(
             &psi_gpu, &v_eff_gpu, &self.pots,
             &self.wave_grid, &self.k_point, &self.cell,
             &vnl_data, &fft_idx_dev, min_veff, max_veff,
-            &kernels, eig, ndeg, &blas, &stream, &ctx,
+            &kernels, &mut pcie, eig, ndeg, &blas, &stream, &ctx,
         )?;
 
         // Rayleigh-Ritz
@@ -332,6 +333,20 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt> {
             psi_bytes + eig_bytes,
             "D2H: expected psi({psi_bytes}) + eigenvalues({eig_bytes}) = {}",
             psi_bytes + eig_bytes,
+        );
+
+        let [ngz, ngy, ngx] = self.wave_grid.grid();
+        let grid_size = ngx * ngy * ngz;
+        let veff_bytes = grid_size * std::mem::size_of::<f64>();
+        let fft_idx_bytes = self.pw_fft_indices.len() * std::mem::size_of::<i32>();
+        let kinetic_bytes = grid_size * std::mem::size_of::<f64>();
+        let vnl_bytes: usize = vnl_data.entries.iter()
+            .map(|e| (e.beta_g.len() + e.d_matrix.len()) * 16)
+            .sum();
+        assert_eq!(
+            pcie.h2d_bytes,
+            psi_bytes + veff_bytes + fft_idx_bytes + kinetic_bytes + vnl_bytes,
+            "H2D tracking check failed",
         );
 
         Ok(ScfIteration {

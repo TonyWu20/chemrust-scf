@@ -7,6 +7,7 @@ use chemrust_hamiltonian_core::Pseudopotential;
 use cudarc::driver::{CudaSlice, CudaStream};
 use num_complex::Complex64;
 
+use crate::device::pcie::PcieAccount;
 use crate::device::CudaComplex;
 use crate::types::{Error, KPoint};
 
@@ -32,6 +33,7 @@ impl VnlBatchData {
         n_bands: usize,
         n_pw: usize,
         stream: &Arc<CudaStream>,
+        pcie: &mut PcieAccount,
     ) -> Result<Self, Error> {
         let kf = k_point.coords;
         let recip = cell.recip_lattice.as_array();
@@ -78,6 +80,7 @@ impl VnlBatchData {
 
             let beta_dev = stream.clone_htod(&beta_flat).map_err(Error::Cuda)?;
             let d_dev = stream.clone_htod(&d_flat).map_err(Error::Cuda)?;
+            pcie.h2d_bytes += (beta_flat.len() + d_flat.len()) * std::mem::size_of::<CudaComplex>();
 
             entries.push(VnlIonData {
                 beta_g: beta_dev,

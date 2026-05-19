@@ -21,6 +21,7 @@ use cudarc::nvrtc::compile_ptx;
 
 use crate::device::blas::{self, BlasHandle, ZgemmConfig};
 use crate::device::fft::BatchedFftPlan3d;
+use crate::device::pcie::PcieAccount;
 use crate::device::{CudaComplex, Gpu};
 use crate::eigensolver::vnl_data::VnlBatchData;
 
@@ -655,6 +656,7 @@ pub(crate) fn chebyshev_filter(
     min_veff: f64,
     max_veff: f64,
     kernels: &CudaKernelSet,            // pre-compiled GPU kernels (shared)
+    pcie: &mut PcieAccount,
     eigenvalues: Option<&[f64]>,
     ndeg: usize,
     blas: &BlasHandle,
@@ -677,6 +679,7 @@ pub(crate) fn chebyshev_filter(
     // ---- Precompute & upload kinetic energy ----
     let kinetic_cpu = compute_kinetic_energies(wave_grid);
     let kinetic_dev: CudaSlice<f64> = stream.clone_htod(&kinetic_cpu).map_err(Error::Cuda)?;
+    pcie.h2d_bytes += kinetic_cpu.len() * std::mem::size_of::<f64>();
 
     // ---- FFT plan (batched C2C) ----
     let fft_plan = BatchedFftPlan3d::plan_batched_c2c(
