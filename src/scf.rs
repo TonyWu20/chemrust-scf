@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use bon::bon;
 use chemrust_hamiltonian_core::{CellGeometry, GVectorGrid, PseudopotentialSet, SpinPolicy, NonSpin};
-use cudarc::driver::CudaContext;
+use cudarc::driver::{CudaContext, CudaSlice};
 use ndarray::{Array3, ShapeBuilder};
 use num_complex::Complex64;
 
@@ -12,6 +12,7 @@ use crate::device::solver::SolverHandle;
 use crate::device::Gpu;
 use crate::eigensolver::chebyshev::chebyshev_filter;
 use crate::eigensolver::rayleigh_ritz::rayleigh_ritz;
+use crate::eigensolver::vnl_data::VnlBatchData;
 use crate::layout::{ColumnDistributed, Cpu, WavefunctionSet};
 use crate::mixing::DensityHistory;
 use crate::types::{Density, EffectivePotential, Error, FinalResult, FineGridArray, KPoint, SmearingParams};
@@ -69,6 +70,8 @@ pub struct ScfIteration<
     pub(crate) fine_grid: GVectorGrid,
     pub(crate) k_point: KPoint,
     pub(crate) smearing: SmearingParams,
+    /// PW G-vector fractional coordinates [h, k, l] for each plane wave.
+    pub(crate) pw_coords: Vec<[i32; 3]>,
 
     // --- Mutable state, governed by phase ---
     pub(crate) density: Density,
@@ -79,6 +82,10 @@ pub struct ScfIteration<
     /// Will be read by `check()` in Phase 2 Goal 5. Suppressed until then.
     #[allow(dead_code)]
     pub(crate) previous_density: Density,
+
+    /// Precomputed linear FFT grid indices for each PW coefficient.
+    /// Index = ix + ngx * (iy + ngy * iz) in C-order (cuFFT convention).
+    pub(crate) pw_fft_indices: Vec<i32>,
 
     _phase: PhantomData<State>,
 }
@@ -98,11 +105,27 @@ impl<S: SpinPolicy> ScfIteration<S, Initialized> {
         fine_grid: GVectorGrid,
         density: Density,
         psi: WavefunctionSet<ColumnDistributed>,
+        pw_coords: Vec<[i32; 3]>,
+        pw_fft_indices: Vec<i32>,
         k_point: KPoint,
         smearing: SmearingParams,
         max_history: usize,
     ) -> Self {
         let previous_density = density.clone();
+        debug_assert_eq!(
+            pw_fft_indices.len(),
+            psi.n_pw,
+            "pw_fft_indices length {} must equal n_pw {}",
+            pw_fft_indices.len(),
+            psi.n_pw,
+        );
+        debug_assert_eq!(
+            pw_coords.len(),
+            psi.n_pw,
+            "pw_coords length {} must equal n_pw {}",
+            pw_coords.len(),
+            psi.n_pw,
+        );
         Self {
             cell,
             pots,
@@ -110,6 +133,8 @@ impl<S: SpinPolicy> ScfIteration<S, Initialized> {
             fine_grid,
             density,
             psi,
+            pw_coords,
+            pw_fft_indices,
             k_point,
             smearing,
             eigenvalues: Vec::new(),
@@ -158,20 +183,37 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt> {
         let v_eff_wave = downsample_array_to_wave_grid(v_eff_arr, &self.fine_grid, &self.wave_grid)?;
         let v_eff_gpu = Gpu::from_host(&v_eff_wave, &stream)?;
 
+        // Clone host data BEFORE moving self.psi into GPU
+        let pw_coords = self.pw_coords.clone();
+        let psi_host = self.psi.data.clone();
+        let n_bands = self.psi.n_bands;
+        let n_pw = self.psi.n_pw;
+
         // H2D psi
         let psi_gpu = Gpu::from_cpu(&Cpu::new(self.psi), &stream)?;
-        let n_bands = psi_gpu.shape()[0];
-        let n_pw = psi_gpu.shape()[1];
+
+        // V_NL precomputation (CPU, uses chemrust-hamiltonian, one-time cost)
+        let vnl_data = VnlBatchData::precompute(
+            &pw_coords, &self.pots, &self.cell,
+            &self.wave_grid, &self.k_point,
+            &psi_host, n_bands, n_pw,
+            &stream,
+        )?;
 
         // Clone eigenvalues before moving self
         let eig_clone = self.eigenvalues.clone();
         let eig = if eig_clone.is_empty() { None } else { Some(eig_clone.as_slice()) };
 
-        // Chebyshev filter
+        // Upload PW-to-FFT index map to GPU
+        let fft_idx_dev: CudaSlice<i32> = stream
+            .clone_htod(&self.pw_fft_indices)
+            .map_err(Error::Cuda)?;
+
+        // Chebyshev filter (pipeline: T+V_loc via FFT, V_NL via gemm)
         let (psi_filtered_row, hpsi_row) = chebyshev_filter(
             &psi_gpu, &v_eff_gpu, &self.pots,
             &self.wave_grid, &self.k_point, &self.cell,
-            eig, ndeg, &blas, &stream, &ctx,
+            &vnl_data, &fft_idx_dev, eig, ndeg, &blas, &stream, &ctx,
         )?;
 
         // Rayleigh-Ritz
@@ -188,10 +230,12 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt> {
         Ok(ScfIteration {
             psi: psi_new,
             eigenvalues,
+            pw_coords,
             cell: self.cell, pots: self.pots,
             wave_grid: self.wave_grid, fine_grid: self.fine_grid,
             k_point: self.k_point, smearing: self.smearing,
             density: self.density, v_eff: self.v_eff,
+            pw_fft_indices: self.pw_fft_indices,
             history: self.history, previous_density: self.previous_density,
             _phase: PhantomData,
         })
@@ -228,8 +272,10 @@ impl<S: SpinPolicy> ScfIteration<S, DensityUpdated> {
             fine_grid: self.fine_grid,
             k_point: self.k_point,
             smearing: self.smearing,
+            pw_coords: self.pw_coords,
             density: mixed,
             psi: self.psi,
+            pw_fft_indices: self.pw_fft_indices,
             eigenvalues: self.eigenvalues,
             v_eff: self.v_eff,
             history: self.history,
@@ -304,6 +350,31 @@ pub fn run_scf<S: SpinPolicy>(
             }
         };
     }
+}
+
+// ---------------------------------------------------------------------------
+// PW-to-FFT index conversion helper
+// ---------------------------------------------------------------------------
+
+/// Convert fractional PW G-vector coordinates to cuFFT C-order linear indices.
+///
+/// Each entry `[h, k, l]` is a fractional G-vector from `KptWaveBlock`.
+/// The output index is `ix + ngx * (iy + ngy * iz)` (cuFFT C-order, nx fastest).
+#[allow(dead_code)]  // Used by test fixture infrastructure (Group F)
+pub(crate) fn pw_coords_to_fft_indices(
+    pw_coords: &[[i32; 3]],
+    wave_grid: &GVectorGrid,
+) -> Vec<i32> {
+    let [ngz, ngy, ngx] = wave_grid.grid();
+    pw_coords
+        .iter()
+        .map(|&[h, k, l]| {
+            let ix = if h >= 0 { h as usize } else { (h + ngx as i32) as usize };
+            let iy = if k >= 0 { k as usize } else { (k + ngy as i32) as usize };
+            let iz = if l >= 0 { l as usize } else { (l + ngz as i32) as usize };
+            (ix + ngx * (iy + ngy * iz)) as i32
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------

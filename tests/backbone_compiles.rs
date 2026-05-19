@@ -79,6 +79,27 @@ fn backbone_compiles() {
         .fine_grid(dummy_fine_grid())
         .density(dummy_density())
         .psi(dummy_wavefunctions())
+        .pw_coords(
+            (0..27)
+                .map(|i| {
+                    let iz = i / 9 - 1;
+                    let iy = (i / 3) % 3 - 1;
+                    let ix = i % 3 - 1;
+                    [ix, iy, iz]
+                })
+                .collect::<Vec<[i32; 3]>>(),
+        )
+        .pw_fft_indices({
+            let ngx = 4; let ngy = 4;
+            (0..27)
+                .map(|i| {
+                    let iz = i / 9;
+                    let iy = (i / 3) % 3;
+                    let ix = i % 3;
+                    (ix + ngx * (iy + ngy * iz)) as i32
+                })
+                .collect::<Vec<i32>>()
+        })
         .k_point(KPoint::default())
         .smearing(SmearingParams {
             width: 0.01,

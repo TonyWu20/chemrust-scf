@@ -19,9 +19,10 @@ use cudarc::driver::{
 };
 use cudarc::nvrtc::compile_ptx;
 
-use crate::device::blas::BlasHandle;
+use crate::device::blas::{self, BlasHandle, ZgemmConfig};
 use crate::device::fft::BatchedFftPlan3d;
 use crate::device::{CudaComplex, Gpu};
+use crate::eigensolver::vnl_data::VnlBatchData;
 
 // ---------------------------------------------------------------------------
 // Helper: call cuFFT C2C in-place (same buffer for input and output)
@@ -245,33 +246,9 @@ pub(crate) fn compute_spectral_bounds(
 // Precomputed FFT metadata (uploaded to GPU)
 // ---------------------------------------------------------------------------
 
-/// Flat FFT linear index for each grid point.
-/// Index = ix + ngx * (iy + ngy * iz) where [iz, iy, ix] is Fortran-layout.
-fn compute_fft_indices(wave_grid: &GVectorGrid) -> Vec<i32> {
-    let [ngz, ngy, ngx] = wave_grid.grid();
-    let gvecs = wave_grid.gvecs();
-    let mut indices = Vec::with_capacity(gvecs.len());
-    for iz in 0..ngz {
-        for iy in 0..ngy {
-            for ix in 0..ngx {
-                let gf = gvecs[[iz, iy, ix]];
-                let h = gf[0] as i32;
-                let k = gf[1] as i32;
-                let l = gf[2] as i32;
-                let fx = if h >= 0 { h as usize } else { (ngx as i32 + h) as usize };
-                let fy = if k >= 0 { k as usize } else { (ngy as i32 + k) as usize };
-                let fz = if l >= 0 { l as usize } else { (ngz as i32 + l) as usize };
-                let idx = fx + ngx * (fy + ngy * fz);
-                indices.push(idx as i32);
-            }
-        }
-    }
-    indices
-}
-
-/// Kinetic energy |G|^2 for each grid point.
+/// Kinetic energy ½|G|² for each grid point (Hartree atomic units).
 fn compute_kinetic_energies(wave_grid: &GVectorGrid) -> Vec<f64> {
-    wave_grid.g2().iter().copied().collect()
+    wave_grid.g2().iter().map(|g2| 0.5 * g2).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -378,7 +355,8 @@ unsafe fn apply_v_loc_hamiltonian(
 }
 
 /// Apply the full Hamiltonian H|psi>. For Phase 2 this includes T + V_loc
-/// (FFT-based). The V_NL skeleton is in place for future phases.
+/// Apply the full Hamiltonian H|psi>. Includes T + V_loc (FFT-based)
+/// and V_NL (non-local pseudopotential via cuBLAS gemm).
 #[allow(clippy::too_many_arguments)]
 unsafe fn apply_full_hamiltonian(
     psi_dev: &CudaSlice<CudaComplex>,
@@ -392,6 +370,8 @@ unsafe fn apply_full_hamiltonian(
     fft_plan: &BatchedFftPlan3d,
     hpsi_dev: &mut CudaSlice<CudaComplex>,
     grid_dev: &mut CudaSlice<CudaComplex>,
+    vnl_data: &VnlBatchData,
+    blas: &BlasHandle,
     kernels: &CudaKernelSet,
     stream: &Arc<CudaStream>,
 ) -> Result<(), Error> {
@@ -401,8 +381,112 @@ unsafe fn apply_full_hamiltonian(
             kinetic_dev, fft_idx_dev, v_eff_dev,
             n_pw as i32, n_bands as i32, grid_size as i32, inv_ntotal,
             fft_plan, kernels, stream,
-        )
+        )?;
+
+        apply_v_nl_hamiltonian(
+            psi_dev, hpsi_dev, vnl_data,
+            n_bands as i32, n_pw as i32,
+            blas, stream,
+        )?;
     }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// V_NL (non-local pseudopotential) via cuBLAS gemm
+// ---------------------------------------------------------------------------
+
+/// Apply V_NL|psi> and accumulate into hpsi for one batch of ion projectors.
+///
+/// For each ion's (beta_g, d_matrix, n_expanded):
+///   C_proj = beta^H . psi     (n_expanded x n_bands)
+///   C_proj = D . C_proj       (n_expanded x n_bands)
+///   hpsi   += beta . C_proj   (n_pw x n_bands, accumulated)
+#[allow(clippy::too_many_arguments)]
+unsafe fn apply_v_nl_hamiltonian(
+    psi_dev: &CudaSlice<CudaComplex>,
+    hpsi_dev: &mut CudaSlice<CudaComplex>,
+    vnl_data: &VnlBatchData,
+    n_bands: i32,
+    n_pw: i32,
+    blas: &BlasHandle,
+    stream: &Arc<CudaStream>,
+) -> Result<(), Error> {
+    for entry in &vnl_data.entries {
+        let ne = entry.n_expanded;
+
+        // C_proj = beta^H . psi  (n_expanded x n_bands)
+        let mut c_proj: CudaSlice<CudaComplex> =
+            stream.alloc_zeros((ne * n_bands) as usize).map_err(Error::Cuda)?;
+
+        unsafe {
+            blas.gemm_c64(
+                ZgemmConfig {
+                    transa: blas::op::C, // conj(beta^T)
+                    transb: blas::op::N,
+                    m: ne,
+                    n: n_bands,
+                    k: n_pw,
+                    alpha: CudaComplex { x: 1.0, y: 0.0 },
+                    lda: n_pw, // beta_g is (ne, n_pw) row-major = col-major (n_pw, ne)
+                    ldb: n_pw, // psi is (n_pw, n_bands) col-major
+                    beta: CudaComplex { x: 0.0, y: 0.0 },
+                    ldc: ne,
+                },
+                &entry.beta_g,
+                psi_dev,
+                &mut c_proj,
+            )?;
+        }
+
+        // C_proj = D . C_proj  (n_expanded x n_bands)
+        // Use a temp buffer since in-place gemm is not supported.
+        let mut c_temp: CudaSlice<CudaComplex> =
+            stream.alloc_zeros((ne * n_bands) as usize).map_err(Error::Cuda)?;
+
+        unsafe {
+            blas.gemm_c64(
+                ZgemmConfig {
+                    transa: blas::op::N,
+                    transb: blas::op::N,
+                    m: ne,
+                    n: n_bands,
+                    k: ne,
+                    alpha: CudaComplex { x: 1.0, y: 0.0 },
+                    lda: ne,
+                    ldb: ne,
+                    beta: CudaComplex { x: 0.0, y: 0.0 },
+                    ldc: ne,
+                },
+                &entry.d_matrix,
+                &c_proj,
+                &mut c_temp,
+            )?;
+        }
+        std::mem::swap(&mut c_proj, &mut c_temp);
+
+        // V_NL += beta . C_proj  (n_pw x n_bands, accumulated into hpsi)
+        unsafe {
+            blas.gemm_c64(
+                ZgemmConfig {
+                    transa: blas::op::N,
+                    transb: blas::op::N,
+                    m: n_pw,
+                    n: n_bands,
+                    k: ne,
+                    alpha: CudaComplex { x: 1.0, y: 0.0 },
+                    lda: n_pw,
+                    ldb: ne,
+                    beta: CudaComplex { x: 1.0, y: 0.0 }, // accumulate into hpsi
+                    ldc: n_pw,
+                },
+                &entry.beta_g,
+                &c_proj,
+                hpsi_dev,
+            )?;
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -514,6 +598,8 @@ pub(crate) fn chebyshev_filter(
     wave_grid: &GVectorGrid,
     _k_point: &KPoint,
     _cell: &CellGeometry,
+    vnl_data: &VnlBatchData,
+    fft_idx_dev: &CudaSlice<i32>,      // PW-to-FFT-grid index map (length = n_pw)
     eigenvalues: Option<&[f64]>,
     ndeg: usize,
     blas: &BlasHandle,
@@ -530,17 +616,14 @@ pub(crate) fn chebyshev_filter(
 
     let [ngz, ngy, ngx] = wave_grid.grid();
     let grid_size = ngx * ngy * ngz;
-    let _grid_size_i32 = grid_size as i32;
     let inv_ntotal = 1.0 / (grid_size as f64);
     let grid_alloc = n_bands * grid_size;
 
     // ---- Compile CUDA kernels ----
     let kernels = CudaKernelSet::new(ctx)?;
 
-    // ---- Precompute & upload FFT metadata ----
-    let fft_indices_cpu = compute_fft_indices(wave_grid);
+    // ---- Precompute & upload kinetic energy ----
     let kinetic_cpu = compute_kinetic_energies(wave_grid);
-    let fft_idx_dev: CudaSlice<i32> = stream.clone_htod(&fft_indices_cpu).map_err(Error::Cuda)?;
     let kinetic_dev: CudaSlice<f64> = stream.clone_htod(&kinetic_cpu).map_err(Error::Cuda)?;
 
     // ---- FFT plan (batched C2C) ----
@@ -586,9 +669,9 @@ pub(crate) fn chebyshev_filter(
         // hpsi = H.psi_0
         unsafe {
             apply_full_hamiltonian(
-                &buf_a, v_eff_dev, &kinetic_dev, &fft_idx_dev,
+                &buf_a, v_eff_dev, &kinetic_dev, fft_idx_dev,
                 n_pw, n_bands, grid_size, inv_ntotal,
-                &fft_plan, &mut hpsi_dev, &mut grid_dev, &kernels, stream,
+                &fft_plan, &mut hpsi_dev, &mut grid_dev, vnl_data, blas, &kernels, stream,
             )?;
         }
 
@@ -607,9 +690,9 @@ pub(crate) fn chebyshev_filter(
         // hpsi = H.psi_{k-1} (psi_{k-1} is in buf_b)
         unsafe {
             apply_full_hamiltonian(
-                &buf_b, v_eff_dev, &kinetic_dev, &fft_idx_dev,
+                &buf_b, v_eff_dev, &kinetic_dev, fft_idx_dev,
                 n_pw, n_bands, grid_size, inv_ntotal,
-                &fft_plan, &mut hpsi_dev, &mut grid_dev, &kernels, stream,
+                &fft_plan, &mut hpsi_dev, &mut grid_dev, vnl_data, blas, &kernels, stream,
             )?;
         }
 
@@ -667,9 +750,9 @@ pub(crate) fn chebyshev_filter(
     // Compute final H|psi> for Rayleigh-Ritz
     unsafe {
         apply_full_hamiltonian(
-            final_psi, v_eff_dev, &kinetic_dev, &fft_idx_dev,
+            final_psi, v_eff_dev, &kinetic_dev, fft_idx_dev,
             n_pw, n_bands, grid_size, inv_ntotal,
-            &fft_plan, &mut hpsi_dev, &mut grid_dev, &kernels, stream,
+            &fft_plan, &mut hpsi_dev, &mut grid_dev, vnl_data, blas, &kernels, stream,
         )?;
     }
 
