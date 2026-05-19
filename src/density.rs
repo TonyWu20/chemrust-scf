@@ -27,7 +27,7 @@ use crate::types::{Density, Error, SmearingParams, SmearingScheme, WaveGridArray
 
 /// Compute occupation numbers via Gaussian smearing.
 ///
-/// occ_b = erfc((μ - ε_b) / w)
+/// occ_b = erfc((ε_b - μ) / w)
 ///
 /// The chemical potential μ satisfies Σ_b occ_b = N_electrons.
 pub(crate) fn compute_occupations(
@@ -40,13 +40,13 @@ pub(crate) fn compute_occupations(
             let mu = find_chemical_potential(eigenvalues, smearing.width, n_electrons)?;
             Ok(eigenvalues
                 .iter()
-                .map(|&e| libm::erfc((mu - e) / smearing.width))
+                .map(|&e| libm::erfc((e - mu) / smearing.width))
                 .collect())
         }
     }
 }
 
-/// Bisection search for μ such that Σ erfc((μ - ε_b) / w) = N_electrons.
+/// Bisection search for μ such that Σ erfc((ε_b - μ) / w) = N_electrons.
 fn find_chemical_potential(
     eigenvalues: &[f64],
     width: f64,
@@ -63,12 +63,12 @@ fn find_chemical_potential(
         let mid = 0.5 * (lo + hi);
         let sum: f64 = eigenvalues
             .iter()
-            .map(|&e| libm::erfc((mid - e) / width))
+            .map(|&e| libm::erfc((e - mid) / width))
             .sum();
         if sum > n_electrons {
-            lo = mid;
-        } else {
             hi = mid;
+        } else {
+            lo = mid;
         }
     }
     Ok(0.5 * (lo + hi))

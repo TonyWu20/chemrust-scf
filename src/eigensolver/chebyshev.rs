@@ -158,22 +158,17 @@ extern \"C\" __global__ void accumulate_density(
     const double2* psi_r, const double* occ,
     double* rho, int n_bands, int grid_size, double inv_omega
 ) {
-    extern __shared__ double sdata[];
-    int r = blockIdx.x;
-    if (r >= grid_size) return;
-    int tid = threadIdx.x;
-    double sum = 0.0;
-    for (int b = tid; b < n_bands; b += blockDim.x) {
-        double2 psi = psi_r[b * grid_size + r];
-        sum += occ[b] * (psi.x * psi.x + psi.y * psi.y);
+    int r = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+    while (r < grid_size) {
+        double sum = 0.0;
+        for (int b = 0; b < n_bands; b++) {
+            double2 psi = psi_r[b * grid_size + r];
+            sum += occ[b] * (psi.x * psi.x + psi.y * psi.y);
+        }
+        rho[r] = sum * inv_omega;
+        r += stride;
     }
-    sdata[tid] = sum;
-    __syncthreads();
-    for (int s = blockDim.x/2; s > 0; s >>= 1) {
-        if (tid < s) sdata[tid] += sdata[tid + s];
-        __syncthreads();
-    }
-    if (tid == 0) rho[r] = sdata[0] * inv_omega;
 }
 
 extern \"C\" __global__ void transpose_row_to_col(
