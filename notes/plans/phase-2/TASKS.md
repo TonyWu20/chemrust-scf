@@ -383,59 +383,193 @@ Future Phase 3+ ports VEffBuilder's FFT calls.
 
 ### Group E — mix + check (Goal 5)
 
-#### E-1: Pulay mixing
+> **Source-audited 2026-05-19.**  Original E-1/E-2 descriptions were written
+> from general domain knowledge without source citations.  Every line was
+> wrong: constrained Pulay → unconstrained DIIS, real-space → reciprocal-space,
+> density differences → residual differences, max|Δρ| → energy-window.
+> Rewritten against CASTEP `dm.f90:895-1093` and `electronic.f90:7536-7644`.
+
+**Source references:**
+- `~/programming/CASTEP-GPU-port/Source/Functional/dm.f90:895-1093` — `dm_mix_density_pulay`
+- `dm.f90:620-719` — `dm_mix_density_kerker`
+- `dm.f90:2296-2365` — `dm_mix_density_dot` (inner product)
+- `dm.f90:2367-2542` — real↔reciprocal space conversion
+- `dm.f90:2544-2598` — `dm_apply_kerker` (preconditioner application)
+- `~/programming/CASTEP-GPU-port/Source/Functional/electronic.f90:7536-7644` — `electronic_store_energy`
+- `~/programming/CASTEP-GPU-port/Source/Fundamental/parameters.f90:210-216` — mixing parameters
+
+#### Mixing Phase Type-State Machine
+
+CASTEP's mixing has three distinct modes that form a natural state machine,
+encoded as a type parameter `M: MixingPhase` on `DensityHistory<M>` and
+`DensityUpdated<M>`:
+
+```
+MixingOff ──(energy stabilizes)──→ Kerker ──(first mix done)──→ Pulay/DIIS
+    │                                  │                          │
+    └── density passes through         └── n_new = n_in + K·R     └── full DIIS
+        unchanged (no mixing)              (preconditioned)            (history ≥ 1)
+```
+
+A runtime `MixingPhaseKind` enum (`Off`, `Kerker`, `Pulay`) is stored on
+`ScfIteration` for the `run_scf` loop to dispatch to the correct
+`construct_density_*` method.  This is the only runtime branch; all other
+code is monomorphized at compile time.
+
+#### E-1: Kerker preconditioner setup
 
 **Kind:** design
 
-**Guidance:** Replace `todo!()` in `DensityHistory::mix()` with Pulay algorithm.
+**Guidance:** Precompute K(G) = G²/(G²+q²) on GPU.  K(G=0) = 0 (no DC
+mixing).  K(G) → 1 as |G| → ∞.  For Phase 2, use q = 1.5 a.u. (typical
+for metals; CASTEP autocomputes from Thomas-Fermi screening).
 
-Input: new ρ (Density), stored history of ρ_i and R_i = ρ_i - ρ_{i-1}.
-
-Algorithm:
-1. Compute residual R_new = ρ_new - ρ_old (GPU subtraction via cuBLAS axpy)
-2. Append to history ring buffer (max `max_history` slots)
-3. Build Pulay metric tensor M_ij = <R_i | R_j> for all i,j in history
-   (GPU dot product reductions via cuBLAS). D2H the history_size² matrix.
-4. Solve constrained linear system on CPU:
-   ```
-   [M  1] [c] = [0]    (Σ c_i = 1 constraint)
-   [1ᵀ  0] [α]   [1]
-   ```
-   Use a small LAPACK solve or hand-rolled Gaussian elimination
-   (history_size ≤ 8, system is tiny).
-5. H2D coefficients c_i (history_size floats)
-6. ρ_mix = Σ c_i ρ_i + α Σ c_i R_i (GPU AXPY combination via cuBLAS)
-7. Return: `(ρ_mix, ρ_new)` — the mixed density and the input snapshot
-
-**Files:** `src/mixing.rs`
+**Files:** new `src/mixing/kerker.rs`
 
 **Success Criteria:**
-- ρ_mix is a linear combination of history densities (coefficients sum to 1)
-- Residual norm ||R_mix|| ≤ ||R_new|| (mixing reduces residual)
+- K(G=0) = 0.0, K(high G) ≈ 1.0
+- Precomputed `DeviceBuffer<f64>` on GPU
 
 ---
 
-#### E-2: Convergence check
+#### E-2: Reciprocal-space DIIS + Kerker mixing (GPU-native)
+
+**Kind:** design
+
+**Guidance:** Implement `DensityHistory<M>::mix()` matching CASTEP's
+`dm_mix_density_pulay`.  All GPU-resident except the tiny DIIS linear
+solve (CPU, history_size ≤ 7).
+
+**CASTEP algorithm (source-audited):**
+
+Mixing is done in **reciprocal space**: density is FFT'd (R2C), PW
+coefficients are mixed, then inverse-FFT'd back.  High-frequency components
+(G > mix_cut_off_energy) pass through unchanged.  For Phase 2 we use the
+full reciprocal grid (the FFT grid cutoff is sufficient).
+
+Residual: **R = n_out - n_in** (output minus input density), both in
+reciprocal PW-coefficient representation.
+
+History stores **deltas, not absolutes** (dm.f90:999-1000):
+- `density_history(i) = n_in(current) - n_in(previous)`  (Δn_in)
+- `residual_history(i) = R(current) - R(previous)`       (ΔR)
+
+DIIS is **unconstrained** (dm.f90:1011-1028): builds matrix
+`M_ij = <ΔR_j | ΔR_i>` and RHS `b_i = -<ΔR_i | R_current>`, solves
+`M · c = b` via `dgesv`.  No Lagrange multiplier (Σc_i = 1 is NOT enforced).
+
+Update formula (dm.f90:1045-1063):
+```
+n_new = n_in + Σc_i·Δn_i + K·[R_current + Σc_i·ΔR_i]
+```
+where K is the Kerker preconditioner applied per PW coefficient.
+
+On `dgesv` failure → fallback to Kerker mixing for this step (dm.f90:1029-1041).
+
+Inner product (dm.f90:2342-2343):
+```
+<den1 | den2> = Σ_ipw conjg(den1%charge(ipw)) · den2%charge(ipw) · mix_metric(ipw)
+```
+For Phase 2, use uniform metric (= 1.0) since Kerker is applied separately.
+
+**Type-state API:**
+```rust
+impl DensityHistory<MixingOff> {
+    fn new(kerker: Gpu<KerkerPreconditioner>) -> Self;
+    fn into_kerker(self) -> DensityHistory<Kerker>;  // no mix() — passthrough
+}
+impl DensityHistory<Kerker> {
+    fn mix(&mut self, density: Density) -> (Density, Density);  // Kerker
+    fn into_pulay(self) -> DensityHistory<Pulay>;
+}
+impl DensityHistory<Pulay> {
+    fn mix(&mut self, density: Density) -> (Density, Density);  // DIIS
+}
+```
+
+**Files:** rewrite `src/mixing.rs`, new `src/mixing/reciprocal_density.rs`
+
+**Success Criteria:**
+- `DensityHistory<MixingOff>` has no `mix()` (compile-time safety)
+- Kerker: first mix uses K·(n_out - n_in), residual norm decreases
+- Pulay: DIIS with growing history, residual decreases monotonically
+- Solve failure: falls back to Kerker, no panic
+- All GPU-resident except 7×7 DIIS matrix D2H (negligible)
+
+---
+
+#### E-3: Total energy computation
+
+**Kind:** design
+
+**Guidance:** Compute E_total = Σ_i f_i ε_i - E_H + E_xc - ∫ρV_xc + E_ewald.
+
+Components:
+1. **E_band** = Σ_i f_i · ε_i (eigenvalues × occupations, already on CPU)
+2. **E_H** = 1/2 · Σ_r ρ(r) · V_H(r) · dV (GPU: element-wise multiply + sum)
+3. **E_xc** from `PbeXcResult.energy` (currently discarded by VEffBuilder)
+4. **∫ρV_xc** = Σ_r ρ(r) · V_xc(r) · dV
+5. **E_ewald**: standard Ewald summation (CPU, ~50 lines)
+
+For E_H, E_xc, and ∫ρV_xc: branch chemrust-hamiltonian as
+`feat/expose-energy` to add `VEffAssemblyResult { v_eff, e_hartree, e_xc,
+v_xc_integral }` return type.  Depend on the branch from chemrust-scf.
+Submit PR upstream later.
+
+**Files:** new `src/energy.rs`, modify `chemrust-hamiltonian-core/src/band_structure.rs`,
+modify `src/scf.rs` (store `total_energy: Option<f64>`)
+
+**Success Criteria:**
+- E_ewald for Cu111_CO matches CASTEP reference within 1e-6 eV
+- Total energy physically reasonable (~-2.4×10⁴ eV for Cu111_CO)
+- All energy components non-NaN
+
+---
+
+#### E-4: Energy-window convergence check
 
 **Kind:** direct
 
-**Guidance:** Fill `ScfIteration::check()` body.
+**Guidance:** Fill `ScfIteration::check()` matching CASTEP's
+`electronic_store_energy` (electronic.f90:7536-7644).
 
-1. Compute density delta: Δρ = ρ_mix - ρ_old (GPU subtraction)
-2. Reduction: max|Δρ| over all grid points (GPU: `cublasIdamax`
-   equivalent, or a custom reduction kernel)
-3. D2H: single f64 crosses PCIe
-4. Compare against tol:
-   - diff < tol: return `Ok(CheckOutcome::Converged(final_state))`
-   - else: return `Ok(CheckOutcome::NotConverged(restart_state))`
-     where restart_state has `v_eff: None` (caller must rebuild)
+Algorithm:
+1. Push `total_energy` into cyclic `energies[elec_convergence_win]` buffer
+2. Track `mixed_status` (CASTEP lines 7614-7638): mark when mixing is active,
+   require full convergence window to use mixed densities
+3. `max_E - min_E ≤ elec_energy_tol × num_ions`? → check mixed_status → Converged/NotConverged
+4. Determine next `MixingPhaseKind`:
+   - `Off → Kerker` when energy diff < `mixing_convergence_tol` (0.1 eV default)
+   - `Kerker → Pulay` after first mix completes
+   - `Pulay → Pulay` for normal DIIS
+5. `elec_energy_tol`: 1e-5 eV (metals), `elec_convergence_win`: 3
 
-**Files:** `src/scf.rs`
+**Files:** `src/scf.rs` (rewrite `check()`, modify `CheckOutcome`, add energy
+buffer + mixed_status fields)
 
 **Success Criteria:**
-- Single-iteration check on Cu111_CO returns NotConverged (won't converge
-  in one iteration)
-- Converged test with artificially low tol returns Converged
+- Single iteration: NotConverged with next_mixing=Off
+- After energy stabilizes: next_mixing transitions Kerker→Pulay
+- Converged when energy window satisfies tolerance with mixed densities
+
+---
+
+#### E-5: Wire mixing phase into run_scf loop
+
+**Kind:** direct
+
+**Guidance:** Add `MixingPhaseKind` runtime enum.  Split `construct_density()`
+into `construct_density_off/kerker/pulay` methods on `WavefunctionsUpdated`.
+`run_scf` matches on `state.next_mixing` to dispatch.  `CheckOutcome::NotConverged`
+carries `next_mixing`.
+
+**Files:** `src/scf.rs` (add `MixingPhaseKind`, modify `run_scf`, add three
+`construct_density_*` methods)
+
+**Success Criteria:**
+- First iterations: passthrough (no mixing)
+- After threshold: Kerker, then Pulay
+- `cargo check` and `cargo test` pass
 
 ---
 
@@ -530,6 +664,36 @@ assert!(diff < 2e-4, "...");
   mapping from GVectorGrid. The scatter/gather pattern for PW ↔ FFT grid
   is the same as chemrust-hamiltonian's `apply_local_hamiltonian` but
   performed on GPU-resident device buffers.
+- **Group E CASTEP source audit (2026-05-19):** Read `dm.f90:895-1093`,
+  `dm.f90:620-719`, `dm.f90:2296-2365`, `dm.f90:2367-2542`,
+  `dm.f90:2544-2598`, `electronic.f90:7536-7644`, and
+  `parameters.f90:210-216`.  Key findings:
+  - Mixing is in **reciprocal space** (PW coefficients), not real-space grid
+  - Algorithm is **unconstrained DIIS** (`dgesv`), not constrained Pulay
+    (Lagrange multiplier)
+  - Residual is **R = n_out - n_in**, not ρ_new - ρ_old
+  - History stores **Δn_in and ΔR** (deltas), not absolute densities
+  - **Kerker preconditioning** K(G) = G²/(G²+q²) is mandatory, not optional
+  - First iteration uses **Kerker**, not Pulay (no history yet yet)
+  - dgesv **failure fallback** to Kerker (singular DIIS matrix)
+  - Convergence is **energy-window** based, not max|Δρ|
+  - `mixing_convergence_tol = 0.1 eV` controls when mixing starts
+  - `elec_convergence_win = 3`, `mix_history_length = 7`
+  - Mixed-status tracking prevents false convergence when mixing is off
+  - Original E-1/E-2 were written from general knowledge; every line was wrong.
+    Rewritten against actual CASTEP source.
+- **chemrust-hamiltonian energy exposure:** VEffBuilder computes XC energy
+  (`PbeXcResult.energy`) but discards it in `assemble()`.  Hartree energy
+  (E_H = 1/2 ∫ ρ·V_H dr) is never computed.  Ewald summation is completely
+  absent.  Plan: branch `feat/expose-energy` in chemrust-hamiltonian to add
+  `VEffAssemblyResult { v_eff, e_hartree, e_xc, v_xc_integral }` return type.
+  Depend on branch from chemrust-scf; submit PR upstream after Phase 2.
+- **Ewald summation:** Standard real/reciprocal split with erfc screening.
+  α = √π / V^(1/3).  Real-space cutoff ~10 Å, reciprocal cutoff ~20 G-vectors
+  per direction.  ~50 lines CPU-side, negligible cost.
+- **GPU mixing FFT cost:** One cuFFT R2C + one C2R per mix call.  Acceptable
+  for Phase 2 since VEffBuilder already does D2H/H2D for CPU FFT (rustfft).
+  Phase 3 can fuse the V_eff FFT with the mixing FFT.
 
 ## Verification
 

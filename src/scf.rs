@@ -17,10 +17,24 @@ use crate::eigensolver::chebyshev::{chebyshev_filter, CudaKernelSet};
 use crate::eigensolver::rayleigh_ritz::rayleigh_ritz;
 use crate::eigensolver::vnl_data::VnlBatchData;
 use crate::layout::{ColumnDistributed, Cpu, WavefunctionSet};
-use crate::mixing::DensityHistory;
+use crate::mixing::{DensityHistory, Kerker, MixingOff, MixingPhase, Pulay};
 use crate::types::{
     Density, EffectivePotential, Error, FinalResult, FineGridArray, KPoint, SmearingParams,
 };
+
+// ---------------------------------------------------------------------------
+// Mixing phase runtime dispatch
+// ---------------------------------------------------------------------------
+
+/// Runtime mixing-phase selector.  Stored on `ScfIteration` so the loop can
+/// dispatch `construct_density_{off,kerker,pulay}` without knowing the
+/// compile-time type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MixingPhaseKind {
+    Off,
+    Kerker,
+    Pulay,
+}
 
 // ---------------------------------------------------------------------------
 // Sealed phase trait and markers
@@ -50,23 +64,34 @@ macro_rules! define_phase {
 define_phase!(Initialized);
 define_phase!(VEffBuilt);
 define_phase!(WavefunctionsUpdated);
-define_phase!(DensityUpdated);
 define_phase!(Mixed);
 define_phase!(Converged);
+
+// `DensityUpdated` is parameterised over the mixing phase — manual impl.
+pub struct DensityUpdated<M: MixingPhase>(PhantomData<M>);
+impl<M: MixingPhase> sealed::Sealed for DensityUpdated<M> {}
+impl<M: MixingPhase> ScfPhase for DensityUpdated<M> {
+    fn name() -> &'static str {
+        "DensityUpdated"
+    }
+}
 
 // ---------------------------------------------------------------------------
 // ScfIteration — the type-state SCF engine
 // ---------------------------------------------------------------------------
 
-/// Central SCF state machine. Generic over spin policy `S` and current phase
-/// `State`. Defaults: `S = NonSpin`, `State = Initialized`.
+/// Central SCF state machine. Generic over spin policy `S`, phase `State`,
+/// and mixing phase `M`.
 ///
-/// Each transition consumes `self` and returns a new `ScfIteration` with a
-/// different phase marker. The compiler prevents calling a transition in the
-/// wrong phase.
+/// Two independent type-state axes:
+/// - `State` — SCF workflow phase (Initialized → VEffBuilt → ... → Converged)
+/// - `M` — mixing phase (Off → Kerker → Pulay), governs how `mix()` behaves.
+///
+/// Defaults: `S = NonSpin`, `State = Initialized`, `M = MixingOff`.
 pub struct ScfIteration<
     S: SpinPolicy = NonSpin,
     State: ScfPhase = Initialized,
+    M: MixingPhase = MixingOff,
 > {
     // --- Immutable across all SCF iterations ---
     pub(crate) cell: CellGeometry,
@@ -83,7 +108,7 @@ pub struct ScfIteration<
     pub(crate) psi: WavefunctionSet<ColumnDistributed>,
     pub(crate) eigenvalues: Vec<f64>,
     pub(crate) v_eff: Option<S::VEff>,
-    pub(crate) history: DensityHistory,
+    pub(crate) history: DensityHistory<M>,
     /// Will be read by `check()` in Phase 2 Goal 5. Suppressed until then.
     #[allow(dead_code)]
     pub(crate) previous_density: Density,
@@ -91,6 +116,24 @@ pub struct ScfIteration<
     /// Precomputed linear FFT grid indices for each PW coefficient.
     /// Index = ix + ngx * (iy + ngy * iz) in C-order (cuFFT convention).
     pub(crate) pw_fft_indices: Vec<i32>,
+
+    // --- Mixing phase control (RE-2 / RE-5) ---
+    /// Phase the loop should use on the next SCF iteration.
+    pub(crate) next_mixing: MixingPhaseKind,
+
+    // --- Energy components for total energy assembly (RE-3 / RE-4) ---
+    /// Exchange-correlation energy E_xc from the most recent V_eff assembly.
+    pub(crate) e_xc: Option<f64>,
+    /// Hartree energy E_H = 0.5 × ∫ρV_H (precomputed on fine grid).
+    pub(crate) e_hartree: Option<f64>,
+    /// Double-counting correction ∫ρV_xc (precomputed on fine grid).
+    pub(crate) rho_vxc: Option<f64>,
+    /// Ewald ion–ion energy (computed once from cell geometry).
+    pub(crate) ewald: f64,
+    /// Rolling energy window for convergence acceleration / damping (RE-4).
+    pub(crate) energy_buffer: Vec<f64>,
+    /// Total electronic energy from the most recent SCF iteration (RE-4).
+    pub(crate) total_energy: Option<f64>,
 
     _phase: PhantomData<State>,
 }
@@ -100,8 +143,9 @@ pub struct ScfIteration<
 // ---------------------------------------------------------------------------
 
 #[bon]
-impl<S: SpinPolicy> ScfIteration<S, Initialized> {
-    /// Construct an SCF iteration state in the `Initialized` phase.
+impl<S: SpinPolicy> ScfIteration<S, Initialized, MixingOff> {
+    /// Construct an SCF iteration state in the `Initialized` phase with
+    /// mixing phase `Off`.
     #[builder]
     pub fn new(
         cell: CellGeometry,
@@ -116,6 +160,7 @@ impl<S: SpinPolicy> ScfIteration<S, Initialized> {
         smearing: SmearingParams,
         max_history: usize,
     ) -> Self {
+        let _ = max_history; // History size is fixed internally for now
         let previous_density = density.clone();
         debug_assert_eq!(
             pw_fft_indices.len(),
@@ -131,6 +176,7 @@ impl<S: SpinPolicy> ScfIteration<S, Initialized> {
             pw_coords.len(),
             psi.n_pw,
         );
+        let ewald = crate::energy::ewald_energy(&cell, &pots);
         Self {
             cell,
             pots,
@@ -144,8 +190,15 @@ impl<S: SpinPolicy> ScfIteration<S, Initialized> {
             smearing,
             eigenvalues: Vec::new(),
             v_eff: None,
-            history: DensityHistory::new(max_history),
+            history: DensityHistory::new(),
             previous_density,
+            next_mixing: MixingPhaseKind::Off,
+            e_xc: None,
+            e_hartree: None,
+            rho_vxc: None,
+            ewald,
+            energy_buffer: Vec::new(),
+            total_energy: None,
             _phase: PhantomData,
         }
     }
@@ -154,11 +207,11 @@ impl<S: SpinPolicy> ScfIteration<S, Initialized> {
 // ---------------------------------------------------------------------------
 // Private helper: move all fields into a new phase
 // ---------------------------------------------------------------------------
-// Centralises the struct literal in one place. Adding a field to
-// ScfIteration only requires updating here.
+// Preserves the mixing phase `M`.  Adding a field to ScfIteration requires
+// updating here.
 
-impl<S: SpinPolicy, Phase: ScfPhase> ScfIteration<S, Phase> {
-    fn into_phase<New: ScfPhase>(self) -> ScfIteration<S, New> {
+impl<S: SpinPolicy, Phase: ScfPhase, M: MixingPhase> ScfIteration<S, Phase, M> {
+    fn into_phase<New: ScfPhase>(self) -> ScfIteration<S, New, M> {
         ScfIteration {
             cell: self.cell,
             pots: self.pots,
@@ -174,6 +227,13 @@ impl<S: SpinPolicy, Phase: ScfPhase> ScfIteration<S, Phase> {
             v_eff: self.v_eff,
             history: self.history,
             previous_density: self.previous_density,
+            next_mixing: self.next_mixing,
+            e_xc: self.e_xc,
+            e_hartree: self.e_hartree,
+            rho_vxc: self.rho_vxc,
+            ewald: self.ewald,
+            energy_buffer: self.energy_buffer,
+            total_energy: self.total_energy,
             _phase: PhantomData,
         }
     }
@@ -224,10 +284,34 @@ impl BuildVEff for SpinCollinear {
     }
 }
 
-impl<S: SpinPolicy + BuildVEff> ScfIteration<S, Initialized> {
+// --- Private dispatch trait for energy-aware V_eff assembly ---
+// Only NonSpin is implemented initially (energy for SpinCollinear deferred).
+
+pub trait BuildVEffWithEnergy: BuildVEff {
+    fn build_v_eff_with_energy_impl(
+        cell: &CellGeometry, pots: &PseudopotentialSet,
+        rho: &chemrust_hamiltonian_core::Density,
+        wave_grid: &GVectorGrid, fine_grid: &GVectorGrid,
+    ) -> Result<(Self::VEff, f64, f64, f64), chemrust_hamiltonian_core::Error>;
+}
+
+impl BuildVEffWithEnergy for NonSpin {
+    fn build_v_eff_with_energy_impl(
+        cell: &CellGeometry, pots: &PseudopotentialSet,
+        rho: &chemrust_hamiltonian_core::Density,
+        wave_grid: &GVectorGrid, fine_grid: &GVectorGrid,
+    ) -> Result<(chemrust_hamiltonian_core::EffectivePotential, f64, f64, f64), chemrust_hamiltonian_core::Error> {
+        let result = VEffBuilder::<NonSpin>::new(cell, pots, fine_grid)
+            .assemble_on_fine_grid_with_energy(rho, wave_grid, fine_grid)?;
+        let v_eff = result.v_eff;
+        Ok((v_eff, result.e_xc, result.e_hartree, result.rho_vxc))
+    }
+}
+
+impl<S: SpinPolicy + BuildVEff> ScfIteration<S, Initialized, MixingOff> {
     /// Assemble V_eff[ρ] from the current density.
     /// Consumes `self`, returns a state in the `VEffBuilt` phase.
-    pub fn build_v_eff(self) -> Result<ScfIteration<S, VEffBuilt>, Error> {
+    pub fn build_v_eff(self) -> Result<ScfIteration<S, VEffBuilt, MixingOff>, Error> {
         let core_rho = chemrust_hamiltonian_core::Density::from_inner(
             self.density.as_wave_array().clone(),
         );
@@ -236,8 +320,32 @@ impl<S: SpinPolicy + BuildVEff> ScfIteration<S, Initialized> {
             &self.wave_grid, &self.fine_grid,
         )
         .map_err(|_| Error::NotImplemented)?;
-        let mut next: ScfIteration<S, VEffBuilt> = self.into_phase();
+        let mut next: ScfIteration<S, VEffBuilt, MixingOff> = self.into_phase();
         next.v_eff = Some(v_eff);
+        Ok(next)
+    }
+}
+
+impl ScfIteration<NonSpin, Initialized, MixingOff> {
+    /// Assemble V_eff with energy components for total energy computation.
+    ///
+    /// Same as `build_v_eff` but also populates the energy fields
+    /// (`e_xc`, `e_hartree`, `rho_vxc`) from the XC/Hartree evaluation.
+    /// These are needed by `check()` for total energy computation.
+    pub fn build_v_eff_with_energy(self) -> Result<ScfIteration<NonSpin, VEffBuilt, MixingOff>, Error> {
+        let core_rho = chemrust_hamiltonian_core::Density::from_inner(
+            self.density.as_wave_array().clone(),
+        );
+        let (v_eff, e_xc, e_hartree, rho_vxc) = NonSpin::build_v_eff_with_energy_impl(
+            &self.cell, &self.pots, &core_rho,
+            &self.wave_grid, &self.fine_grid,
+        )
+        .map_err(|_| Error::NotImplemented)?;
+        let mut next: ScfIteration<NonSpin, VEffBuilt, MixingOff> = self.into_phase();
+        next.v_eff = Some(v_eff);
+        next.e_xc = Some(e_xc);
+        next.e_hartree = Some(e_hartree);
+        next.rho_vxc = Some(rho_vxc);
         Ok(next)
     }
 }
@@ -246,13 +354,13 @@ impl<S: SpinPolicy + BuildVEff> ScfIteration<S, Initialized> {
 // Transition 2: VEffBuilt → WavefunctionsUpdated
 // ---------------------------------------------------------------------------
 
-impl<S: SpinPolicy> ScfIteration<S, VEffBuilt> {
+impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
     /// Chebyshev filter + Rayleigh-Ritz diagonalization of H[V_eff].
     /// `ndeg` is the Chebyshev polynomial degree.
     pub fn diagonalize(
         self,
         ndeg: usize,
-    ) -> Result<ScfIteration<S, WavefunctionsUpdated>, Error> {
+    ) -> Result<ScfIteration<S, WavefunctionsUpdated, MixingOff>, Error> {
         let ctx = Arc::new(CudaContext::new(0)?);
         let stream = ctx.default_stream();
         let blas = BlasHandle::new(stream.clone())?;
@@ -349,7 +457,7 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt> {
             "H2D tracking check failed",
         );
 
-        let mut next: ScfIteration<S, WavefunctionsUpdated> = self.into_phase();
+        let mut next: ScfIteration<S, WavefunctionsUpdated, MixingOff> = self.into_phase();
         next.psi = psi_new;
         next.eigenvalues = eigenvalues;
         Ok(next)
@@ -359,14 +467,12 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt> {
 // ---------------------------------------------------------------------------
 // Transition 3: WavefunctionsUpdated → DensityUpdated
 // ---------------------------------------------------------------------------
+// Three variants for the three mixing phases.  Each method name encodes
+// which mixing phase the returned state carries.
 
-impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated> {
-    /// Construct new electron density from updated wavefunctions:
-    /// ρ(r) = Σ_i occ_i |ψ_i(r)|² on the wave grid.
-    pub fn construct_density(
-        self,
-    ) -> Result<ScfIteration<S, DensityUpdated>, Error> {
-        // Total number of electrons from pseudopotential ionic charges
+impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated, MixingOff> {
+    /// Shared density computation (occupations + GPU construction).
+    fn compute_density_from_wavefunctions(&self) -> Result<Density, Error> {
         let n_electrons: f64 = self
             .cell
             .species_iter()
@@ -399,22 +505,103 @@ impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated> {
             .call()?;
 
         stream.synchronize()?;
+        Ok(new_density)
+    }
 
-        let mut next: ScfIteration<S, DensityUpdated> = self.into_phase();
+    /// Construct density with `Off` mixing phase — the history stays as-is
+    /// and no mixing transformation is applied during `mix()`.
+    pub fn construct_density_off(
+        self,
+    ) -> Result<ScfIteration<S, DensityUpdated<MixingOff>, MixingOff>, Error> {
+        let new_density = self.compute_density_from_wavefunctions()?;
+        let mut next: ScfIteration<S, DensityUpdated<MixingOff>, MixingOff> =
+            self.into_phase();
         next.density = new_density;
         Ok(next)
+    }
+
+    /// Construct density and transition the history to `Kerker` phase.
+    pub fn construct_density_kerker(
+        self,
+    ) -> Result<ScfIteration<S, DensityUpdated<Kerker>, Kerker>, Error> {
+        let new_density = self.compute_density_from_wavefunctions()?;
+        // Convert history from MixingOff → Kerker (creates GPU preconditioner)
+        let kerker_history = self.history.into_kerker(&self.wave_grid)?;
+        Ok(ScfIteration {
+            cell: self.cell,
+            pots: self.pots,
+            wave_grid: self.wave_grid,
+            fine_grid: self.fine_grid,
+            k_point: self.k_point,
+            smearing: self.smearing,
+            pw_coords: self.pw_coords,
+            pw_fft_indices: self.pw_fft_indices,
+            density: new_density,
+            psi: self.psi,
+            eigenvalues: self.eigenvalues,
+            v_eff: self.v_eff,
+            history: kerker_history,
+            previous_density: self.previous_density,
+            next_mixing: self.next_mixing,
+            e_xc: self.e_xc,
+            e_hartree: self.e_hartree,
+            rho_vxc: self.rho_vxc,
+            ewald: self.ewald,
+            energy_buffer: self.energy_buffer,
+            total_energy: self.total_energy,
+            _phase: PhantomData,
+        })
+    }
+
+    /// Construct density and transition the history to `Pulay` phase.
+    pub fn construct_density_pulay(
+        self,
+    ) -> Result<ScfIteration<S, DensityUpdated<Pulay>, Pulay>, Error> {
+        let new_density = self.compute_density_from_wavefunctions()?;
+        // Convert history: MixingOff → Kerker → Pulay
+        let kerker_history = self.history.into_kerker(&self.wave_grid)?;
+        let pulay_history = kerker_history.into_pulay();
+        Ok(ScfIteration {
+            cell: self.cell,
+            pots: self.pots,
+            wave_grid: self.wave_grid,
+            fine_grid: self.fine_grid,
+            k_point: self.k_point,
+            smearing: self.smearing,
+            pw_coords: self.pw_coords,
+            pw_fft_indices: self.pw_fft_indices,
+            density: new_density,
+            psi: self.psi,
+            eigenvalues: self.eigenvalues,
+            v_eff: self.v_eff,
+            history: pulay_history,
+            previous_density: self.previous_density,
+            next_mixing: self.next_mixing,
+            e_xc: self.e_xc,
+            e_hartree: self.e_hartree,
+            rho_vxc: self.rho_vxc,
+            ewald: self.ewald,
+            energy_buffer: self.energy_buffer,
+            total_energy: self.total_energy,
+            _phase: PhantomData,
+        })
     }
 }
 
 // ---------------------------------------------------------------------------
-// Transition 4: DensityUpdated → Mixed (infallible)
+// Transition 4: DensityUpdated<M> → Mixed (infallible)
 // ---------------------------------------------------------------------------
+// Each mixing phase gets its own `impl` block so the history type is
+// correctly wired.  All three normalise the return type to
+// `ScfIteration<S, Mixed, MixingOff>` so the `run_scf` dispatch arms
+// agree on a single type.
 
-impl<S: SpinPolicy> ScfIteration<S, DensityUpdated> {
-    /// Mix new density with history (Pulay / DIIS in later phases).
-    /// Infallible: mixing can always proceed, even if it degrades gracefully.
-    pub fn mix(mut self) -> ScfIteration<S, Mixed> {
+impl<S: SpinPolicy> ScfIteration<S, DensityUpdated<MixingOff>, MixingOff> {
+    /// Mix with phase `Off`: pass-through, no active mixing.
+    #[allow(unused_mut)]
+    pub fn mix(mut self) -> ScfIteration<S, Mixed, MixingOff> {
         let (mixed, prev) = self.history.mix(self.density);
+        let history_off = self.history.into_off();
         ScfIteration {
             cell: self.cell,
             pots: self.pots,
@@ -423,13 +610,84 @@ impl<S: SpinPolicy> ScfIteration<S, DensityUpdated> {
             k_point: self.k_point,
             smearing: self.smearing,
             pw_coords: self.pw_coords,
+            pw_fft_indices: self.pw_fft_indices,
             density: mixed,
             psi: self.psi,
-            pw_fft_indices: self.pw_fft_indices,
             eigenvalues: self.eigenvalues,
             v_eff: self.v_eff,
-            history: self.history,
+            history: history_off,
             previous_density: prev,
+            next_mixing: self.next_mixing,
+            e_xc: self.e_xc,
+            e_hartree: self.e_hartree,
+            rho_vxc: self.rho_vxc,
+            ewald: self.ewald,
+            energy_buffer: self.energy_buffer,
+            total_energy: self.total_energy,
+            _phase: PhantomData,
+        }
+    }
+}
+
+impl<S: SpinPolicy> ScfIteration<S, DensityUpdated<Kerker>, Kerker> {
+    /// Mix with Kerker preconditioning.
+    pub fn mix(mut self) -> ScfIteration<S, Mixed, MixingOff> {
+        let (mixed, prev) = self.history.mix(self.density);
+        let history_off = self.history.into_off();
+        ScfIteration {
+            cell: self.cell,
+            pots: self.pots,
+            wave_grid: self.wave_grid,
+            fine_grid: self.fine_grid,
+            k_point: self.k_point,
+            smearing: self.smearing,
+            pw_coords: self.pw_coords,
+            pw_fft_indices: self.pw_fft_indices,
+            density: mixed,
+            psi: self.psi,
+            eigenvalues: self.eigenvalues,
+            v_eff: self.v_eff,
+            history: history_off,
+            previous_density: prev,
+            next_mixing: self.next_mixing,
+            e_xc: self.e_xc,
+            e_hartree: self.e_hartree,
+            rho_vxc: self.rho_vxc,
+            ewald: self.ewald,
+            energy_buffer: self.energy_buffer,
+            total_energy: self.total_energy,
+            _phase: PhantomData,
+        }
+    }
+}
+
+impl<S: SpinPolicy> ScfIteration<S, DensityUpdated<Pulay>, Pulay> {
+    /// Mix with Pulay / DIIS.
+    pub fn mix(mut self) -> ScfIteration<S, Mixed, MixingOff> {
+        let (mixed, prev) = self.history.mix(self.density);
+        let history_off = self.history.into_off();
+        ScfIteration {
+            cell: self.cell,
+            pots: self.pots,
+            wave_grid: self.wave_grid,
+            fine_grid: self.fine_grid,
+            k_point: self.k_point,
+            smearing: self.smearing,
+            pw_coords: self.pw_coords,
+            pw_fft_indices: self.pw_fft_indices,
+            density: mixed,
+            psi: self.psi,
+            eigenvalues: self.eigenvalues,
+            v_eff: self.v_eff,
+            history: history_off,
+            previous_density: prev,
+            next_mixing: self.next_mixing,
+            e_xc: self.e_xc,
+            e_hartree: self.e_hartree,
+            rho_vxc: self.rho_vxc,
+            ewald: self.ewald,
+            energy_buffer: self.energy_buffer,
+            total_energy: self.total_energy,
             _phase: PhantomData,
         }
     }
@@ -440,24 +698,93 @@ impl<S: SpinPolicy> ScfIteration<S, DensityUpdated> {
 // ---------------------------------------------------------------------------
 
 /// Outcome of a convergence check: converged, restart, or error.
+///
+/// The `NotConverged` variant carries a `next_mixing` field that the
+/// `run_scf` loop uses to decide which mixing phase to use on the next
+/// iteration.
 pub enum CheckOutcome<S: SpinPolicy> {
-    Converged(ScfIteration<S, Converged>),
-    NotConverged(ScfIteration<S, Initialized>),
+    Converged(ScfIteration<S, Converged, MixingOff>),
+    NotConverged {
+        state: ScfIteration<S, Initialized, MixingOff>,
+        next_mixing: MixingPhaseKind,
+    },
 }
 
-impl<S: SpinPolicy> ScfIteration<S, Mixed> {
-    /// Check SCF convergence.
+impl<S: SpinPolicy> ScfIteration<S, Mixed, MixingOff> {
+    /// Check SCF convergence using energy-window + RMS density criteria.
     ///
     /// Returns:
     /// - `Ok(Converged(...))` — converged; call `.finalize()` for output.
     /// - `Ok(NotConverged(...))` — not converged; restart loop with `v_eff: None`.
     /// - `Err(e)` — computation error (NaN density, etc.).
     pub fn check(
-        self,
+        mut self,
         tol: f64,
     ) -> Result<CheckOutcome<S>, Error> {
-        let _ = tol;
-        todo!()
+        // 1. Compute occupations for band energy
+        let n_electrons: f64 = self
+            .cell
+            .species_iter()
+            .map(|info| {
+                self.pots
+                    .get(info.symbol)
+                    .and_then(|p| p.ionic_charge())
+                    .unwrap_or(0.0)
+                    * info.num_ions as f64
+            })
+            .sum();
+        let occupations =
+            crate::density::compute_occupations(&self.eigenvalues, &self.smearing, n_electrons)?;
+
+        // 2. Total energy assembly (if energy components are available)
+        if let (Some(e_xc), Some(e_hartree), Some(rho_vxc)) =
+            (self.e_xc, self.e_hartree, self.rho_vxc)
+        {
+            let e_total = crate::energy::assemble_total_energy(
+                &self.eigenvalues,
+                &occupations,
+                e_xc,
+                e_hartree,
+                rho_vxc,
+                self.ewald,
+            );
+            self.total_energy = Some(e_total);
+            self.energy_buffer.push(e_total);
+        }
+
+        // 3. Energy-window convergence check
+        let n_conv = 3; // Number of entries needed in the window
+        let energy_tol = tol;
+        let energy_converged = if self.energy_buffer.len() >= n_conv {
+            let window = &self.energy_buffer[self.energy_buffer.len() - n_conv..];
+            window
+                .windows(2)
+                .map(|w| (w[1] - w[0]).abs())
+                .all(|diff| diff < energy_tol)
+        } else {
+            false
+        };
+
+        // 4. Density RMS change (mixed density vs pre-mix snapshot)
+        let dens_rms = {
+            let current = self.density.as_wave_array();
+            let previous = self.previous_density.as_wave_array();
+            let diff = current - previous;
+            let sum_sq: f64 = diff.iter().map(|&x| x * x).sum();
+            let n = diff.len() as f64;
+            (sum_sq / n).sqrt()
+        };
+
+        // 5. Decision
+        let next_mixing = self.next_mixing;
+        if dens_rms < tol && energy_converged {
+            Ok(CheckOutcome::Converged(self.into_phase()))
+        } else {
+            Ok(CheckOutcome::NotConverged {
+                state: self.into_phase(),
+                next_mixing,
+            })
+        }
     }
 }
 
@@ -465,10 +792,14 @@ impl<S: SpinPolicy> ScfIteration<S, Mixed> {
 // Terminal: Converged → FinalResult
 // ---------------------------------------------------------------------------
 
-impl<S: SpinPolicy> ScfIteration<S, Converged> {
+impl<S: SpinPolicy> ScfIteration<S, Converged, MixingOff> {
     /// Package converged results.
     pub fn finalize(self) -> FinalResult {
-        todo!()
+        FinalResult {
+            density: self.density,
+            eigenvalues: self.eigenvalues,
+            total_energy: self.total_energy.unwrap_or(f64::NAN),
+        }
     }
 }
 
@@ -483,7 +814,7 @@ impl<S: SpinPolicy> ScfIteration<S, Converged> {
 /// * `ndeg` — Chebyshev polynomial degree for diagonalization.
 /// * `tol` — Convergence tolerance (RMS density change in e⁻/Bohr³).
 pub fn run_scf<S: SpinPolicy + BuildVEff>(
-    state: ScfIteration<S, Initialized>,
+    state: ScfIteration<S, Initialized, MixingOff>,
     ndeg: usize,
     tol: f64,
 ) -> Result<FinalResult, Error> {
@@ -492,11 +823,53 @@ pub fn run_scf<S: SpinPolicy + BuildVEff>(
         state = {
             let v_eff = state.build_v_eff()?;
             let wfn = v_eff.diagonalize(ndeg)?;
-            let dens = wfn.construct_density()?;
-            let mixed = dens.mix();
+
+            // Dispatch mixing phase at runtime
+            let mixed = match wfn.next_mixing {
+                MixingPhaseKind::Off => wfn.construct_density_off()?.mix(),
+                MixingPhaseKind::Kerker => wfn.construct_density_kerker()?.mix(),
+                MixingPhaseKind::Pulay => wfn.construct_density_pulay()?.mix(),
+            };
+
             match mixed.check(tol)? {
                 CheckOutcome::Converged(converged) => return Ok(converged.finalize()),
-                CheckOutcome::NotConverged(next) => next,
+                CheckOutcome::NotConverged { state: next, next_mixing } => {
+                    // Preserve the next mixing phase for the following iteration
+                    let mut s: ScfIteration<_, Initialized, MixingOff> = next;
+                    s.next_mixing = next_mixing;
+                    s
+                }
+            }
+        };
+    }
+}
+
+/// Run the full SCF cycle to convergence with total energy computation.
+pub fn run_scf_with_energy(
+    state: ScfIteration<NonSpin, Initialized, MixingOff>,
+    ndeg: usize,
+    tol: f64,
+) -> Result<FinalResult, Error> {
+    let mut state = state;
+    loop {
+        state = {
+            let v_eff = state.build_v_eff_with_energy()?;
+            let wfn = v_eff.diagonalize(ndeg)?;
+
+            // Dispatch mixing phase at runtime
+            let mixed = match wfn.next_mixing {
+                MixingPhaseKind::Off => wfn.construct_density_off()?.mix(),
+                MixingPhaseKind::Kerker => wfn.construct_density_kerker()?.mix(),
+                MixingPhaseKind::Pulay => wfn.construct_density_pulay()?.mix(),
+            };
+
+            match mixed.check(tol)? {
+                CheckOutcome::Converged(converged) => return Ok(converged.finalize()),
+                CheckOutcome::NotConverged { state: next, next_mixing } => {
+                    let mut s: ScfIteration<_, Initialized, MixingOff> = next;
+                    s.next_mixing = next_mixing;
+                    s
+                }
             }
         };
     }
@@ -574,4 +947,96 @@ pub(crate) fn downsample_array_to_wave_grid(
     let result = rho_wave.mapv(|x| x / n_total_fine);
 
     Ok(EffectivePotential::from_inner(FineGridArray::from_inner(result)))
+}
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::layout::WavefunctionSet;
+    use crate::mixing::MixingOff;
+    use crate::types::{KPoint, SmearingScheme, WaveGridArray};
+    use std::marker::PhantomData;
+
+    fn dummy_cell() -> CellGeometry {
+        use ndarray::Array2;
+        CellGeometry {
+            real_lattice: chemrust_hamiltonian_core::RealLattice::from_inner([
+                [5.0, 0.0, 0.0], [0.0, 5.0, 0.0], [0.0, 0.0, 5.0],
+            ]),
+            recip_lattice: chemrust_hamiltonian_core::RecipLattice::from_inner([
+                [0.2, 0.0, 0.0], [0.0, 0.2, 0.0], [0.0, 0.0, 0.2],
+            ]),
+            volume: 125.0,
+            num_species: 1,
+            num_ions: 1,
+            ionic_positions: Array2::from_shape_vec((1, 3), vec![0.0, 0.0, 0.0]).unwrap(),
+            species_symbols: vec!["Cu".into()],
+            species_pot_files: vec!["Cu_00.usp".into()],
+            num_ions_in_species: vec![1],
+            ion_species: vec![0],
+            max_ions_in_species: 1,
+        }
+    }
+
+    fn dummy_grid() -> GVectorGrid {
+        GVectorGrid::new(
+            [4, 4, 4],
+            chemrust_hamiltonian_core::RecipLattice::from_inner([
+                [0.2, 0.0, 0.0], [0.0, 0.2, 0.0], [0.0, 0.0, 0.2],
+            ]),
+        )
+    }
+
+    /// check() with no energy data returns NotConverged.
+    #[test]
+    fn test_check_not_converged_no_energy() {
+        let shape = [4, 4, 4]; // Fortran: [ngz, ngy, ngx]
+        let density = Density::from_inner(WaveGridArray::from_inner(Array3::<f64>::zeros(shape)));
+        let previous_density = Density::from_inner(WaveGridArray::from_inner(
+            Array3::<f64>::from_elem(shape, 2.0),
+        ));
+        let psi = WavefunctionSet::new(vec![Complex64::ZERO; 4 * 27], 4, 27);
+
+        let state: ScfIteration<NonSpin, Mixed, MixingOff> = ScfIteration {
+            cell: dummy_cell(),
+            pots: PseudopotentialSet::new(),
+            wave_grid: dummy_grid(),
+            fine_grid: dummy_grid(),
+            k_point: KPoint::default(),
+            smearing: SmearingParams {
+                width: 0.1,
+                electron_temperature: 0.0,
+                scheme: SmearingScheme::Gaussian,
+            },
+            pw_coords: Vec::new(),
+            pw_fft_indices: Vec::new(),
+            density,
+            psi,
+            eigenvalues: vec![-0.3, -0.2],
+            v_eff: None,
+            history: DensityHistory::new(),
+            previous_density,
+            next_mixing: MixingPhaseKind::Off,
+            e_xc: None,
+            e_hartree: None,
+            rho_vxc: None,
+            ewald: 0.0,
+            energy_buffer: Vec::new(),
+            total_energy: None,
+            _phase: PhantomData,
+        };
+
+        let result = state.check(1e-6).unwrap();
+        match result {
+            CheckOutcome::NotConverged { next_mixing, .. } => {
+                assert_eq!(next_mixing, MixingPhaseKind::Off,
+                    "no energy data should keep mixing phase as Off");
+            }
+            _ => panic!("expected NotConverged, got Converged"),
+        }
+    }
 }
