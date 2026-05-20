@@ -416,6 +416,29 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
             let max = arr.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
             (min, max)
         };
+        {
+            let rho_arr = self.density.as_wave_array();
+            let n_grid = rho_arr.len() as f64;
+            let rho_sum: f64 = rho_arr.iter().sum();
+            let rho_min = rho_arr.iter().cloned().fold(f64::INFINITY, f64::min);
+            let rho_max = rho_arr.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let total_e_raw_conv = rho_sum / n_grid;
+            let total_e_phys_conv = rho_sum * self.cell.volume / n_grid;
+            let psi_data = &self.psi.data;
+            let (mut psi_abs_min, mut psi_abs_max) = (f64::INFINITY, 0.0f64);
+            for c in psi_data.iter() {
+                let a = c.norm();
+                if a < psi_abs_min { psi_abs_min = a; }
+                if a > psi_abs_max { psi_abs_max = a; }
+            }
+            eprintln!(
+                "[V_eff] min={:.4} max={:.4} range={:.4} Ha  [Density] rho_sum={:.4e} rho_min={:.4e} rho_max={:.4e}  total_e(raw_conv=sum/N)={:.6}  total_e(phys_conv=sum*Ω/N)={:.6}  [psi] |c|_min={:.3e} |c|_max={:.3e}",
+                min_veff, max_veff, max_veff - min_veff,
+                rho_sum, rho_min, rho_max,
+                total_e_raw_conv, total_e_phys_conv,
+                psi_abs_min, psi_abs_max,
+            );
+        }
         let v_eff_gpu = Gpu::from_host_with(&v_eff_wave, &stream, &mut pcie)?;
 
         // Clone host data BEFORE moving self.psi into GPU
@@ -598,6 +621,23 @@ impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated, MixingOff> {
             .call()?;
 
         stream.synchronize()?;
+        {
+            let rho_arr = new_density.as_wave_array();
+            let n_grid = rho_arr.len() as f64;
+            let rho_sum: f64 = rho_arr.iter().sum();
+            let rho_min = rho_arr.iter().cloned().fold(f64::INFINITY, f64::min);
+            let rho_max = rho_arr.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let total_e_raw_conv = rho_sum / n_grid;
+            let total_e_phys_conv = rho_sum * self.cell.volume / n_grid;
+            let occ_sum: f64 = occupations.0.iter().sum();
+            let occ_max = occupations.0.iter().cloned().fold(0.0f64, f64::max);
+            eprintln!(
+                "[NewDensity] rho_sum={:.4e} rho_min={:.4e} rho_max={:.4e}  total_e(raw_conv=sum/N)={:.6}  total_e(phys_conv=sum*Ω/N)={:.6}  [occ] Σocc={:.4} max_occ={:.4} target_n_e={:.4} chem_pot={:.4} Ha",
+                rho_sum, rho_min, rho_max,
+                total_e_raw_conv, total_e_phys_conv,
+                occ_sum, occ_max, n_electrons, chem_pot.0,
+            );
+        }
         Ok((new_density, chem_pot))
     }
 

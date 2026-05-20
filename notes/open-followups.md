@@ -123,6 +123,25 @@ every time, giving `half_width ≈ 74 Ha` and ratios ~20-28×/step. RR then
 produces unphysical eigenvalues (band-1 ≈ -29 Ha, drifting negative each
 iteration).
 
+**Status (2026-05-21): ROOT CAUSE LOCALISED — see §8.** The Lanczos
+estimator is *not* the bug. After instrumenting `lanczos_upper_bound` and the
+call site:
+- `norm0 = 245.09` healthy (no early-return).
+- Iter-1 `alpha = [8.80, 7.50, 7.41, 7.36, 7.13, 6.18]`, `beta` small ⇒
+  textbook well-conditioned T_k, `b_up_raw = 20.76 Ha`. RR band-1 = −1.03 Ha.
+- Iter-2 `alpha[0] = 9.61` (sane) then **alpha[1] = −391 Ha** — impossible for
+  a unit vector under any Hermitian H. The Lanczos kernel is correct; **H
+  itself is corrupted** in iter 2.
+- Iter-1 gershgorin = 116 Ha, iter-2 gershgorin = 147 Ha ⇒ `(max_veff −
+  min_veff)` jumped by 31 Ha between iterations. V_eff range: iter-1 = 8.69
+  Ha vs iter-2 = 39.95 Ha. iter-2 V_eff degenerates into bare V_loc (deep
+  −35 Ha wells with no V_H/V_xc smoothing) because the density fed into
+  iter-2's V_eff assembly is the smooth-PW-only density, missing USPP
+  augmentation. See §8.
+
+The original "next steps" list below is preserved for historical context;
+items 1-3 are no longer relevant (root cause is upstream of Lanczos).
+
 **Root cause analysis (2026-05-21):**
 
 The Lanczos upper-bound estimator (`lanczos_upper_bound` in
@@ -168,3 +187,92 @@ and the Lanczos `b_up` is somehow ≤ 0.13 Ha.
    from max Ritz of previous iteration. Algorithm 5.1 — first-step bootstrap
    using T_k midpoint for b_low. Paper at
    `reference_paper/zhou2014-chebyshev-filtered-subspace-iteration-jcp.zip`.
+
+## 8. USPP augmentation density missing in `construct_density_gpu`
+
+**Symptom:** Iter-2 V_eff range jumps from iter-1's 8.69 Ha to 39.95 Ha. The
+density built by `construct_density_gpu` (`src/density.rs:93`) integrates to
+~0.002 in raw `ρ × Ω` units (`sum/N`), vs the fixture's 186.0 (= N_electrons).
+Equivalently, `construct_density_gpu`'s `rho_sum = 904.59` while the fixture's
+`rho_sum = 8.1356e7` for the same physical electron count. Ratio ≈ 89,944 ≈
+**4 · Ω** (Ω ≈ 22,310 Bohr³). The factor of 4 above the simple
+convention-mismatch factor Ω is the smoking gun.
+
+**Root cause (2026-05-21):** `accumulate_density` computes only the smooth
+plane-wave term `Σ_b occ_b · |ψ_b(r)|² / Ω`. CASTEP `.check` wavefunctions
+are S-orthonormal under USPP S (`⟨ψ_b|S|ψ_b⟩ = 1`), so the plane-wave norm
+`Σ_G |c_{b,G}|² = ⟨ψ_b|ψ_b⟩` is *less* than 1 per band — the rest of the
+charge lives in the augmentation channels. The full USPP density is
+
+  ρ(r) = Σ_b occ_b [|ψ_b(r)|² + Σ_{I,L,L'} Q^I_{LL'}(r) ⟨ψ_b|β_{IL}⟩ ⟨β_{IL'}|ψ_b⟩]
+       = smooth ρ_PW + augmentation Σ_I,L,L' Q^I_{LL'}(r) · ω^I_{LL'}
+
+where `ω^I_{LL'} = Σ_b occ_b ⟨ψ_b|β_{IL}⟩ ⟨β_{IL'}|ψ_b⟩` is the occupancy
+matrix. For Cu 3d states the augmentation contributes the bulk of the
+charge — empirically, `⟨ψ|ψ⟩_avg ≈ 0.25` across occupied bands, matching the
+observed factor of 4.
+
+The fixture density (CASTEP `.den_fmt`/`.castep_bin`) already contains
+augmentation, so iter-1 (which uses the fixture density) is correct. Iter-2
+takes the smooth-only output of `construct_density_gpu`, which collapses V_H
+(linear in ρ, so ~5 orders of magnitude smaller than expected after the
+convention/augmentation mismatch) and V_xc (nonlinear, but also tiny), leaving
+V_eff ≈ V_loc — bare pseudopotential wells, no Hartree/XC smoothing. Lanczos
+faithfully reports the spectrum of this corrupted H (`lambda_min_tk ≈ −1170
+Ha` near the deepest V_loc point) and Chebyshev amplifies it.
+
+**Crude rescale experiment (reverted; only the diagnostic prints remain in
+tree):** scaling the smooth ρ uniformly so `sum/N` matches `N_electrons`
+reduces iter-2 V_eff range to 32.80 Ha and band-1 to −13.34 Ha — directionally
+improved (39.95 → 32.80 Ha range, −29 → −13 Ha band-1) but still ~4× too wide
+vs the correct 8.69 Ha range. Iter-3 `[CrudeScale] scale` drops from 89,937 to
+76,438 — the required rescale factor is *iteration-dependent*, confirming that
+no single uniform scaling can substitute for the spatially-localised
+augmentation contribution.
+
+**Diagnostic evidence in tree:** the eprintln prints in `chebyshev.rs`,
+`density.rs`, and `scf.rs` (tagged `[Lanczos]`, `[Lanczos@call]`,
+`[ConstructDensity]`, `[V_eff]`, `[Density]`, `[NewDensity]`, `[psi]`) are
+the artifacts of this diagnosis. A reference run is preserved at
+`/tmp/lanczos-diag-0115.log` (and the conversation transcript). Decision
+tree from the diagnosis is recorded in `notes/plans/notes-open-followups-md-issue-after-car-snug-ripple.md`.
+
+**Fix scope:** implement USPP augmentation density on top of
+`construct_density_gpu`. Reusable infrastructure already exists:
+
+1. **β projector matrix elements `⟨β_{IL}|ψ_b⟩`** — computed inside
+   `VnlBatchData::precompute` (`src/eigensolver/vnl_data.rs`) for the
+   D-matrix application path. The same projections need to be exposed for
+   density construction (CPU reduction across bands, weighted by `occ_b`).
+
+2. **`Q^I_{LL'}(r)` real-space augmentation functions** — the screened-D
+   path (`chemrust-hamiltonian-core::compute_screened_d`) already FFTs
+   `Q^I_{LL'}(G)` onto the fine grid for `∫Q·V_eff`. Same pipeline can be
+   reused for density assembly.
+
+3. **Augmentation accumulation kernel** — new CUDA kernel (or CPU code,
+   since occupancy matrices are small per ion). For each ion I and
+   channel-pair (L,L'), add `ω^I_{LL'} · Q^I_{LL'}(r)` to the smooth
+   density buffer.
+
+**Affected files for the fix:**
+- `src/density.rs` — add augmentation pass after `accumulate_density`
+- `src/eigensolver/vnl_data.rs` — expose β projection matrix elements
+- `chemrust-hamiltonian-core` — reuse Q-FFT pipeline from screened-D code
+- Tests: extend `tests/ca_scf_convergence.rs::fixed_point_matches_castep_energy`
+  with a tighter assertion on iter-2 V_eff range (should match iter-1's ~9 Ha).
+
+**Next steps for dedicated session:**
+1. Read CASTEP source (`~/programming/CASTEP-GPU-port/`) for the
+   reference `density.F90` augmentation accumulation — specifically
+   `aug_charge_addition` or equivalent. Note the convention CASTEP uses for
+   storing `ω^I_{LL'}` and the indexing of `Q^I_{LL'}(r)` on the fine grid.
+2. Verify the β projections currently stored in `VnlBatchData` carry the
+   raw `⟨β_{IL}|ψ_b⟩` values (not contracted into D · ⟨β|ψ⟩ for V_NL apply).
+   If they're pre-contracted, the augmentation density path needs its own
+   projection pass.
+3. After implementing, the discriminator test is iter-2 V_eff range —
+   should land within ±1 Ha of iter-1's 8.69 Ha (the fixture-based value).
+   Loose acceptance: iter-2 band-1 within ±0.2 Ha of CASTEP's −1.06 Ha
+   reference.
+

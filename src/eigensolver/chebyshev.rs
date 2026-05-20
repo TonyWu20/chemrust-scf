@@ -374,8 +374,11 @@ unsafe fn lanczos_upper_bound(
         let dot = blas.dotc_c64(n, &v_cur, 1, &v_cur, 1).map_err(Error::Blas)?;
         dot.x.sqrt()
     };
+    eprintln!("[Lanczos] entry: n_pw={} grid_size={} k_steps={}", n_pw, grid_size, k_steps);
+    eprintln!("[Lanczos] norm0 = {:.6e}", norm0);
     if norm0 < 1e-30 {
         // Degenerate starting vector — fall back to Gershgorin
+        eprintln!("[Lanczos] EARLY-RETURN: norm0 < 1e-30 → fallback to (INF, -INF, INF)");
         return Ok((f64::INFINITY, f64::NEG_INFINITY, f64::INFINITY));
     }
     let inv_norm0 = CudaComplex { x: 1.0 / norm0, y: 0.0 };
@@ -444,6 +447,8 @@ unsafe fn lanczos_upper_bound(
     // Find λ_max and λ_min of the k×k symmetric tridiagonal T_k on CPU
     // via Gershgorin bounds. T_k is at most 6×6 so this is trivial.
     let k = alpha.len();
+    eprintln!("[Lanczos] alpha = {:?}", alpha);
+    eprintln!("[Lanczos] beta  = {:?}", beta);
     let lambda_max_tk = (0..k).map(|i| {
         let b_left  = if i > 0   { beta[i].abs() } else { 0.0 };
         let b_right = if i+1 < k { beta[i+1].abs() } else { 0.0 };
@@ -457,7 +462,12 @@ unsafe fn lanczos_upper_bound(
 
     // Rigorous upper bound: λ_max(H) ≤ λ_max(T_k) + ‖r_k‖
     let residual_norm = beta[k - 1];
-    Ok((lambda_max_tk + residual_norm, lambda_min_tk, lambda_max_tk))
+    let b_up_raw = lambda_max_tk + residual_norm;
+    eprintln!(
+        "[Lanczos] T_k bounds: lambda_min_tk = {:.4} Ha  lambda_max_tk = {:.4} Ha  residual_norm(beta[k-1]) = {:.4e}  → b_up_raw = {:.4} Ha",
+        lambda_min_tk, lambda_max_tk, residual_norm, b_up_raw,
+    );
+    Ok((b_up_raw, lambda_min_tk, lambda_max_tk))
 }
 
 // ---------------------------------------------------------------------------
@@ -1042,25 +1052,41 @@ pub(crate) fn chebyshev_filter(
             };
             // Cap Lanczos b_up at Gershgorin — Lanczos can overshoot when the
             // starting vector is nearly invariant (well-converged wavefunctions).
-            let b_up = (b_up_lanczos * 1.1).min(gershgorin_b_up);
+            let scaled = b_up_lanczos * 1.1;
+            let b_up = scaled.min(gershgorin_b_up);
+            let capped_by_gershgorin = scaled >= gershgorin_b_up;
+            eprintln!(
+                "[Lanczos@call] b_up_lanczos={:.4}  ritz_min={:.4}  ritz_max={:.4}  gershgorin={:.4}  scaled(*1.1)={:.4}  → b_up={:.4}  capped_by_gershgorin={}",
+                b_up_lanczos, ritz_min, ritz_max, gershgorin_b_up, scaled, b_up, capped_by_gershgorin,
+            );
 
             // b_low: use Ritz values from previous RR when available (Alg 4.1 §7.2).
             // On first call (no prior eigenvalues), derive from Lanczos T_k Ritz
             // values per Algorithm 5.1 eq.(13): β=0.5 → midpoint of T_k spectrum.
-            let b_low = match eigenvalues {
+            let (b_low, b_low_src) = match eigenvalues {
                 Some(eig) if !eig.is_empty() => {
                     // Steady-state: b_low = largest Ritz value from previous RR.
                     // This guarantees all occupied states are below b_low and
                     // will be magnified by the filter.
-                    eig[eig.len() - 1]
+                    (eig[eig.len() - 1], "eig[last]")
                 }
                 _ => {
                     // First call: eq.(13) with β=0.5 → midpoint of T_k spectrum.
-                    0.5 * ritz_min + 0.5 * ritz_max
+                    (0.5 * ritz_min + 0.5 * ritz_max, "T_k midpoint")
                 }
             };
+            eprintln!("[Lanczos@call] b_low={:.4}  source={}", b_low, b_low_src);
 
-            if b_up.is_finite() && b_up > b_low {
+            let guard_pass = b_up.is_finite() && b_up > b_low;
+            eprintln!(
+                "[Lanczos@call] guard pass={}  (b_up.is_finite()={} && b_up>{:.4}={})",
+                guard_pass,
+                b_up.is_finite(),
+                b_low,
+                b_up > b_low,
+            );
+
+            if guard_pass {
                 bounds = SpectralBounds {
                     lambda_max: b_up,
                     eps_cut: b_low,
