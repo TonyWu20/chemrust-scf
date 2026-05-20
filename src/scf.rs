@@ -19,8 +19,10 @@ use crate::eigensolver::vnl_data::VnlBatchData;
 use crate::layout::{ColumnDistributed, Cpu, WavefunctionSet};
 use crate::mixing::{DensityHistory, Kerker, MixingOff, MixingPhase, Pulay};
 use crate::types::{
-    Density, EffectivePotential, Error, FinalResult, FineGridArray, KPoint, SmearingParams,
+    ChemicalPotential, Density, EffectivePotential, Error, FinalResult, FineGridArray, KPoint,
+    SmearingParams,
 };
+use crate::energy::HARTREE_TO_EV;
 
 // ---------------------------------------------------------------------------
 // Mixing phase runtime dispatch
@@ -134,6 +136,8 @@ pub struct ScfIteration<
     pub(crate) energy_buffer: Vec<f64>,
     /// Total electronic energy from the most recent SCF iteration (RE-4).
     pub(crate) total_energy: Option<f64>,
+    /// Fermi energy / chemical potential from the most recent occupation search.
+    pub(crate) fermi_energy: Option<f64>,
 
     _phase: PhantomData<State>,
 }
@@ -199,6 +203,7 @@ impl<S: SpinPolicy> ScfIteration<S, Initialized, MixingOff> {
             ewald,
             energy_buffer: Vec::new(),
             total_energy: None,
+            fermi_energy: None,
             _phase: PhantomData,
         }
     }
@@ -234,6 +239,7 @@ impl<S: SpinPolicy, Phase: ScfPhase, M: MixingPhase> ScfIteration<S, Phase, M> {
             ewald: self.ewald,
             energy_buffer: self.energy_buffer,
             total_energy: self.total_energy,
+            fermi_energy: self.fermi_energy,
             _phase: PhantomData,
         }
     }
@@ -301,10 +307,33 @@ impl BuildVEffWithEnergy for NonSpin {
         rho: &chemrust_hamiltonian_core::Density,
         wave_grid: &GVectorGrid, fine_grid: &GVectorGrid,
     ) -> Result<(chemrust_hamiltonian_core::EffectivePotential, f64, f64, f64), chemrust_hamiltonian_core::Error> {
+        use chemrust_hamiltonian_core::{nlcc, upsample_density_to_fine_grid, xc, Density as CoreDensity};
+        let rho_fine =
+            upsample_density_to_fine_grid(rho.as_array(), wave_grid, fine_grid)
+                .map_err(|_| chemrust_hamiltonian_core::Error::Format {
+                    section: "build_v_eff_with_energy".into(),
+                    detail: "upsample failed".into(),
+                })?;
         let result = VEffBuilder::<NonSpin>::new(cell, pots, fine_grid)
-            .assemble_on_fine_grid_with_energy(rho, wave_grid, fine_grid)?;
-        let v_eff = result.v_eff;
-        Ok((v_eff, result.e_xc, result.e_hartree, result.rho_vxc))
+            .with_density(CoreDensity::from_inner(rho_fine.clone()), None)
+            .assemble_with_energy()?;
+        // Compute double-counting terms: E_H and ∫ρV_xc
+        let rho_core = nlcc::reconstruct_rho_core(cell, pots, fine_grid)?
+            .into_inner();
+        let density_total = CoreDensity::from_inner(rho_fine.clone() + &rho_core);
+        let v_xc = xc::compute_pbe_xc(density_total.as_array(), fine_grid, cell.volume)?;
+        let n_grid = density_total.as_array().len() as f64;
+        let d_v = cell.volume / n_grid;
+        let e_hartree_raw: f64 = rho_fine.iter()
+            .zip(result.v_h.as_array().iter())
+            .map(|(&rv, &vh)| rv * vh * d_v)
+            .sum();
+        let e_hartree = 0.5 * e_hartree_raw;
+        let rho_vxc: f64 = rho_fine.iter()
+            .zip(v_xc.v_xc.iter())
+            .map(|(&rv, &vxc)| rv * vxc * d_v)
+            .sum();
+        Ok((result.v_eff, v_xc.energy, e_hartree, rho_vxc))
     }
 }
 
@@ -357,9 +386,12 @@ impl ScfIteration<NonSpin, Initialized, MixingOff> {
 impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
     /// Chebyshev filter + Rayleigh-Ritz diagonalization of H[V_eff].
     /// `ndeg` is the Chebyshev polynomial degree.
+    /// `occupations` — if `Some`, use for D-matrix screening (debug/testing only).
+    ///   `None` uses bare D0 (standard SCF path where screening emerges iteratively).
     pub fn diagonalize(
         self,
         ndeg: usize,
+        occupations: Option<&[f64]>,
     ) -> Result<ScfIteration<S, WavefunctionsUpdated, MixingOff>, Error> {
         let ctx = Arc::new(CudaContext::new(0)?);
         let stream = ctx.default_stream();
@@ -398,7 +430,7 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
         let vnl_data = VnlBatchData::precompute(
             &pw_coords, &self.pots, &self.cell,
             &self.wave_grid, &self.k_point,
-            &psi_host, n_bands, n_pw,
+            &psi_host, n_bands, n_pw, occupations,
             &stream, &mut pcie,
         )?;
 
@@ -416,6 +448,7 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
         let (psi_filtered_row, hpsi_row) = chebyshev_filter(
             &psi_gpu, &v_eff_gpu, &self.pots,
             &self.wave_grid, &self.k_point, &self.cell,
+            &self.pw_coords,
             &vnl_data, &fft_idx_dev, min_veff, max_veff,
             &kernels, &mut pcie, eig, ndeg, &blas, &stream, &ctx,
         )?;
@@ -447,7 +480,7 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
         let grid_size = ngx * ngy * ngz;
         let veff_bytes = grid_size * std::mem::size_of::<f64>();
         let fft_idx_bytes = self.pw_fft_indices.len() * std::mem::size_of::<i32>();
-        let kinetic_bytes = grid_size * std::mem::size_of::<f64>();
+        let kinetic_bytes = n_pw * std::mem::size_of::<f64>();
         let vnl_bytes: usize = vnl_data.entries.iter()
             .map(|e| (e.beta_g.len() + e.d_matrix.len()) * 16)
             .sum();
@@ -472,7 +505,8 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
 
 impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated, MixingOff> {
     /// Shared density computation (occupations + GPU construction).
-    fn compute_density_from_wavefunctions(&self) -> Result<Density, Error> {
+    /// Returns (new_density, chemical_potential).
+    fn compute_density_from_wavefunctions(&self) -> Result<(Density, ChemicalPotential), Error> {
         let n_electrons: f64 = self
             .cell
             .species_iter()
@@ -485,7 +519,7 @@ impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated, MixingOff> {
             })
             .sum();
 
-        let occupations =
+        let (occupations, chem_pot) =
             crate::density::compute_occupations(&self.eigenvalues, &self.smearing, n_electrons)?;
 
         let ctx = Arc::new(CudaContext::new(0)?);
@@ -494,7 +528,7 @@ impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated, MixingOff> {
 
         let new_density = crate::density::construct_density_gpu()
             .psi_data(&self.psi.data)
-            .occupations(&occupations)
+            .occupations(&occupations.0)
             .fft_indices(&self.pw_fft_indices)
             .wave_grid(&self.wave_grid)
             .cell_volume(self.cell.volume)
@@ -505,7 +539,7 @@ impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated, MixingOff> {
             .call()?;
 
         stream.synchronize()?;
-        Ok(new_density)
+        Ok((new_density, chem_pot))
     }
 
     /// Construct density with `Off` mixing phase — the history stays as-is
@@ -513,10 +547,11 @@ impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated, MixingOff> {
     pub fn construct_density_off(
         self,
     ) -> Result<ScfIteration<S, DensityUpdated<MixingOff>, MixingOff>, Error> {
-        let new_density = self.compute_density_from_wavefunctions()?;
+        let (new_density, chem_pot) = self.compute_density_from_wavefunctions()?;
         let mut next: ScfIteration<S, DensityUpdated<MixingOff>, MixingOff> =
             self.into_phase();
         next.density = new_density;
+        next.fermi_energy = Some(chem_pot.0);
         Ok(next)
     }
 
@@ -524,7 +559,7 @@ impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated, MixingOff> {
     pub fn construct_density_kerker(
         self,
     ) -> Result<ScfIteration<S, DensityUpdated<Kerker>, Kerker>, Error> {
-        let new_density = self.compute_density_from_wavefunctions()?;
+        let (new_density, chem_pot) = self.compute_density_from_wavefunctions()?;
         // Convert history from MixingOff → Kerker (creates GPU preconditioner)
         let kerker_history = self.history.into_kerker(&self.wave_grid)?;
         Ok(ScfIteration {
@@ -549,6 +584,7 @@ impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated, MixingOff> {
             ewald: self.ewald,
             energy_buffer: self.energy_buffer,
             total_energy: self.total_energy,
+            fermi_energy: Some(chem_pot.0),
             _phase: PhantomData,
         })
     }
@@ -557,7 +593,7 @@ impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated, MixingOff> {
     pub fn construct_density_pulay(
         self,
     ) -> Result<ScfIteration<S, DensityUpdated<Pulay>, Pulay>, Error> {
-        let new_density = self.compute_density_from_wavefunctions()?;
+        let (new_density, chem_pot) = self.compute_density_from_wavefunctions()?;
         // Convert history: MixingOff → Kerker → Pulay
         let kerker_history = self.history.into_kerker(&self.wave_grid)?;
         let pulay_history = kerker_history.into_pulay();
@@ -583,6 +619,7 @@ impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated, MixingOff> {
             ewald: self.ewald,
             energy_buffer: self.energy_buffer,
             total_energy: self.total_energy,
+            fermi_energy: Some(chem_pot.0),
             _phase: PhantomData,
         })
     }
@@ -624,6 +661,7 @@ impl<S: SpinPolicy> ScfIteration<S, DensityUpdated<MixingOff>, MixingOff> {
             ewald: self.ewald,
             energy_buffer: self.energy_buffer,
             total_energy: self.total_energy,
+            fermi_energy: self.fermi_energy,
             _phase: PhantomData,
         }
     }
@@ -656,6 +694,7 @@ impl<S: SpinPolicy> ScfIteration<S, DensityUpdated<Kerker>, Kerker> {
             ewald: self.ewald,
             energy_buffer: self.energy_buffer,
             total_energy: self.total_energy,
+            fermi_energy: self.fermi_energy,
             _phase: PhantomData,
         }
     }
@@ -688,6 +727,7 @@ impl<S: SpinPolicy> ScfIteration<S, DensityUpdated<Pulay>, Pulay> {
             ewald: self.ewald,
             energy_buffer: self.energy_buffer,
             total_energy: self.total_energy,
+            fermi_energy: self.fermi_energy,
             _phase: PhantomData,
         }
     }
@@ -733,8 +773,9 @@ impl<S: SpinPolicy> ScfIteration<S, Mixed, MixingOff> {
                     * info.num_ions as f64
             })
             .sum();
-        let occupations =
+        let (occupations, chem_pot) =
             crate::density::compute_occupations(&self.eigenvalues, &self.smearing, n_electrons)?;
+        self.fermi_energy = Some(chem_pot.0);
 
         // 2. Total energy assembly (if energy components are available)
         if let (Some(e_xc), Some(e_hartree), Some(rho_vxc)) =
@@ -742,7 +783,7 @@ impl<S: SpinPolicy> ScfIteration<S, Mixed, MixingOff> {
         {
             let e_total = crate::energy::assemble_total_energy(
                 &self.eigenvalues,
-                &occupations,
+                &occupations.0,
                 e_xc,
                 e_hartree,
                 rho_vxc,
@@ -852,7 +893,7 @@ pub fn run_scf<S: SpinPolicy + BuildVEff>(
     loop {
         state = {
             let v_eff = state.build_v_eff()?;
-            let wfn = v_eff.diagonalize(ndeg)?;
+            let wfn = v_eff.diagonalize(ndeg, None)?;
 
             // Dispatch mixing phase at runtime
             let mixed = match wfn.next_mixing {
@@ -875,16 +916,25 @@ pub fn run_scf<S: SpinPolicy + BuildVEff>(
 }
 
 /// Run the full SCF cycle to convergence with total energy computation.
+///
+/// When `RUST_LOG=info` is set, emits per-iteration output in the same
+/// column format as CASTEP's SCF convergence table.
 pub fn run_scf_with_energy(
     state: ScfIteration<NonSpin, Initialized, MixingOff>,
     ndeg: usize,
     tol: f64,
 ) -> Result<FinalResult, Error> {
+    use std::time::Instant;
+
     let mut state = state;
+    let t_start = Instant::now();
+    let mut iter_count: u64 = 0;
+    let mut prev_energy: Option<f64> = None;
+    let mut header_printed = false;
     loop {
         state = {
             let v_eff = state.build_v_eff_with_energy()?;
-            let wfn = v_eff.diagonalize(ndeg)?;
+            let wfn = v_eff.diagonalize(ndeg, None)?;
 
             // Dispatch mixing phase at runtime
             let mixed = match wfn.next_mixing {
@@ -894,8 +944,48 @@ pub fn run_scf_with_energy(
             };
 
             match mixed.check(tol)? {
-                CheckOutcome::Converged(converged) => return Ok(converged.finalize()),
+                CheckOutcome::Converged(converged) => {
+                    return Ok(converged.finalize());
+                }
                 CheckOutcome::NotConverged { state: next, next_mixing } => {
+                    // Per-iteration SCF output (CASTEP column format, silent by default)
+                    if !header_printed && tracing::level_enabled!(tracing::Level::INFO) {
+                        tracing::info!(
+                            "------------------------------------------------------------------------"
+                        );
+                        tracing::info!(
+                            "SCF loop      Energy           Fermi           Energy gain       Timer"
+                        );
+                        tracing::info!(
+                            "                               energy          per atom          (sec)"
+                        );
+                        tracing::info!(
+                            "------------------------------------------------------------------------"
+                        );
+                        header_printed = true;
+                    }
+                    iter_count += 1;
+                    if let (Some(e_total), Some(fermi)) =
+                        (next.total_energy, next.fermi_energy)
+                    {
+                        let energy_ev = e_total * HARTREE_TO_EV;
+                        let gain_per_atom = prev_energy
+                            .map(|prev| (e_total - prev) / next.cell.num_ions as f64)
+                            .unwrap_or(0.0);
+                        let gain_ev = gain_per_atom * HARTREE_TO_EV;
+                        let fermi_ev = fermi * HARTREE_TO_EV;
+                        let elapsed = t_start.elapsed().as_secs_f64();
+                        tracing::info!(
+                            "{:>7}  {:>15.8E}  {:>15.8E}  {:>15.8E}  {:>9.2}",
+                            iter_count,
+                            energy_ev,
+                            fermi_ev,
+                            gain_ev,
+                            elapsed,
+                        );
+                        prev_energy = Some(e_total);
+                    }
+
                     let mut s: ScfIteration<_, Initialized, MixingOff> = next;
                     s.next_mixing = next_mixing;
                     s
@@ -909,12 +999,14 @@ pub fn run_scf_with_energy(
 // PW-to-FFT index conversion helper
 // ---------------------------------------------------------------------------
 
-/// Convert fractional PW G-vector coordinates to cuFFT C-order linear indices.
+/// Convert fractional PW G-vector coordinates to cuFFT Fortran-order linear indices.
 ///
 /// Each entry `[h, k, l]` is a fractional G-vector from `KptWaveBlock`.
-/// The output index is `ix + ngx * (iy + ngy * iz)` (cuFFT C-order, nx fastest).
-#[allow(dead_code)]  // Used by test fixture infrastructure (Group F)
-pub(crate) fn pw_coords_to_fft_indices(
+/// The output index is `iz + ngz * (iy + ngy * ix)` (cuFFT Fortran-order for
+/// `[ngz, ngy, ngx]` dimensions where iz varies fastest, ix slowest).
+/// Used by test fixture infrastructure (Group F).
+#[doc(hidden)]
+pub fn pw_coords_to_fft_indices(
     pw_coords: &[[i32; 3]],
     wave_grid: &GVectorGrid,
 ) -> Vec<i32> {
@@ -925,7 +1017,7 @@ pub(crate) fn pw_coords_to_fft_indices(
             let ix = if h >= 0 { h as usize } else { (h + ngx as i32) as usize };
             let iy = if k >= 0 { k as usize } else { (k + ngy as i32) as usize };
             let iz = if l >= 0 { l as usize } else { (l + ngz as i32) as usize };
-            (ix + ngx * (iy + ngy * iz)) as i32
+            (iz + ngz * (iy + ngy * ix)) as i32
         })
         .collect()
 }
@@ -940,7 +1032,8 @@ pub(crate) fn pw_coords_to_fft_indices(
 /// Forward FFT on the fine grid, copy only the wave-grid G-vector subset,
 /// inverse FFT on the wave grid. Returns a `crate::types::EffectivePotential`
 /// on the wave grid suitable for GPU upload.
-pub(crate) fn downsample_array_to_wave_grid(
+#[doc(hidden)]
+pub fn downsample_array_to_wave_grid(
     fine_arr: &Array3<f64>,
     fine_grid: &GVectorGrid,
     wave_grid: &GVectorGrid,
@@ -979,6 +1072,43 @@ pub(crate) fn downsample_array_to_wave_grid(
     Ok(EffectivePotential::from_inner(FineGridArray::from_inner(result)))
 }
 
+// ---------------------------------------------------------------------------
+// Accessor methods for integration tests
+// ---------------------------------------------------------------------------
+
+impl<S: SpinPolicy, M: MixingPhase> ScfIteration<S, VEffBuilt, M> {
+    /// Access the assembled effective potential (for testing).
+    pub fn v_eff(&self) -> &Option<S::VEff> {
+        &self.v_eff
+    }
+    /// Replace the effective potential (debug/testing only).
+    #[doc(hidden)]
+    pub fn set_v_eff(&mut self, v: S::VEff) {
+        self.v_eff = Some(v);
+    }
+}
+
+impl<S: SpinPolicy, M: MixingPhase> ScfIteration<S, WavefunctionsUpdated, M> {
+    /// Access the eigenvalues (for testing).
+    pub fn eigenvalues(&self) -> &[f64] {
+        &self.eigenvalues
+    }
+}
+
+impl<S: SpinPolicy, M: MixingPhase> ScfIteration<S, DensityUpdated<M>, MixingOff> {
+    /// Access the computed density (for testing).
+    pub fn density(&self) -> &Density {
+        &self.density
+    }
+}
+
+impl<S: SpinPolicy> ScfIteration<S, Initialized, MixingOff> {
+    /// Mutable access to density (for perturbation testing).
+    pub fn density_mut(&mut self) -> &mut Density {
+        &mut self.density
+    }
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -1009,6 +1139,7 @@ mod tests {
             num_ions_in_species: vec![1],
             ion_species: vec![0],
             max_ions_in_species: 1,
+            species_lcao_states: vec![],
         }
     }
 
@@ -1057,6 +1188,7 @@ mod tests {
             ewald: 0.0,
             energy_buffer: Vec::new(),
             total_energy: None,
+            fermi_energy: None,
             _phase: PhantomData,
         };
 
@@ -1106,6 +1238,7 @@ mod tests {
             ewald: 0.0,
             energy_buffer,
             total_energy: None,
+            fermi_energy: None,
             _phase: PhantomData,
         }
     }

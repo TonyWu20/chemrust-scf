@@ -48,7 +48,7 @@ unsafe fn c2c_forward_inplace(
     unsafe { plan.c2c_forward(&mut *ptr, &mut *ptr) }
 }
 use crate::layout::{ColumnDistributed, RowDistributed, WavefunctionSet};
-use crate::types::{Error, KPoint};
+use crate::types::{Error, KineticEnergies, KPoint};
 
 // ---------------------------------------------------------------------------
 // Type alias for the complex Chebyshev return type
@@ -278,9 +278,29 @@ pub(crate) fn compute_spectral_bounds(
 // Precomputed FFT metadata (uploaded to GPU)
 // ---------------------------------------------------------------------------
 
-/// Kinetic energy ½|G|² for each grid point (Hartree atomic units).
-fn compute_kinetic_energies(wave_grid: &GVectorGrid) -> Vec<f64> {
-    wave_grid.g2().iter().map(|g2| 0.5 * g2).collect()
+/// Kinetic energy ½|G|² for each plane-wave (Hartree atomic units).
+///
+/// Computed directly from the fractional G-vectors (from `pw_coords`) rather than
+/// from the full grid `g2()`, because the kernel `init_kinetic` indexes by
+/// plane-wave index (0..n_pw), not by grid position.
+fn compute_kinetic_energies(
+    pw_coords: &[[i32; 3]],
+    recip_lattice: &chemrust_hamiltonian_core::RecipLattice,
+) -> KineticEnergies {
+    let r = recip_lattice.as_array();
+    let ke: Vec<f64> = pw_coords
+        .iter()
+        .map(|&[h, k, l]| {
+            let hf = h as f64;
+            let kf = k as f64;
+            let lf = l as f64;
+            let gx = hf * r[0][0] + kf * r[1][0] + lf * r[2][0];
+            let gy = hf * r[0][1] + kf * r[1][1] + lf * r[2][1];
+            let gz = hf * r[0][2] + kf * r[1][2] + lf * r[2][2];
+            0.5 * (gx * gx + gy * gy + gz * gz)
+        })
+        .collect();
+    KineticEnergies(ke)
 }
 
 // ---------------------------------------------------------------------------
@@ -651,6 +671,7 @@ pub(crate) fn chebyshev_filter(
     wave_grid: &GVectorGrid,
     _k_point: &KPoint,
     _cell: &CellGeometry,
+    pw_coords: &[[i32; 3]],
     vnl_data: &VnlBatchData,
     fft_idx_dev: &CudaSlice<i32>,      // PW-to-FFT-grid index map (length = n_pw)
     min_veff: f64,
@@ -676,10 +697,11 @@ pub(crate) fn chebyshev_filter(
     let inv_ntotal = 1.0 / (grid_size as f64);
     let grid_alloc = n_bands * grid_size;
 
-    // ---- Precompute & upload kinetic energy ----
-    let kinetic_cpu = compute_kinetic_energies(wave_grid);
-    let kinetic_dev: CudaSlice<f64> = stream.clone_htod(&kinetic_cpu).map_err(Error::Cuda)?;
-    pcie.h2d_bytes += kinetic_cpu.len() * std::mem::size_of::<f64>();
+    // ---- Precompute & upload kinetic energy (per-PW, not per-grid-point) ----
+    let kinetic_cpu = compute_kinetic_energies(pw_coords, wave_grid.recip_lattice());
+    let kinetic_dev: CudaSlice<f64> =
+        stream.clone_htod(&kinetic_cpu.0).map_err(Error::Cuda)?;
+    pcie.h2d_bytes += kinetic_cpu.0.len() * std::mem::size_of::<f64>();
 
     // ---- FFT plan (batched C2C) ----
     let fft_plan = BatchedFftPlan3d::plan_batched_c2c(

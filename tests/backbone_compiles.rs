@@ -32,13 +32,14 @@ fn dummy_cell() -> CellGeometry {
         num_ions_in_species: vec![1],
         ion_species: vec![0],
         max_ions_in_species: 1,
+        species_lcao_states: vec![],
     }
 }
 
-/// A 4³ wavefunction FFT grid (Fortran layout [ngz, ngy, ngx]).
+/// A 4×4×6 wavefunction FFT grid (non-cubic, Fortran layout [ngz, ngy, ngx]).
 fn dummy_wave_grid() -> GVectorGrid {
     GVectorGrid::new(
-        [4, 4, 4],
+        [6, 4, 4],
         RecipLattice::from_inner([
             [0.2, 0.0, 0.0],
             [0.0, 0.2, 0.0],
@@ -47,10 +48,10 @@ fn dummy_wave_grid() -> GVectorGrid {
     )
 }
 
-/// An 8³ fine FFT grid (2× upsampled).
+/// An 8×8×12 fine FFT grid (2× upsampled).
 fn dummy_fine_grid() -> GVectorGrid {
     GVectorGrid::new(
-        [8, 8, 8],
+        [12, 8, 8],
         RecipLattice::from_inner([
             [0.2, 0.0, 0.0],
             [0.0, 0.2, 0.0],
@@ -59,9 +60,9 @@ fn dummy_fine_grid() -> GVectorGrid {
     )
 }
 
-/// Zero-initialized density on the 4³ wave grid.
+/// Zero-initialized density on the 6×4×4 wave grid.
 fn dummy_density() -> Density {
-    Density::from_inner(WaveGridArray::from_inner(Array3::<f64>::zeros((4, 4, 4))))
+    Density::from_inner(WaveGridArray::from_inner(Array3::<f64>::zeros((6, 4, 4))))
 }
 
 /// Minimal wavefunction set: 4 bands, 27 plane waves (3³).
@@ -90,13 +91,13 @@ fn backbone_compiles() {
                 .collect::<Vec<[i32; 3]>>(),
         )
         .pw_fft_indices({
-            let ngx = 4; let ngy = 4;
+            let ngz = 6; let ngy = 4;
             (0..27)
                 .map(|i| {
-                    let iz = i / 9;
-                    let iy = (i / 3) % 3;
                     let ix = i % 3;
-                    (ix + ngx * (iy + ngy * iz)) as i32
+                    let iy = (i / 3) % 3;
+                    let iz = i / 9;
+                    (iz + ngz * (iy + ngy * ix)) as i32
                 })
                 .collect::<Vec<i32>>()
         })

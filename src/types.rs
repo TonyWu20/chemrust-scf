@@ -234,6 +234,22 @@ pub struct FinalResult {
 }
 
 // ---------------------------------------------------------------------------
+// Occupation numbers and chemical potential
+// ---------------------------------------------------------------------------
+
+/// Kinetic energies ½|G|² per plane-wave (Hartree), indexed by PW index.
+#[derive(Debug, Clone)]
+pub struct KineticEnergies(pub(crate) Vec<f64>);
+
+/// Occupation numbers per band (dimensionless, 0–2 per band for spin-degenerate).
+#[derive(Debug, Clone)]
+pub(crate) struct Occupations(pub(crate) Vec<f64>);
+
+/// Chemical potential μ from smearing occupation search (Hartree).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ChemicalPotential(pub(crate) f64);
+
+// ---------------------------------------------------------------------------
 // Crate-level error type
 // ---------------------------------------------------------------------------
 

@@ -32,6 +32,7 @@ impl VnlBatchData {
         psi_data: &[Complex64],
         n_bands: usize,
         n_pw: usize,
+        occupations: Option<&[f64]>,
         stream: &Arc<CudaStream>,
         pcie: &mut PcieAccount,
     ) -> Result<Self, Error> {
@@ -73,10 +74,45 @@ impl VnlBatchData {
             let d_mat = build_d0_expanded(aug);
             let n_expanded = beta_g.shape()[0] as i32;
 
+            // Compute screened D matrix if occupations are provided.
+            // D_screened = D0 + Σ_b occ[b] · (β^H · ψ_b) · (β^H · ψ_b)^H
+            // where (β^H · ψ_b)[i] = Σ_g conj(beta_g[i][g]) · ψ_b[g]
+            let d_screened: Vec<f64> = if let Some(occ) = occupations {
+                let mut screened = d_mat.clone();
+                // beta_g is (n_expanded, n_pw) row-major
+                let beta_slice = beta_g.as_slice().unwrap();
+                for b in 0..n_bands {
+                    let occ_b = occ[b];
+                    if occ_b.abs() < 1e-15 {
+                        continue;
+                    }
+                    // C_proj[i] = Σ_g conj(beta_g[i][g]) · psi_data[b * n_pw + g]
+                    let mut c_proj = vec![Complex64::new(0.0, 0.0); n_expanded as usize];
+                    for i in 0..n_expanded as usize {
+                        let mut sum = Complex64::new(0.0, 0.0);
+                        let row_offset = i * n_pw;
+                        for g in 0..n_pw {
+                            sum += beta_slice[row_offset + g].conj()
+                                * psi_data[b * n_pw + g];
+                        }
+                        c_proj[i] = sum;
+                    }
+                    // D_screen[i][j] += occ_b · c_proj[i] · conj(c_proj[j])
+                    for i in 0..n_expanded as usize {
+                        for j in 0..n_expanded as usize {
+                            screened[[i, j]] += occ_b * (c_proj[i] * c_proj[j].conj()).re;
+                        }
+                    }
+                }
+                screened.iter().copied().collect()
+            } else {
+                d_mat.iter().copied().collect()
+            };
+
             let beta_flat: Vec<CudaComplex> =
                 beta_g.iter().map(|&c| crate::device::complex_to_cuda(c)).collect();
             let d_flat: Vec<CudaComplex> =
-                d_mat.iter().map(|&d| CudaComplex { x: d, y: 0.0 }).collect();
+                d_screened.iter().map(|&d| CudaComplex { x: d, y: 0.0 }).collect();
 
             let beta_dev = stream.clone_htod(&beta_flat).map_err(Error::Cuda)?;
             let d_dev = stream.clone_htod(&d_flat).map_err(Error::Cuda)?;
