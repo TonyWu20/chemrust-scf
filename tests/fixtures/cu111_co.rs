@@ -82,9 +82,12 @@ fn load_fixture() -> Result<Cu111CoFixture, Box<dyn std::error::Error>> {
     let bands_text = std::fs::read_to_string(&bands_path)?;
     let bands_eigenvalues = parse_bands_file(&bands_text)?;
 
-    // 6. Load pseudopotentials for all species
-    let species: Vec<String> = bin.cell.species_symbols.clone();
-    let pots = PseudopotentialSet::from_dir(&potential_dir, &species)?;
+    // 6. Load pseudopotentials for all species using exact filenames from .castep_bin
+    let pots = PseudopotentialSet::from_dir(
+        potential_dir,
+        &bin.cell.species_symbols,
+        &bin.cell.species_pot_files,
+    )?;
 
     Ok(Cu111CoFixture {
         bin,
@@ -145,8 +148,8 @@ pub fn build_scf_state(fx: &Cu111CoFixture) -> ScfIteration {
     let wave_grid_dims = wfc.grid; // CASTEP [ngx, ngy, ngz]
     let [ngx, ngy, ngz] = wave_grid_dims;
 
-    // GVectorGrid expects [ngz, ngy, ngx]
-    let wave_grid = GVectorGrid::new([ngz, ngy, ngx], cell.recip_lattice);
+    // GVectorGrid expects positional (ngx, ngy, ngz)
+    let wave_grid = GVectorGrid::new(ngx, ngy, ngz, cell.recip_lattice);
 
     // Fine grid from .check file
     let fine_grid_dims = fx
@@ -154,7 +157,7 @@ pub fn build_scf_state(fx: &Cu111CoFixture) -> ScfIteration {
         .fine_grid
         .expect(".check must have fine_grid");
     let [fgx, fgy, fgz] = fine_grid_dims;
-    let fine_grid = GVectorGrid::new([fgz, fgy, fgx], cell.recip_lattice);
+    let fine_grid = GVectorGrid::new(fgx, fgy, fgz, cell.recip_lattice);
 
     // Verify density grid matches wavefunction grid
     let den_grid = fx.bin.density.grid; // [ngx, ngy, ngz]
@@ -166,7 +169,7 @@ pub fn build_scf_state(fx: &Cu111CoFixture) -> ScfIteration {
 
     // Density from .castep_bin — try raw values (no volume normalization)
     let density = Density::from_inner(WaveGridArray::from_inner(
-        fx.bin.density.charge.as_array().clone(),
+        fx.bin.density.charge.as_real_grid().as_real_array().clone(),
     ));
 
     // Wavefunctions from .check (first k-point, first spin)

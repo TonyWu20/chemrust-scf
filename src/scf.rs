@@ -283,7 +283,7 @@ impl BuildVEff for SpinCollinear {
         // Phase 3+ will compute proper spin density from wavefunctions.
         let shape = [wave_grid.grid()[2], wave_grid.grid()[1], wave_grid.grid()[0]];
         let zero_spin = chemrust_hamiltonian_core::Density::from_inner(
-            Array3::zeros(shape),
+            chemrust_hamiltonian_core::fft::RealGrid::from_inner(Array3::zeros(shape)),
         );
         VEffBuilder::<SpinCollinear>::new(cell, pots, fine_grid)
             .assemble_on_fine_grid(rho, &zero_spin, wave_grid, fine_grid)
@@ -307,33 +307,34 @@ impl BuildVEffWithEnergy for NonSpin {
         rho: &chemrust_hamiltonian_core::Density,
         wave_grid: &GVectorGrid, fine_grid: &GVectorGrid,
     ) -> Result<(chemrust_hamiltonian_core::EffectivePotential, f64, f64, f64), chemrust_hamiltonian_core::Error> {
-        use chemrust_hamiltonian_core::{nlcc, upsample_density_to_fine_grid, xc, Density as CoreDensity};
+        use chemrust_hamiltonian_core::{nlcc, poisson, upsample_density_to_fine_grid, xc, Density as CoreDensity};
         let rho_fine =
-            upsample_density_to_fine_grid(rho.as_array(), wave_grid, fine_grid)
+            upsample_density_to_fine_grid(rho.as_real_grid(), wave_grid, fine_grid)
                 .map_err(|_| chemrust_hamiltonian_core::Error::Format {
                     section: "build_v_eff_with_energy".into(),
                     detail: "upsample failed".into(),
                 })?;
-        let result = VEffBuilder::<NonSpin>::new(cell, pots, fine_grid)
+        let v_eff = VEffBuilder::<NonSpin>::new(cell, pots, fine_grid)
             .with_density(CoreDensity::from_inner(rho_fine.clone()), None)
-            .assemble_with_energy()?;
-        // Compute double-counting terms: E_H and ∫ρV_xc
+            .assemble()?;
+        // Compute double-counting terms: E_H = 0.5·∫ρV_H and ∫ρV_xc
         let rho_core = nlcc::reconstruct_rho_core(cell, pots, fine_grid)?
             .into_inner();
         let density_total = CoreDensity::from_inner(rho_fine.clone() + &rho_core);
-        let v_xc = xc::compute_pbe_xc(density_total.as_array(), fine_grid, cell.volume)?;
-        let n_grid = density_total.as_array().len() as f64;
+        let v_h = poisson::solve_poisson(&CoreDensity::from_inner(rho_fine.clone()), fine_grid)?;
+        let v_xc = xc::compute_pbe_xc(density_total.as_real_grid().as_real_array(), fine_grid, cell.volume)?;
+        let n_grid = density_total.as_real_grid().as_real_array().len() as f64;
         let d_v = cell.volume / n_grid;
-        let e_hartree_raw: f64 = rho_fine.iter()
-            .zip(result.v_h.as_array().iter())
+        let e_hartree_raw: f64 = rho_fine.as_real_array().iter()
+            .zip(v_h.as_real_grid().as_real_array().iter())
             .map(|(&rv, &vh)| rv * vh * d_v)
             .sum();
         let e_hartree = 0.5 * e_hartree_raw;
-        let rho_vxc: f64 = rho_fine.iter()
+        let rho_vxc: f64 = rho_fine.as_real_array().iter()
             .zip(v_xc.v_xc.iter())
             .map(|(&rv, &vxc)| rv * vxc * d_v)
             .sum();
-        Ok((result.v_eff, v_xc.energy, e_hartree, rho_vxc))
+        Ok((v_eff, v_xc.energy, e_hartree, rho_vxc))
     }
 }
 
@@ -342,7 +343,7 @@ impl<S: SpinPolicy + BuildVEff> ScfIteration<S, Initialized, MixingOff> {
     /// Consumes `self`, returns a state in the `VEffBuilt` phase.
     pub fn build_v_eff(self) -> Result<ScfIteration<S, VEffBuilt, MixingOff>, Error> {
         let core_rho = chemrust_hamiltonian_core::Density::from_inner(
-            self.density.as_wave_array().clone(),
+            chemrust_hamiltonian_core::fft::RealGrid::from_inner(self.density.as_wave_array().clone()),
         );
         let v_eff = S::build_v_eff_impl(
             &self.cell, &self.pots, &core_rho,
@@ -363,7 +364,7 @@ impl ScfIteration<NonSpin, Initialized, MixingOff> {
     /// These are needed by `check()` for total energy computation.
     pub fn build_v_eff_with_energy(self) -> Result<ScfIteration<NonSpin, VEffBuilt, MixingOff>, Error> {
         let core_rho = chemrust_hamiltonian_core::Density::from_inner(
-            self.density.as_wave_array().clone(),
+            chemrust_hamiltonian_core::fft::RealGrid::from_inner(self.density.as_wave_array().clone()),
         );
         let (v_eff, e_xc, e_hartree, rho_vxc) = NonSpin::build_v_eff_with_energy_impl(
             &self.cell, &self.pots, &core_rho,
@@ -402,7 +403,7 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
         // Extract V_eff as raw Array3<f64> via SpinPolicy::v_eff_for_spin
         let v_eff_ref = self.v_eff.as_ref().expect("VEffBuilt phase guarantees v_eff is Some");
         let v_eff_spin = S::v_eff_for_spin(v_eff_ref, 0);
-        let v_eff_arr = v_eff_spin.as_array();
+        let v_eff_arr = v_eff_spin.as_real_grid().as_real_array();
 
         // PCI-E transfer tracker (catches unexpected H2D/D2H in the hot path)
         let mut pcie = PcieAccount::default();
@@ -427,10 +428,15 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
         let psi_gpu = Gpu::from_host_with(&self.psi, &stream, &mut pcie)?;
 
         // V_NL precomputation (CPU, uses chemrust-hamiltonian, one-time cost)
+        // Pass the downsampled V_eff for D-matrix screening (D = D0 + ∫ Q·V_eff).
+        let v_eff_for_d = chemrust_hamiltonian_core::EffectivePotential::from_inner(
+            chemrust_hamiltonian_core::fft::RealGrid::from_inner(v_eff_wave.as_fine_array().clone()),
+        );
         let vnl_data = VnlBatchData::precompute(
             &pw_coords, &self.pots, &self.cell,
             &self.wave_grid, &self.k_point,
             &psi_host, n_bands, n_pw, occupations,
+            Some(&v_eff_for_d),
             &stream, &mut pcie,
         )?;
 
@@ -455,7 +461,7 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
 
         // Rayleigh-Ritz
         let (psi_new_gpu, eigenvalues_cpu) = rayleigh_ritz(
-            &psi_filtered_row, &hpsi_row,
+            &psi_filtered_row, &hpsi_row, &vnl_data,
             n_bands, n_pw, &kernels,
             &mut pcie,
             &solver, &blas, &stream, &ctx,
@@ -482,7 +488,7 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
         let fft_idx_bytes = self.pw_fft_indices.len() * std::mem::size_of::<i32>();
         let kinetic_bytes = n_pw * std::mem::size_of::<f64>();
         let vnl_bytes: usize = vnl_data.entries.iter()
-            .map(|e| (e.beta_g.len() + e.d_matrix.len()) * 16)
+            .map(|e| (e.beta_g.len() + e.d_matrix.len() + e.q_matrix.len() + e.s_inv_mat.len()) * 16)
             .sum();
         assert_eq!(
             pcie.h2d_bytes,
@@ -494,6 +500,55 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
         next.psi = psi_new;
         next.eigenvalues = eigenvalues;
         Ok(next)
+    }
+
+    /// Diagnostic-only: run one application of H = T + V_loc + V_NL on the
+    /// current `psi` (no Chebyshev recurrence, no Rayleigh-Ritz mixing) and
+    /// return per-band components useful for direct ⟨ψ_b|H|ψ_b⟩ analysis.
+    ///
+    /// Returns `(hpsi_t, hpsi_tv, hpsi_full)` in column-major (n_bands × n_pw)
+    /// layout matching `psi.data`.
+    #[doc(hidden)]
+    pub fn apply_h_components_for_test(
+        &self,
+        occupations: Option<&[f64]>,
+    ) -> Result<crate::eigensolver::chebyshev::HComponentsForTest, Error> {
+        let ctx = Arc::new(CudaContext::new(0)?);
+        let stream = ctx.default_stream();
+        let blas = BlasHandle::new(stream.clone())?;
+        let kernels = CudaKernelSet::new(&ctx)?;
+
+        // V_eff via SpinPolicy
+        let v_eff_ref = self.v_eff.as_ref().expect("VEffBuilt phase guarantees v_eff is Some");
+        let v_eff_spin = S::v_eff_for_spin(v_eff_ref, 0);
+        let v_eff_arr = v_eff_spin.as_real_grid().as_real_array();
+
+        let mut pcie = PcieAccount::default();
+        let v_eff_wave = downsample_array_to_wave_grid(v_eff_arr, &self.fine_grid, &self.wave_grid)?;
+        let v_eff_gpu = Gpu::from_host_with(&v_eff_wave, &stream, &mut pcie)?;
+        let psi_gpu = Gpu::from_host_with(&self.psi, &stream, &mut pcie)?;
+
+        let v_eff_for_d = chemrust_hamiltonian_core::EffectivePotential::from_inner(
+            chemrust_hamiltonian_core::fft::RealGrid::from_inner(v_eff_wave.as_fine_array().clone()),
+        );
+        let psi_host = self.psi.data.clone();
+        let n_bands = self.psi.n_bands;
+        let n_pw = self.psi.n_pw;
+        let vnl_data = VnlBatchData::precompute(
+            &self.pw_coords, &self.pots, &self.cell,
+            &self.wave_grid, &self.k_point,
+            &psi_host, n_bands, n_pw, occupations,
+            Some(&v_eff_for_d),
+            &stream, &mut pcie,
+        )?;
+
+        let fft_idx_dev: CudaSlice<i32> = stream.clone_htod(&self.pw_fft_indices)
+            .map_err(Error::Cuda)?;
+
+        crate::eigensolver::chebyshev::apply_h_components_for_test(
+            &psi_gpu, &v_eff_gpu, &self.wave_grid, &self.pw_coords,
+            &vnl_data, &fft_idx_dev, &kernels, &blas, &stream,
+        )
     }
 }
 
@@ -1043,8 +1098,14 @@ pub fn downsample_array_to_wave_grid(
     let [ngz, ngy, ngx] = wave_grid.grid();
     let [ngz_f, ngy_f, ngx_f] = fine_grid.grid();
 
+    // Same grid → no downsampling needed, return as-is.
+    if ngz == ngz_f && ngy == ngy_f && ngx == ngx_f {
+        return Ok(EffectivePotential::from_inner(FineGridArray::from_inner(fine_arr.clone())));
+    }
+
     // Forward FFT fine-grid V_eff → G-space
-    let fine_g = fft_forward_3d(fine_arr).map_err(|_| Error::NotImplemented)?;
+    let fine_g = fft_forward_3d(&chemrust_hamiltonian_core::fft::RealGrid::from_inner(fine_arr.clone()))
+        .map_err(|_| Error::NotImplemented)?;
 
     // Truncate: copy only wave-grid G-vectors to a new G-space array
     let mut wave_g = Array3::<Complex64>::zeros((ngz, ngy, ngx).f());
@@ -1061,13 +1122,14 @@ pub fn downsample_array_to_wave_grid(
             let ix_f = f2ix(fx, ngx_f);
             let iy_f = f2ix(fy, ngy_f);
             let iz_f = f2ix(fz, ngz_f);
-            *coeff = fine_g[[iz_f, iy_f, ix_f]];
+            *coeff = fine_g.as_recip_array()[[iz_f, iy_f, ix_f]];
         });
 
     // Inverse FFT back to real space on wave grid
     let n_total_fine = (ngx_f * ngy_f * ngz_f) as f64;
-    let rho_wave = fft_inverse_3d(&wave_g).map_err(|_| Error::NotImplemented)?;
-    let result = rho_wave.mapv(|x| x / n_total_fine);
+    let rho_wave = fft_inverse_3d(&chemrust_hamiltonian_core::fft::RecipGrid::from_inner(wave_g))
+        .map_err(|_| Error::NotImplemented)?;
+    let result = rho_wave.into_inner().mapv(|x| x / n_total_fine);
 
     Ok(EffectivePotential::from_inner(FineGridArray::from_inner(result)))
 }
@@ -1145,7 +1207,7 @@ mod tests {
 
     fn dummy_grid() -> GVectorGrid {
         GVectorGrid::new(
-            [4, 4, 4],
+            4, 4, 4,
             chemrust_hamiltonian_core::RecipLattice::from_inner([
                 [0.2, 0.0, 0.0], [0.0, 0.2, 0.0], [0.0, 0.0, 0.2],
             ]),

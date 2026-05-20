@@ -39,7 +39,7 @@ fn dummy_cell() -> CellGeometry {
 /// A 4×4×6 wavefunction FFT grid (non-cubic, Fortran layout [ngz, ngy, ngx]).
 fn dummy_wave_grid() -> GVectorGrid {
     GVectorGrid::new(
-        [6, 4, 4],
+        4, 4, 6,
         RecipLattice::from_inner([
             [0.2, 0.0, 0.0],
             [0.0, 0.2, 0.0],
@@ -51,7 +51,7 @@ fn dummy_wave_grid() -> GVectorGrid {
 /// An 8×8×12 fine FFT grid (2× upsampled).
 fn dummy_fine_grid() -> GVectorGrid {
     GVectorGrid::new(
-        [12, 8, 8],
+        8, 8, 12,
         RecipLattice::from_inner([
             [0.2, 0.0, 0.0],
             [0.0, 0.2, 0.0],
