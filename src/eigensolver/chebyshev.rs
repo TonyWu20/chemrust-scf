@@ -1172,6 +1172,41 @@ pub(crate) fn chebyshev_filter(
     stream.memcpy_dtod(final_psi, &mut psi_row_dev).map_err(Error::Cuda)?;
     stream.memcpy_dtod(&hpsi_dev, &mut hpsi_row_dev).map_err(Error::Cuda)?;
 
+    // Normalize each band so S_sub = ψ†ψ is well-conditioned for ZHEGVD.
+    // The Chebyshev filter amplifies the wanted subspace by T_ndeg(σ) which
+    // can reach ~2700× for ndeg=8, making S_sub nearly singular otherwise.
+    // Scale both ψ_b and Hψ_b by 1/‖ψ_b‖ so each band has unit norm.
+    unsafe {
+        let (psi_ptr, _) = psi_row_dev.device_ptr_mut(stream);
+        let (hpsi_ptr, _) = hpsi_row_dev.device_ptr_mut(stream);
+        for b in 0..n_bands {
+            let offset = (b * n_pw) as isize;
+            let p = (psi_ptr as *mut CudaComplex).offset(offset);
+            let hp = (hpsi_ptr as *mut CudaComplex).offset(offset);
+            let mut dot = CudaComplex { x: 0.0, y: 0.0 };
+            cudarc::cublas::sys::cublasZdotc_v2(
+                blas.raw_handle(), n_pw_i32,
+                p as *const _, 1,
+                p as *const _, 1,
+                &mut dot as *mut _ as *mut _,
+            ).result().map_err(Error::Blas)?;
+            let norm = dot.x.sqrt();
+            if norm > 1e-30 {
+                let inv_norm = CudaComplex { x: 1.0 / norm, y: 0.0 };
+                cudarc::cublas::sys::cublasZscal_v2(
+                    blas.raw_handle(), n_pw_i32,
+                    &inv_norm as *const _ as *const _,
+                    p as *mut _, 1,
+                ).result().map_err(Error::Blas)?;
+                cudarc::cublas::sys::cublasZscal_v2(
+                    blas.raw_handle(), n_pw_i32,
+                    &inv_norm as *const _ as *const _,
+                    hp as *mut _, 1,
+                ).result().map_err(Error::Blas)?;
+            }
+        }
+    }
+
     // Wrap into Gpu<WavefunctionSet<L>>
     let psi_row = Gpu::<WavefunctionSet<RowDistributed>> {
         slice: psi_row_dev,
