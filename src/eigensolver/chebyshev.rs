@@ -329,7 +329,6 @@ pub(crate) fn compute_spectral_bounds(
 /// n_bands plan used by the main Chebyshev recurrence.
 #[allow(clippy::too_many_arguments)]
 unsafe fn lanczos_upper_bound(
-    psi_dev: &CudaSlice<CudaComplex>,   // starting vector (first band, n_pw elements)
     v_eff_dev: &CudaSlice<f64>,
     kinetic_dev: &CudaSlice<f64>,
     fft_idx_dev: &CudaSlice<i32>,
@@ -356,10 +355,20 @@ unsafe fn lanczos_upper_bound(
     let mut hv: CudaSlice<CudaComplex> = stream.alloc_zeros(n_pw).map_err(Error::Cuda)?;
     let mut grid1: CudaSlice<CudaComplex> = stream.alloc_zeros(grid_size).map_err(Error::Cuda)?;
 
-    // Copy first band of psi_dev into v_cur
+    // Use a deterministic pseudo-random starting vector so Lanczos explores
+    // the full spectrum. Using the first band (lowest eigenstate) as start
+    // causes Lanczos to converge to λ_min, giving b_up ≈ λ_min + ε << λ_max.
     {
-        let src = psi_dev.slice(0..n_pw);
-        stream.memcpy_dtod(&src, &mut v_cur).map_err(Error::Cuda)?;
+        let rand_cpu: Vec<CudaComplex> = (0..n_pw)
+            .map(|i| {
+                // Simple deterministic sequence with good spectral coverage
+                let t = (i as f64 * 2.399963) % (2.0 * std::f64::consts::PI);
+                CudaComplex { x: t.cos(), y: t.sin() }
+            })
+            .collect();
+        stream.clone_htod(&rand_cpu)
+            .map(|s| { let _ = stream.memcpy_dtod(&s, &mut v_cur); })
+            .map_err(Error::Cuda)?;
     }
 
     // Normalise v_cur
@@ -1021,7 +1030,7 @@ pub(crate) fn chebyshev_filter(
     if ndeg > 0 {
         let lanczos_result = unsafe {
             lanczos_upper_bound(
-                &psi_input, v_eff_dev, &kinetic_dev, fft_idx_dev,
+                v_eff_dev, &kinetic_dev, fft_idx_dev,
                 n_pw, grid_size, inv_ntotal,
                 ngx, ngy, ngz,
                 vnl_data, blas, kernels, stream,

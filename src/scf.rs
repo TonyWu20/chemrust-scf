@@ -472,6 +472,10 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
         let eig_bytes = n_bands * 8;
         let Cpu(psi_new) = psi_new_gpu.sync_to_host_with(&stream, &mut pcie)?;
         let eigenvalues = eigenvalues_cpu.into_inner();
+        eprintln!("[RR] eigenvalues: first={:.4e} Ha  last={:.4e} Ha  count={}",
+            eigenvalues.first().copied().unwrap_or(f64::NAN),
+            eigenvalues.last().copied().unwrap_or(f64::NAN),
+            eigenvalues.len());
 
         // Assert: hot path should only have setup H2D + final D2H.
         // Any additional transfer (e.g. D2H inside the Chebyshev loop) is a bug.
