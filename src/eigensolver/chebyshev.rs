@@ -361,14 +361,12 @@ unsafe fn lanczos_upper_bound(
     {
         let rand_cpu: Vec<CudaComplex> = (0..n_pw)
             .map(|i| {
-                // Simple deterministic sequence with good spectral coverage
                 let t = (i as f64 * 2.399963) % (2.0 * std::f64::consts::PI);
                 CudaComplex { x: t.cos(), y: t.sin() }
             })
             .collect();
-        stream.clone_htod(&rand_cpu)
-            .map(|s| { let _ = stream.memcpy_dtod(&s, &mut v_cur); })
-            .map_err(Error::Cuda)?;
+        let rand_dev = stream.clone_htod(&rand_cpu).map_err(Error::Cuda)?;
+        stream.memcpy_dtod(&rand_dev, &mut v_cur).map_err(Error::Cuda)?;
     }
 
     // Normalise v_cur
