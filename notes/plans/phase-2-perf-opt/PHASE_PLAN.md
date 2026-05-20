@@ -37,9 +37,13 @@ hide this on those fixtures.
 
 Two implementation options, pick during exploration:
 
-- **Goal 2a (cheap, first):** rayon-parallelize the radial sum over the
-  species-pair index (`compute_beta_g`, `precompute_q_on_grid`,
-  `compute_screened_d_from_fft` ion loops). On 8-core, expect 4–8×.
+- **Goal 2a (cheap, first):** rayon-parallelize tasks with small
+  per-task working sets only — `compute_beta_g` (per-ion G-vector
+  projection) and `precompute_q_on_grid` (per-species radial Bessel
+  transform on log grid). On 8-core, expect 4–8× on these loops.
+  Explicitly *not* the fine-grid FFT loops — see Design Notes (rayon
+  scope) for the memory-overhead constraint that killed the previous
+  attempt.
 - **Goal 2b (only if needed):** GPU-port `precompute_q_on_grid` radial
   Bessel transform kernel. Only do this if Goal 2a + a multi-species
   fixture profile shows the radial transform still dominant.
@@ -128,14 +132,25 @@ Empirically measure on test GPU after Goal 1 lands, then set budget at
   (geometry-static), tracked separately from per-iter assertion. ω^I and
   ρ_aug stay GPU-resident → zero per-iter PCI-E for the augmentation
   channel.
-- **rayon scope (Goal 2a):** thread the per-species `precompute_q_on_grid`
-  loop and the per-ion `compute_screened_d_from_fft` loop with
-  `par_iter`. Note: chemrust-hamiltonian has a "no `for` loop rule"
-  (commit `6b16508`) — combinators are already idiomatic, rayon
-  composes via `par_iter().map(...).collect()`. The recently reverted
-  `compute_screened_d_from_fft` rayon (commit `d73d42a`) should be
-  investigated: why was it reverted? Re-enable carefully if the regression
-  it caused is now understood.
+- **rayon scope (Goal 2a):** thread only loops where each task's
+  working set is small. Specifically:
+  - **Eligible:** per-species `precompute_q_on_grid` radial Bessel
+    transform (small log-grid arrays per task), per-ion `compute_beta_g`
+    (G-vector projection sums, no fine grid).
+  - **Not eligible:** the per-ion FFT loop inside
+    `compute_screened_d_from_fft`. Rayon was tried there
+    (chemrust-hamiltonian `a50cc05`) and reverted (`d73d42a`) because
+    each thread needs its own fine-grid FFT scratch (~28 MB at Cu111_CO
+    437k Complex128) and the memory pressure overwhelmed the parallel
+    speedup. The same constraint applies to any task that allocates a
+    full fine-grid buffer per iteration.
+  - **Guard:** before adding `par_iter` anywhere, audit the per-task
+    allocation footprint. Per-task memory > a few MB is a red flag.
+    Document the per-task footprint in the commit message so future
+    re-parallelization attempts have the data.
+  - Note: chemrust-hamiltonian has a "no `for` loop rule" (commit
+    `6b16508`) — combinators are already idiomatic, rayon composes via
+    `par_iter().map(...).collect()`.
 - **Multi-species fixture choice:** prefer NiO (2 species, 4 atoms,
   smaller cell than Fe2O3) for the first cross-check — fast to load
   and exercises species-pair index without slowing the iteration loop.
