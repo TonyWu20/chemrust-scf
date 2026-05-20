@@ -575,6 +575,89 @@ carries `next_mixing`.
 
 ### Group F — CASTEP Validation (Goal 6)
 
+> **Source-audited 2026-05-20.**  Read the actual CASTEP `.castep` file
+> (lines 286–324) for the SCF output format, verified `.check` stores
+> only converged state, checked grid-indexing conventions in
+> `castep_bin/density.rs` and `scf.rs`, traced `compute_occupations`
+> call graph to find missing Fermi energy plumbing.
+
+**Source references:**
+- `Cu111_CO.castep:286-324` — SCF convergence output format
+- `castep_bin/density.rs:193-223` — `reconstruct_density` grid transposition
+- `castep_bin/parameters.rs:118` — `field_meta.grid` stored as `[ngx, ngy, ngz]`
+- `scf.rs:917-931` — `pw_coords_to_fft_indices` C-order FFT index convention
+- `density.rs:39-46,50-75` — `compute_occupations` discards chemical potential μ
+
+**`.check` caveat:** The `.check` file stores the **converged** state (dumped at
+end of calculation, `Cu111_CO.castep` line 333).  Loading it and running one SCF
+iteration tests fixed-point stability, not convergence dynamics.  CASTEP's initial
+SCF (pseudoatomic calculations, atomic-superposition starting density) is not
+implemented in chemrust-hamiltonian.  F-3 addresses this with a perturbation-recovery
+test.
+
+#### F-0: Per-iteration SCF tracing output
+
+**Kind:** direct
+
+**Guidance:** Add `tracing`-based per-iteration output to `run_scf_with_energy`
+matching CASTEP's SCF column format (`.castep` lines 286–324):
+
+```
+------------------------------------------------------------------------ <-- SCF
+SCF loop      Energy           Fermi           Energy gain       Timer   <-- SCF
+                               energy          per atom          (sec)   <-- SCF
+------------------------------------------------------------------------ <-- SCF
+      1  -2.30069691E+004  2.36299163E+000   6.15319444E+001      25.03  <-- SCF
+```
+
+Columns: iteration, total energy (eV), Fermi energy (eV), energy gain per atom
+(eV), wall time (sec).  CASTEP prints free energy (E−TS) in this table; we print
+total electronic energy.
+
+At `tracing::debug!` level, emit energy decomposition:
+```
+  E_band={:.8E}  -E_H={:.8E}  E_xc={:.8E}  -∫ρVxc={:.8E}  E_ewald={:.8E}
+```
+
+**Prerequisites (included in this task):**
+
+1. Add `tracing = { version = "0.1", default-features = false, features =
+   ["std"] }` to `Cargo.toml`.
+
+2. Add domain newtypes to `src/types.rs`:
+   - `Occupations(Vec<f64>)` — occupation numbers per band
+   - `ChemicalPotential(f64)` — chemical potential μ from smearing search (Hartree)
+
+3. Add unit constants to `src/energy.rs`:
+   - `pub(crate) const EV_TO_HARTREE: f64 = 1.0 / 27.211384;`
+   - `pub(crate) const HARTREE_TO_EV: f64 = 27.211384;`
+   
+   Re-export both from `src/lib.rs`.
+
+4. Add `fermi_energy: Option<f64>` field to `ScfIteration`, plumb through
+   `into_phase` and constructor.
+
+5. Change `compute_occupations` return type from `Vec<f64>` to
+   `(Occupations, ChemicalPotential)`.  Update both call sites in `scf.rs`
+   (`compute_density_from_wavefunctions` and `check()`) to store `mu.0`
+   as `self.fermi_energy`.
+
+6. In `run_scf_with_energy`: add `Instant` timer, iteration counter, header
+   print on first iteration, per-iteration `tracing::info!` after `check()`.
+
+Output is gated on `RUST_LOG=info` (no output by default).
+
+**Files:** `Cargo.toml`, `src/types.rs`, `src/energy.rs`, `src/density.rs`,
+`src/scf.rs`, `src/lib.rs`
+
+**Success Criteria:**
+- `RUST_LOG=info cargo test ...` emits one line per SCF iteration in CASTEP format
+- `RUST_LOG=debug cargo test ...` additionally emits energy decomposition
+- Fermi energy column is non-zero and physically reasonable (~ -0.12 Hartree for Cu111_CO)
+- `cargo check` — no unused field warnings on `fermi_energy`
+
+---
+
 #### F-1: Fixture loading infrastructure
 
 **Kind:** design
@@ -582,23 +665,74 @@ carries `next_mixing`.
 **Guidance:** Build test helpers to load Cu111_CO reference data.
 
 Reuse chemrust-hamiltonian's:
-- `castep_bin::CastepBinFile::read()` — reads `.castep_bin` for cell data,
-  wavefunction coefficients, eigenvalues
-- `formatted::parse_den_fmt()` — reads `.den_fmt` → reference density
-- `formatted::parse_pot_fmt()` — reads `.pot_fmt` → reference V_eff
-- `PseudopotentialSet::from_directory()` — loads USP files
+- `CastepBinFile::read()` — reads `.castep_bin` for cell, density, eigenvalues
+- `CheckFile::read()` — reads `.check` for wavefunctions, fine_grid
+- `formatted::parse_den_fmt()` — reads `.den_fmt` → reference density (fine grid)
+- `formatted::parse_pot_fmt()` — reads `.pot_fmt` → reference V_eff (fine grid)
+- `ParsedotentialSet::from_dir()` — loads USP files
 
-Constants:
+**Grid reordering (critical):**
+
+| Source | Convention |
+|--------|-----------|
+| CASTEP `FieldMetadata.grid` | `[ngx, ngy, ngz]` |
+| CASTEP `ElectronDensity.charge` (Array3 shape) | `(ngx, ngy, ngz)` |
+| scf `GVectorGrid::grid()` | `[ngz, ngy, ngx]` |
+| scf `Density` (Array3 shape, from `construct_density_gpu:177`) | `(ngx, ngy, ngz)` |
+
+**Conversion rules:**
+- `GVectorGrid::new([ngz, ngy, ngx], recip)` where `[ngx, ngy, ngz] = field_meta.grid`
+- Density Array3: same shape convention — **no transpose needed**
+- `WavefunctionCoeffs.grid` and `.check` `fine_grid`: reorder `[ngx, ngy, ngz]` → `[ngz, ngy, ngx]`
+
+Verify grid shapes with runtime assertions at fixture load time.
+
+**Cached struct** (`OnceLock` — stable since Rust 1.80, available in edition 2024):
+
+```rust
+pub struct Cu111CoFixture {
+    pub bin: CastepBin,              // .castep_bin
+    pub check: CastepBin,            // .check (155 MB, wavefunction + fine_grid)
+    pub pot_fmt: Array3<f64>,        // .pot_fmt reference V_eff (fine grid)
+    pub den_fmt: ElectronDensity,    // .den_fmt reference density (fine grid)
+    pub bands_eigenvalues: Vec<f64>, // .bands eigenvalues in Hartree
+    pub pots: PseudopotentialSet,
+}
+```
+
+**`build_scf_state` helper:**
+1. Cell from `fx.bin.cell`, pots from `fx.pots`
+2. Wave grid: reorder `field_meta.grid` → `GVectorGrid::new([ngz, ngy, ngx], recip)`
+3. Fine grid: reorder `fx.check.fine_grid.unwrap()` → `GVectorGrid::new(...)`
+4. Density: wrap `fx.bin.density.charge.as_array().clone()` — no transpose
+5. Wavefunctions from `fx.check.wavefunction.unwrap().kpt_data[0]` (Gamma-only):
+   - `pw_coords = kpt_block.pw_grid_coord.clone()`
+   - `pw_fft_indices = pw_coords_to_fft_indices(&pw_coords, &wave_grid)`
+   - `psi = WavefunctionSet::<ColumnDistributed>::new(kpt_block.bands.concat(), n_bands, nplw)`
+6. Smearing: Gaussian, 0.1 eV width (CASTEP default, `.castep` line 154)
+7. `ScfIteration::builder()...build()`
+
+**Visibility:** Change `pw_coords_to_fft_indices` from `pub(crate)` to
+`#[doc(hidden)] pub` in `src/scf.rs:917`; re-export from `src/lib.rs`.
+
+**Constants:**
 - Fixture dir: `/export/public_castep_jobs/tony/Cu111_CO_SinglePoint/`
-- Reference energy: `-24110.96665069 eV` (18 atoms: Cu(111) slab + CO)
+  (overridable via `CASTEP_FIXTURE_DIR` env var)
+- Pseudopotential dir: `/export/Potentials/` (overridable via `CASTEP_POTENTIAL_DIR`)
+- Reference energy: `-24110.96665069 eV` (Cu111_CO.castep line 326, 18 ions)
 - Tolerance: 2e-4 eV total
 
-**Files:** `tests/fixtures/cu111_mod.rs` (module with loading helpers)
+**Files:** `tests/fixtures/mod.rs`, `tests/fixtures/cu111_co.rs`,
+`src/scf.rs` (visibility), `src/lib.rs` (re-export)
 
 **Success Criteria:**
-- Parse CASTEP binary format, extract cell, ψ, eigenvalues
-- Load reference V_eff from `.pot_fmt` matches internal VEffBuilder output
-- Load reference density from `.den_fmt`
+- Parse `.castep_bin` + `.check` → cell, density, ψ, eigenvalues, fine_grid
+- Parse `.pot_fmt` → reference V_eff array on fine grid
+- Parse `.den_fmt` → reference density on fine grid
+- Parse `.bands` → 160 eigenvalues in Hartree
+- Load USP pseudopotentials for Cu, C, O
+- `build_scf_state` produces valid `ScfIteration<NonSpin, Initialized, MixingOff>`
+- Grid shape assertions pass at load time
 
 ---
 
@@ -606,42 +740,68 @@ Constants:
 
 **Kind:** direct
 
-**Guidance:** Integration test that runs one SCF iteration and compares
-each step against CASTEP reference:
-1. Load initial state from fixtures
-2. `build_v_eff` → compare V_eff against `.pot_fmt` (H2D then D2H for
-   comparison — use absolute tolerance for FP differences)
-3. `diagonalize` → compare eigenvalues against `.bands` (within 1e-4 eV)
-4. `construct_density` → compare ρ_new against `.den_fmt`
+**Guidance:** Integration test (`#[ignore]` — requires GPU) running three
+sub-tests, each comparing one SCF step against CASTEP reference.
 
-**Files:** `tests/single_iteration_validation.rs`
+GPU detection: `cudarc::driver::CudaContext::new(0).is_ok()` inside
+`catch_unwind` → skip if unavailable.
+
+**Test 2a — `compare_v_eff_against_pot_fmt`:**
+1. `state.build_v_eff()` → extract V_eff as `&Array3<f64>`
+2. Reference: `fx.pot_fmt` (fine grid)
+3. Assert `max_abs_diff < 1e-3` Hartree, `rms_diff < 1e-4` Hartree
+   (pseudopotential interpolation differences, same physics)
+
+**Test 2b — `compare_eigenvalues_against_bands`:**
+1. `state.build_v_eff()?.diagonalize(8)`
+2. Compare `diag_state.eigenvalues` vs `fx.bands_eigenvalues` (both Hartree)
+3. Assert RMS diff < 5e-3 Hartree (~0.14 eV)
+4. Assert fewer than 5% of bands exceed 0.1 eV individual diff
+
+**Test 2c — `compare_density_against_castep_bin`:**
+1. `state.build_v_eff()?.diagonalize(8)?.construct_density_off()`
+2. Compare computed density vs `fx.bin.density.charge.as_array()` (wave grid)
+3. Assert RMS diff < 1e-5 e/Bohr³
+4. Assert |∫ρ_computed − ∫ρ_ref| < 0.1 e
+
+**Files:** `tests/ca_step_validation.rs`
 
 **Success Criteria:**
-- All three comparisons pass with per-type tolerances
+- All three sub-tests pass on GPU-equipped machine
+- Tolerances calibrated against known CASTEP–chemrust differences
 
 ---
 
-#### F-3: Full SCF convergence test
+#### F-3: SCF convergence tests
 
 **Kind:** direct
 
-**Guidance:** Integration test that runs `run_scf` to convergence and
-compares final total energy against CASTEP reference.
+**Guidance:** Two sub-tests (`#[ignore]` — requires GPU).  The `.check`
+caveat means we cannot test convergence from CASTEP's actual starting point,
+so we test both fixed-point stability and perturbation recovery.
 
-```
-let state: ScfIteration = load_cu111_state()?;
-let result = run_scf(state, ndeg=8, tol=1e-8)?;
-let diff = (result.total_energy - (-24110.96665069)).abs();
-assert!(diff < 2e-4, "...");
-```
+**Test 3a — `fixed_point_matches_castep_energy`:**
+Load converged state, run `run_scf_with_energy(state, ndeg=8, tol=1e-8)`.
+Assert `|result.total_energy * HARTREE_TO_EV - (-24110.96665069)| < 2e-4`.
+Converges in 1–3 iterations (state is already at the fixed point).
 
-**Files:** `tests/full_scf_validation.rs`
+**Test 3b — `perturbation_recovers_castep_energy`:**
+1. Load converged state
+2. Apply 5% multiplicative noise to density: `ρ(r) *= 1.0 ± 0.05`
+3. Renormalize to preserve total charge
+4. Run `run_scf_with_energy` → assert energy recovers within 2e-4 eV
+5. Assert iteration count > 1 (noise pushed off fixed point)
+
+The noise amplitude (5%) is small enough that DIIS can recover but large enough
+to test real convergence dynamics.  CASTEP's Pulay mixing amplitude of 0.5
+suggests the SCF can handle ~50% perturbations.
+
+**Files:** `tests/ca_scf_convergence.rs`
 
 **Success Criteria:**
-- SCF converges within 50 iterations (CASTEP converges in 17)
-  (First run: may need more iterations due to GPU prelim stages —
-  the 50-iteration limit is generous)
-- Total energy within 2e-4 eV of -24110.96665069 eV
+- Fixed-point: energy matches CASTEP reference within 2e-4 eV
+- Perturbation: energy recovers within 2e-4 eV, more than 1 iteration
+- Both tests pass on GPU-equipped machine
 
 ## Exploration Notes
 
@@ -694,6 +854,28 @@ assert!(diff < 2e-4, "...");
 - **GPU mixing FFT cost:** One cuFFT R2C + one C2R per mix call.  Acceptable
   for Phase 2 since VEffBuilder already does D2H/H2D for CPU FFT (rustfft).
   Phase 3 can fuse the V_eff FFT with the mixing FFT.
+- **Group F source audit (2026-05-20):** Read `Cu111_CO.castep` lines 286–324
+  for actual SCF output format (not the generic format assumed before).  Key
+  findings:
+  - CASTEP's SCF loop took **33 iterations** to converge (not 50), from initial
+    energy −21899.39 eV to final free energy −24111.22 eV.
+  - Columns: iteration, free energy E−TS (eV), Fermi energy (eV), energy gain
+    per atom (eV), cumulative wall time (sec).
+  - CASTEP SCF free energy differs from `Final energy, E` by ~0.25 eV (TS term
+    from Gaussian smearing).  We output total electronic energy, not free energy.
+  - `.check` file stores **converged** state only — loading it tests the fixed
+    point, not convergence dynamics.  Perturbation-recovery test (F-3b) is the
+    practical workaround until chemrust has its own initial-SCF.
+  - Grid conventions: `FieldMetadata.grid` is `[ngx, ngy, ngz]`; `GVectorGrid`
+    expects `[ngz, ngy, ngx]`.  Density Array3 shapes match (both `(ngx, ngy, ngz)`)
+    so no transpose needed for density — only for grid construction.
+  - `compute_occupations` computed chemical potential μ (Fermi energy) but
+    discarded it.  Added `ChemicalPotential` newtype + `fermi_energy` field to
+    `ScfIteration` so the per-iteration output can display it.
+  - Added `Occupations(Vec<f64>)` and `ChemicalPotential(f64)` newtypes to
+    avoid bare tuples — consistent with project's granular newtype convention.
+  - Added `EV_TO_HARTREE` / `HARTREE_TO_EV` constants to `src/energy.rs` as
+    single source of truth, re-exported from `lib.rs`.
 
 ## Verification
 
@@ -703,16 +885,13 @@ cargo check                              # Must succeed
 cargo clippy --workspace -- -D warnings  # Must succeed (0 warnings)
 cargo test                               # GPU tests require CUDA-capable GPU
 
-# Specific validation:
-cargo test cu111_co_full_scf             # Full SCF convergence test
-cargo test single_iteration_validation   # Per-step comparison against CASTEP
+# Specific validation (GPU required, per-iteration output enabled):
+RUST_LOG=info cargo test compare_v_eff_against_pot_fmt -- --ignored
+RUST_LOG=info cargo test compare_eigenvalues_against_bands -- --ignored
+RUST_LOG=info cargo test compare_density_against_castep_bin -- --ignored
+RUST_LOG=info cargo test fixed_point_matches_castep_energy -- --ignored
+RUST_LOG=info cargo test perturbation_recovers_castep_energy -- --ignored
 
-# Expected output (first run, before all transitions are filled):
-# - A-1, A-2, A-3: compile-only, no runtime test
-# - A-4: nix develop enters CUDA shell
-# - B-2, B-3, B-4, B-5: per-cuFFT/cuBLAS/cuSOLVER unit tests
-# - C-1, C-2: diagonalize integration test
-# - D-1, D-2: density + V_eff tests
-# - E-1, E-2: mixing + check tests
-# - F-1, F-2, F-3: full validation against CASTEP
+# All GPU tests with energy decomposition:
+RUST_LOG=debug cargo test -- --ignored
 ```

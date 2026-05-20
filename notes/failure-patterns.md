@@ -1,0 +1,26 @@
+# Failure Patterns
+
+## 2026-05-20: spectral-bounds-not-root-cause-of-eigenvalue-errors
+**Root cause**: Spectral bounds were implicated as cause of eigenvalue errors, but bounds only affect convergence rate — the filter is a polynomial in H that preserves eigenvectors. Real cause was G-vector FFT index order + kinetic energy indexing (fixed in `5037e64`).
+**Fix**: `src/eigensolver/chebyshev.rs:246-283` — improved `compute_spectral_bounds` to use physically-grounded b_low on first iteration and `max_i Ritz_i` on subsequent iterations (matching CheFSI §5 step 11).
+**Pattern**: wrong-attribution — symptom (wrong eigenvalues) mismatched to hypothesis (spectral bounds). The debug-outcomes divergence-surface enumeration correctly ruled out spectral bounds before implementing the fix.
+
+## 2026-05-20: cufft-dim-ordering-and-rr-transpose-layout
+**Root cause**: Two compounding bugs that partially cancelled on the Cu111_CO non-cubic grid:
+  1. cuFFT plan dim ordering passed as `(ngz, ngy, ngx)` but our scatter formula `iz + ngz*(iy + ngy*ix)` makes `ngz` innermost — cuFFT expected `n[rank-1]` innermost so the plan should be `(ngx, ngy, ngz)`.
+  2. `transpose_col_to_row` CUDA kernel produced col-major (n_bands, n_pw) memory while Rayleigh-Ritz's gemm expected col-major (n_pw, n_bands). Result: H_sub and S_sub matrices were scrambled, ZHEGVD diagonalized garbage.
+**Fix**:
+  - `src/eigensolver/chebyshev.rs:844` and `src/density.rs:147` — swap to `(ngx, ngy, ngz)`.
+  - `src/eigensolver/chebyshev.rs:980` — replace transpose calls with memcpy (ColumnDistributed memory is already in the layout RR expects).
+  - `src/eigensolver/rayleigh_ritz.rs:269` — replace step 4-5 with direct `psi_new = psi_row · X` gemm in col-major (n_pw, n_bands) layout.
+**Pattern**: bug-cancellation. Fixing only the cuFFT plan dim made the Cu111_CO test result *worse* (band 1: -2.57 → -3.48 Ha), because the wrong cuFFT happened to feed the wrong RR transpose in a way that partially cancelled. This misled debugging until an isolated `cufft_dim_ordering_isolated_diagnostic` test (Phase G) and a brute-force `apply_h_components_for_test` that returns per-band `T`/`V_loc`/`V_NL` decompositions (Phase H) decoupled the two bugs. Lesson: when a "fix" makes things worse, suspect a second compounding bug rather than reverting.
+**Diagnostic anchors**: `tests/ca_step_validation.rs` → `cufft_dim_ordering_isolated_diagnostic`, `diagonal_h_expectation_gpu_vs_cpu`, `h_sub_off_diagonal_magnitude` (with `RR_DUMP_HS=1`).
+**Resolution**: see `notes/debug/debug-20260520-1923/RESOLUTION.md`.
+
+## 2026-05-20: dont-revert-empirically-correct-fix-on-regression
+**Pattern**: When a fix is independently verified correct by an isolated unit test (e.g. analytic match to 1e-15) but applying it to the full pipeline makes the end-to-end result *worse*, the right response is to **keep the fix and hunt for a second compounding bug** — not to revert. Two independent wrongs can partially cancel; reverting the correct fix restores the cancellation, hides the second bug, and traps the debug session in a loop blaming the already-correct component.
+**Concrete instance (this session)**: cuFFT plan dim swap from `(ngz, ngy, ngx)` to `(ngx, ngy, ngz)` was verified correct by `cufft_dim_ordering_isolated_diagnostic` (analytic match to 1e-15, only ordering of 6 permutations to do so). Applying the swap moved Cu111_CO band 1 from −2.57 Ha (closer to ref −1.06 Ha) to −3.48 Ha (further). Looked like a regression. Was actually unmasking the Rayleigh–Ritz transpose layout bug that had been hidden because wrong-cuFFT × wrong-RR partially cancelled. User explicitly directed: *"do not let the currently worse result intimidate you. Or things might be further convoluted with mutual canceling, shadowing the real cause."* That call was load-bearing — without it the RR bug stays hidden.
+**Counter-example boundary**: This applies when the fix has strong isolated evidence (analytic match, independent reference). A fix supported only by intuition or a single empirical check still warrants reconsideration on regression.
+**Action when triggered**: After a "fix-but-worse" outcome, the next diagnostic should isolate components downstream of the fix (here: H_sub/S_sub dump after gemm, per-band ⟨ψ|H|ψ⟩ decomposition) — not roll back.
+
+

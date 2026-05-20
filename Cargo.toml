@@ -12,6 +12,8 @@ thiserror = "2.0.18"
 bon = "3.9.1"
 libm = "0.2"
 cudarc = { version = "0.19.7", features = ["cuda-12090", "cublas", "cufft", "cusolver", "nvrtc"] }
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+rand = "0.8"
 
 [lib]
 name = "chemrust_scf"

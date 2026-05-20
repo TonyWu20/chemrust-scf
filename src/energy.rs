@@ -16,6 +16,11 @@
 
 use chemrust_hamiltonian_core::{CellGeometry, PseudopotentialSet};
 
+/// eV to Hartree conversion (1 eV = 1/27.211384 Hartree).
+pub const EV_TO_HARTREE: f64 = 1.0 / 27.211384;
+/// Hartree to eV conversion (1 Hartree = 27.211384 eV).
+pub const HARTREE_TO_EV: f64 = 27.211384;
+
 // ---------------------------------------------------------------------------
 // Ewald summation
 // ---------------------------------------------------------------------------
@@ -289,6 +294,7 @@ mod tests {
             num_ions_in_species: vec![1],
             ion_species: vec![0],
             max_ions_in_species: 1,
+            species_lcao_states: vec![],
         }
     }
 
