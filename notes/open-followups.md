@@ -56,18 +56,6 @@ Tight test `screened_d_band_1_residual_improves` added (GPU, `#[ignore]`):
 - band-1 residual < 0.30 Ha (bare-D0 gives 0.37 Ha)
 - RMS first 10 bands < 0.85 Ha (bare-D0 gives 1.06 Ha)
 
-**Current eigenvalue status** (bare D0, ndeg=0, reference .pot_fmt) — **post-1d fix (2026-05-20)**:
-- Band 1: -1.43 Ha (ref -1.06 Ha)
-- Bare D0 RMS: 1.06 Ha
-- Screened-D RMS (Some(occupations) but currently falls through to D0 in code): 0.72 Ha
-
-**Remaining residual** is methodological: bare D0 lacks the screened-D
-contribution that CASTEP applies. Resolving that depends on
-chemrust-hamiltonian#8 (`compute_screened_d` non-cubic axis bug, see 1e).
-
-**Downstream impact:** SCF total energy still wrong (~13919 eV too high).
-All SCF validation tests (F-3) will fail until the V_loc+T discrepancy is fixed.
-
 ## 2. Density unit convention across crates
 
 **Symptom:** The CASTEP binary stores density as `ρ × Ω` (raw grid values,
@@ -125,3 +113,58 @@ workaround in `diagnose_d_screening_values` removed.
 max 0.09 Ha. Caused by missing NLCC core charge (ρ_core) in XC evaluation.
 
 **Status:** FIXED (2026-05-20). V_eff now matches reference RMS 0.004 Ha.
+
+## 7. Chebyshev filter diverges in SCF loop — Lanczos b_up stuck at Gershgorin cap
+
+**Symptom:** `fixed_point_matches_castep_energy` fails. The Chebyshev filter
+works correctly on SCF iteration 1 (b_up ≈ 23 Ha, ratios ~4×/step, RR gives
+band-1 = -1.03 Ha). From iteration 2 onwards, `b_up = 147 Ha` (Gershgorin cap)
+every time, giving `half_width ≈ 74 Ha` and ratios ~20-28×/step. RR then
+produces unphysical eigenvalues (band-1 ≈ -29 Ha, drifting negative each
+iteration).
+
+**Root cause analysis (2026-05-21):**
+
+The Lanczos upper-bound estimator (`lanczos_upper_bound` in
+`src/eigensolver/chebyshev.rs`) uses a deterministic pseudo-random starting
+vector (complex exponential). After `cargo clean` and rebuild, iteration 2
+still returns `b_up = 147.7446 Ha` (Gershgorin cap), identical to before the
+fix. This means the Lanczos estimator is still falling back to Gershgorin on
+every post-first-iteration call.
+
+**Suspected cause:** The Lanczos estimator returns `(b_up, ritz_min, ritz_max)`
+and the call site uses `b_up_raw = b_up_lanczos.min(gershgorin_b_up)`. If the
+Lanczos `b_up` is already ≥ Gershgorin (e.g. due to large residual norm from
+a poorly-conditioned starting vector), `b_up_raw = gershgorin`. Alternatively,
+the condition `b_up > b_low` may be failing because `b_low = eig[last] = 0.13 Ha`
+and the Lanczos `b_up` is somehow ≤ 0.13 Ha.
+
+**What is known:**
+- Iteration 1: Lanczos works correctly (b_up = 22.8 Ha, b_low = 7.13 Ha from
+  T_k midpoint). RR produces physically correct eigenvalues (band-1 = -1.03 Ha,
+  band-160 = 0.13 Ha).
+- Iteration 2: b_low = eig[last] = 0.13 Ha (correct per Alg 4.1 §7.2).
+  Lanczos b_up falls back to Gershgorin 147 Ha. The 160-band subspace after
+  Gram-Schmidt + RR rotation is the lowest 160 eigenstates — the starting
+  vector for Lanczos (random complex exponential) should still find λ_max ≈
+  12-15 Ha. Why it doesn't is unresolved.
+
+**Diagnostic prints still active** (remove before production):
+- `[Chebyshev] b_up=... b_low=...` in `chebyshev_filter`
+- `[RR] eigenvalues: first=... last=...` in `scf.rs:474`
+- `[Chebyshev] k=N norm_prev=... norm_curr=... ratio=...` in filter loop
+
+**Next steps for dedicated session:**
+1. Add a diagnostic print inside `lanczos_upper_bound` showing the raw
+   `(b_up_lanczos, ritz_min, ritz_max)` tuple before the Gershgorin cap is
+   applied, to determine whether Lanczos is returning a bad value or the
+   cap logic is wrong.
+2. Check whether `norm0 < 1e-30` early-return is triggering (v_cur all-zeros
+   despite the fix). Add an eprintln for `norm0` inside the estimator.
+3. Consider whether the Gram-Schmidt step is consuming the `final_psi_buf`
+   in a way that leaves it in a state where the random vector upload to
+   `v_cur` is racing with a stream operation.
+4. Reference: Zhou (2014) Algorithm 4.1 §7.1 — b_up from Lanczos, b_low
+   from max Ritz of previous iteration. Algorithm 5.1 — first-step bootstrap
+   using T_k midpoint for b_low. Paper at
+   `reference_paper/zhou2014-chebyshev-filtered-subspace-iteration-jcp.zip`.
