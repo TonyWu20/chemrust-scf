@@ -239,10 +239,36 @@ pub(crate) struct SpectralBounds {
     pub half_width: f64,
 }
 
-/// Estimate spectral bounds for the Hamiltonian.
+/// Estimate spectral bounds for the Chebyshev filter.
 ///
-/// * First call (no eigenvalues yet): rough estimate from kinetic + potential.
-/// * Subsequent calls: use eigenvalue spectrum with guard band.
+/// Follows Zhou (2014, J. Comput. Phys. 255, §3–§5) with available data:
+///
+/// * **b_up** (λ_max): upper bound on the full spectrum of H.  Must satisfy
+///   b_up ≥ λ_max(H) for every eigenvalue, otherwise unwanted high-energy
+///   states map to |x| > 1 and the Chebyshev polynomial amplifies them
+///   exponentially — destroying the subspace.  We use the Gershgorin-circle
+///   estimate `max_kinetic + (max_veff − min_veff)`, which is safe (very
+///   conservative) but makes the filter less selective than a Lanczos
+///   estimator would.
+///
+///   **TODO(lanczos):** replace with the k-step Lanczos estimator from
+///   Zhou & Li (2011, Linear Algebra Appl. 435, §2): run k = 5…8 Lanczos
+///   steps on H with a random start vector, then
+///   b_up = λ_max(T_k) + ‖f_k‖₂.  This gives a much tighter bound and
+///   makes the filter discriminate effectively.
+///
+/// * **b_low** (ε_cut): filters map [b_low, b_up] → [−1, 1], so states
+///   below b_low are *magnified* and states inside the interval are
+///   *damped*.  In CheFSI §5, b_low = max_i Ritz_i — the largest Ritz
+///   value from the *previous* SCF iteration — which separates the
+///   tracked bands (≤ b_low) from the untracked remainder of the
+///   spectrum (> b_low).  We use the same rule when eigenvalues exist,
+///   and fall back to a physically-grounded guess on the first call.
+///
+/// * **No scaled filtering**: we use the unscaled recurrence (Zhou
+///   Algorithm 3.1 / eq. 8).  Scaled filtering (Algorithm 3.2) with a_L
+///   is needed only when eigenvalues are far from [−1, 1] and overflow
+///   is possible — not currently an issue with our conservative b_up.
 pub(crate) fn compute_spectral_bounds(
     eigenvalues: Option<&[f64]>,
     wave_grid: &GVectorGrid,
@@ -251,27 +277,176 @@ pub(crate) fn compute_spectral_bounds(
 ) -> Result<SpectralBounds, Error> {
     let gmax = wave_grid.gmax();
     let kinetic_max = 0.5 * gmax * gmax;
+    // Gershgorin-circle upper bound: λ_max(H) ≤ max_kinetic + ΔV.
+    // Safe (overestimates by ~100× for typical DFT Hamiltonians) but
+    // always an upper bound.
+    let b_up = kinetic_max + (max_veff - min_veff);
 
-    let (lambda_max, eps_cut) = match eigenvalues {
+    // Lower bound of the *unwanted* spectrum — separates tracked bands
+    // (magnified) from untracked higher bands (damped).
+    let b_low = match eigenvalues {
         None | Some([]) => {
-            let lm = kinetic_max + (max_veff - min_veff);
-            (lm, lm / 3.0)
+            // No Ritz values available — first SCF iteration.
+            // Physical intuition: eigenvalues seldom exceed the maximum
+            // V_eff value by more than a few Hartree, and the Fermi
+            // level of a metal sits near max_veff.  A conservative
+            // choice that avoids magnifying unwanted states is to place
+            // b_low just above the potential's maximum.
+            max_veff.max(0.0) + 2.0
         }
         Some(eig) => {
-            let e0 = eig[0];
-            let e_last = eig[eig.len() - 1];
-            let lm = kinetic_max + (max_veff - min_veff);
-            let raw_eps = e_last + 0.2 * (e_last - e0);
-            (lm, raw_eps.min(lm * 0.95))
+            // CheFSI §5 step 11: b_low = max_i Ritz_i — the largest
+            // eigenvalue still in the tracked subspace.  This damps
+            // bands beyond our subspace while magnifying the bands we
+            // track (occupied + a few unoccupied).
+            eig[eig.len() - 1]
         }
     };
 
+    // Clamp: b_low must stay strictly below b_up for the affine map to
+    // be well-defined (otherwise half_width ≤ 0).
+    let b_low = b_low.min(b_up * 0.95);
+
     Ok(SpectralBounds {
-        lambda_max,
-        eps_cut,
-        center: (lambda_max + eps_cut) / 2.0,
-        half_width: (lambda_max - eps_cut) / 2.0,
+        lambda_max: b_up,
+        eps_cut: b_low,
+        center: (b_up + b_low) / 2.0,
+        half_width: (b_up - b_low) / 2.0,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Lanczos upper-bound estimator
+// ---------------------------------------------------------------------------
+
+/// Estimate λ_max(H) via k Lanczos steps with a single starting vector.
+///
+/// Runs the k-step Lanczos algorithm on H using the first band of `psi_dev`
+/// as the starting vector. Returns `λ_max(T_k) + ‖r_k‖₂` as a rigorous
+/// upper bound on λ_max(H) (Zhou & Li 2011, Linear Algebra Appl. 435, §2).
+///
+/// Uses a dedicated 1-band FFT plan so it does not interfere with the
+/// n_bands plan used by the main Chebyshev recurrence.
+#[allow(clippy::too_many_arguments)]
+unsafe fn lanczos_upper_bound(
+    psi_dev: &CudaSlice<CudaComplex>,   // starting vector (first band, n_pw elements)
+    v_eff_dev: &CudaSlice<f64>,
+    kinetic_dev: &CudaSlice<f64>,
+    fft_idx_dev: &CudaSlice<i32>,
+    n_pw: usize,
+    grid_size: usize,
+    inv_ntotal: f64,
+    ngx: usize, ngy: usize, ngz: usize,
+    vnl_data: &VnlBatchData,
+    blas: &BlasHandle,
+    kernels: &CudaKernelSet,
+    stream: &Arc<CudaStream>,
+    k_steps: usize,
+) -> Result<f64, Error> {
+    let n = n_pw as i32;
+
+    // 1-band FFT plan for the Lanczos vectors
+    let plan1 = BatchedFftPlan3d::plan_batched_c2c(
+        ngx as i32, ngy as i32, ngz as i32, 1, stream.clone(),
+    )?;
+
+    // Working buffers: v (current), v_prev (previous), Hv
+    let mut v_cur: CudaSlice<CudaComplex> = stream.alloc_zeros(n_pw).map_err(Error::Cuda)?;
+    let mut v_prev: CudaSlice<CudaComplex> = stream.alloc_zeros(n_pw).map_err(Error::Cuda)?;
+    let mut hv: CudaSlice<CudaComplex> = stream.alloc_zeros(n_pw).map_err(Error::Cuda)?;
+    let mut grid1: CudaSlice<CudaComplex> = stream.alloc_zeros(grid_size).map_err(Error::Cuda)?;
+
+    // Copy first band of psi_dev into v_cur
+    {
+        let src = psi_dev.slice(0..n_pw);
+        stream.memcpy_dtod(&src, &mut v_cur).map_err(Error::Cuda)?;
+    }
+
+    // Normalise v_cur
+    let norm0 = {
+        let dot = blas.dotc_c64(n, &v_cur, 1, &v_cur, 1).map_err(Error::Blas)?;
+        dot.x.sqrt()
+    };
+    if norm0 < 1e-30 {
+        // Degenerate starting vector — fall back to Gershgorin
+        return Ok(f64::INFINITY);
+    }
+    let inv_norm0 = CudaComplex { x: 1.0 / norm0, y: 0.0 };
+    unsafe {
+        let (ptr, _) = v_cur.device_ptr_mut(stream);
+        cudarc::cublas::sys::cublasZscal_v2(blas.raw_handle(), n, &inv_norm0 as *const _ as *const _, ptr as *mut _, 1)
+            .result().map_err(Error::Blas)?;
+    }
+
+    // Tridiagonal matrix entries
+    let mut alpha = vec![0.0_f64; k_steps]; // diagonal
+    let mut beta  = vec![0.0_f64; k_steps]; // sub-diagonal (beta[0] unused)
+
+    for j in 0..k_steps {
+        // Hv = H · v_cur
+        unsafe {
+            apply_full_hamiltonian(
+                &v_cur, v_eff_dev, kinetic_dev, fft_idx_dev,
+                n_pw, 1, grid_size, inv_ntotal,
+                &plan1, &mut hv, &mut grid1, vnl_data, blas, kernels, stream,
+            )?;
+        }
+
+        // alpha[j] = <v_cur | Hv>  (real part; H is Hermitian)
+        let dot_aj = blas.dotc_c64(n, &v_cur, 1, &hv, 1).map_err(Error::Blas)?;
+        alpha[j] = dot_aj.x;
+
+        // Hv -= alpha[j] * v_cur
+        let neg_a = CudaComplex { x: -alpha[j], y: 0.0 };
+        blas.axpy_c64(n, neg_a, &v_cur.clone(), 1, &mut hv, 1).map_err(Error::Blas)?;
+
+        // Hv -= beta[j] * v_prev  (skip on first step)
+        if j > 0 {
+            let neg_b = CudaComplex { x: -beta[j], y: 0.0 };
+            blas.axpy_c64(n, neg_b, &v_prev.clone(), 1, &mut hv, 1).map_err(Error::Blas)?;
+        }
+
+        if j + 1 == k_steps {
+            // Last step: record ‖r‖ as beta for the bound, then stop
+            let dot_r = blas.dotc_c64(n, &hv, 1, &hv, 1).map_err(Error::Blas)?;
+            beta[j] = dot_r.x.sqrt(); // ‖r_k‖ stored in beta[k-1]
+            break;
+        }
+
+        // beta[j+1] = ‖Hv‖
+        let dot_b = blas.dotc_c64(n, &hv, 1, &hv, 1).map_err(Error::Blas)?;
+        beta[j + 1] = dot_b.x.sqrt();
+
+        if beta[j + 1] < 1e-14 {
+            // Invariant subspace — Lanczos converged early
+            beta[j] = 0.0; // no residual
+            break;
+        }
+
+        // v_prev = v_cur;  v_cur = Hv / beta[j+1]
+        stream.memcpy_dtod(&v_cur, &mut v_prev).map_err(Error::Cuda)?;
+        let inv_b = CudaComplex { x: 1.0 / beta[j + 1], y: 0.0 };
+        stream.memcpy_dtod(&hv, &mut v_cur).map_err(Error::Cuda)?;
+        unsafe {
+            let (ptr, _) = v_cur.device_ptr_mut(stream);
+            cudarc::cublas::sys::cublasZscal_v2(blas.raw_handle(), n, &inv_b as *const _ as *const _, ptr as *mut _, 1)
+                .result().map_err(Error::Blas)?;
+        }
+    }
+
+    // Find λ_max of the k×k symmetric tridiagonal T_k on CPU.
+    // Use the Gershgorin bound on T_k: λ_max(T_k) ≤ max_i(alpha[i] + |beta[i]| + |beta[i+1]|).
+    // This is cheap and sufficient — T_k is at most 6×6.
+    let k = alpha.len();
+    let lambda_max_tk = (0..k).map(|i| {
+        let b_left  = if i > 0   { beta[i].abs() } else { 0.0 };
+        let b_right = if i+1 < k { beta[i+1].abs() } else { 0.0 };
+        alpha[i] + b_left + b_right
+    }).fold(f64::NEG_INFINITY, f64::max);
+
+    // Rigorous upper bound: λ_max(H) ≤ λ_max(T_k) + ‖r_k‖
+    let residual_norm = beta[k - 1];
+    Ok(lambda_max_tk + residual_norm)
 }
 
 // ---------------------------------------------------------------------------
@@ -541,6 +716,102 @@ unsafe fn apply_v_nl_hamiltonian(
 }
 
 // ---------------------------------------------------------------------------
+// S⁻¹ (USPP overlap inverse via Woodbury)
+// ---------------------------------------------------------------------------
+
+/// Apply the USPP overlap inverse to each band of `hpsi`.
+///
+/// Uses the Woodbury formula (Levitt & Torrent 2015, §4.1):
+///   S⁻¹ = I − P (D_S⁻¹ + PᵀP)⁻¹ Pᵀ
+///
+/// For each ion with projectors `beta_g` (≡ P) and precomputed
+/// `s_inv_mat = (Q⁻¹ + beta^H·beta)⁻¹`:
+///   p = beta_g^H · hpsi          (project)
+///   q = s_inv_mat · p            (small solve)
+///   hpsi −= beta_g · q           (subtract correction)
+#[allow(clippy::too_many_arguments)]
+unsafe fn apply_s_inverse(
+    hpsi_dev: &mut CudaSlice<CudaComplex>,
+    vnl_data: &VnlBatchData,
+    n_bands: i32,
+    n_pw: i32,
+    blas: &BlasHandle,
+    stream: &Arc<CudaStream>,
+) -> Result<(), Error> {
+    for entry in &vnl_data.entries {
+        let ne = entry.n_expanded;
+
+        // p = beta_g^H · hpsi  (n_expanded × n_bands)
+        let mut p: CudaSlice<CudaComplex> =
+            stream.alloc_zeros(ne as usize * n_bands as usize).map_err(Error::Cuda)?;
+        unsafe {
+            blas.gemm_c64(
+                ZgemmConfig {
+                    transa: blas::op::C,
+                    transb: blas::op::N,
+                    m: ne,
+                    n: n_bands,
+                    k: n_pw,
+                    alpha: CudaComplex { x: 1.0, y: 0.0 },
+                    lda: n_pw,
+                    ldb: n_pw,
+                    beta: CudaComplex { x: 0.0, y: 0.0 },
+                    ldc: ne,
+                },
+                &entry.beta_g,
+                hpsi_dev,
+                &mut p,
+            )?;
+        }
+
+        // q = s_inv_mat · p  (n_expanded × n_bands)
+        let mut q: CudaSlice<CudaComplex> =
+            stream.alloc_zeros(ne as usize * n_bands as usize).map_err(Error::Cuda)?;
+        unsafe {
+            blas.gemm_c64(
+                ZgemmConfig {
+                    transa: blas::op::N,
+                    transb: blas::op::N,
+                    m: ne,
+                    n: n_bands,
+                    k: ne,
+                    alpha: CudaComplex { x: 1.0, y: 0.0 },
+                    lda: ne,
+                    ldb: ne,
+                    beta: CudaComplex { x: 0.0, y: 0.0 },
+                    ldc: ne,
+                },
+                &entry.s_inv_mat,
+                &p,
+                &mut q,
+            )?;
+        }
+
+        // hpsi −= beta_g · q  (accumulate with beta = −1)
+        unsafe {
+            blas.gemm_c64(
+                ZgemmConfig {
+                    transa: blas::op::N,
+                    transb: blas::op::N,
+                    m: n_pw,
+                    n: n_bands,
+                    k: ne,
+                    alpha: CudaComplex { x: -1.0, y: 0.0 },
+                    lda: n_pw,
+                    ldb: ne,
+                    beta: CudaComplex { x: 1.0, y: 0.0 },
+                    ldc: n_pw,
+                },
+                &entry.beta_g,
+                &q,
+                hpsi_dev,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Scaled Hamiltonian
 // ---------------------------------------------------------------------------
 
@@ -704,8 +975,15 @@ pub(crate) fn chebyshev_filter(
     pcie.h2d_bytes += kinetic_cpu.0.len() * std::mem::size_of::<f64>();
 
     // ---- FFT plan (batched C2C) ----
+    // cuFFT uses row-major layout: n[0] is slowest-varying (outermost),
+    // n[rank-1] is fastest-varying (innermost). Our scatter index formula
+    // `iz + ngz*(iy + ngy*ix)` makes iz innermost, ix outermost; the
+    // matching plan dims are `(ngx, ngy, ngz)`. Verified by the isolated
+    // FFT test `cufft_dim_ordering_isolated_diagnostic` (only this
+    // ordering reproduces the analytic exp(2πi·G·r) for a single δ in G).
+    // Cubic grids are insensitive to this ordering; non-cubic grids are not.
     let fft_plan = BatchedFftPlan3d::plan_batched_c2c(
-        ngz as i32, ngy as i32, ngx as i32, n_bands_i32, stream.clone(),
+        ngx as i32, ngy as i32, ngz as i32, n_bands_i32, stream.clone(),
     )?;
 
     // ---- GPU workspace buffers ----
@@ -728,7 +1006,33 @@ pub(crate) fn chebyshev_filter(
         stream.alloc_zeros(n_elem).map_err(Error::Cuda)?;
 
     // ---- Spectral bounds ----
-    let bounds = compute_spectral_bounds(eigenvalues, wave_grid, min_veff, max_veff)?;
+    // Get Gershgorin upper bound first, then tighten with Lanczos if ndeg > 0.
+    let mut bounds = compute_spectral_bounds(eigenvalues, wave_grid, min_veff, max_veff)?;
+    if ndeg > 0 {
+        let lanczos_b_up = unsafe {
+            lanczos_upper_bound(
+                &psi_input, v_eff_dev, &kinetic_dev, fft_idx_dev,
+                n_pw, grid_size, inv_ntotal,
+                ngx, ngy, ngz,
+                vnl_data, blas, kernels, stream,
+                6, // k_steps
+            )
+        };
+        if let Ok(b_up_lanczos) = lanczos_b_up {
+            if b_up_lanczos.is_finite() && b_up_lanczos > bounds.eps_cut {
+                // Add 10% safety margin so the bound is never tight enough to
+                // accidentally exclude a wanted eigenvalue.
+                let b_up = b_up_lanczos * 1.1;
+                let b_low = bounds.eps_cut.min(b_up * 0.95);
+                bounds = SpectralBounds {
+                    lambda_max: b_up,
+                    eps_cut: b_low,
+                    center: (b_up + b_low) / 2.0,
+                    half_width: (b_up - b_low) / 2.0,
+                };
+            }
+        }
+    }
 
     // ---- Chebyshev recurrence ----
     //
@@ -833,15 +1137,20 @@ pub(crate) fn chebyshev_filter(
         )?;
     }
 
-    // Transpose both to RowDistributed
-    unsafe {
-        transpose_col_to_row_on_gpu(
-            final_psi, &mut psi_row_dev, n_bands_i32, n_pw_i32, kernels, stream,
-        )?;
-        transpose_col_to_row_on_gpu(
-            &hpsi_dev, &mut hpsi_row_dev, n_bands_i32, n_pw_i32, kernels, stream,
-        )?;
-    }
+    // Pass psi/hpsi as RowDistributed.
+    //
+    // ColumnDistributed memory layout: flat[b*n_pw + g] = psi[band b, PW g].
+    // In BLAS terms this IS col-major (n_pw, n_bands) with leading dim n_pw,
+    // which is exactly what `rayleigh_ritz` expects (gemm uses lda = n_pw and
+    // op::C). So the same buffer can be reinterpreted as RowDistributed without
+    // any data movement.
+    //
+    // The previous `transpose_col_to_row` kernel produced col-major
+    // (n_bands, n_pw) [flat[g*n_bands + b] = psi[b, g]] which gemm with
+    // lda = n_pw mis-read, scrambling H_sub and S_sub. Found via the
+    // RR_DUMP_HS diagnostic in `rayleigh_ritz.rs`.
+    stream.memcpy_dtod(final_psi, &mut psi_row_dev).map_err(Error::Cuda)?;
+    stream.memcpy_dtod(&hpsi_dev, &mut hpsi_row_dev).map_err(Error::Cuda)?;
 
     // Wrap into Gpu<WavefunctionSet<L>>
     let psi_row = Gpu::<WavefunctionSet<RowDistributed>> {
@@ -858,4 +1167,115 @@ pub(crate) fn chebyshev_filter(
     };
 
     Ok((psi_row, hpsi_row))
+}
+
+// ---------------------------------------------------------------------------
+// Test diagnostics — direct ⟨ψ|H|ψ⟩ computation (Phase H)
+// ---------------------------------------------------------------------------
+// `apply_h_components_for_test` runs the apply pipeline three times to extract
+// per-band contributions: kinetic only, kinetic + V_loc, and kinetic + V_loc + V_NL.
+// All three are returned as Vec<Complex64> in column-major (n_bands × n_pw) layout
+// so test code can compute ⟨ψ_b|h_part_b⟩ on CPU.
+
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn apply_h_components_for_test(
+    psi_gpu: &Gpu<WavefunctionSet<ColumnDistributed>>,
+    v_eff_gpu: &Gpu<crate::types::EffectivePotential>,
+    wave_grid: &GVectorGrid,
+    pw_coords: &[[i32; 3]],
+    vnl_data: &VnlBatchData,
+    fft_idx_dev: &CudaSlice<i32>,
+    kernels: &CudaKernelSet,
+    blas: &BlasHandle,
+    stream: &Arc<CudaStream>,
+) -> Result<HComponentsForTest, Error> {
+    let n_bands = psi_gpu.shape()[0];
+    let n_pw = psi_gpu.shape()[1];
+    let n_elem = n_bands * n_pw;
+    let n_pw_i32 = n_pw as i32;
+    let n_bands_i32 = n_bands as i32;
+
+    let [ngz, ngy, ngx] = wave_grid.grid();
+    let grid_size = ngx * ngy * ngz;
+    let inv_ntotal = 1.0 / (grid_size as f64);
+    let grid_alloc = n_bands * grid_size;
+
+    let kinetic_cpu = compute_kinetic_energies(pw_coords, wave_grid.recip_lattice());
+    let kinetic_dev: CudaSlice<f64> = stream.clone_htod(&kinetic_cpu.0).map_err(Error::Cuda)?;
+
+    // Plan with the cuFFT-correct dim ordering (matches chebyshev_filter at line 844).
+    let fft_plan = BatchedFftPlan3d::plan_batched_c2c(
+        ngx as i32, ngy as i32, ngz as i32, n_bands_i32, stream.clone(),
+    )?;
+
+    let v_eff_dev = v_eff_gpu.as_device_slice();
+    let psi_input = psi_gpu.as_device_slice();
+
+    let mut grid_dev: CudaSlice<CudaComplex> = stream.alloc_zeros(grid_alloc).map_err(Error::Cuda)?;
+
+    // Component 1: kinetic only. Run init_kinetic by itself.
+    let mut hpsi_t: CudaSlice<CudaComplex> = stream.alloc_zeros(n_elem).map_err(Error::Cuda)?;
+    unsafe {
+        stream
+            .launch_builder(&kernels.init_kinetic)
+            .arg(&mut hpsi_t)
+            .arg(psi_input)
+            .arg(&kinetic_dev)
+            .arg(&n_pw_i32)
+            .arg(&n_bands_i32)
+            .launch(LaunchConfig::for_num_elems((n_bands_i32 * n_pw_i32) as u32))
+    }
+    .map_err(Error::Cuda)?;
+
+    // Component 2: kinetic + V_loc (full apply_v_loc_hamiltonian).
+    let mut hpsi_tv: CudaSlice<CudaComplex> = stream.alloc_zeros(n_elem).map_err(Error::Cuda)?;
+    unsafe {
+        apply_v_loc_hamiltonian(
+            psi_input, &mut hpsi_tv, &mut grid_dev,
+            &kinetic_dev, fft_idx_dev, v_eff_dev,
+            n_pw_i32, n_bands_i32, grid_size as i32, inv_ntotal,
+            &fft_plan, kernels, stream,
+        )?;
+    }
+
+    // Component 3: kinetic + V_loc + V_NL (full apply_full_hamiltonian).
+    let mut hpsi_full: CudaSlice<CudaComplex> = stream.alloc_zeros(n_elem).map_err(Error::Cuda)?;
+    unsafe {
+        apply_v_loc_hamiltonian(
+            psi_input, &mut hpsi_full, &mut grid_dev,
+            &kinetic_dev, fft_idx_dev, v_eff_dev,
+            n_pw_i32, n_bands_i32, grid_size as i32, inv_ntotal,
+            &fft_plan, kernels, stream,
+        )?;
+        apply_v_nl_hamiltonian(
+            psi_input, &mut hpsi_full, vnl_data,
+            n_bands_i32, n_pw_i32, blas, stream,
+        )?;
+    }
+
+    stream.synchronize()?;
+
+    // D2H all three.
+    let to_complex = |raw: Vec<CudaComplex>| -> Vec<num_complex::Complex64> {
+        raw.into_iter()
+            .map(|c| num_complex::Complex64::new(c.x, c.y))
+            .collect()
+    };
+    Ok(HComponentsForTest {
+        hpsi_t: to_complex(stream.clone_dtoh(&hpsi_t).map_err(Error::Cuda)?),
+        hpsi_tv: to_complex(stream.clone_dtoh(&hpsi_tv).map_err(Error::Cuda)?),
+        hpsi_full: to_complex(stream.clone_dtoh(&hpsi_full).map_err(Error::Cuda)?),
+        n_bands,
+        n_pw,
+    })
+}
+
+#[doc(hidden)]
+pub struct HComponentsForTest {
+    pub hpsi_t: Vec<num_complex::Complex64>,
+    pub hpsi_tv: Vec<num_complex::Complex64>,
+    pub hpsi_full: Vec<num_complex::Complex64>,
+    pub n_bands: usize,
+    pub n_pw: usize,
 }
