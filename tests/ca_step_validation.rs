@@ -664,19 +664,8 @@ fn diagnose_d_screening_values() {
         if let Some(((ne, me), q_arr)) = q_on_grid.pairs.first() {
             eprintln!("  Q_arr[({ne},{me})] shape = {:?}", q_arr.shape());
         }
-        // Try compute_screened_d with pre-transposed V_eff to work around
-        // fft_forward_3d transposing non-cubic grids (chemrust-hamiltonian#8).
-        // FFT maps [54,90,90] → [90,90,54].  Pre-transpose [54,90,90] → [90,54,90]
-        // via permuted_axes([2,0,1]) so FFT(pre) → [54,90,90] matches Q_arr/gvecs.
-        // fft_forward_3d reverses axes: [a,b,c] → [c,b,a].
-        // Pre-reverse V_eff so FFT output matches Q_arr shape.
-        let v_eff_arr = v_eff_core.as_real_grid().as_real_array().clone();
-        let v_eff_pre = v_eff_arr.permuted_axes([2, 1, 0]).to_owned();
-        eprintln!("  V_eff_pre shape = {:?}", v_eff_pre.shape());
-        let v_eff_pre_fft = chemrust_hamiltonian_core::fft::fft_forward_3d(&RealGrid::from_inner(v_eff_pre.clone())).unwrap();
-        eprintln!("  V_eff_pre_fft shape = {:?} (expect [54,90,90])", v_eff_pre_fft.shape());
-        let v_eff_pre_pot = chemrust_hamiltonian_core::EffectivePotential::from_inner(RealGrid::from_inner(v_eff_pre));
-        let d_screen = compute_screened_d(&q_on_grid, &v_eff_pre_pot, cell, global_ion, &wave_grid, &d0).unwrap();
+        // compute_screened_d now handles non-cubic grids correctly via RealGrid/RecipGrid types
+        let d_screen = compute_screened_d(&q_on_grid, &v_eff_core, cell, global_ion, &wave_grid, &d0).unwrap();
 
         let ne = d0.shape()[0];
         eprintln!("Ion {global_ion} ({symbol}): n_expanded={ne}");
@@ -709,6 +698,68 @@ fn diagnose_d_screening_values() {
         }
         ion_idx += 1;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Tight test: screened-D improves band-1 eigenvalue residual
+// ---------------------------------------------------------------------------
+// External anchor: Cu111_CO.bands (band-1 = -1.05502287 Ha).
+// Bare-D0 baseline (notes/open-followups.md §1d): band-1 = -1.43 Ha, RMS = 1.06 Ha.
+// With screened-D (manual permute workaround): RMS = 0.72 Ha.
+// Threshold: band-1 residual < 0.30 Ha (bare-D0 gives 0.37 Ha → 1.2× separation).
+//            RMS first 10 bands < 0.85 Ha (bare-D0 gives 1.06 Ha → 1.2× separation).
+#[test]
+#[ignore = "requires GPU and CASTEP fixture data"]
+fn screened_d_band_1_residual_improves() {
+    if !gpu_available() { eprintln!("SKIP: no GPU"); return; }
+
+    let fx = fixtures::cu111_co::fixture();
+    let state = fixtures::cu111_co::build_scf_state(fx);
+    let mut v_eff_state = state.build_v_eff().expect("build_v_eff");
+    v_eff_state.set_v_eff(CoreEffectivePotential::from_inner(RealGrid::from_inner(fx.pot_fmt.clone())));
+
+    // Use occupations-based D screening (Some) to engage compute_screened_d
+    let n_electrons = 186.0;
+    let width = 0.1 * EV_TO_HARTREE;
+    let mu = compute_mu(&fx.bands_eigenvalues, n_electrons, width);
+    let occupations: Vec<f64> = fx.bands_eigenvalues.iter()
+        .map(|&e| libm::erfc((e - mu) / width)).collect();
+
+    let diag_state = v_eff_state
+        .diagonalize(0, Some(&occupations))
+        .expect("diagonalize with screened D");
+
+    let computed = diag_state.eigenvalues();
+    let reference = &fx.bands_eigenvalues;
+
+    // Band-1 anchor: Cu111_CO.bands line 12 = -1.05502287 Ha
+    let ref_band1 = reference[0];
+    let band1 = computed[0];
+    let band1_residual = (band1 - ref_band1).abs();
+
+    println!("band-1: computed={:.6e} Ha  ref={:.6e} Ha  residual={:.6e} Ha",
+             band1, ref_band1, band1_residual);
+
+    // RMS over first 10 bands
+    let rms_10: f64 = (computed.iter().zip(reference.iter()).take(10)
+        .map(|(c, r)| (c - r).powi(2)).sum::<f64>() / 10.0).sqrt();
+    println!("RMS first 10 bands: {:.6e} Ha", rms_10);
+
+    // Discriminator: bare-D0 gives residual ~0.37 Ha; screened-D should be < 0.30 Ha.
+    // Source: Cu111_CO.bands (external fixture).
+    assert!(
+        band1_residual < 0.30,
+        "band-1 residual {:.4} Ha ≥ 0.30 Ha — screened-D not improving over bare-D0 (0.37 Ha). \
+         ref = {:.6} Ha",
+        band1_residual, ref_band1,
+    );
+
+    // Discriminator: bare-D0 RMS = 1.06 Ha; screened-D should be < 0.85 Ha.
+    assert!(
+        rms_10 < 0.85,
+        "RMS first 10 bands {:.4} Ha ≥ 0.85 Ha — screened-D not improving over bare-D0 (1.06 Ha)",
+        rms_10,
+    );
 }
 
 // ---------------------------------------------------------------------------
