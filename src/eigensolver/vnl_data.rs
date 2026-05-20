@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use chemrust_hamiltonian_core::augment::beta_phi::{
@@ -123,6 +124,25 @@ impl VnlBatchData {
         };
 
         let mut entries = Vec::new();
+
+        // Precompute Q-on-grid once per species (ion-independent, expensive).
+        // For Cu111_CO: 18 expanded pairs × 437k grid points × 18 Cu ions would
+        // be ~1.3B ops if done per-ion; caching reduces it to one call per species.
+        let q_on_grid_cache: HashMap<String, Option<chemrust_hamiltonian_core::nlpot::QOnGrid>> =
+            if v_eff_wave.is_some() {
+                cell.species_symbols.iter().filter_map(|symbol| {
+                    let pot = pots.get(symbol)?;
+                    let aug: &dyn HasAugmentationData = match pot {
+                        Pseudopotential::Usp(d) => d,
+                        _ => return None,
+                    };
+                    let q = chemrust_hamiltonian_core::nlpot::precompute_q_on_grid(aug, wave_grid).ok();
+                    Some((symbol.clone(), q))
+                }).collect()
+            } else {
+                HashMap::new()
+            };
+
         for ion_idx in 0..cell.num_ions {
             let species_idx = cell.ion_species[ion_idx];
             let symbol = &cell.species_symbols[species_idx];
@@ -141,13 +161,14 @@ impl VnlBatchData {
 
             // Compute screened D matrix: D = D0 + ∫ Q(r)·V_eff(r) dr
             let d_screened = if let Some(v_eff) = v_eff_wave {
-                chemrust_hamiltonian_core::nlpot::precompute_q_on_grid(aug, wave_grid)
+                q_on_grid_cache.get(symbol)
+                    .and_then(|opt_q| opt_q.as_ref())
                     .and_then(|q_on_grid| {
                         chemrust_hamiltonian_core::nlpot::compute_screened_d(
-                            &q_on_grid, v_eff, cell, ion_idx, wave_grid, &d0_expanded,
-                        )
+                            q_on_grid, v_eff, cell, ion_idx, wave_grid, &d0_expanded,
+                        ).ok()
                     })
-                    .unwrap_or_else(|_| d0_expanded.clone())
+                    .unwrap_or_else(|| d0_expanded.clone())
             } else {
                 d0_expanded.clone()
             };
