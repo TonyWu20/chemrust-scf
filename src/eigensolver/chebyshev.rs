@@ -342,7 +342,7 @@ unsafe fn lanczos_upper_bound(
     kernels: &CudaKernelSet,
     stream: &Arc<CudaStream>,
     k_steps: usize,
-) -> Result<f64, Error> {
+) -> Result<(f64, f64, f64), Error> {
     let n = n_pw as i32;
 
     // 1-band FFT plan for the Lanczos vectors
@@ -369,7 +369,7 @@ unsafe fn lanczos_upper_bound(
     };
     if norm0 < 1e-30 {
         // Degenerate starting vector — fall back to Gershgorin
-        return Ok(f64::INFINITY);
+        return Ok((f64::INFINITY, f64::NEG_INFINITY, f64::INFINITY));
     }
     let inv_norm0 = CudaComplex { x: 1.0 / norm0, y: 0.0 };
     unsafe {
@@ -434,19 +434,23 @@ unsafe fn lanczos_upper_bound(
         }
     }
 
-    // Find λ_max of the k×k symmetric tridiagonal T_k on CPU.
-    // Use the Gershgorin bound on T_k: λ_max(T_k) ≤ max_i(alpha[i] + |beta[i]| + |beta[i+1]|).
-    // This is cheap and sufficient — T_k is at most 6×6.
+    // Find λ_max and λ_min of the k×k symmetric tridiagonal T_k on CPU
+    // via Gershgorin bounds. T_k is at most 6×6 so this is trivial.
     let k = alpha.len();
     let lambda_max_tk = (0..k).map(|i| {
         let b_left  = if i > 0   { beta[i].abs() } else { 0.0 };
         let b_right = if i+1 < k { beta[i+1].abs() } else { 0.0 };
         alpha[i] + b_left + b_right
     }).fold(f64::NEG_INFINITY, f64::max);
+    let lambda_min_tk = (0..k).map(|i| {
+        let b_left  = if i > 0   { beta[i].abs() } else { 0.0 };
+        let b_right = if i+1 < k { beta[i+1].abs() } else { 0.0 };
+        alpha[i] - b_left - b_right
+    }).fold(f64::INFINITY, f64::min);
 
     // Rigorous upper bound: λ_max(H) ≤ λ_max(T_k) + ‖r_k‖
     let residual_norm = beta[k - 1];
-    Ok(lambda_max_tk + residual_norm)
+    Ok((lambda_max_tk + residual_norm, lambda_min_tk, lambda_max_tk))
 }
 
 // ---------------------------------------------------------------------------
@@ -1009,10 +1013,13 @@ pub(crate) fn chebyshev_filter(
         stream.alloc_zeros(n_elem).map_err(Error::Cuda)?;
 
     // ---- Spectral bounds ----
-    // Get Gershgorin upper bound first, then tighten with Lanczos if ndeg > 0.
+    // Per Zhou (2014) Algorithm 4.1 §7.1-7.2:
+    //   b_up  = Lanczos estimator (capped at Gershgorin)
+    //   b_low = max Ritz value from previous SCF iteration (step 7.2)
+    //         = Lanczos-derived midpoint on first call (Algorithm 5.1 eq.13)
     let mut bounds = compute_spectral_bounds(eigenvalues, wave_grid, min_veff, max_veff)?;
     if ndeg > 0 {
-        let lanczos_b_up = unsafe {
+        let lanczos_result = unsafe {
             lanczos_upper_bound(
                 &psi_input, v_eff_dev, &kinetic_dev, fft_idx_dev,
                 n_pw, grid_size, inv_ntotal,
@@ -1021,20 +1028,32 @@ pub(crate) fn chebyshev_filter(
                 6, // k_steps
             )
         };
-        if let Ok(b_up_lanczos) = lanczos_b_up {
-            // Lanczos can overshoot if the starting vector is poorly conditioned
-            // (e.g. nearly invariant). Cap at the Gershgorin bound, which is
-            // always a valid upper bound.
+        if let Ok((b_up_lanczos, ritz_min, ritz_max)) = lanczos_result {
             let gershgorin_b_up = {
                 let gmax = wave_grid.gmax();
                 0.5 * gmax * gmax + (max_veff - min_veff)
             };
-            let b_up_raw = b_up_lanczos.min(gershgorin_b_up);
-            if b_up_raw.is_finite() && b_up_raw > bounds.eps_cut {
-                // Add 10% safety margin so the bound is never tight enough to
-                // accidentally exclude a wanted eigenvalue.
-                let b_up = b_up_raw * 1.1;
-                let b_low = bounds.eps_cut.min(b_up * 0.95);
+            // Cap Lanczos b_up at Gershgorin — Lanczos can overshoot when the
+            // starting vector is nearly invariant (well-converged wavefunctions).
+            let b_up = (b_up_lanczos * 1.1).min(gershgorin_b_up);
+
+            // b_low: use Ritz values from previous RR when available (Alg 4.1 §7.2).
+            // On first call (no prior eigenvalues), derive from Lanczos T_k Ritz
+            // values per Algorithm 5.1 eq.(13): β=0.5 → midpoint of T_k spectrum.
+            let b_low = match eigenvalues {
+                Some(eig) if !eig.is_empty() => {
+                    // Steady-state: b_low = largest Ritz value from previous RR.
+                    // This guarantees all occupied states are below b_low and
+                    // will be magnified by the filter.
+                    eig[eig.len() - 1]
+                }
+                _ => {
+                    // First call: eq.(13) with β=0.5 → midpoint of T_k spectrum.
+                    0.5 * ritz_min + 0.5 * ritz_max
+                }
+            };
+
+            if b_up.is_finite() && b_up > b_low {
                 bounds = SpectralBounds {
                     lambda_max: b_up,
                     eps_cut: b_low,
@@ -1042,15 +1061,11 @@ pub(crate) fn chebyshev_filter(
                     half_width: (b_up - b_low) / 2.0,
                 };
             }
-            eprintln!(
-                "[Chebyshev] Lanczos b_up={:.4} Ha  b_low={:.4} Ha  center={:.4} Ha  half_width={:.4} Ha  (Gershgorin b_up={:.4} Ha)",
-                bounds.lambda_max, bounds.eps_cut, bounds.center, bounds.half_width,
-                {
-                    let gmax = wave_grid.gmax();
-                    0.5 * gmax * gmax + (max_veff - min_veff)
-                }
-            );
         }
+        eprintln!(
+            "[Chebyshev] b_up={:.4} Ha  b_low={:.4} Ha  center={:.4} Ha  half_width={:.4} Ha",
+            bounds.lambda_max, bounds.eps_cut, bounds.center, bounds.half_width,
+        );
     }
 
     // ---- Chebyshev recurrence ----
@@ -1145,13 +1160,62 @@ pub(crate) fn chebyshev_filter(
     // After loop:
     // If ndeg >= 1: psi_ndeg is in buf_b
     // If ndeg == 0: psi_0 is in buf_a (or psi_input)
-    // Normalize: if ndeg >= 1, final is buf_b; else final is buf_a
-    let final_psi: &CudaSlice<CudaComplex> = if ndeg >= 1 { &buf_b } else { &buf_a };
+    let final_psi_buf: &mut CudaSlice<CudaComplex> = if ndeg >= 1 { &mut buf_b } else { &mut buf_a };
+
+    // ---- Gram-Schmidt orthonormalization (Algorithm 4.1 step 7.4) ----
+    // The Chebyshev filter amplifies the wanted subspace but does not
+    // orthonormalize it. Without this step, S_sub = ψ†ψ is ill-conditioned
+    // and ZHEGVD fails. Two passes of classical Gram-Schmidt for stability.
+    unsafe {
+        let (psi_ptr, _) = final_psi_buf.device_ptr_mut(stream);
+        for _pass in 0..2 {
+            for b in 0..n_bands {
+                let col_b = (psi_ptr as *mut CudaComplex).add(b * n_pw);
+                // Subtract projections onto all previous orthonormal columns
+                for j in 0..b {
+                    let col_j = (psi_ptr as *mut CudaComplex).add(j * n_pw);
+                    // dot = <col_j | col_b>
+                    let mut dot = CudaComplex { x: 0.0, y: 0.0 };
+                    cudarc::cublas::sys::cublasZdotc_v2(
+                        blas.raw_handle(), n_pw_i32,
+                        col_j as *const _, 1,
+                        col_b as *const _, 1,
+                        &mut dot as *mut _ as *mut _,
+                    ).result().map_err(Error::Blas)?;
+                    // col_b -= dot * col_j
+                    let neg_dot = CudaComplex { x: -dot.x, y: -dot.y };
+                    cudarc::cublas::sys::cublasZaxpy_v2(
+                        blas.raw_handle(), n_pw_i32,
+                        &neg_dot as *const _ as *const _,
+                        col_j as *const _, 1,
+                        col_b as *mut _, 1,
+                    ).result().map_err(Error::Blas)?;
+                }
+                // Normalize col_b
+                let mut norm_sq = CudaComplex { x: 0.0, y: 0.0 };
+                cudarc::cublas::sys::cublasZdotc_v2(
+                    blas.raw_handle(), n_pw_i32,
+                    col_b as *const _, 1,
+                    col_b as *const _, 1,
+                    &mut norm_sq as *mut _ as *mut _,
+                ).result().map_err(Error::Blas)?;
+                let norm = norm_sq.x.sqrt();
+                if norm > 1e-30 {
+                    let inv_norm = CudaComplex { x: 1.0 / norm, y: 0.0 };
+                    cudarc::cublas::sys::cublasZscal_v2(
+                        blas.raw_handle(), n_pw_i32,
+                        &inv_norm as *const _ as *const _,
+                        col_b as *mut _, 1,
+                    ).result().map_err(Error::Blas)?;
+                }
+            }
+        }
+    }
 
     // Compute final H|psi> for Rayleigh-Ritz
     unsafe {
         apply_full_hamiltonian(
-            final_psi, v_eff_dev, &kinetic_dev, fft_idx_dev,
+            final_psi_buf, v_eff_dev, &kinetic_dev, fft_idx_dev,
             n_pw, n_bands, grid_size, inv_ntotal,
             &fft_plan, &mut hpsi_dev, &mut grid_dev, vnl_data, blas, kernels, stream,
         )?;
@@ -1169,43 +1233,12 @@ pub(crate) fn chebyshev_filter(
     // (n_bands, n_pw) [flat[g*n_bands + b] = psi[b, g]] which gemm with
     // lda = n_pw mis-read, scrambling H_sub and S_sub. Found via the
     // RR_DUMP_HS diagnostic in `rayleigh_ritz.rs`.
-    stream.memcpy_dtod(final_psi, &mut psi_row_dev).map_err(Error::Cuda)?;
+    stream.memcpy_dtod(final_psi_buf, &mut psi_row_dev).map_err(Error::Cuda)?;
     stream.memcpy_dtod(&hpsi_dev, &mut hpsi_row_dev).map_err(Error::Cuda)?;
 
-    // Normalize each band so S_sub = ψ†ψ is well-conditioned for ZHEGVD.
-    // The Chebyshev filter amplifies the wanted subspace by T_ndeg(σ) which
-    // can reach ~2700× for ndeg=8, making S_sub nearly singular otherwise.
-    // Scale both ψ_b and Hψ_b by 1/‖ψ_b‖ so each band has unit norm.
-    unsafe {
-        let (psi_ptr, _) = psi_row_dev.device_ptr_mut(stream);
-        let (hpsi_ptr, _) = hpsi_row_dev.device_ptr_mut(stream);
-        for b in 0..n_bands {
-            let offset = (b * n_pw) as isize;
-            let p = (psi_ptr as *mut CudaComplex).offset(offset);
-            let hp = (hpsi_ptr as *mut CudaComplex).offset(offset);
-            let mut dot = CudaComplex { x: 0.0, y: 0.0 };
-            cudarc::cublas::sys::cublasZdotc_v2(
-                blas.raw_handle(), n_pw_i32,
-                p as *const _, 1,
-                p as *const _, 1,
-                &mut dot as *mut _ as *mut _,
-            ).result().map_err(Error::Blas)?;
-            let norm = dot.x.sqrt();
-            if norm > 1e-30 {
-                let inv_norm = CudaComplex { x: 1.0 / norm, y: 0.0 };
-                cudarc::cublas::sys::cublasZscal_v2(
-                    blas.raw_handle(), n_pw_i32,
-                    &inv_norm as *const _ as *const _,
-                    p as *mut _, 1,
-                ).result().map_err(Error::Blas)?;
-                cudarc::cublas::sys::cublasZscal_v2(
-                    blas.raw_handle(), n_pw_i32,
-                    &inv_norm as *const _ as *const _,
-                    hp as *mut _, 1,
-                ).result().map_err(Error::Blas)?;
-            }
-        }
-    }
+    // The Gram-Schmidt step above already orthonormalized the bands, so
+    // S_sub = ψ†ψ ≈ I and ZHEGVD is well-conditioned. No further per-band
+    // scaling needed.
 
     // Wrap into Gpu<WavefunctionSet<L>>
     let psi_row = Gpu::<WavefunctionSet<RowDistributed>> {
