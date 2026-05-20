@@ -125,18 +125,22 @@ impl VnlBatchData {
 
         let mut entries = Vec::new();
 
-        // Precompute Q-on-grid once per species (ion-independent, expensive).
-        // For Cu111_CO: 18 expanded pairs × 437k grid points × 18 Cu ions would
-        // be ~1.3B ops if done per-ion; caching reduces it to one call per species.
-        let q_on_grid_cache: HashMap<String, Option<chemrust_hamiltonian_core::nlpot::QOnGrid>> =
-            if v_eff_wave.is_some() {
+        // Precompute Q-on-grid once per species and FFT V_eff once total.
+        // For Cu111_CO: 18 Cu ions × 171 Q-pairs × 437k grid points = ~1.3B ops
+        // if done per-ion. Caching reduces Q to one call per species and FFT to one call.
+        let v_eff_fft = v_eff_wave.and_then(|v_eff| {
+            chemrust_hamiltonian_core::fft_forward_3d(v_eff.as_real_grid()).ok()
+        });
+
+        let q_on_grid_cache: HashMap<String, Option<chemrust_hamiltonian_core::QOnGrid>> =
+            if v_eff_fft.is_some() {
                 cell.species_symbols.iter().filter_map(|symbol| {
                     let pot = pots.get(symbol)?;
                     let aug: &dyn HasAugmentationData = match pot {
                         Pseudopotential::Usp(d) => d,
                         _ => return None,
                     };
-                    let q = chemrust_hamiltonian_core::nlpot::precompute_q_on_grid(aug, wave_grid).ok();
+                    let q = chemrust_hamiltonian_core::precompute_q_on_grid(aug, wave_grid).ok();
                     Some((symbol.clone(), q))
                 }).collect()
             } else {
@@ -160,17 +164,13 @@ impl VnlBatchData {
             let n_expanded = beta_g.shape()[0] as i32;
 
             // Compute screened D matrix: D = D0 + ∫ Q(r)·V_eff(r) dr
-            let d_screened = if let Some(v_eff) = v_eff_wave {
-                q_on_grid_cache.get(symbol)
-                    .and_then(|opt_q| opt_q.as_ref())
-                    .and_then(|q_on_grid| {
-                        chemrust_hamiltonian_core::nlpot::compute_screened_d(
-                            q_on_grid, v_eff, cell, ion_idx, wave_grid, &d0_expanded,
-                        ).ok()
-                    })
-                    .unwrap_or_else(|| d0_expanded.clone())
-            } else {
-                d0_expanded.clone()
+            let d_screened = match (&v_eff_fft, q_on_grid_cache.get(symbol).and_then(|o| o.as_ref())) {
+                (Some(fft), Some(q_on_grid)) => {
+                    chemrust_hamiltonian_core::compute_screened_d_from_fft(
+                        q_on_grid, fft, cell, ion_idx, wave_grid, &d0_expanded,
+                    )
+                }
+                _ => d0_expanded.clone(),
             };
 
             let beta_flat: Vec<CudaComplex> =
