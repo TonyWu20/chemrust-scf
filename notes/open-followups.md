@@ -276,3 +276,94 @@ tree from the diagnosis is recorded in `notes/plans/notes-open-followups-md-issu
    Loose acceptance: iter-2 band-1 within ±0.2 Ha of CASTEP's −1.06 Ha
    reference.
 
+**Resolution (2026-05-21):** Implemented and discriminator test green —
+iter-1 = 8.6877 Ha, iter-2 = 8.5573 Ha, |Δ| = 0.1304 Ha (target < 1.0 Ha,
+7.7× margin). Two pieces of work were needed:
+
+1. **State-machine wiring**: cached `⟨β|ψ_new⟩` from Rayleigh–Ritz into a
+   new `ScfIteration.beta_psi_per_ion` field (one extra GPU gemm +
+   batched D2H, ~1 MB). New `density.rs::compute_aug_density_fine` builds
+   per-ion `ω^I_{nm} = Σ_b occ_b · conj(βψ)_n,b · (βψ)_m,b` and calls a
+   new chemrust-hamiltonian wrapper `assemble_aug_density_fine` that sums
+   `Σ_I ω^I · Q^I(G) · exp(-iG·R_I)` and inverse-FFTs to real space.
+   `build_v_eff_with_energy_impl` adds ρ_aug to upsampled ρ_PW before
+   feeding Poisson + XC. ρ_aug regenerates each iteration; not mixed.
+2. **Hidden unit bug**: `construct_density_gpu` was producing density in
+   electrons/Bohr³ (multiplying by `inv_omega = 1/Ω`) while VEffBuilder /
+   solve_poisson / compute_pbe_xc expect CASTEP raw `ρ_phys × V_cell`
+   units (matches `.castep_bin` storage). The fixture density iter-1
+   path silently worked because it's loaded raw, but iter-2 saw a
+   factor-of-Ω mismatch on top of the missing augmentation. Fixed by
+   dropping the `inv_omega` factor in `density.rs`.
+
+Empirical electron-count balance post-fix:
+- Smooth ρ_PW integral: 1,029,838  (≈ 25% of total — matches `<ψ|ψ>_PW`)
+- Augmentation ρ_aug integral: 3,120,753
+- Total: **4,150,591** — matches iter-1 fixture density exactly (= N_e × Ω).
+
+## 9. Performance — iter-2 path takes ~531 s (mostly CPU)
+
+**Symptom:** With Issue #8 resolved, the green discriminator test still
+takes 8-9 minutes to complete two iterations. Most of the cost is
+single-threaded CPU work outside the GPU hot path.
+
+**Approximate breakdown** (Cu111+CO, 18 ions, fine grid 54·90·90 = 437k):
+- `VnlBatchData::precompute` — ~200-300 s. `precompute_q_on_grid` per
+  species (Cu Q-on-grid: 171 channel pairs × radial Bessel transform on
+  log grid), `compute_screened_d_from_fft` per ion (18×), CPU `compute_beta_g`
+  per ion, Gauss-Jordan inversion for S^{-1} Woodbury matrix per ion.
+  Already cached per species where possible.
+- **`compute_aug_density_fine` (new) — ~100-200 s.** `apply_q_and_sf` runs
+  per ion on the fine grid: for each (n_exp, m_exp) channel pair with
+  non-zero ω, walks the fine-grid G-vectors with `real_solid_harmonic +
+  interp_uniform`. 18 ions × ~100-300 non-zero pairs × 437k grid
+  points × CG-sum × radial interp → dominant CPU bottleneck. Plus the
+  inverse FFT on the assembled ρ_aug(G).
+- Chebyshev + Rayleigh–Ritz — ~5-10 s (GPU).
+- `build_v_eff_with_energy_impl` (Poisson + XC + upsample) — ~5-10 s.
+
+**Optimization proposal (deferred — not in Issue #8 scope):**
+
+The Q-function infrastructure is geometry-static — `Q^I_{nm}(G)` for
+each ion depends only on the cell, pseudopotential, and ion position.
+Only `ω^I_{nm}` and the structure factor change per iteration. Two
+tiers of speedup are available:
+
+1. **Cache `Q^I_{nm}(G) · exp(-iG·R_I)` per ion on GPU once at SCF
+   start.** Replaces the per-iteration `apply_q_and_sf` CPU walk with a
+   single gemm `ρ_aug(G) = Σ_I (Q^I(G) ⊙ SF_I) · ω^I` and a batched
+   IFFT on GPU. Expected gain: ~100-200 s → <1 s per iteration. Memory
+   cost: 18 ions × ~100-300 non-zero pairs × 437k Complex64 ≈ 1-3 GB —
+   feasible on Pascal+. Implementation: extend `VnlBatchData` (or a
+   sibling) to hold `q_sf_gpu: Vec<CudaSlice<CudaComplex>>` per ion,
+   built once when V_eff iter-1 starts (geometry-stable). Then expose
+   a `compute_aug_density_gpu(beta_psi_gpu, occ_gpu, q_sf_gpu)` kernel
+   that:
+   - Builds ω^I on GPU from cached β·ψ (no D2H needed — keep
+     `beta_psi_per_ion` GPU-resident as `Vec<CudaSlice<CudaComplex>>`).
+   - Reduces to `ρ_aug(G) = Σ_I Σ_{n,m} ω^I_{nm} · (Q^I_{nm}(G) ⊙ SF_I)`
+     via a single batched gemm per ion (n_expanded × n_expanded × n_G).
+   - One IFFT to real space.
+2. **GPU-port `VnlBatchData::precompute`'s radial Bessel transform** —
+   the 200-300 s `precompute_q_on_grid` cost is mostly geometry-static
+   per species (one species → one Q table → reused for all 18 Cu ions).
+   The current cache already amortizes Cu's Q across 18 ions, so this
+   is only worth doing if a multi-species fixture shows it dominant.
+   Likely a bigger CPU-side win is parallelising the radial sum with
+   rayon over the species-pair index (currently sequential).
+
+**Tier-1 alone (cached Q·SF gemm) probably collapses iter-2 wall time
+from 8-9 min to ~1-2 min**, dominated by `VnlBatchData::precompute`.
+Tier-1 is a self-contained piece that does not touch the SCF state
+machine — `compute_aug_density_fine` becomes a 5-line wrapper.
+
+**Suggested entry point:** add a sibling
+`chemrust_hamiltonian_core::QSfCache` that owns the per-ion
+`Q^I_{nm}(G) · exp(-iG·R_I)` arrays on GPU. Build it inside
+`ScfIteration::new` (geometry is known at construction). Expose
+`compute_aug_density_gpu(...) -> RealGrid<f64>` and swap it for the
+host `compute_aug_density_fine` call in `compute_density_from_wavefunctions`.
+The unit test gate stays the same (iter-2 V_eff range within 1 Ha of
+iter-1); regression check is `cargo test --release -- --ignored
+iter2_v_eff_range_within_one_ha_of_iter1`.
+

@@ -139,6 +139,18 @@ pub struct ScfIteration<
     /// Fermi energy / chemical potential from the most recent occupation search.
     pub(crate) fermi_energy: Option<f64>,
 
+    /// Per-ion ⟨β_{IL}|ψ_b⟩ projections of the most recent ψ, cached from the
+    /// Rayleigh–Ritz step. Shape per ion: `(n_expanded × n_bands)`. `None`
+    /// before the first `diagonalize` (e.g. iter-1 driven from a fixture
+    /// density). Consumed by `compute_aug_density_fine` to build ω^I_{nm}.
+    pub(crate) beta_psi_per_ion: Option<Vec<ndarray::Array2<num_complex::Complex64>>>,
+    /// USPP augmentation density ρ_aug(r) on the fine grid, regenerated from
+    /// the current ψ + occ each iteration. `None` for iter-1 (fixture
+    /// density already encodes augmentation in the wave-grid convention).
+    /// Added inside `build_v_eff_with_energy_impl` to the upsampled smooth
+    /// density before V_H/V_xc evaluation.
+    pub(crate) density_aug_fine: Option<chemrust_hamiltonian_core::fft::RealGrid<f64>>,
+
     _phase: PhantomData<State>,
 }
 
@@ -204,6 +216,8 @@ impl<S: SpinPolicy> ScfIteration<S, Initialized, MixingOff> {
             energy_buffer: Vec::new(),
             total_energy: None,
             fermi_energy: None,
+            beta_psi_per_ion: None,
+            density_aug_fine: None,
             _phase: PhantomData,
         }
     }
@@ -240,6 +254,8 @@ impl<S: SpinPolicy, Phase: ScfPhase, M: MixingPhase> ScfIteration<S, Phase, M> {
             energy_buffer: self.energy_buffer,
             total_energy: self.total_energy,
             fermi_energy: self.fermi_energy,
+            beta_psi_per_ion: self.beta_psi_per_ion,
+            density_aug_fine: self.density_aug_fine,
             _phase: PhantomData,
         }
     }
@@ -297,6 +313,7 @@ pub trait BuildVEffWithEnergy: BuildVEff {
     fn build_v_eff_with_energy_impl(
         cell: &CellGeometry, pots: &PseudopotentialSet,
         rho: &chemrust_hamiltonian_core::Density,
+        rho_aug_fine: Option<&chemrust_hamiltonian_core::fft::RealGrid<f64>>,
         wave_grid: &GVectorGrid, fine_grid: &GVectorGrid,
     ) -> Result<(Self::VEff, f64, f64, f64), chemrust_hamiltonian_core::Error>;
 }
@@ -305,32 +322,41 @@ impl BuildVEffWithEnergy for NonSpin {
     fn build_v_eff_with_energy_impl(
         cell: &CellGeometry, pots: &PseudopotentialSet,
         rho: &chemrust_hamiltonian_core::Density,
+        rho_aug_fine: Option<&chemrust_hamiltonian_core::fft::RealGrid<f64>>,
         wave_grid: &GVectorGrid, fine_grid: &GVectorGrid,
     ) -> Result<(chemrust_hamiltonian_core::EffectivePotential, f64, f64, f64), chemrust_hamiltonian_core::Error> {
         use chemrust_hamiltonian_core::{nlcc, poisson, upsample_density_to_fine_grid, xc, Density as CoreDensity};
-        let rho_fine =
+        let rho_fine_pw =
             upsample_density_to_fine_grid(rho.as_real_grid(), wave_grid, fine_grid)
                 .map_err(|_| chemrust_hamiltonian_core::Error::Format {
                     section: "build_v_eff_with_energy".into(),
                     detail: "upsample failed".into(),
                 })?;
+        // Add USPP augmentation (when available) so V_H, V_xc and the energy
+        // double-counting integrals all see the full ρ_total = ρ_PW + ρ_aug.
+        let rho_total_fine = match rho_aug_fine {
+            Some(aug) => chemrust_hamiltonian_core::fft::RealGrid::from_inner(
+                rho_fine_pw.as_real_array() + aug.as_real_array(),
+            ),
+            None => rho_fine_pw,
+        };
         let v_eff = VEffBuilder::<NonSpin>::new(cell, pots, fine_grid)
-            .with_density(CoreDensity::from_inner(rho_fine.clone()), None)
+            .with_density(CoreDensity::from_inner(rho_total_fine.clone()), None)
             .assemble()?;
         // Compute double-counting terms: E_H = 0.5·∫ρV_H and ∫ρV_xc
         let rho_core = nlcc::reconstruct_rho_core(cell, pots, fine_grid)?
             .into_inner();
-        let density_total = CoreDensity::from_inner(rho_fine.clone() + &rho_core);
-        let v_h = poisson::solve_poisson(&CoreDensity::from_inner(rho_fine.clone()), fine_grid)?;
+        let density_total = CoreDensity::from_inner(rho_total_fine.clone() + &rho_core);
+        let v_h = poisson::solve_poisson(&CoreDensity::from_inner(rho_total_fine.clone()), fine_grid)?;
         let v_xc = xc::compute_pbe_xc(density_total.as_real_grid().as_real_array(), fine_grid, cell.volume)?;
         let n_grid = density_total.as_real_grid().as_real_array().len() as f64;
         let d_v = cell.volume / n_grid;
-        let e_hartree_raw: f64 = rho_fine.as_real_array().iter()
+        let e_hartree_raw: f64 = rho_total_fine.as_real_array().iter()
             .zip(v_h.as_real_grid().as_real_array().iter())
             .map(|(&rv, &vh)| rv * vh * d_v)
             .sum();
         let e_hartree = 0.5 * e_hartree_raw;
-        let rho_vxc: f64 = rho_fine.as_real_array().iter()
+        let rho_vxc: f64 = rho_total_fine.as_real_array().iter()
             .zip(v_xc.v_xc.iter())
             .map(|(&rv, &vxc)| rv * vxc * d_v)
             .sum();
@@ -368,6 +394,7 @@ impl ScfIteration<NonSpin, Initialized, MixingOff> {
         );
         let (v_eff, e_xc, e_hartree, rho_vxc) = NonSpin::build_v_eff_with_energy_impl(
             &self.cell, &self.pots, &core_rho,
+            self.density_aug_fine.as_ref(),
             &self.wave_grid, &self.fine_grid,
         )
         .map_err(|_| Error::NotImplemented)?;
@@ -483,7 +510,7 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
         )?;
 
         // Rayleigh-Ritz
-        let (psi_new_gpu, eigenvalues_cpu) = rayleigh_ritz(
+        let (psi_new_gpu, eigenvalues_cpu, beta_psi_cpu) = rayleigh_ritz(
             &psi_filtered_row, &hpsi_row, &vnl_data,
             n_bands, n_pw, &kernels,
             &mut pcie,
@@ -493,8 +520,12 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
         stream.synchronize()?;
         let psi_bytes = n_bands * n_pw * 16;            // complex double
         let eig_bytes = n_bands * 8;
+        let beta_psi_bytes: usize = vnl_data.entries.iter()
+            .map(|e| e.n_expanded as usize * n_bands * 16)  // complex double
+            .sum();
         let Cpu(psi_new) = psi_new_gpu.sync_to_host_with(&stream, &mut pcie)?;
         let eigenvalues = eigenvalues_cpu.into_inner();
+        let beta_psi_per_ion = beta_psi_cpu.into_inner();
         eprintln!("[RR] eigenvalues: first={:.4e} Ha  last={:.4e} Ha  count={}",
             eigenvalues.first().copied().unwrap_or(f64::NAN),
             eigenvalues.last().copied().unwrap_or(f64::NAN),
@@ -504,9 +535,9 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
         // Any additional transfer (e.g. D2H inside the Chebyshev loop) is a bug.
         assert_eq!(
             pcie.d2h_bytes,
-            psi_bytes + eig_bytes,
-            "D2H: expected psi({psi_bytes}) + eigenvalues({eig_bytes}) = {}",
-            psi_bytes + eig_bytes,
+            psi_bytes + eig_bytes + beta_psi_bytes,
+            "D2H: expected psi({psi_bytes}) + eigenvalues({eig_bytes}) + beta_psi({beta_psi_bytes}) = {}",
+            psi_bytes + eig_bytes + beta_psi_bytes,
         );
 
         let [ngz, ngy, ngx] = self.wave_grid.grid();
@@ -526,6 +557,7 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
         let mut next: ScfIteration<S, WavefunctionsUpdated, MixingOff> = self.into_phase();
         next.psi = psi_new;
         next.eigenvalues = eigenvalues;
+        next.beta_psi_per_ion = Some(beta_psi_per_ion);
         Ok(next)
     }
 
@@ -587,8 +619,21 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
 
 impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated, MixingOff> {
     /// Shared density computation (occupations + GPU construction).
-    /// Returns (new_density, chemical_potential).
-    fn compute_density_from_wavefunctions(&self) -> Result<(Density, ChemicalPotential), Error> {
+    /// Returns `(new_density, density_aug_fine, chemical_potential)`. The
+    /// augmentation density is `Some` only when `beta_psi_per_ion` is cached
+    /// from a prior `diagonalize` call; in iter-1 (fixture density path) it
+    /// stays `None` and `build_v_eff_with_energy` reads the wave-grid density
+    /// as-is.
+    fn compute_density_from_wavefunctions(
+        &self,
+    ) -> Result<
+        (
+            Density,
+            Option<chemrust_hamiltonian_core::fft::RealGrid<f64>>,
+            ChemicalPotential,
+        ),
+        Error,
+    > {
         let n_electrons: f64 = self
             .cell
             .species_iter()
@@ -638,7 +683,36 @@ impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated, MixingOff> {
                 occ_sum, occ_max, n_electrons, chem_pot.0,
             );
         }
-        Ok((new_density, chem_pot))
+
+        // USPP augmentation density on the fine grid (only when β·ψ is cached
+        // from this iteration's RR; iter-1 fixture path skips this).
+        let density_aug_fine = match self.beta_psi_per_ion.as_ref() {
+            Some(beta_psi) => {
+                let rho_aug = crate::density::compute_aug_density_fine(
+                    beta_psi,
+                    &occupations.0,
+                    &self.pots,
+                    &self.cell,
+                    &self.fine_grid,
+                )?;
+                {
+                    let arr = rho_aug.as_real_array();
+                    let aug_sum: f64 = arr.iter().sum();
+                    let aug_min = arr.iter().cloned().fold(f64::INFINITY, f64::min);
+                    let aug_max = arr.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                    let n_grid = arr.len() as f64;
+                    eprintln!(
+                        "[AugDensity] aug_sum={:.4e} aug_min={:.4e} aug_max={:.4e}  ∫ρ_aug dV ≈ {:.4}",
+                        aug_sum, aug_min, aug_max,
+                        aug_sum * self.cell.volume / n_grid,
+                    );
+                }
+                Some(rho_aug)
+            }
+            None => None,
+        };
+
+        Ok((new_density, density_aug_fine, chem_pot))
     }
 
     /// Construct density with `Off` mixing phase — the history stays as-is
@@ -646,10 +720,11 @@ impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated, MixingOff> {
     pub fn construct_density_off(
         self,
     ) -> Result<ScfIteration<S, DensityUpdated<MixingOff>, MixingOff>, Error> {
-        let (new_density, chem_pot) = self.compute_density_from_wavefunctions()?;
+        let (new_density, density_aug_fine, chem_pot) = self.compute_density_from_wavefunctions()?;
         let mut next: ScfIteration<S, DensityUpdated<MixingOff>, MixingOff> =
             self.into_phase();
         next.density = new_density;
+        next.density_aug_fine = density_aug_fine;
         next.fermi_energy = Some(chem_pot.0);
         Ok(next)
     }
@@ -658,7 +733,7 @@ impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated, MixingOff> {
     pub fn construct_density_kerker(
         self,
     ) -> Result<ScfIteration<S, DensityUpdated<Kerker>, Kerker>, Error> {
-        let (new_density, chem_pot) = self.compute_density_from_wavefunctions()?;
+        let (new_density, density_aug_fine, chem_pot) = self.compute_density_from_wavefunctions()?;
         // Convert history from MixingOff → Kerker (creates GPU preconditioner)
         let kerker_history = self.history.into_kerker(&self.wave_grid)?;
         Ok(ScfIteration {
@@ -684,6 +759,8 @@ impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated, MixingOff> {
             energy_buffer: self.energy_buffer,
             total_energy: self.total_energy,
             fermi_energy: Some(chem_pot.0),
+            beta_psi_per_ion: self.beta_psi_per_ion,
+            density_aug_fine,
             _phase: PhantomData,
         })
     }
@@ -692,7 +769,7 @@ impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated, MixingOff> {
     pub fn construct_density_pulay(
         self,
     ) -> Result<ScfIteration<S, DensityUpdated<Pulay>, Pulay>, Error> {
-        let (new_density, chem_pot) = self.compute_density_from_wavefunctions()?;
+        let (new_density, density_aug_fine, chem_pot) = self.compute_density_from_wavefunctions()?;
         // Convert history: MixingOff → Kerker → Pulay
         let kerker_history = self.history.into_kerker(&self.wave_grid)?;
         let pulay_history = kerker_history.into_pulay();
@@ -719,6 +796,8 @@ impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated, MixingOff> {
             energy_buffer: self.energy_buffer,
             total_energy: self.total_energy,
             fermi_energy: Some(chem_pot.0),
+            beta_psi_per_ion: self.beta_psi_per_ion,
+            density_aug_fine,
             _phase: PhantomData,
         })
     }
@@ -761,6 +840,8 @@ impl<S: SpinPolicy> ScfIteration<S, DensityUpdated<MixingOff>, MixingOff> {
             energy_buffer: self.energy_buffer,
             total_energy: self.total_energy,
             fermi_energy: self.fermi_energy,
+            beta_psi_per_ion: self.beta_psi_per_ion,
+            density_aug_fine: self.density_aug_fine,
             _phase: PhantomData,
         }
     }
@@ -794,6 +875,8 @@ impl<S: SpinPolicy> ScfIteration<S, DensityUpdated<Kerker>, Kerker> {
             energy_buffer: self.energy_buffer,
             total_energy: self.total_energy,
             fermi_energy: self.fermi_energy,
+            beta_psi_per_ion: self.beta_psi_per_ion,
+            density_aug_fine: self.density_aug_fine,
             _phase: PhantomData,
         }
     }
@@ -827,6 +910,8 @@ impl<S: SpinPolicy> ScfIteration<S, DensityUpdated<Pulay>, Pulay> {
             energy_buffer: self.energy_buffer,
             total_energy: self.total_energy,
             fermi_energy: self.fermi_energy,
+            beta_psi_per_ion: self.beta_psi_per_ion,
+            density_aug_fine: self.density_aug_fine,
             _phase: PhantomData,
         }
     }
@@ -1295,6 +1380,8 @@ mod tests {
             energy_buffer: Vec::new(),
             total_energy: None,
             fermi_energy: None,
+            beta_psi_per_ion: None,
+            density_aug_fine: None,
             _phase: PhantomData,
         };
 
@@ -1345,6 +1432,8 @@ mod tests {
             energy_buffer,
             total_energy: None,
             fermi_energy: None,
+            beta_psi_per_ion: None,
+            density_aug_fine: None,
             _phase: PhantomData,
         }
     }

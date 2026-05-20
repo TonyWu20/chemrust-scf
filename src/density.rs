@@ -11,15 +11,17 @@
 use std::sync::Arc;
 
 use bon::builder;
-use chemrust_hamiltonian_core::GVectorGrid;
+use chemrust_hamiltonian_core::{
+    assemble_aug_density_fine, CellGeometry, GVectorGrid, PseudopotentialSet,
+};
 use cudarc::driver::{CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
-use ndarray::Array3;
+use ndarray::{Array2, Array3};
 use num_complex::Complex64;
 
 use crate::device::fft::BatchedFftPlan3d;
 use crate::device::{complex_slice_to_cuda, CudaComplex};
 use crate::eigensolver::chebyshev::CudaKernelSet;
-use crate::types::{Density, Error, SmearingParams, SmearingScheme, WaveGridArray};
+use crate::types::{ChemicalPotential, Density, Error, Occupations, SmearingParams, SmearingScheme, WaveGridArray};
 
 // ---------------------------------------------------------------------------
 // Occupation numbers (Gaussian smearing, CASTEP default)
@@ -34,14 +36,17 @@ pub(crate) fn compute_occupations(
     eigenvalues: &[f64],
     smearing: &SmearingParams,
     n_electrons: f64,
-) -> Result<Vec<f64>, Error> {
+) -> Result<(Occupations, ChemicalPotential), Error> {
     match smearing.scheme {
         SmearingScheme::Gaussian => {
             let mu = find_chemical_potential(eigenvalues, smearing.width, n_electrons)?;
-            Ok(eigenvalues
-                .iter()
-                .map(|&e| libm::erfc((e - mu) / smearing.width))
-                .collect())
+            let occ = Occupations(
+                eigenvalues
+                    .iter()
+                    .map(|&e| libm::erfc((e - mu) / smearing.width))
+                    .collect(),
+            );
+            Ok((occ, ChemicalPotential(mu)))
         }
     }
 }
@@ -84,8 +89,14 @@ fn find_chemical_potential(
 /// 1. H2D psi, fft_indices, occupations
 /// 2. Scatter sparse PW → full FFT grid (reuse `scatter_pw_to_grid` kernel)
 /// 3. Batched C2C IFFT (reuse `BatchedFftPlan3d`)
-/// 4. ρ[r] = (1/Ω) Σ_b occ_b |ψ_b[r]|² (`accumulate_density` kernel)
+/// 4. ρ[r] = Σ_b occ_b |ψ_b[r]|² (`accumulate_density` kernel)
 /// 5. D2H → Density(WaveGridArray)
+///
+/// **Unit convention**: the output is in CASTEP raw units (ρ_phys × V_cell),
+/// matching `.castep_bin` density storage and `solve_poisson`/`compute_pbe_xc`
+/// expectations downstream. The `accumulate_density` kernel multiplies by
+/// `inv_omega = 1.0`, i.e. no Ω division (left as a parameter for potential
+/// future Ha/Bohr³ callers, but always 1.0 in this SCF pipeline).
 #[builder]
 pub(crate) fn construct_density_gpu(
     psi_data: &[Complex64],
@@ -100,7 +111,12 @@ pub(crate) fn construct_density_gpu(
 ) -> Result<Density, Error> {
     let [ngz, ngy, ngx] = wave_grid.grid();
     let grid_size = (ngz * ngy * ngx) as i32;
-    let inv_omega = 1.0 / cell_volume;
+    // CASTEP raw density convention: ρ stored as ρ_phys × V_cell (electrons
+    // per grid point × N_grid). solve_poisson + compute_pbe_xc downstream
+    // expect this convention. We keep `inv_omega` as a kernel parameter to
+    // preserve the existing call site, but pass 1.0 to skip the Ω division.
+    let _ = cell_volume;
+    let inv_omega = 1.0_f64;
 
     let n_bands_i = n_bands as i32;
     let n_pw_i = n_pw as i32;
@@ -141,8 +157,10 @@ pub(crate) fn construct_density_gpu(
     .map_err(Error::Cuda)?;
 
     // 4. Batched C2C IFFT (in-place on grid_dev)
+    // cuFFT: n[0] outermost, n[rank-1] innermost. Our scatter formula makes
+    // iz innermost, so plan dims = (ngx, ngy, ngz). See chebyshev.rs:844.
     let fft_plan = BatchedFftPlan3d::plan_batched_c2c(
-        ngz as i32, ngy as i32, ngx as i32,
+        ngx as i32, ngy as i32, ngz as i32,
         n_bands as i32, Arc::clone(stream),
     )?;
     // In-place IFFT: same buffer for input and output via raw pointer
@@ -150,6 +168,35 @@ pub(crate) fn construct_density_gpu(
         let ptr = &mut grid_dev as *mut CudaSlice<CudaComplex>;
         fft_plan.c2c_inverse(&mut *ptr, &mut *ptr)?
     };
+
+    // DIAGNOSTIC: probe Σ|grid[r]|² for the first band to pin down the
+    // missing factor of ~4 in the density normalization.
+    // - If Σ|grid|² == N (=ngx·ngy·ngz): IFFT is unnormalized, Σ_G|c|²=1 holds
+    //   → factor-of-4 lives in `accumulate_density` kernel or in `inv_omega`
+    // - If Σ|grid|² == N/4: IFFT or the PW coef convention carries the factor
+    // - If Σ|grid|² ≈ 1: IFFT divides by N (fully normalized)
+    {
+        let probe: Vec<CudaComplex> = stream
+            .clone_dtoh(&grid_dev)
+            .map_err(Error::Cuda)?;
+        let s_b0: f64 = probe
+            .iter()
+            .take(grid_size as usize)
+            .map(|c| (c.x as f64).powi(2) + (c.y as f64).powi(2))
+            .sum();
+        let psi_pw_norm_b0: f64 = psi_data
+            .iter()
+            .take(n_pw)
+            .map(|c| c.re * c.re + c.im * c.im)
+            .sum();
+        eprintln!(
+            "[ConstructDensity] band-0 Σ|grid[r]|² = {:.6e}  N=ngx·ngy·ngz={}  Σ_G|c_G|² = {:.6e}  ratio Σ|grid|² / (N · Σ|c|²) = {:.6e}",
+            s_b0,
+            grid_size,
+            psi_pw_norm_b0,
+            s_b0 / (grid_size as f64 * psi_pw_norm_b0),
+        );
+    }
 
     // 5. Accumulate density: ρ[r] = inv_omega × Σ_b occ[b] × |ψ_b[r]|²
     let mut rho_dev: CudaSlice<f64> = {
@@ -178,4 +225,66 @@ pub(crate) fn construct_density_gpu(
         .map_err(|_| Error::NotImplemented)?;
 
     Ok(Density::from_inner(WaveGridArray::from_inner(array)))
+}
+
+// ---------------------------------------------------------------------------
+// USPP augmentation density on the fine grid
+// ---------------------------------------------------------------------------
+
+/// Build the USPP augmentation density `ρ_aug(r)` on the fine grid from
+/// cached `⟨β|ψ⟩` projections and band occupations.
+///
+/// Pipeline (CPU-only):
+/// 1. For each ion `I`, compute `ω^I_{nm} = Σ_b occ_b · conj(βψ_I)_{n,b} · (βψ_I)_{m,b}`.
+///    `ω^I` is Hermitian by construction.
+/// 2. Hand the per-ion `ω` slice to `chemrust_hamiltonian_core::assemble_aug_density_fine`,
+///    which sums `Σ_I ω^I · Q^I(G) · exp(-iG·R_I)` and inverse-FFTs to real
+///    space on the fine grid.
+///
+/// `beta_psi_per_ion` must have one entry per ion in `cell.ionic_positions`,
+/// each shape `(n_expanded × n_bands)`. Ions whose pseudopotential lacks
+/// augmentation (Recpot) contribute nothing and may carry any value (the
+/// upstream wrapper skips them).
+pub(crate) fn compute_aug_density_fine(
+    beta_psi_per_ion: &[Array2<Complex64>],
+    occupations: &[f64],
+    pots: &PseudopotentialSet,
+    cell: &CellGeometry,
+    fine_grid: &GVectorGrid,
+) -> Result<chemrust_hamiltonian_core::fft::RealGrid<f64>, Error> {
+    debug_assert_eq!(
+        beta_psi_per_ion.len(),
+        cell.num_ions,
+        "beta_psi_per_ion length {} must equal cell.num_ions {}",
+        beta_psi_per_ion.len(),
+        cell.num_ions,
+    );
+
+    let rho_nm_per_ion: Vec<Array2<Complex64>> = beta_psi_per_ion
+        .iter()
+        .map(|bp| {
+            let (ne, n_bands) = (bp.shape()[0], bp.shape()[1]);
+            debug_assert_eq!(
+                n_bands,
+                occupations.len(),
+                "beta_psi n_bands ({}) must match occupations len ({})",
+                n_bands,
+                occupations.len(),
+            );
+            let mut rho_nm = Array2::<Complex64>::zeros((ne, ne));
+            for n in 0..ne {
+                for m in 0..ne {
+                    let mut acc = Complex64::ZERO;
+                    for b in 0..n_bands {
+                        acc += occupations[b] * bp[[n, b]].conj() * bp[[m, b]];
+                    }
+                    rho_nm[[n, m]] = acc;
+                }
+            }
+            rho_nm
+        })
+        .collect();
+
+    assemble_aug_density_fine(&rho_nm_per_ion, pots, cell, fine_grid)
+        .map_err(|_| Error::NotImplemented)
 }
