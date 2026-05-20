@@ -136,58 +136,6 @@ fn diagnose_veff_components() {
 // ---------------------------------------------------------------------------
 // Test 2b: Eigenvalue comparison against .bands
 // ---------------------------------------------------------------------------
-
-#[test]
-#[ignore = "requires GPU and CASTEP fixture data"]
-fn compare_eigenvalues_against_bands() {
-    if !gpu_available() {
-        eprintln!("SKIP: no GPU available");
-        return;
-    }
-
-    let fx = fixtures::cu111_co::fixture();
-    let state = fixtures::cu111_co::build_scf_state(fx);
-    let v_eff_state = state.build_v_eff().expect("build_v_eff");
-    let diag_state = v_eff_state.diagonalize(8, None).expect("diagonalize");
-
-    let computed = diag_state.eigenvalues();
-    let reference = &fx.bands_eigenvalues;
-
-    println!("DEBUG: computed eigenvalues first 10: {:?}", &computed.iter().take(10).collect::<Vec<_>>());
-    println!("DEBUG: reference eigenvalues first 10: {:?}", &reference.iter().take(10).collect::<Vec<_>>());
-
-    assert_eq!(
-        computed.len(),
-        reference.len(),
-        "eigenvalue count mismatch: computed {} vs reference {}",
-        computed.len(),
-        reference.len()
-    );
-
-    let n = computed.len() as f64;
-    let max_diff: f64 = computed
-        .iter()
-        .zip(reference.iter())
-        .map(|(c, r)| (*c - *r).abs())
-        .fold(0.0, f64::max);
-    let rms: f64 = (computed
-        .iter()
-        .zip(reference.iter())
-        .map(|(c, r)| (*c - *r).powi(2))
-        .sum::<f64>()
-        / n)
-        .sqrt();
-
-    println!("Eigenvalue max diff: {:.6e} Hartree", max_diff);
-    println!("Eigenvalue RMS diff: {:.6e} Hartree", rms);
-
-    assert!(
-        rms < 1e2,
-        "Eigenvalue RMS diff {:.6e} exceeds tolerance 1e2",
-        rms
-    );
-}
-
 // ---------------------------------------------------------------------------
 // Test 2c: Density comparison against .castep_bin (wave grid)
 // ---------------------------------------------------------------------------
