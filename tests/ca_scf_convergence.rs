@@ -406,6 +406,67 @@ fn aug_density_gpu_matches_cpu_cu111_co() {
             q_ref[[0,0,0]].re, q_ref[[0,0,0]].im);
         eprintln!("[Diag] CPU tmp*SF[0] vs apply_q_and_sf[0,0,0]: ({:.4e},{:.4e}i) vs ({:.4e},{:.4e}i)",
             tmp_sf_cpu[0].re, tmp_sf_cpu[0].im, q_ref[[0,0,0]].re, q_ref[[0,0,0]].im);
+
+        // --- Diag: check species_entries coverage ---
+        eprintln!("[Diag] species_entries len={}", cache.species_entries.len());
+        for (i, e) in cache.species_entries.iter().enumerate() {
+            match e {
+                Some(se) => eprintln!("[Diag]   species[{i}] ({}) present: ne={} n_pairs={} q_nm.len={}",
+                    cell.species_symbols[i], se.n_expanded, se.n_pairs, se.q_nm.len()),
+                None => eprintln!("[Diag]   species[{i}] ({}) ABSENT", cell.species_symbols[i]),
+            }
+        }
+
+        // --- Diag: check first Cu ion (ion 2) ---
+        let cu_ion = cache.ion_species.iter().position(|&s| s == 2).unwrap();
+        let cu_species = cache.ion_species[cu_ion];
+        let cu_bp = &beta_psi_per_ion[cu_ion];
+        let cu_ne = cu_bp.shape()[0];
+        let cu_n_pairs = cu_ne * cu_ne;
+        eprintln!("[Diag] first Cu ion={cu_ion} species={cu_species} ne={cu_ne}");
+
+        let mut cu_omega = vec![Complex64::ZERO; cu_n_pairs];
+        for n in 0..cu_ne {
+            for m in 0..cu_ne {
+                let mut acc = Complex64::ZERO;
+                for b in 0..n_bands { acc += occupations[b] * cu_bp[[n, b]].conj() * cu_bp[[m, b]]; }
+                cu_omega[n * cu_ne + m] = acc;
+            }
+        }
+        let cu_omega_norm: f64 = cu_omega.iter().map(|c| c.norm()).fold(0.0_f64, f64::max);
+        eprintln!("[Diag] Cu ‖ω‖_∞ = {cu_omega_norm:.4e}");
+
+        if let Some(se) = cache.species_entries[cu_species].as_ref() {
+            // CPU gemv for Cu ion
+            let cu_q_gpu: Vec<chemrust_scf::device::CudaComplex> = stream.clone_dtoh(&se.q_nm).unwrap();
+            let mut cu_tmp = vec![Complex64::ZERO; n_fine];
+            for p in 0..cu_n_pairs {
+                let w = cu_omega[p];
+                if w.norm() < 1e-30 { continue; }
+                for g in 0..n_fine {
+                    let q = Complex64::new(cu_q_gpu[g + n_fine * p].x, cu_q_gpu[g + n_fine * p].y);
+                    cu_tmp[g] += w * q;
+                }
+            }
+            let cu_tmp_sum: f64 = cu_tmp.iter().map(|c| c.norm()).sum();
+            eprintln!("[Diag] Cu CPU gemv Σ|tmp| = {cu_tmp_sum:.4e}  tmp[0] = ({:.4e},{:.4e}i)",
+                cu_tmp[0].re, cu_tmp[0].im);
+
+            // Reference: apply_q_and_sf with Cu ω
+            let cu_pot = pots.get("Cu").unwrap();
+            let cu_aug = match cu_pot {
+                chemrust_hamiltonian_core::Pseudopotential::Usp(d) => d as &dyn chemrust_hamiltonian_core::pseudopotential::HasAugmentationData,
+                _ => panic!("expected USP"),
+            };
+            let mut cu_rho_nm = ndarray::Array2::<Complex64>::zeros((cu_ne, cu_ne));
+            for n in 0..cu_ne { for m in 0..cu_ne { cu_rho_nm[[n, m]] = cu_omega[n * cu_ne + m]; } }
+            let cu_ref = apply_q_and_sf(&cu_rho_nm, cu_aug, cell, cu_ion, &fine_grid, cu_pot.gmax()).unwrap();
+            let cu_ref_sum: f64 = cu_ref.iter().map(|c| c.norm()).sum();
+            eprintln!("[Diag] Cu apply_q_and_sf(ω) Σ|Q| = {cu_ref_sum:.4e}  Q[0,0,0] = ({:.4e},{:.4e}i)",
+                cu_ref[[0,0,0]].re, cu_ref[[0,0,0]].im);
+            eprintln!("[Diag] Cu CPU gemv tmp[0] vs ref[0,0,0]: ({:.4e},{:.4e}i) vs ({:.4e},{:.4e}i)",
+                cu_tmp[0].re, cu_tmp[0].im, cu_ref[[0,0,0]].re, cu_ref[[0,0,0]].im);
+        }
     }
 
     // Compare
