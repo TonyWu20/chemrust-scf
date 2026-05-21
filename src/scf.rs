@@ -12,7 +12,7 @@ use num_complex::Complex64;
 use crate::device::blas::BlasHandle;
 use crate::device::solver::SolverHandle;
 use crate::device::pcie::PcieAccount;
-use crate::device::Gpu;
+use crate::device::{CudaComplex, Gpu};
 use crate::eigensolver::chebyshev::{chebyshev_filter, CudaKernelSet};
 use crate::eigensolver::rayleigh_ritz::rayleigh_ritz;
 use crate::eigensolver::vnl_data::VnlBatchData;
@@ -141,10 +141,11 @@ pub struct ScfIteration<
     pub(crate) fermi_energy: Option<f64>,
 
     /// Per-ion ⟨β_{IL}|ψ_b⟩ projections of the most recent ψ, cached from the
-    /// Rayleigh–Ritz step. Shape per ion: `(n_expanded × n_bands)`. `None`
-    /// before the first `diagonalize` (e.g. iter-1 driven from a fixture
-    /// density). Consumed by `compute_aug_density_fine` to build ω^I_{nm}.
-    pub(crate) beta_psi_per_ion: Option<Vec<ndarray::Array2<num_complex::Complex64>>>,
+    /// Rayleigh–Ritz step. Shape per ion: `(n_expanded × n_bands)`. GPU-resident
+    /// as `CudaSlice<CudaComplex>`. `None` before the first `diagonalize`
+    /// (e.g. iter-1 driven from a fixture density). Consumed by
+    /// `compute_aug_density_gpu` to build ω^I_{nm}.
+    pub(crate) beta_psi_per_ion: Option<Vec<CudaSlice<CudaComplex>>>,
     /// GPU cache of Q_{nm}(G)·exp(-iG·R_I) per ion. Built lazily on first
     /// `compute_density_from_wavefunctions` call that has a GPU stream.
     /// `None` until first build; geometry-static thereafter.
@@ -517,7 +518,7 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
         )?;
 
         // Rayleigh-Ritz
-        let (psi_new_gpu, eigenvalues_cpu, beta_psi_cpu) = rayleigh_ritz(
+        let (psi_new_gpu, eigenvalues_cpu, beta_psi_gpu) = rayleigh_ritz(
             &psi_filtered_row, &hpsi_row, &vnl_data,
             n_bands, n_pw, &kernels,
             &mut pcie,
@@ -527,12 +528,11 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
         stream.synchronize()?;
         let psi_bytes = n_bands * n_pw * 16;            // complex double
         let eig_bytes = n_bands * 8;
-        let beta_psi_bytes: usize = vnl_data.entries.iter()
+        let _beta_psi_bytes: usize = vnl_data.entries.iter()
             .map(|e| e.n_expanded as usize * n_bands * 16)  // complex double
             .sum();
         let Cpu(psi_new) = psi_new_gpu.sync_to_host_with(&stream, &mut pcie)?;
         let eigenvalues = eigenvalues_cpu.into_inner();
-        let beta_psi_per_ion = beta_psi_cpu.into_inner();
         eprintln!("[RR] eigenvalues: first={:.4e} Ha  last={:.4e} Ha  count={}",
             eigenvalues.first().copied().unwrap_or(f64::NAN),
             eigenvalues.last().copied().unwrap_or(f64::NAN),
@@ -540,11 +540,12 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
 
         // Assert: hot path should only have setup H2D + final D2H.
         // Any additional transfer (e.g. D2H inside the Chebyshev loop) is a bug.
+        // beta_psi is now GPU-resident, so it's excluded from D2H accounting.
         assert_eq!(
             pcie.d2h_bytes,
-            psi_bytes + eig_bytes + beta_psi_bytes,
-            "D2H: expected psi({psi_bytes}) + eigenvalues({eig_bytes}) + beta_psi({beta_psi_bytes}) = {}",
-            psi_bytes + eig_bytes + beta_psi_bytes,
+            psi_bytes + eig_bytes,
+            "D2H: expected psi({psi_bytes}) + eigenvalues({eig_bytes}) = {}",
+            psi_bytes + eig_bytes,
         );
 
         let [ngz, ngy, ngx] = self.wave_grid.grid();
@@ -564,7 +565,7 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
         let mut next: ScfIteration<S, WavefunctionsUpdated, MixingOff> = self.into_phase();
         next.psi = psi_new;
         next.eigenvalues = eigenvalues;
-        next.beta_psi_per_ion = Some(beta_psi_per_ion);
+        next.beta_psi_per_ion = Some(beta_psi_gpu);
         Ok(next)
     }
 
@@ -719,8 +720,28 @@ impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated, MixingOff> {
                         &mut pcie,
                     )?
                 } else {
+                    // QSfCache build failed — fall back to CPU path.
+                    // D2H beta_psi slices (small: ~18 × n_bands × 16 bytes per ion).
+                    let beta_psi_cpu: Vec<ndarray::Array2<num_complex::Complex64>> = beta_psi
+                        .iter()
+                        .map(|bp_dev| {
+                            let ne_times_nb = bp_dev.len();
+                            let bp_host: Vec<CudaComplex> = stream.clone_dtoh(bp_dev).map_err(Error::Cuda)?;
+                            // Determine n_expanded from the slice length and n_bands
+                            let n_bands = occupations.0.len();
+                            let ne = ne_times_nb / n_bands;
+                            let bp_complex: Vec<num_complex::Complex64> = bp_host
+                                .iter()
+                                .map(|c| num_complex::Complex64::new(c.x, c.y))
+                                .collect();
+                            ndarray::Array2::from_shape_vec(
+                                (ne, n_bands).f(),
+                                bp_complex,
+                            ).map_err(|_| Error::NotImplemented)
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
                     crate::density::compute_aug_density_fine(
-                        beta_psi,
+                        &beta_psi_cpu,
                         &occupations.0,
                         &self.pots,
                         &self.cell,

@@ -97,7 +97,7 @@ impl VnlBatchData {
         psi_data: &[Complex64],
         n_bands: usize,
         n_pw: usize,
-        occupations: Option<&[f64]>,
+        _occupations: Option<&[f64]>,
         v_eff_wave: Option<&chemrust_hamiltonian_core::EffectivePotential>,
         stream: &Arc<CudaStream>,
         pcie: &mut PcieAccount,
@@ -296,11 +296,6 @@ impl VnlBatchData {
                 }
             }
             // s_inv now holds M^{-1}
-
-            let s_inv_flat: Vec<CudaComplex> = s_inv
-                .iter()
-                .map(|&x| CudaComplex { x, y: 0.0 })
-                .collect();
 
             let s_inv_flat: Vec<CudaComplex> = m_inv
                 .iter()

@@ -14,7 +14,6 @@ use std::sync::Arc;
 
 use cudarc::cusolver::sys::{cublasFillMode_t, cusolverEigMode_t};
 use cudarc::driver::{CudaContext, CudaSlice, CudaStream};
-use ndarray::ShapeBuilder;
 
 use crate::device::blas::{op, ZgemmConfig};
 use crate::device::blas::BlasHandle;
@@ -34,7 +33,7 @@ type RayleighRitzResult = Result<
     (
         Gpu<WavefunctionSet<ColumnDistributed>>,
         Cpu<Vec<f64>>,
-        Cpu<Vec<ndarray::Array2<num_complex::Complex64>>>,
+        Vec<CudaSlice<CudaComplex>>,
     ),
     Error,
 >;
@@ -60,7 +59,7 @@ pub(crate) fn rayleigh_ritz(
     vnl_data: &VnlBatchData,
     n_bands: usize,
     n_pw: usize,
-    kernels: &CudaKernelSet,
+    _kernels: &CudaKernelSet,
     pcie: &mut PcieAccount,
     solver: &SolverHandle,
     blas: &BlasHandle,
@@ -268,16 +267,14 @@ pub(crate) fn rayleigh_ritz(
     // ---- Step 5b: Project β_g^H · ψ_new per ion (USPP augmentation density) ----
     //
     // For each ion I, compute βψ_I = β_g^H · ψ_new with shape (n_expanded × n_bands).
-    // These projections feed `compute_aug_density_fine` which accumulates the
+    // These projections feed `compute_aug_density_gpu` which accumulates the
     // occupancy matrix ω^I_{nm} = Σ_b occ_b · conj(βψ_I)_{n,b} · (βψ_I)_{m,b}.
     //
     // Layout: β_g is col-major (n_pw, n_expanded), ψ_new is col-major
     // (n_pw, n_bands). The gemm with transa=C gives (n_expanded × n_bands)
-    // col-major, which maps to an ndarray Array2 with shape (n_expanded,
-    // n_bands) in column-major order. We copy to host as a flat Vec and
-    // construct Array2 via `from_shape_vec` with `.f()` layout to preserve
-    // the column-major memory order.
-    let mut beta_psi_per_ion: Vec<ndarray::Array2<num_complex::Complex64>> =
+    // col-major. Keep βψ_I GPU-resident as CudaSlice<CudaComplex> to avoid
+    // unnecessary D2H roundtrip.
+    let mut beta_psi_per_ion: Vec<CudaSlice<CudaComplex>> =
         Vec::with_capacity(vnl_data.entries.len());
     let psi_new_slice: &CudaSlice<CudaComplex> = &psi_new_dev;
     for entry in &vnl_data.entries {
@@ -303,18 +300,7 @@ pub(crate) fn rayleigh_ritz(
                 &mut bp_dev,
             )?;
         }
-        let bp_host: Vec<CudaComplex> = stream.clone_dtoh(&bp_dev).map_err(Error::Cuda)?;
-        pcie.d2h_bytes += bp_host.len() * std::mem::size_of::<CudaComplex>();
-        let bp_complex: Vec<num_complex::Complex64> = bp_host
-            .iter()
-            .map(|c| num_complex::Complex64::new(c.x, c.y))
-            .collect();
-        let arr = ndarray::Array2::from_shape_vec(
-            (ne as usize, n_bands).f(),
-            bp_complex,
-        )
-        .map_err(|_| Error::NotImplemented)?;
-        beta_psi_per_ion.push(arr);
+        beta_psi_per_ion.push(bp_dev);
     }
 
     // ---- Step 6: D2H eigenvalues ----
@@ -333,5 +319,5 @@ pub(crate) fn rayleigh_ritz(
         _marker: PhantomData,
     };
 
-    Ok((psi_new_gpu, Cpu(eigenvalues), Cpu(beta_psi_per_ion)))
+    Ok((psi_new_gpu, Cpu(eigenvalues), beta_psi_per_ion))
 }

@@ -210,6 +210,8 @@ fn aug_density_gpu_matches_cpu_cu111_co() {
         save_q_sf_cache_to_disk, load_q_sf_cache_from_disk,
     };
     use chemrust_scf::device::pcie::PcieAccount;
+    use chemrust_scf::device::CudaComplex;
+    use cudarc::driver::CudaSlice;
     use ndarray::Array2;
     use num_complex::Complex64;
     use std::sync::Arc;
@@ -305,10 +307,21 @@ fn aug_density_gpu_matches_cpu_cu111_co() {
         c
     };
 
+    // Upload beta_psi_per_ion to GPU for compute_aug_density_gpu
+    let beta_psi_gpu: Vec<CudaSlice<CudaComplex>> = beta_psi_per_ion
+        .iter()
+        .map(|arr| {
+            let flat: Vec<CudaComplex> = arr.iter()
+                .map(|c| CudaComplex { x: c.re, y: c.im })
+                .collect();
+            stream.clone_htod(&flat).expect("H2D beta_psi")
+        })
+        .collect();
+
     let mut pcie2 = PcieAccount::default();
     let rho_aug_gpu = compute_aug_density_gpu(
         &cache,
-        &beta_psi_per_ion,
+        &beta_psi_gpu,
         &occupations,
         &stream,
         &mut pcie2,

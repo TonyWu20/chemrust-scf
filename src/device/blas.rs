@@ -124,6 +124,7 @@ impl BlasHandle {
     ///
     /// # Safety
     /// A, x, y must point to valid device memory of sufficient dimensions.
+    #[allow(clippy::too_many_arguments)]
     pub unsafe fn gemv_c64(
         &self,
         trans: cublasOperation_t,

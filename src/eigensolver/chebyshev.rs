@@ -200,7 +200,9 @@ pub(crate) struct CudaKernelSet {
     pub(crate) accumulate_density: CudaFunction,
     pub(crate) veff_multiply: CudaFunction,
     pub(crate) gather_add_kinetic: CudaFunction,
+    #[allow(dead_code)]
     pub(crate) transpose_col_to_row: CudaFunction,
+    #[allow(dead_code)]
     pub(crate) transpose_row_to_col: CudaFunction,
 }
 
@@ -751,6 +753,7 @@ unsafe fn apply_v_nl_hamiltonian(
 ///   q = s_inv_mat · p            (small solve)
 ///   hpsi −= beta_g · q           (subtract correction)
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 unsafe fn apply_s_inverse(
     hpsi_dev: &mut CudaSlice<CudaComplex>,
     vnl_data: &VnlBatchData,
@@ -903,6 +906,7 @@ fn check_norm_stability(norm_curr: f64, norm_prev: f64, iteration: usize) -> Res
 // ---------------------------------------------------------------------------
 
 /// Transpose ColumnDistributed layout -> RowDistributed layout on GPU.
+#[allow(dead_code)]
 unsafe fn transpose_col_to_row_on_gpu(
     col_dev: &CudaSlice<CudaComplex>,
     row_dev: &mut CudaSlice<CudaComplex>,
@@ -925,6 +929,7 @@ unsafe fn transpose_col_to_row_on_gpu(
 }
 
 /// Transpose RowDistributed layout -> ColumnDistributed layout on GPU.
+#[allow(dead_code)]
 pub(crate) unsafe fn transpose_row_to_col_on_gpu(
     row_dev: &CudaSlice<CudaComplex>,
     col_dev: &mut CudaSlice<CudaComplex>,

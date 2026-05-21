@@ -333,7 +333,7 @@ pub(crate) fn construct_density_gpu(
         let s_b0: f64 = probe
             .iter()
             .take(grid_size as usize)
-            .map(|c| (c.x as f64).powi(2) + (c.y as f64).powi(2))
+            .map(|c| c.x.powi(2) + c.y.powi(2))
             .sum();
         let psi_pw_norm_b0: f64 = psi_data
             .iter()
@@ -453,10 +453,11 @@ pub fn compute_aug_density_fine(
 ///    (uses species-shared Q_{nm}(G) from cache)
 /// 4. Element-wise multiply tmp[g] *= exp(-iG·R_I) (from ion_sf cache)
 /// 5. Accumulate: ρ_aug(G) += tmp
+///
 /// After all ions: C2C inverse FFT, D2H, normalize.
 pub fn compute_aug_density_gpu(
     q_sf_cache: &QSfCache,
-    beta_psi_per_ion: &[Array2<Complex64>],
+    beta_psi_per_ion: &[CudaSlice<CudaComplex>],
     occupations: &[f64],
     stream: &Arc<CudaStream>,
     pcie: &mut PcieAccount,
@@ -471,7 +472,7 @@ pub fn compute_aug_density_gpu(
         .alloc_zeros(n_fine_grid)
         .map_err(Error::Cuda)?;
 
-    for ion_idx in 0..q_sf_cache.ion_sf.len() {
+    for (ion_idx, bp_dev) in beta_psi_per_ion.iter().enumerate() {
         let species_idx = q_sf_cache.ion_species[ion_idx];
 
         let species_entry = match q_sf_cache.species_entries.get(species_idx).and_then(|e| e.as_ref()) {
@@ -481,7 +482,21 @@ pub fn compute_aug_density_gpu(
 
         let n_expanded = species_entry.n_expanded;
         let n_pairs = species_entry.n_pairs;
-        let bp = &beta_psi_per_ion[ion_idx];
+
+        // D2H the GPU-resident βψ_I for ω computation on CPU
+        let bp_host: Vec<CudaComplex> = stream.clone_dtoh(bp_dev).map_err(Error::Cuda)?;
+        pcie.d2h_bytes += bp_host.len() * std::mem::size_of::<CudaComplex>();
+
+        // Convert to ndarray Array2 for indexing (col-major layout)
+        let bp_complex: Vec<Complex64> = bp_host
+            .iter()
+            .map(|c| Complex64::new(c.x, c.y))
+            .collect();
+        let bp = Array2::from_shape_vec(
+            (n_expanded, n_bands).f(),
+            bp_complex,
+        )
+        .map_err(|_| Error::NotImplemented)?;
 
         // ω^I_{nm} on CPU (n_expanded ~18, O(ne² × n_bands) ≈ 18² × 160 = 52k ops)
         let mut omega_host: Vec<CudaComplex> = vec![CudaComplex { x: 0.0, y: 0.0 }; n_pairs];
@@ -536,7 +551,7 @@ pub fn compute_aug_density_gpu(
                 y: t.x * s.y + t.y * s.x,
             }
         }).collect();
-        let mut tmp_sf: CudaSlice<CudaComplex> = stream.clone_htod(&multiplied).map_err(Error::Cuda)?;
+        let tmp_sf: CudaSlice<CudaComplex> = stream.clone_htod(&multiplied).map_err(Error::Cuda)?;
 
         // ρ_aug(G) += tmp_sf
         blas.axpy_c64(n_fine_grid as i32, one, &tmp_sf, 1, &mut rho_aug_g, 1)
@@ -559,7 +574,7 @@ pub fn compute_aug_density_gpu(
     // CPU fft_inverse_3d returns (ngx, ngy, ngz) C-order. Match that shape.
     let rho_arr = Array3::from_shape_fn((ngx, ngy, ngz), |(ix, iy, iz)| {
         let idx = iz + ngz * (iy + ngy * ix);
-        rho_aug_host[idx].x as f64
+        rho_aug_host[idx].x
     });
 
     Ok(RealGrid::from_inner(rho_arr))
@@ -603,7 +618,6 @@ pub fn save_q_sf_cache_to_disk(
     stream: &std::sync::Arc<cudarc::driver::CudaStream>,
     path: &std::path::Path,
 ) -> Result<(), Error> {
-    use std::io::Write;
     let mut buf: Vec<u8> = Vec::new();
 
     let write_u64 = |buf: &mut Vec<u8>, v: u64| buf.extend_from_slice(&v.to_le_bytes());
