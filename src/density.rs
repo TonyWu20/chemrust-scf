@@ -14,7 +14,7 @@ use bon::builder;
 use chemrust_hamiltonian_core::{
     assemble_aug_density_fine, CellGeometry, GVectorGrid, PseudopotentialSet,
     augment::beta_phi::expanded_projector_count,
-    augment::q_apply::apply_q_and_sf,
+    augment::q_apply::compute_q_nm_per_pair,
     pseudopotential::{Pseudopotential, HasAugmentationData},
     fft::RealGrid,
 };
@@ -120,8 +120,9 @@ pub struct QSfCache {
 
 /// Build the QSfCache by computing Q augmentation functions for all ions.
 ///
-/// For each ion, calls `apply_q_and_sf` to compute `Q^I_{nm}(G) · exp(-iG·R_I)`
-/// on the fine grid, then uploads to GPU.
+/// For each ion, calls `compute_q_nm_per_pair` to compute `Q_{nm}(G) · exp(-iG·R_I)`
+/// for all (n_exp, m_exp) pairs in a single pass (radial Bessel transforms computed
+/// once, reused across all pairs), then uploads the flat result to GPU.
 ///
 /// # Arguments
 /// - `pots` — pseudopotential set (species-keyed)
@@ -174,28 +175,20 @@ pub fn build_q_sf_cache(
 
         let projectors = aug.projectors();
         let n_expanded = expanded_projector_count(projectors);
-        let gmax_pp = pot.gmax();
 
-        // Call apply_q_and_sf once per (n,m) pair with a unit matrix that has
-        // only rho_nm[n,m] = 1.0. This extracts Q_{nm}(G)·exp(-iG·R_I) for
-        // each pair individually, so compute_aug_density_gpu can contract with
-        // the full ω^I_{nm} at runtime.
+        // Compute Q_{nm}(G)·exp(-iG·R_I) for all (n_exp, m_exp) pairs in one
+        // pass — qlnm_g (radial Bessel transforms) is computed once and reused
+        // across all pairs, avoiding the O(n_pairs) redundant recomputation that
+        // the old per-pair apply_q_and_sf loop incurred.
+        let per_pair = compute_q_nm_per_pair(aug, cell, ion_idx, fine_grid)
+            .map_err(|_| Error::NotImplemented)?;
+
         let mut q_sf_flat: Vec<CudaComplex> = Vec::with_capacity(n_expanded * n_expanded * n_fine_grid);
         let mut pairs: Vec<(usize, usize)> = Vec::with_capacity(n_expanded * n_expanded);
 
-        for n in 0..n_expanded {
-            for m in 0..n_expanded {
-                let mut rho_nm = Array2::<Complex64>::zeros((n_expanded, n_expanded));
-                rho_nm[[n, m]] = Complex64::new(1.0, 0.0);
-
-                let q_nm_g = apply_q_and_sf(&rho_nm, aug, cell, ion_idx, fine_grid, gmax_pp)
-                    .map_err(|_| Error::NotImplemented)?;
-
-                // q_nm_g is Array3<Complex64> of shape (ngz, ngy, ngx) in Fortran layout.
-                // Append in row-major order (iter() follows memory order for F-layout).
-                q_sf_flat.extend(q_nm_g.iter().map(|&c| CudaComplex { x: c.re, y: c.im }));
-                pairs.push((n, m));
-            }
+        for ((n, m), q_arr) in per_pair {
+            q_sf_flat.extend(q_arr.iter().map(|&c| CudaComplex { x: c.re, y: c.im }));
+            pairs.push((n, m));
         }
 
         // Upload flat [n_pairs × n_fine_grid] to GPU
