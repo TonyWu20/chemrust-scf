@@ -187,3 +187,122 @@ fn iter2_v_eff_range_within_one_ha_of_iter1() {
          by more than 1 Ha — augmentation density likely missing",
     );
 }
+
+// ---------------------------------------------------------------------------
+// Test: GPU aug density matches CPU aug density on Cu111_CO fixture
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "requires GPU and CASTEP fixture data"]
+fn aug_density_gpu_matches_cpu_cu111_co() {
+    if !gpu_available() {
+        eprintln!("SKIP: no GPU available");
+        return;
+    }
+
+    use chemrust_hamiltonian_core::{
+        GVectorGrid, Pseudopotential,
+        augment::beta_phi::compute_beta_phi,
+        pseudopotential::HasAugmentationData,
+    };
+    use chemrust_scf::density::test_api::{
+        build_q_sf_cache, compute_aug_density_fine, compute_aug_density_gpu,
+    };
+    use chemrust_scf::device::pcie::PcieAccount;
+    use ndarray::Array2;
+    use num_complex::Complex64;
+    use std::sync::Arc;
+
+    let fx = fixtures::cu111_co::fixture();
+    let cell = &fx.bin.cell;
+    let pots = &fx.pots;
+
+    let wfc = fx.check.wavefunction.as_ref().expect(".check must have wavefunction");
+    let [ngx, ngy, ngz] = wfc.grid;
+    let wave_grid = GVectorGrid::new(ngx, ngy, ngz, cell.recip_lattice);
+
+    let [fgx, fgy, fgz] = fx.check.fine_grid.expect(".check must have fine_grid");
+    let fine_grid = GVectorGrid::new(fgx, fgy, fgz, cell.recip_lattice);
+
+    let kpt_block = &wfc.kpt_data[0];
+    let k_cart = [0.0f64; 3]; // Gamma point
+
+    // Build occupations from .check eigenvalues (Gaussian smearing, 0.1 eV)
+    let n_bands = kpt_block.bands.len();
+    let occupations: Vec<f64> = (0..n_bands).map(|_| 1.0).collect(); // unit occupations for test
+
+    // Build beta_psi_per_ion: ⟨β_I|ψ_b⟩ for all ions
+    let beta_psi_per_ion: Vec<Array2<Complex64>> = (0..cell.num_ions)
+        .map(|ion_idx| {
+            let species_idx = cell.ion_species[ion_idx];
+            let symbol = &cell.species_symbols[species_idx];
+            let pot = pots.get(symbol).expect("pot must exist");
+            let aug: &dyn HasAugmentationData = match pot {
+                Pseudopotential::Usp(d) => d,
+                Pseudopotential::Recpot(_) => {
+                    // No augmentation: return zero matrix
+                    let n_exp = 0;
+                    return Array2::zeros((n_exp, n_bands));
+                }
+            };
+            let gmax_pp = pot.gmax();
+            compute_beta_phi(kpt_block, aug, cell, ion_idx, &wave_grid, gmax_pp, k_cart)
+                .expect("compute_beta_phi")
+        })
+        .collect();
+
+    // CPU path
+    let rho_aug_cpu = compute_aug_density_fine(
+        &beta_psi_per_ion,
+        &occupations,
+        pots,
+        cell,
+        &fine_grid,
+    ).expect("CPU aug density");
+
+    // GPU path
+    let ctx = Arc::new(cudarc::driver::CudaContext::new(0).expect("CUDA context"));
+    let stream = ctx.default_stream();
+    let mut pcie = PcieAccount::default();
+
+    let cache = build_q_sf_cache(pots, cell, &fine_grid, &stream, &mut pcie)
+        .expect("build_q_sf_cache");
+    eprintln!("[QSfCache] H2D {} bytes", pcie.h2d_bytes);
+
+    let mut pcie2 = PcieAccount::default();
+    let rho_aug_gpu = compute_aug_density_gpu(
+        &cache,
+        &beta_psi_per_ion,
+        &occupations,
+        &stream,
+        &mut pcie2,
+    ).expect("GPU aug density");
+
+    // Compare
+    let cpu_arr = rho_aug_cpu.as_real_array();
+    let gpu_arr = rho_aug_gpu.as_real_array();
+
+    assert_eq!(cpu_arr.shape(), gpu_arr.shape(), "shape mismatch");
+
+    let max_diff = cpu_arr.iter().zip(gpu_arr.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0_f64, f64::max);
+
+    let cpu_sum: f64 = cpu_arr.iter().sum();
+    let gpu_sum: f64 = gpu_arr.iter().sum();
+    let sum_diff = (cpu_sum - gpu_sum).abs();
+
+    println!("‖ρ_aug_gpu − ρ_aug_cpu‖_∞ = {:.4e}", max_diff);
+    println!("∫ρ_aug_cpu = {:.6e}  ∫ρ_aug_gpu = {:.6e}  |Δ| = {:.4e}", cpu_sum, gpu_sum, sum_diff);
+
+    assert!(
+        max_diff < 1e-6,
+        "‖ρ_aug_gpu − ρ_aug_cpu‖_∞ = {:.4e}, expected < 1e-6",
+        max_diff,
+    );
+    assert!(
+        sum_diff < 1e-4 * cpu_sum.abs().max(1.0),
+        "∫ρ_aug sum diff = {:.4e}, expected < 1e-4 × |∫ρ_aug_cpu|",
+        sum_diff,
+    );
+}

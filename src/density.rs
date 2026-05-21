@@ -93,7 +93,7 @@ fn find_chemical_potential(
 ///
 /// Stores `Q^I_{nm}(G) · exp(-iG·R_I)` for all non-zero (n_exp, m_exp) pairs
 /// of a single ion. The flat GPU slice is indexed as `[pair_idx * n_fine_grid + grid_idx]`.
-pub(crate) struct QSfIonEntry {
+pub struct QSfIonEntry {
     /// Flat GPU slice: [n_pairs × n_fine_grid] CudaComplex.
     /// `Q^I_{nm}(G) · exp(-iG·R_I)` for all non-zero (n_exp, m_exp) pairs.
     pub q_sf: CudaSlice<CudaComplex>,
@@ -111,7 +111,7 @@ pub(crate) struct QSfIonEntry {
 /// Memory layout: species-shared approach (no per-ion structure factor).
 /// Store `Q_{nm}(G)` without structure factor; apply `exp(-iG·R_I)` per-iteration
 /// on GPU (cheap element-wise multiply).
-pub(crate) struct QSfCache {
+pub struct QSfCache {
     /// Per-ion GPU slices. Each slice is flat [n_pairs × n_fine_grid] Complex128.
     pub entries: Vec<QSfIonEntry>,
     /// Fine grid dimensions [ngz, ngy, ngx].
@@ -132,7 +132,7 @@ pub(crate) struct QSfCache {
 ///
 /// # Returns
 /// `QSfCache` with all ions' Q functions cached on GPU.
-pub(crate) fn build_q_sf_cache(
+pub fn build_q_sf_cache(
     pots: &PseudopotentialSet,
     cell: &CellGeometry,
     fine_grid: &GVectorGrid,
@@ -384,7 +384,7 @@ pub(crate) fn construct_density_gpu(
 /// each shape `(n_expanded × n_bands)`. Ions whose pseudopotential lacks
 /// augmentation (Recpot) contribute nothing and may carry any value (the
 /// upstream wrapper skips them).
-pub(crate) fn compute_aug_density_fine(
+pub fn compute_aug_density_fine(
     beta_psi_per_ion: &[Array2<Complex64>],
     occupations: &[f64],
     pots: &PseudopotentialSet,
@@ -441,7 +441,7 @@ pub(crate) fn compute_aug_density_fine(
 ///    c. gemv: ρ_aug(G) += Q_cache[I] · ω_flat  (n_fine_grid accumulation)
 /// 2. C2C inverse FFT ρ_aug(G) → ρ_aug(r)
 /// 3. D2H, normalize by 1/N_grid (cuFFT unnormalized), return RealGrid<f64>
-pub(crate) fn compute_aug_density_gpu(
+pub fn compute_aug_density_gpu(
     q_sf_cache: &QSfCache,
     beta_psi_per_ion: &[Array2<Complex64>],
     occupations: &[f64],
@@ -571,4 +571,15 @@ pub(crate) fn compute_aug_density_gpu(
     });
 
     Ok(RealGrid::from_inner(rho_arr))
+}
+
+/// Re-exports for integration tests that need to compare CPU and GPU
+/// augmentation density paths directly.
+pub mod test_api {
+    pub use super::{
+        QSfCache, QSfIonEntry,
+        build_q_sf_cache,
+        compute_aug_density_fine,
+        compute_aug_density_gpu,
+    };
 }

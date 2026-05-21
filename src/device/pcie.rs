@@ -18,7 +18,7 @@ use crate::layout::Cpu;
 /// Accumulated PCI-E transfer volume.
 #[derive(Debug, Clone, Copy, Default)]
 #[must_use]   // ← forces every call site to handle the account
-pub(crate) struct PcieAccount {
+pub struct PcieAccount {
     pub h2d_bytes: usize,   // host → device
     pub d2h_bytes: usize,   // device → host
 }
