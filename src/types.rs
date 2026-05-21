@@ -276,4 +276,6 @@ pub enum Error {
     Cuda(#[from] cudarc::driver::result::DriverError),
     #[error("NVRTC compilation error: {0}")]
     Nvrtc(String),
+    #[error("I/O error: {0}")]
+    Io(String),
 }

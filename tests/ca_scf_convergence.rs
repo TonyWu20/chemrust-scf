@@ -207,6 +207,7 @@ fn aug_density_gpu_matches_cpu_cu111_co() {
     };
     use chemrust_scf::density::test_api::{
         build_q_sf_cache, compute_aug_density_fine, compute_aug_density_gpu,
+        save_q_sf_cache_to_disk, load_q_sf_cache_from_disk,
     };
     use chemrust_scf::device::pcie::PcieAccount;
     use ndarray::Array2;
@@ -260,14 +261,27 @@ fn aug_density_gpu_matches_cpu_cu111_co() {
         &fine_grid,
     ).expect("CPU aug density");
 
-    // GPU path
+    // GPU path — load cache from disk if available, build and save otherwise.
     let ctx = Arc::new(cudarc::driver::CudaContext::new(0).expect("CUDA context"));
     let stream = ctx.default_stream();
-    let mut pcie = PcieAccount::default();
+    let cache_path = std::path::Path::new("/tmp/cu111_co_q_sf_cache.bin");
 
-    let cache = build_q_sf_cache(pots, cell, &fine_grid, &stream, &mut pcie)
-        .expect("build_q_sf_cache");
-    eprintln!("[QSfCache] H2D {} bytes", pcie.h2d_bytes);
+    let cache = if cache_path.exists() {
+        eprintln!("[QSfCache] loading from disk: {}", cache_path.display());
+        let mut pcie = PcieAccount::default();
+        let c = load_q_sf_cache_from_disk(cache_path, &stream, &mut pcie)
+            .expect("load_q_sf_cache_from_disk");
+        eprintln!("[QSfCache] loaded, H2D {} bytes", pcie.h2d_bytes);
+        c
+    } else {
+        eprintln!("[QSfCache] building (first run, will save to disk)...");
+        let mut pcie = PcieAccount::default();
+        let c = build_q_sf_cache(pots, cell, &fine_grid, &stream, &mut pcie)
+            .expect("build_q_sf_cache");
+        eprintln!("[QSfCache] built, H2D {} bytes — saving to {}", pcie.h2d_bytes, cache_path.display());
+        save_q_sf_cache_to_disk(&c, &stream, cache_path).expect("save_q_sf_cache_to_disk");
+        c
+    };
 
     let mut pcie2 = PcieAccount::default();
     let rho_aug_gpu = compute_aug_density_gpu(

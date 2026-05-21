@@ -205,7 +205,8 @@ pub fn build_q_sf_cache(
         let pos = cell.ionic_positions.row(ion_idx);
         let (rx, ry, rz) = (pos[0], pos[1], pos[2]);
 
-        // Fortran layout: iz fastest, then iy, then ix — matches Array3 F-order iteration.
+        // Fortran order: iz fastest — matches cuFFT scatter formula iz + ngz*(iy + ngy*ix)
+        // and the Q_{nm} flat buffer from compute_q_nm_per_pair (Array3 F-order iteration).
         let sf_host: Vec<CudaComplex> = {
             let mut v = Vec::with_capacity(n_fine_grid);
             for ix in 0..ngx {
@@ -553,7 +554,9 @@ pub fn compute_aug_density_gpu(
     pcie.record_d2h(&rho_aug_g);
 
     let inv_n = 1.0 / n_fine_grid as f64;
-    let rho_arr = Array3::from_shape_fn((ngz, ngy, ngx).f(), |(iz, iy, ix)| {
+    // cuFFT plan (ngx, ngy, ngz) with iz innermost → flat index iz + ngz*(iy + ngy*ix).
+    // CPU fft_inverse_3d returns (ngx, ngy, ngz) C-order. Match that shape.
+    let rho_arr = Array3::from_shape_fn((ngx, ngy, ngz), |(ix, iy, iz)| {
         let idx = iz + ngz * (iy + ngy * ix);
         rho_aug_host[idx].x as f64 * inv_n
     });
@@ -569,5 +572,144 @@ pub mod test_api {
         build_q_sf_cache,
         compute_aug_density_fine,
         compute_aug_density_gpu,
+        save_q_sf_cache_to_disk,
+        load_q_sf_cache_from_disk,
     };
+}
+
+// ---------------------------------------------------------------------------
+// QSfCache disk serialization (for test caching)
+// ---------------------------------------------------------------------------
+
+/// Serialized form of QSfCache for disk storage.
+/// Layout: a simple binary format — no external dependencies.
+///
+/// Format:
+///   [u64: n_species]
+///   for each species:
+///     [u8: present (1) or absent (0)]
+///     if present:
+///       [u64: n_expanded] [u64: n_pairs] [u64: n_fine_grid]
+///       [n_pairs * n_fine_grid * 16 bytes: q_nm flat f64 pairs]
+///   [u64: n_ions]
+///   for each ion:
+///     [u64: n_fine_grid] [n_fine_grid * 16 bytes: sf flat f64 pairs]
+///   [u64: ngz] [u64: ngy] [u64: ngx]
+///   [u64: n_ions for ion_species]
+///   [n_ions * 8 bytes: ion_species u64 values]
+pub fn save_q_sf_cache_to_disk(
+    cache: &QSfCache,
+    stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+    path: &std::path::Path,
+) -> Result<(), Error> {
+    use std::io::Write;
+    let mut buf: Vec<u8> = Vec::new();
+
+    let write_u64 = |buf: &mut Vec<u8>, v: u64| buf.extend_from_slice(&v.to_le_bytes());
+    let write_f64 = |buf: &mut Vec<u8>, v: f64| buf.extend_from_slice(&v.to_le_bytes());
+
+    write_u64(&mut buf, cache.species_entries.len() as u64);
+    for entry in &cache.species_entries {
+        match entry {
+            None => { buf.push(0); }
+            Some(e) => {
+                buf.push(1);
+                write_u64(&mut buf, e.n_expanded as u64);
+                write_u64(&mut buf, e.n_pairs as u64);
+                let n_fine = e.q_nm.len() / e.n_pairs;
+                write_u64(&mut buf, n_fine as u64);
+                let host: Vec<CudaComplex> = stream.clone_dtoh(&e.q_nm).map_err(Error::Cuda)?;
+                for c in &host { write_f64(&mut buf, c.x); write_f64(&mut buf, c.y); }
+            }
+        }
+    }
+
+    write_u64(&mut buf, cache.ion_sf.len() as u64);
+    let [ngz, ngy, ngx] = cache.fine_grid;
+    let n_fine = ngz * ngy * ngx;
+    for ion in &cache.ion_sf {
+        write_u64(&mut buf, n_fine as u64);
+        let host: Vec<CudaComplex> = stream.clone_dtoh(&ion.sf).map_err(Error::Cuda)?;
+        for c in &host { write_f64(&mut buf, c.x); write_f64(&mut buf, c.y); }
+    }
+
+    write_u64(&mut buf, ngz as u64);
+    write_u64(&mut buf, ngy as u64);
+    write_u64(&mut buf, ngx as u64);
+
+    write_u64(&mut buf, cache.ion_species.len() as u64);
+    for &s in &cache.ion_species { write_u64(&mut buf, s as u64); }
+
+    std::fs::write(path, &buf).map_err(|e| Error::Io(e.to_string()))?;
+    Ok(())
+}
+
+/// Load a QSfCache from disk (written by `save_q_sf_cache_to_disk`).
+pub fn load_q_sf_cache_from_disk(
+    path: &std::path::Path,
+    stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+    pcie: &mut PcieAccount,
+) -> Result<QSfCache, Error> {
+    let bytes = std::fs::read(path).map_err(|e| Error::Io(e.to_string()))?;
+    let mut pos = 0usize;
+
+    let read_u64 = |bytes: &[u8], pos: &mut usize| -> u64 {
+        let v = u64::from_le_bytes(bytes[*pos..*pos+8].try_into().unwrap());
+        *pos += 8;
+        v
+    };
+    let read_f64 = |bytes: &[u8], pos: &mut usize| -> f64 {
+        let v = f64::from_le_bytes(bytes[*pos..*pos+8].try_into().unwrap());
+        *pos += 8;
+        v
+    };
+
+    let n_species = read_u64(&bytes, &mut pos) as usize;
+    let mut species_entries: Vec<Option<QSfSpeciesEntry>> = Vec::with_capacity(n_species);
+    for _ in 0..n_species {
+        let present = bytes[pos]; pos += 1;
+        if present == 0 {
+            species_entries.push(None);
+        } else {
+            let n_expanded = read_u64(&bytes, &mut pos) as usize;
+            let n_pairs    = read_u64(&bytes, &mut pos) as usize;
+            let n_fine     = read_u64(&bytes, &mut pos) as usize;
+            let mut host: Vec<CudaComplex> = Vec::with_capacity(n_pairs * n_fine);
+            for _ in 0..n_pairs * n_fine {
+                let x = read_f64(&bytes, &mut pos);
+                let y = read_f64(&bytes, &mut pos);
+                host.push(CudaComplex { x, y });
+            }
+            let gpu = stream.clone_htod(&host).map_err(Error::Cuda)?;
+            pcie.record_h2d(&gpu);
+            species_entries.push(Some(QSfSpeciesEntry { q_nm: gpu, n_expanded, n_pairs }));
+        }
+    }
+
+    let n_ions = read_u64(&bytes, &mut pos) as usize;
+    let mut ion_sf: Vec<IonSfEntry> = Vec::with_capacity(n_ions);
+    for _ in 0..n_ions {
+        let n_fine = read_u64(&bytes, &mut pos) as usize;
+        let mut host: Vec<CudaComplex> = Vec::with_capacity(n_fine);
+        for _ in 0..n_fine {
+            let x = read_f64(&bytes, &mut pos);
+            let y = read_f64(&bytes, &mut pos);
+            host.push(CudaComplex { x, y });
+        }
+        let gpu = stream.clone_htod(&host).map_err(Error::Cuda)?;
+        pcie.record_h2d(&gpu);
+        ion_sf.push(IonSfEntry { sf: gpu });
+    }
+
+    let ngz = read_u64(&bytes, &mut pos) as usize;
+    let ngy = read_u64(&bytes, &mut pos) as usize;
+    let ngx = read_u64(&bytes, &mut pos) as usize;
+
+    let n_ion_species = read_u64(&bytes, &mut pos) as usize;
+    let mut ion_species: Vec<usize> = Vec::with_capacity(n_ion_species);
+    for _ in 0..n_ion_species {
+        ion_species.push(read_u64(&bytes, &mut pos) as usize);
+    }
+
+    Ok(QSfCache { species_entries, ion_sf, ion_species, fine_grid: [ngz, ngy, ngx] })
 }
