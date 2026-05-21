@@ -181,3 +181,25 @@ Contains slurm output from CASTEP GPU-resident SCF crash logs.
 **Pseudopotentials:**
 `~/Downloads/Potentials/`
 USP files for all species.
+
+## Physics Conventions
+
+**Density unit convention:**
+Raw `ρ × Ω` not Ha/Bohr³ for ρ entering Poisson/XC. The `accumulate_density`
+kernel uses `inv_omega = 1.0` (no Ω division). `solve_poisson` and
+`compute_pbe_xc` downstream expect this convention. The `.castep_bin` density
+storage uses the same convention.
+
+**FFT axis convention:**
+`RealGrid<T>` stores data in Fortran layout `(ngz, ngy, ngx).f()`.
+`RecipGrid<T>` stores the forward FFT result in the same layout. cuFFT plan
+dims are `(ngx, ngy, ngz)` (innermost first) to match the scatter formula
+`iz + ngz*(iy + ngy*ix)`. See failure-patterns.md:
+`cufft-dim-ordering-and-rr-transpose-layout`.
+
+**Augmentation Density domain term:**
+ρ_aug(r) = Σ_I Σ_{n,m} ω^I_{nm} · Q^I_{nm}(r). Separate channel from smooth
+PW ρ_PW. Total ρ = ρ_PW + ρ_aug. The `.castep_bin` density already stores the
+sum. In the SCF loop: `construct_density_gpu` produces smooth-only ρ_PW;
+`compute_aug_density_gpu` adds ρ_aug; `build_v_eff_with_energy_impl` sums them
+before Poisson + XC.
