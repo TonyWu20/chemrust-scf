@@ -498,20 +498,22 @@ pub fn compute_aug_density_gpu(
         let omega_dev: CudaSlice<CudaComplex> = stream.clone_htod(&omega_host).map_err(Error::Cuda)?;
 
         // tmp[g] = Σ_{nm} ω_{nm} · Q_{nm}(g)
-        // Q stored as [n_pairs × n_fine_grid] row-major = [n_fine_grid × n_pairs] col-major.
-        // gemv: tmp(n_fine_grid) = Q^T · ω  where Q is (n_pairs × n_fine_grid) col-major
-        //   → trans=T, m=n_pairs, n=n_fine_grid
+        // Q flat buffer layout: flat[pair_idx * n_fine_grid + g_idx] (pair-major, grid-minor).
+        // Interpreted as col-major matrix: element [g, p] = flat[g + n_fine_grid * p]
+        //   → this IS col-major (n_fine_grid × n_pairs) with lda=n_fine_grid.
+        // gemv: tmp(n_fine_grid) = A(n_fine_grid × n_pairs) · ω(n_pairs)
+        //   → trans=N, m=n_fine_grid, n=n_pairs, lda=n_fine_grid
         let mut tmp: CudaSlice<CudaComplex> = stream.alloc_zeros(n_fine_grid).map_err(Error::Cuda)?;
         let one  = CudaComplex { x: 1.0, y: 0.0 };
         let zero = CudaComplex { x: 0.0, y: 0.0 };
         unsafe {
             blas.gemv_c64(
-                op::T,
-                n_pairs as i32,
+                op::N,
                 n_fine_grid as i32,
+                n_pairs as i32,
                 one,
                 &species_entry.q_nm,
-                n_pairs as i32,
+                n_fine_grid as i32,
                 &omega_dev,
                 1,
                 zero,
