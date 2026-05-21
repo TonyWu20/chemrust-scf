@@ -13,6 +13,9 @@ use std::sync::Arc;
 use bon::builder;
 use chemrust_hamiltonian_core::{
     assemble_aug_density_fine, CellGeometry, GVectorGrid, PseudopotentialSet,
+    augment::beta_phi::expanded_projector_count,
+    augment::q_apply::apply_q_and_sf,
+    pseudopotential::{Pseudopotential, HasAugmentationData},
 };
 use cudarc::driver::{CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
 use ndarray::{Array2, Array3};
@@ -20,6 +23,7 @@ use num_complex::Complex64;
 
 use crate::device::fft::BatchedFftPlan3d;
 use crate::device::{complex_slice_to_cuda, CudaComplex};
+use crate::device::pcie::PcieAccount;
 use crate::eigensolver::chebyshev::CudaKernelSet;
 use crate::types::{ChemicalPotential, Density, Error, Occupations, SmearingParams, SmearingScheme, WaveGridArray};
 
@@ -77,6 +81,139 @@ fn find_chemical_potential(
         }
     }
     Ok(0.5 * (lo + hi))
+}
+
+// ---------------------------------------------------------------------------
+// QSfCache: GPU-resident Q augmentation function cache
+// ---------------------------------------------------------------------------
+
+/// Per-ion Q augmentation function cache on GPU.
+///
+/// Stores `Q^I_{nm}(G) · exp(-iG·R_I)` for all non-zero (n_exp, m_exp) pairs
+/// of a single ion. The flat GPU slice is indexed as `[pair_idx * n_fine_grid + grid_idx]`.
+pub(crate) struct QSfIonEntry {
+    /// Flat GPU slice: [n_pairs × n_fine_grid] CudaComplex.
+    /// `Q^I_{nm}(G) · exp(-iG·R_I)` for all non-zero (n_exp, m_exp) pairs.
+    pub q_sf: CudaSlice<CudaComplex>,
+    /// Expanded projector pair indices: Vec<(n_exp, m_exp)>.
+    pub pairs: Vec<(usize, usize)>,
+    /// Number of expanded projectors for this ion.
+    pub n_expanded: usize,
+}
+
+/// GPU cache for USPP augmentation density computation.
+///
+/// Caches `Q^I_{nm}(G) · exp(-iG·R_I)` per ion on GPU. Geometry-static:
+/// built once at SCF init, invariant under SCF iterations.
+///
+/// Memory layout: species-shared approach (no per-ion structure factor).
+/// Store `Q_{nm}(G)` without structure factor; apply `exp(-iG·R_I)` per-iteration
+/// on GPU (cheap element-wise multiply).
+pub(crate) struct QSfCache {
+    /// Per-ion GPU slices. Each slice is flat [n_pairs × n_fine_grid] Complex128.
+    pub entries: Vec<QSfIonEntry>,
+    /// Fine grid dimensions [ngz, ngy, ngx].
+    pub fine_grid: [usize; 3],
+}
+
+/// Build the QSfCache by computing Q augmentation functions for all ions.
+///
+/// For each ion, calls `apply_q_and_sf` to compute `Q^I_{nm}(G) · exp(-iG·R_I)`
+/// on the fine grid, then uploads to GPU.
+///
+/// # Arguments
+/// - `pots` — pseudopotential set (species-keyed)
+/// - `cell` — cell geometry
+/// - `fine_grid` — fine FFT grid
+/// - `stream` — CUDA stream for H2D transfers
+/// - `pcie` — PCIe accounting for memory tracking
+///
+/// # Returns
+/// `QSfCache` with all ions' Q functions cached on GPU.
+pub(crate) fn build_q_sf_cache(
+    pots: &PseudopotentialSet,
+    cell: &CellGeometry,
+    fine_grid: &GVectorGrid,
+    stream: &Arc<CudaStream>,
+    pcie: &mut PcieAccount,
+) -> Result<QSfCache, Error> {
+    let [ngz, ngy, ngx] = fine_grid.grid();
+    let n_fine_grid = ngz * ngy * ngx;
+
+    let mut entries = Vec::with_capacity(cell.num_ions);
+
+    for ion_idx in 0..cell.num_ions {
+        let species_idx = cell.ion_species[ion_idx];
+        let symbol = &cell.species_symbols[species_idx];
+
+        let Some(pot) = pots.get(symbol) else {
+            // Species not in pseudopotential set: empty entry
+            entries.push(QSfIonEntry {
+                q_sf: stream.alloc_zeros(0).map_err(Error::Cuda)?,
+                pairs: Vec::new(),
+                n_expanded: 0,
+            });
+            continue;
+        };
+
+        // Check if this species has augmentation data (USP vs Recpot)
+        let aug = match pot {
+            Pseudopotential::Usp(usp_data) => usp_data,
+            Pseudopotential::Recpot(_) => {
+                // No augmentation: empty entry
+                entries.push(QSfIonEntry {
+                    q_sf: stream.alloc_zeros(0).map_err(Error::Cuda)?,
+                    pairs: Vec::new(),
+                    n_expanded: 0,
+                });
+                continue;
+            }
+        };
+
+        let projectors = aug.projectors();
+        let n_expanded = expanded_projector_count(projectors);
+        let gmax_pp = pot.gmax();
+
+        // Call apply_q_and_sf once per (n,m) pair with a unit matrix that has
+        // only rho_nm[n,m] = 1.0. This extracts Q_{nm}(G)·exp(-iG·R_I) for
+        // each pair individually, so compute_aug_density_gpu can contract with
+        // the full ω^I_{nm} at runtime.
+        let mut q_sf_flat: Vec<CudaComplex> = Vec::with_capacity(n_expanded * n_expanded * n_fine_grid);
+        let mut pairs: Vec<(usize, usize)> = Vec::with_capacity(n_expanded * n_expanded);
+
+        for n in 0..n_expanded {
+            for m in 0..n_expanded {
+                let mut rho_nm = Array2::<Complex64>::zeros((n_expanded, n_expanded));
+                rho_nm[[n, m]] = Complex64::new(1.0, 0.0);
+
+                let q_nm_g = apply_q_and_sf(&rho_nm, aug, cell, ion_idx, fine_grid, gmax_pp)
+                    .map_err(|_| Error::NotImplemented)?;
+
+                // q_nm_g is Array3<Complex64> of shape (ngz, ngy, ngx) in Fortran layout.
+                // Append in row-major order (iter() follows memory order for F-layout).
+                q_sf_flat.extend(q_nm_g.iter().map(|&c| CudaComplex { x: c.re, y: c.im }));
+                pairs.push((n, m));
+            }
+        }
+
+        // Upload flat [n_pairs × n_fine_grid] to GPU
+        let q_sf_gpu = stream
+            .clone_htod(&q_sf_flat)
+            .map_err(Error::Cuda)?;
+
+        pcie.record_h2d(&q_sf_gpu);
+
+        entries.push(QSfIonEntry {
+            q_sf: q_sf_gpu,
+            pairs,
+            n_expanded,
+        });
+    }
+
+    Ok(QSfCache {
+        entries,
+        fine_grid: [ngz, ngy, ngx],
+    })
 }
 
 // ---------------------------------------------------------------------------
