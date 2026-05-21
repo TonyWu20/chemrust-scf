@@ -700,7 +700,7 @@ impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated, MixingOff> {
                     let mut pcie = PcieAccount::default();
                     match build_q_sf_cache(&self.pots, &self.cell, &self.fine_grid, &stream, &mut pcie) {
                         Ok(cache) => {
-                            eprintln!("[QSfCache] built: {} ions, H2D {} bytes", cache.entries.len(), pcie.h2d_bytes);
+                            eprintln!("[QSfCache] built: {} ions, H2D {} bytes", cache.ion_sf.len(), pcie.h2d_bytes);
                             self.q_sf_cache = Some(cache);
                         }
                         Err(e) => {

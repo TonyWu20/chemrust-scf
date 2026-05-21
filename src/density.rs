@@ -229,11 +229,6 @@ pub fn build_q_sf_cache(
     Ok(QSfCache { species_entries, ion_sf, ion_species: cell.ion_species.clone(), fine_grid: [ngz, ngy, ngx] })
 }
 
-    Ok(QSfCache {
-        entries,
-        fine_grid: [ngz, ngy, ngx],
-    })
-}
 
 // ---------------------------------------------------------------------------
 // GPU density construction (builder API via bon)
