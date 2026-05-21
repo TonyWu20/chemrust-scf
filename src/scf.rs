@@ -18,6 +18,7 @@ use crate::eigensolver::rayleigh_ritz::rayleigh_ritz;
 use crate::eigensolver::vnl_data::VnlBatchData;
 use crate::layout::{ColumnDistributed, Cpu, WavefunctionSet};
 use crate::mixing::{DensityHistory, Kerker, MixingOff, MixingPhase, Pulay};
+use crate::density::{QSfCache, build_q_sf_cache};
 use crate::types::{
     ChemicalPotential, Density, EffectivePotential, Error, FinalResult, FineGridArray, KPoint,
     SmearingParams,
@@ -144,6 +145,10 @@ pub struct ScfIteration<
     /// before the first `diagonalize` (e.g. iter-1 driven from a fixture
     /// density). Consumed by `compute_aug_density_fine` to build ω^I_{nm}.
     pub(crate) beta_psi_per_ion: Option<Vec<ndarray::Array2<num_complex::Complex64>>>,
+    /// GPU cache of Q_{nm}(G)·exp(-iG·R_I) per ion. Built lazily on first
+    /// `compute_density_from_wavefunctions` call that has a GPU stream.
+    /// `None` until first build; geometry-static thereafter.
+    pub(crate) q_sf_cache: Option<QSfCache>,
     /// USPP augmentation density ρ_aug(r) on the fine grid, regenerated from
     /// the current ψ + occ each iteration. `None` for iter-1 (fixture
     /// density already encodes augmentation in the wave-grid convention).
@@ -217,6 +222,7 @@ impl<S: SpinPolicy> ScfIteration<S, Initialized, MixingOff> {
             total_energy: None,
             fermi_energy: None,
             beta_psi_per_ion: None,
+            q_sf_cache: None,
             density_aug_fine: None,
             _phase: PhantomData,
         }
@@ -255,6 +261,7 @@ impl<S: SpinPolicy, Phase: ScfPhase, M: MixingPhase> ScfIteration<S, Phase, M> {
             total_energy: self.total_energy,
             fermi_energy: self.fermi_energy,
             beta_psi_per_ion: self.beta_psi_per_ion,
+            q_sf_cache: self.q_sf_cache,
             density_aug_fine: self.density_aug_fine,
             _phase: PhantomData,
         }
@@ -625,7 +632,7 @@ impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated, MixingOff> {
     /// stays `None` and `build_v_eff_with_energy` reads the wave-grid density
     /// as-is.
     fn compute_density_from_wavefunctions(
-        &self,
+        &mut self,
     ) -> Result<
         (
             Density,
@@ -688,13 +695,38 @@ impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated, MixingOff> {
         // from this iteration's RR; iter-1 fixture path skips this).
         let density_aug_fine = match self.beta_psi_per_ion.as_ref() {
             Some(beta_psi) => {
-                let rho_aug = crate::density::compute_aug_density_fine(
-                    beta_psi,
-                    &occupations.0,
-                    &self.pots,
-                    &self.cell,
-                    &self.fine_grid,
-                )?;
+                // Lazily build QSfCache on first use (geometry-static).
+                if self.q_sf_cache.is_none() {
+                    let mut pcie = PcieAccount::default();
+                    match build_q_sf_cache(&self.pots, &self.cell, &self.fine_grid, &stream, &mut pcie) {
+                        Ok(cache) => {
+                            eprintln!("[QSfCache] built: {} ions, H2D {} bytes", cache.entries.len(), pcie.h2d_bytes);
+                            self.q_sf_cache = Some(cache);
+                        }
+                        Err(e) => {
+                            eprintln!("[QSfCache] build failed ({e:?}), falling back to CPU aug density");
+                        }
+                    }
+                }
+
+                let rho_aug = if let Some(cache) = self.q_sf_cache.as_ref() {
+                    let mut pcie = PcieAccount::default();
+                    crate::density::compute_aug_density_gpu(
+                        cache,
+                        beta_psi,
+                        &occupations.0,
+                        &stream,
+                        &mut pcie,
+                    )?
+                } else {
+                    crate::density::compute_aug_density_fine(
+                        beta_psi,
+                        &occupations.0,
+                        &self.pots,
+                        &self.cell,
+                        &self.fine_grid,
+                    )?
+                };
                 {
                     let arr = rho_aug.as_real_array();
                     let aug_sum: f64 = arr.iter().sum();
@@ -718,7 +750,7 @@ impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated, MixingOff> {
     /// Construct density with `Off` mixing phase — the history stays as-is
     /// and no mixing transformation is applied during `mix()`.
     pub fn construct_density_off(
-        self,
+        mut self,
     ) -> Result<ScfIteration<S, DensityUpdated<MixingOff>, MixingOff>, Error> {
         let (new_density, density_aug_fine, chem_pot) = self.compute_density_from_wavefunctions()?;
         let mut next: ScfIteration<S, DensityUpdated<MixingOff>, MixingOff> =
@@ -731,7 +763,7 @@ impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated, MixingOff> {
 
     /// Construct density and transition the history to `Kerker` phase.
     pub fn construct_density_kerker(
-        self,
+        mut self,
     ) -> Result<ScfIteration<S, DensityUpdated<Kerker>, Kerker>, Error> {
         let (new_density, density_aug_fine, chem_pot) = self.compute_density_from_wavefunctions()?;
         // Convert history from MixingOff → Kerker (creates GPU preconditioner)
@@ -760,6 +792,7 @@ impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated, MixingOff> {
             total_energy: self.total_energy,
             fermi_energy: Some(chem_pot.0),
             beta_psi_per_ion: self.beta_psi_per_ion,
+            q_sf_cache: self.q_sf_cache,
             density_aug_fine,
             _phase: PhantomData,
         })
@@ -767,7 +800,7 @@ impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated, MixingOff> {
 
     /// Construct density and transition the history to `Pulay` phase.
     pub fn construct_density_pulay(
-        self,
+        mut self,
     ) -> Result<ScfIteration<S, DensityUpdated<Pulay>, Pulay>, Error> {
         let (new_density, density_aug_fine, chem_pot) = self.compute_density_from_wavefunctions()?;
         // Convert history: MixingOff → Kerker → Pulay
@@ -797,6 +830,7 @@ impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated, MixingOff> {
             total_energy: self.total_energy,
             fermi_energy: Some(chem_pot.0),
             beta_psi_per_ion: self.beta_psi_per_ion,
+            q_sf_cache: self.q_sf_cache,
             density_aug_fine,
             _phase: PhantomData,
         })
@@ -841,6 +875,7 @@ impl<S: SpinPolicy> ScfIteration<S, DensityUpdated<MixingOff>, MixingOff> {
             total_energy: self.total_energy,
             fermi_energy: self.fermi_energy,
             beta_psi_per_ion: self.beta_psi_per_ion,
+            q_sf_cache: self.q_sf_cache,
             density_aug_fine: self.density_aug_fine,
             _phase: PhantomData,
         }
@@ -876,6 +911,7 @@ impl<S: SpinPolicy> ScfIteration<S, DensityUpdated<Kerker>, Kerker> {
             total_energy: self.total_energy,
             fermi_energy: self.fermi_energy,
             beta_psi_per_ion: self.beta_psi_per_ion,
+            q_sf_cache: self.q_sf_cache,
             density_aug_fine: self.density_aug_fine,
             _phase: PhantomData,
         }
@@ -911,6 +947,7 @@ impl<S: SpinPolicy> ScfIteration<S, DensityUpdated<Pulay>, Pulay> {
             total_energy: self.total_energy,
             fermi_energy: self.fermi_energy,
             beta_psi_per_ion: self.beta_psi_per_ion,
+            q_sf_cache: self.q_sf_cache,
             density_aug_fine: self.density_aug_fine,
             _phase: PhantomData,
         }
@@ -1381,6 +1418,7 @@ mod tests {
             total_energy: None,
             fermi_energy: None,
             beta_psi_per_ion: None,
+            q_sf_cache: None,
             density_aug_fine: None,
             _phase: PhantomData,
         };
@@ -1433,6 +1471,7 @@ mod tests {
             total_energy: None,
             fermi_energy: None,
             beta_psi_per_ion: None,
+            q_sf_cache: None,
             density_aug_fine: None,
             _phase: PhantomData,
         }
