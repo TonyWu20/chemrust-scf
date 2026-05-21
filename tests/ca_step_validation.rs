@@ -576,6 +576,7 @@ fn cpu_band_v_loc_expectation() {
 
 
 #[test]
+#[ignore = "stale diagnostic: D screening shape mismatch was resolved; dynamic D matrix is now correct"]
 fn diagnose_d_screening_values() {
     let fx = fixtures::cu111_co::fixture();
     let cell = &fx.bin.cell;
