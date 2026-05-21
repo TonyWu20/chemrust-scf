@@ -554,12 +554,12 @@ pub fn compute_aug_density_gpu(
     let rho_aug_host: Vec<CudaComplex> = stream.clone_dtoh(&rho_aug_g).map_err(Error::Cuda)?;
     pcie.record_d2h(&rho_aug_g);
 
-    let inv_n = 1.0 / n_fine_grid as f64;
+    // cuFFT inverse is unnormalized (same as CPU fft_inverse_3d). No 1/N factor.
     // cuFFT plan (ngx, ngy, ngz) with iz innermost → flat index iz + ngz*(iy + ngy*ix).
     // CPU fft_inverse_3d returns (ngx, ngy, ngz) C-order. Match that shape.
     let rho_arr = Array3::from_shape_fn((ngx, ngy, ngz), |(ix, iy, iz)| {
         let idx = iz + ngz * (iy + ngy * ix);
-        rho_aug_host[idx].x as f64 * inv_n
+        rho_aug_host[idx].x as f64
     });
 
     Ok(RealGrid::from_inner(rho_arr))
