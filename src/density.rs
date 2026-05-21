@@ -14,7 +14,7 @@ use bon::builder;
 use chemrust_hamiltonian_core::{
     assemble_aug_density_fine, CellGeometry, GVectorGrid, PseudopotentialSet,
     augment::beta_phi::expanded_projector_count,
-    augment::q_apply::compute_q_nm_per_pair,
+    augment::q_apply::compute_q_nm_flat,
     pseudopotential::{Pseudopotential, HasAugmentationData},
     fft::RealGrid,
 };
@@ -183,14 +183,13 @@ pub fn build_q_sf_cache(
         let rep_ion = cell.ion_species.iter().position(|&s| s == species_idx)
             .unwrap_or(0);
 
-        // compute_q_nm_per_pair with origin cell → pure Q_{nm}(G), no SF.
-        let per_pair = compute_q_nm_per_pair(aug, &cell_origin, rep_ion, fine_grid)
+        // Single-pass flat buffer: [n_pairs × n_fine_grid], pair-major grid-minor.
+        let (q_flat_complex, _) = compute_q_nm_flat(aug, &cell_origin, rep_ion, fine_grid)
             .map_err(|_| Error::NotImplemented)?;
 
-        let mut q_flat: Vec<CudaComplex> = Vec::with_capacity(n_pairs * n_fine_grid);
-        for (_, q_arr) in per_pair {
-            q_flat.extend(q_arr.iter().map(|&c| CudaComplex { x: c.re, y: c.im }));
-        }
+        let q_flat: Vec<CudaComplex> = q_flat_complex.iter()
+            .map(|&c| CudaComplex { x: c.re, y: c.im })
+            .collect();
 
         let q_gpu = stream.clone_htod(&q_flat).map_err(Error::Cuda)?;
         pcie.record_h2d(&q_gpu);
