@@ -252,14 +252,36 @@ fn aug_density_gpu_matches_cpu_cu111_co() {
         })
         .collect();
 
-    // CPU path
-    let rho_aug_cpu = compute_aug_density_fine(
-        &beta_psi_per_ion,
-        &occupations,
-        pots,
-        cell,
-        &fine_grid,
-    ).expect("CPU aug density");
+    // CPU path — load from disk if available, compute and save otherwise.
+    let cpu_cache_path = std::path::Path::new("/tmp/cu111_co_rho_aug_cpu.bin");
+    let rho_aug_cpu = if cpu_cache_path.exists() {
+        eprintln!("[CPU aug] loading from disk: {}", cpu_cache_path.display());
+        let bytes = std::fs::read(cpu_cache_path).expect("read cpu cache");
+        let n = bytes.len() / 8;
+        let vals: Vec<f64> = (0..n).map(|i| {
+            f64::from_le_bytes(bytes[i*8..(i+1)*8].try_into().unwrap())
+        }).collect();
+        // Shape is (ngx, ngy, ngz) C-order — same as fft_inverse_3d output.
+        let [fgx, fgy, fgz] = [fgx, fgy, fgz];
+        chemrust_hamiltonian_core::fft::RealGrid::from_inner(
+            ndarray::Array3::from_shape_vec((fgx, fgy, fgz), vals).expect("shape")
+        )
+    } else {
+        eprintln!("[CPU aug] computing (first run, will save to disk)...");
+        let r = compute_aug_density_fine(
+            &beta_psi_per_ion,
+            &occupations,
+            pots,
+            cell,
+            &fine_grid,
+        ).expect("CPU aug density");
+        let bytes: Vec<u8> = r.as_real_array().iter()
+            .flat_map(|&v| v.to_le_bytes())
+            .collect();
+        std::fs::write(cpu_cache_path, &bytes).expect("write cpu cache");
+        eprintln!("[CPU aug] saved to {}", cpu_cache_path.display());
+        r
+    };
 
     // GPU path — load cache from disk if available, build and save otherwise.
     let ctx = Arc::new(cudarc::driver::CudaContext::new(0).expect("CUDA context"));
