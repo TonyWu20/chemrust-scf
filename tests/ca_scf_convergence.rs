@@ -314,6 +314,78 @@ fn aug_density_gpu_matches_cpu_cu111_co() {
         &mut pcie2,
     ).expect("GPU aug density");
 
+    // ---------------------------------------------------------------------------
+    // Diagnostics: isolate where GPU and CPU diverge
+    // ---------------------------------------------------------------------------
+    {
+        use chemrust_hamiltonian_core::{
+            augment::q_apply::{apply_q_and_sf, compute_q_nm_flat},
+        };
+        use ndarray::Array2;
+
+        // Pick ion 0 (first Cu ion)
+        let ion_idx = 0;
+        let species_idx = cache.ion_species[ion_idx];
+        let bp = &beta_psi_per_ion[ion_idx];
+        let ne = bp.shape()[0];
+        let n_bands = occupations.len();
+
+        // --- Diag 1: ω matrix ---
+        let mut omega_cpu = Array2::<Complex64>::zeros((ne, ne));
+        for n in 0..ne {
+            for m in 0..ne {
+                let mut acc = Complex64::ZERO;
+                for b in 0..n_bands {
+                    acc += occupations[b] * bp[[n, b]].conj() * bp[[m, b]];
+                }
+                omega_cpu[[n, m]] = acc;
+            }
+        }
+        let omega_norm: f64 = omega_cpu.iter().map(|c| c.norm()).fold(0.0_f64, f64::max);
+        eprintln!("[Diag] ion={ion_idx} species={species_idx} ne={ne} ‖ω‖_∞ = {omega_norm:.4e}");
+
+        // --- Diag 2: Q_{nm}(G) from compute_q_nm_flat vs apply_q_and_sf ---
+        // Use pair (0,0) as a spot check.
+        let pot = pots.get(&cell.species_symbols[species_idx]).unwrap();
+        let aug = match pot {
+            chemrust_hamiltonian_core::Pseudopotential::Usp(d) => d as &dyn chemrust_hamiltonian_core::pseudopotential::HasAugmentationData,
+            _ => panic!("expected USP"),
+        };
+
+        // CPU reference: apply_q_and_sf with rho_nm = identity (pair 0,0 only)
+        let mut rho_unit = Array2::<Complex64>::zeros((ne, ne));
+        rho_unit[[0, 0]] = Complex64::new(1.0, 0.0);
+        let q_ref = apply_q_and_sf(&rho_unit, aug, cell, ion_idx, &fine_grid, pot.gmax())
+            .expect("apply_q_and_sf");
+        let q_ref_sum: f64 = q_ref.iter().map(|c| c.norm()).sum();
+        eprintln!("[Diag] apply_q_and_sf pair(0,0) Σ|Q| = {q_ref_sum:.4e}");
+
+        // compute_q_nm_flat with origin cell (no SF)
+        let mut cell_origin = cell.clone();
+        for mut row in cell_origin.ionic_positions.rows_mut() { row.fill(0.0); }
+        let (flat, _) = compute_q_nm_flat(aug, &cell_origin, ion_idx, &fine_grid)
+            .expect("compute_q_nm_flat");
+        let n_fine = fine_grid.grid().iter().product::<usize>();
+        // pair (0,0) is at flat[0..n_fine]
+        let q_flat_sum: f64 = flat[..n_fine].iter().map(|c| c.norm()).sum();
+        eprintln!("[Diag] compute_q_nm_flat pair(0,0) Σ|Q| = {q_flat_sum:.4e}");
+
+        // --- Diag 3: SF for ion 0 at G=0 ---
+        let sf_host: Vec<chemrust_scf::device::CudaComplex> = stream.clone_dtoh(&cache.ion_sf[ion_idx].sf).unwrap();
+        let sf_g0 = sf_host[0];
+        eprintln!("[Diag] SF[ion=0, G=0] = ({:.6}, {:.6}i)  |SF| = {:.6}",
+            sf_g0.x, sf_g0.y, (sf_g0.x*sf_g0.x + sf_g0.y*sf_g0.y).sqrt());
+
+        // --- Diag 4: Q_{nm} GPU slice for species 0, pair (0,0), first 3 elements ---
+        if let Some(se) = cache.species_entries[species_idx].as_ref() {
+            let q_gpu_host: Vec<chemrust_scf::device::CudaComplex> = stream.clone_dtoh(&se.q_nm).unwrap();
+            eprintln!("[Diag] Q_gpu[species={species_idx}] first 3 elements: {:?}",
+                &q_gpu_host[..3.min(q_gpu_host.len())]);
+            eprintln!("[Diag] Q_flat[pair(0,0)] first 3 elements: {:?}",
+                flat[..3.min(flat.len())].iter().map(|c| (c.re, c.im)).collect::<Vec<_>>());
+        }
+    }
+
     // Compare
     let cpu_arr = rho_aug_cpu.as_real_array();
     let gpu_arr = rho_aug_gpu.as_real_array();
