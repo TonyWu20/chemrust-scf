@@ -89,50 +89,55 @@ fn find_chemical_potential(
 // QSfCache: GPU-resident Q augmentation function cache
 // ---------------------------------------------------------------------------
 
-/// Per-ion Q augmentation function cache on GPU.
+/// Per-species Q augmentation function cache on GPU.
 ///
-/// Stores `Q^I_{nm}(G) · exp(-iG·R_I)` for all non-zero (n_exp, m_exp) pairs
-/// of a single ion. The flat GPU slice is indexed as `[pair_idx * n_fine_grid + grid_idx]`.
-pub struct QSfIonEntry {
+/// Stores `Q_{nm}(G)` (no structure factor) for all (n_exp, m_exp) pairs of
+/// one species. The flat GPU slice is indexed as `[pair_idx * n_fine_grid + g_idx]`.
+/// The structure factor `exp(-iG·R_I)` is applied per-ion at contraction time.
+pub struct QSfSpeciesEntry {
     /// Flat GPU slice: [n_pairs × n_fine_grid] CudaComplex.
-    /// `Q^I_{nm}(G) · exp(-iG·R_I)` for all non-zero (n_exp, m_exp) pairs.
-    pub q_sf: CudaSlice<CudaComplex>,
-    /// Expanded projector pair indices: Vec<(n_exp, m_exp)>.
-    pub pairs: Vec<(usize, usize)>,
-    /// Number of expanded projectors for this ion.
+    /// `Q_{nm}(G)` without structure factor.
+    pub q_nm: CudaSlice<CudaComplex>,
+    /// Number of expanded projectors for this species.
     pub n_expanded: usize,
+    /// n_pairs = n_expanded²
+    pub n_pairs: usize,
+}
+
+/// Per-ion structure factor cache on GPU.
+///
+/// Stores `exp(-iG·R_I)` for one ion as a flat [n_fine_grid] GPU slice.
+/// Geometry-static: built once per cell, reused every SCF iteration.
+pub struct IonSfEntry {
+    /// Flat GPU slice: [n_fine_grid] CudaComplex. `exp(-iG·R_I)`.
+    pub sf: CudaSlice<CudaComplex>,
 }
 
 /// GPU cache for USPP augmentation density computation.
 ///
-/// Caches `Q^I_{nm}(G) · exp(-iG·R_I)` per ion on GPU. Geometry-static:
-/// built once at SCF init, invariant under SCF iterations.
+/// Species-shared layout: `Q_{nm}(G)` stored once per species (no structure
+/// factor). Structure factors `exp(-iG·R_I)` stored per ion. At contraction
+/// time, `Q_{nm}(G) · exp(-iG·R_I)` is formed on-the-fly via element-wise
+/// multiply into a temporary, then contracted with `ω^I_{nm}` via gemv.
 ///
-/// Memory layout: species-shared approach (no per-ion structure factor).
-/// Store `Q_{nm}(G)` without structure factor; apply `exp(-iG·R_I)` per-iteration
-/// on GPU (cheap element-wise multiply).
+/// Memory: n_species × n_pairs × n_fine_grid × 16 bytes
+///       + n_ions × n_fine_grid × 16 bytes
+/// For Cu111_CO: 1 × 324 × 437k × 16 ≈ 2.3 GB  +  18 × 437k × 16 ≈ 126 MB
 pub struct QSfCache {
-    /// Per-ion GPU slices. Each slice is flat [n_pairs × n_fine_grid] Complex128.
-    pub entries: Vec<QSfIonEntry>,
+    /// Per-species Q function slices, keyed by species index.
+    pub species_entries: Vec<Option<QSfSpeciesEntry>>,
+    /// Per-ion structure factor slices.
+    pub ion_sf: Vec<IonSfEntry>,
+    /// ion_species[ion_idx] = species_idx — mirrors CellGeometry.ion_species.
+    pub ion_species: Vec<usize>,
     /// Fine grid dimensions [ngz, ngy, ngx].
     pub fine_grid: [usize; 3],
 }
 
-/// Build the QSfCache by computing Q augmentation functions for all ions.
+/// Build the QSfCache using the species-shared layout.
 ///
-/// For each ion, calls `compute_q_nm_per_pair` to compute `Q_{nm}(G) · exp(-iG·R_I)`
-/// for all (n_exp, m_exp) pairs in a single pass (radial Bessel transforms computed
-/// once, reused across all pairs), then uploads the flat result to GPU.
-///
-/// # Arguments
-/// - `pots` — pseudopotential set (species-keyed)
-/// - `cell` — cell geometry
-/// - `fine_grid` — fine FFT grid
-/// - `stream` — CUDA stream for H2D transfers
-/// - `pcie` — PCIe accounting for memory tracking
-///
-/// # Returns
-/// `QSfCache` with all ions' Q functions cached on GPU.
+/// Computes `Q_{nm}(G)` once per species (no structure factor) and
+/// `exp(-iG·R_I)` once per ion. Total VRAM: O(n_species × n_pairs × n_fine_grid).
 pub fn build_q_sf_cache(
     pots: &PseudopotentialSet,
     cell: &CellGeometry,
@@ -142,68 +147,87 @@ pub fn build_q_sf_cache(
 ) -> Result<QSfCache, Error> {
     let [ngz, ngy, ngx] = fine_grid.grid();
     let n_fine_grid = ngz * ngy * ngx;
+    let tau = 2.0 * std::f64::consts::PI;
 
-    let mut entries = Vec::with_capacity(cell.num_ions);
+    // --- Per-species Q_{nm}(G) (no structure factor) ---
+    // Use a dummy ion_idx=0 position of (0,0,0) so exp(-iG·R)=1 and
+    // compute_q_nm_per_pair returns pure Q_{nm}(G).
+    let n_species = cell.num_species;
+    let mut species_entries: Vec<Option<QSfSpeciesEntry>> = Vec::with_capacity(n_species);
 
-    for ion_idx in 0..cell.num_ions {
-        let species_idx = cell.ion_species[ion_idx];
+    // Build a temporary cell with all ions at the origin to strip the SF.
+    let mut cell_origin = cell.clone();
+    for mut row in cell_origin.ionic_positions.rows_mut() {
+        row.fill(0.0);
+    }
+
+    for species_idx in 0..n_species {
         let symbol = &cell.species_symbols[species_idx];
-
         let Some(pot) = pots.get(symbol) else {
-            // Species not in pseudopotential set: empty entry
-            entries.push(QSfIonEntry {
-                q_sf: stream.alloc_zeros(0).map_err(Error::Cuda)?,
-                pairs: Vec::new(),
-                n_expanded: 0,
-            });
+            species_entries.push(None);
             continue;
         };
-
-        // Check if this species has augmentation data (USP vs Recpot)
         let aug = match pot {
-            Pseudopotential::Usp(usp_data) => usp_data,
+            Pseudopotential::Usp(d) => d,
             Pseudopotential::Recpot(_) => {
-                // No augmentation: empty entry
-                entries.push(QSfIonEntry {
-                    q_sf: stream.alloc_zeros(0).map_err(Error::Cuda)?,
-                    pairs: Vec::new(),
-                    n_expanded: 0,
-                });
+                species_entries.push(None);
                 continue;
             }
         };
 
         let projectors = aug.projectors();
         let n_expanded = expanded_projector_count(projectors);
+        let n_pairs = n_expanded * n_expanded;
 
-        // Compute Q_{nm}(G)·exp(-iG·R_I) for all (n_exp, m_exp) pairs in one
-        // pass — qlnm_g (radial Bessel transforms) is computed once and reused
-        // across all pairs, avoiding the O(n_pairs) redundant recomputation that
-        // the old per-pair apply_q_and_sf loop incurred.
-        let per_pair = compute_q_nm_per_pair(aug, cell, ion_idx, fine_grid)
+        // Find the first ion of this species to use as the representative.
+        let rep_ion = cell.ion_species.iter().position(|&s| s == species_idx)
+            .unwrap_or(0);
+
+        // compute_q_nm_per_pair with origin cell → pure Q_{nm}(G), no SF.
+        let per_pair = compute_q_nm_per_pair(aug, &cell_origin, rep_ion, fine_grid)
             .map_err(|_| Error::NotImplemented)?;
 
-        let mut q_sf_flat: Vec<CudaComplex> = Vec::with_capacity(n_expanded * n_expanded * n_fine_grid);
-        let mut pairs: Vec<(usize, usize)> = Vec::with_capacity(n_expanded * n_expanded);
-
-        for ((n, m), q_arr) in per_pair {
-            q_sf_flat.extend(q_arr.iter().map(|&c| CudaComplex { x: c.re, y: c.im }));
-            pairs.push((n, m));
+        let mut q_flat: Vec<CudaComplex> = Vec::with_capacity(n_pairs * n_fine_grid);
+        for (_, q_arr) in per_pair {
+            q_flat.extend(q_arr.iter().map(|&c| CudaComplex { x: c.re, y: c.im }));
         }
 
-        // Upload flat [n_pairs × n_fine_grid] to GPU
-        let q_sf_gpu = stream
-            .clone_htod(&q_sf_flat)
-            .map_err(Error::Cuda)?;
+        let q_gpu = stream.clone_htod(&q_flat).map_err(Error::Cuda)?;
+        pcie.record_h2d(&q_gpu);
 
-        pcie.record_h2d(&q_sf_gpu);
-
-        entries.push(QSfIonEntry {
-            q_sf: q_sf_gpu,
-            pairs,
-            n_expanded,
-        });
+        species_entries.push(Some(QSfSpeciesEntry { q_nm: q_gpu, n_expanded, n_pairs }));
     }
+
+    // --- Per-ion structure factors exp(-iG·R_I) ---
+    let mut ion_sf: Vec<IonSfEntry> = Vec::with_capacity(cell.num_ions);
+
+    for ion_idx in 0..cell.num_ions {
+        let pos = cell.ionic_positions.row(ion_idx);
+        let (rx, ry, rz) = (pos[0], pos[1], pos[2]);
+
+        // Fortran layout: iz fastest, then iy, then ix — matches Array3 F-order iteration.
+        let sf_host: Vec<CudaComplex> = {
+            let mut v = Vec::with_capacity(n_fine_grid);
+            for ix in 0..ngx {
+                for iy in 0..ngy {
+                    for iz in 0..ngz {
+                        let gf = fine_grid.gvecs()[[iz, iy, ix]];
+                        let phase = -tau * (gf[0] * rx + gf[1] * ry + gf[2] * rz);
+                        let (s, c) = phase.sin_cos();
+                        v.push(CudaComplex { x: c, y: s });
+                    }
+                }
+            }
+            v
+        };
+
+        let sf_gpu = stream.clone_htod(&sf_host).map_err(Error::Cuda)?;
+        pcie.record_h2d(&sf_gpu);
+        ion_sf.push(IonSfEntry { sf: sf_gpu });
+    }
+
+    Ok(QSfCache { species_entries, ion_sf, ion_species: cell.ion_species.clone(), fine_grid: [ngz, ngy, ngx] })
+}
 
     Ok(QSfCache {
         entries,
@@ -427,13 +451,14 @@ pub fn compute_aug_density_fine(
 
 /// Compute ρ_aug(r) on the fine grid using GPU-resident QSfCache.
 ///
-/// Algorithm:
-/// 1. For each ion I:
-///    a. H2D beta_psi_I (n_expanded × n_bands)
-///    b. gemm: ω^I = conj(βψ) · diag(occ) · βψ^T  (n_expanded × n_expanded)
-///    c. gemv: ρ_aug(G) += Q_cache[I] · ω_flat  (n_fine_grid accumulation)
-/// 2. C2C inverse FFT ρ_aug(G) → ρ_aug(r)
-/// 3. D2H, normalize by 1/N_grid (cuFFT unnormalized), return RealGrid<f64>
+/// Algorithm per ion I:
+/// 1. Compute ω^I_{nm} on CPU (n_expanded ~18, cheap)
+/// 2. H2D ω^I
+/// 3. Allocate tmp[n_fine_grid]: tmp[g] = Σ_{nm} ω_{nm} · Q_{nm}(g) via gemv
+///    (uses species-shared Q_{nm}(G) from cache)
+/// 4. Element-wise multiply tmp[g] *= exp(-iG·R_I) (from ion_sf cache)
+/// 5. Accumulate: ρ_aug(G) += tmp
+/// After all ions: C2C inverse FFT, D2H, normalize.
 pub fn compute_aug_density_gpu(
     q_sf_cache: &QSfCache,
     beta_psi_per_ion: &[Array2<Complex64>],
@@ -447,117 +472,92 @@ pub fn compute_aug_density_gpu(
 
     let blas = BlasHandle::new(Arc::clone(stream)).map_err(Error::Blas)?;
 
-    // Accumulator: ρ_aug(G) on GPU, shape [n_fine_grid], initialized to zero.
     let mut rho_aug_g: CudaSlice<CudaComplex> = stream
         .alloc_zeros(n_fine_grid)
         .map_err(Error::Cuda)?;
 
-    // H2D occupations once
-    let occ_host: Vec<CudaComplex> = occupations
-        .iter()
-        .map(|&o| CudaComplex { x: o, y: 0.0 })
-        .collect();
-    let occ_dev: CudaSlice<CudaComplex> = stream.clone_htod(&occ_host).map_err(Error::Cuda)?;
+    for ion_idx in 0..q_sf_cache.ion_sf.len() {
+        let species_idx = q_sf_cache.ion_species[ion_idx];
 
-    for (ion_idx, entry) in q_sf_cache.entries.iter().enumerate() {
-        let n_pairs = entry.pairs.len();
-        if n_pairs == 0 || entry.q_sf.len() == 0 {
-            continue;
-        }
-        let n_expanded = entry.n_expanded;
-        if n_expanded == 0 {
-            continue;
-        }
+        let species_entry = match q_sf_cache.species_entries.get(species_idx).and_then(|e| e.as_ref()) {
+            Some(e) => e,
+            None => continue,
+        };
 
+        let n_expanded = species_entry.n_expanded;
+        let n_pairs = species_entry.n_pairs;
         let bp = &beta_psi_per_ion[ion_idx];
-        debug_assert_eq!(bp.shape()[0], n_expanded);
-        debug_assert_eq!(bp.shape()[1], n_bands);
 
-        // H2D beta_psi_I: shape (n_expanded × n_bands), col-major
-        let bp_host: Vec<CudaComplex> = bp
-            .iter()
-            .map(|&c| CudaComplex { x: c.re, y: c.im })
-            .collect();
-        let bp_dev: CudaSlice<CudaComplex> = stream.clone_htod(&bp_host).map_err(Error::Cuda)?;
-        pcie.record_h2d(&bp_dev);
-
-        // Step 1b: ω^I_{nm} = Σ_b occ_b · conj(βψ_I)_{n,b} · (βψ_I)_{m,b}
-        // = (βψ · diag(occ))^H · βψ  — but simpler: scale each column of βψ by sqrt(occ_b),
-        // then ω = scaled_βψ · scaled_βψ^H.
-        // We use: ω = conj(βψ) · diag(occ) · βψ^T
-        // In cuBLAS col-major: ω = βψ^H · diag(occ) · βψ
-        // Implemented as two steps: first scale βψ columns by occ, then gemm.
-        //
-        // Simpler: ω_{nm} = Σ_b occ_b · bp[n,b]* · bp[m,b]
-        // = (bp^H · diag(occ) · bp) where bp is (n_expanded × n_bands) col-major.
-        // cuBLAS ZGEMM: C = α·A^H·B + β·C
-        //   A = bp (n_expanded × n_bands), A^H = (n_bands × n_expanded)
-        //   B = bp (n_expanded × n_bands)
-        //   C = ω (n_expanded × n_expanded)
-        // But we need to weight by occ first. Scale bp columns by occ on GPU via axpy is complex.
-        // Simpler: compute ω on CPU (n_expanded is small, ~18 for Cu).
-        let ne = n_expanded;
-        let mut omega_host: Vec<CudaComplex> = vec![CudaComplex { x: 0.0, y: 0.0 }; ne * ne];
-        for n in 0..ne {
-            for m in 0..ne {
+        // ω^I_{nm} on CPU (n_expanded ~18, O(ne² × n_bands) ≈ 18² × 160 = 52k ops)
+        let mut omega_host: Vec<CudaComplex> = vec![CudaComplex { x: 0.0, y: 0.0 }; n_pairs];
+        for n in 0..n_expanded {
+            for m in 0..n_expanded {
                 let mut acc = Complex64::ZERO;
                 for b in 0..n_bands {
                     acc += occupations[b] * bp[[n, b]].conj() * bp[[m, b]];
                 }
-                // col-major: omega[m * ne + n]
-                omega_host[m * ne + n] = CudaComplex { x: acc.re, y: acc.im };
+                // row-major pair order: pair_idx = n * n_expanded + m
+                omega_host[n * n_expanded + m] = CudaComplex { x: acc.re, y: acc.im };
             }
         }
         let omega_dev: CudaSlice<CudaComplex> = stream.clone_htod(&omega_host).map_err(Error::Cuda)?;
 
-        // Step 1c: ρ_aug(G) += Σ_{nm} ω_{nm} · Q_{nm}(G)
-        // Q cache: flat [n_pairs × n_fine_grid], row-major (pair_idx * n_fine_grid + g_idx)
-        // ω_flat: [n_pairs] = [n_expanded × n_expanded] in same (n,m) order as pairs
-        // This is: ρ_aug += Q^T · ω_flat  where Q is (n_pairs × n_fine_grid)
-        // = gemv: y = α·A·x + β·y  with A=(n_fine_grid × n_pairs), x=ω_flat, y=ρ_aug
-        // In cuBLAS col-major: A stored as (n_pairs × n_fine_grid) row-major
-        //   = (n_fine_grid × n_pairs) col-major → use CUBLAS_OP_T
-        // gemv: y(n_fine_grid) = α · A^T(n_fine_grid × n_pairs) · x(n_pairs) + β·y
-        //   where A is stored col-major as (n_pairs × n_fine_grid)
-        //   → transa=T, m=n_pairs, n=n_fine_grid → result has n_fine_grid elements
-        let alpha = CudaComplex { x: 1.0, y: 0.0 };
-        let beta  = CudaComplex { x: 1.0, y: 0.0 };
-        // Q cache: [n_pairs × n_fine_grid] row-major = [n_fine_grid × n_pairs] col-major.
-        // gemv: ρ_aug(n_fine_grid) += Q^T(n_fine_grid × n_pairs) · ω_flat(n_pairs)
-        // cublasZgemv: y = α·op(A)·x + β·y
-        //   A stored col-major as (n_pairs × n_fine_grid), trans=T → op(A) is (n_fine_grid × n_pairs)
-        //   m=n_pairs (rows of A), n=n_fine_grid (cols of A), result length = n_fine_grid
+        // tmp[g] = Σ_{nm} ω_{nm} · Q_{nm}(g)
+        // Q stored as [n_pairs × n_fine_grid] row-major = [n_fine_grid × n_pairs] col-major.
+        // gemv: tmp(n_fine_grid) = Q^T · ω  where Q is (n_pairs × n_fine_grid) col-major
+        //   → trans=T, m=n_pairs, n=n_fine_grid
+        let mut tmp: CudaSlice<CudaComplex> = stream.alloc_zeros(n_fine_grid).map_err(Error::Cuda)?;
+        let one  = CudaComplex { x: 1.0, y: 0.0 };
+        let zero = CudaComplex { x: 0.0, y: 0.0 };
         unsafe {
             blas.gemv_c64(
                 op::T,
                 n_pairs as i32,
                 n_fine_grid as i32,
-                alpha,
-                &entry.q_sf,
+                one,
+                &species_entry.q_nm,
                 n_pairs as i32,
                 &omega_dev,
                 1,
-                beta,
-                &mut rho_aug_g,
+                zero,
+                &mut tmp,
                 1,
             ).map_err(Error::Blas)?;
         }
+
+        // tmp[g] *= exp(-iG·R_I)  (element-wise, using ion_sf cache)
+        // Implemented as axpy-style: no dedicated kernel, use the multiply kernel
+        // via a custom CUDA kernel or do it on CPU. Since we don't have a
+        // pointwise-multiply kernel yet, do it via D2H → multiply → H2D.
+        // This is a temporary fallback — a proper GPU kernel would avoid the roundtrip.
+        let tmp_host: Vec<CudaComplex> = stream.clone_dtoh(&tmp).map_err(Error::Cuda)?;
+        let sf_host: Vec<CudaComplex> = stream.clone_dtoh(&q_sf_cache.ion_sf[ion_idx].sf).map_err(Error::Cuda)?;
+        let multiplied: Vec<CudaComplex> = tmp_host.iter().zip(sf_host.iter()).map(|(t, s)| {
+            // (a + ib)(c + id) = (ac - bd) + i(ad + bc)
+            CudaComplex {
+                x: t.x * s.x - t.y * s.y,
+                y: t.x * s.y + t.y * s.x,
+            }
+        }).collect();
+        let mut tmp_sf: CudaSlice<CudaComplex> = stream.clone_htod(&multiplied).map_err(Error::Cuda)?;
+
+        // ρ_aug(G) += tmp_sf
+        blas.axpy_c64(n_fine_grid as i32, one, &tmp_sf, 1, &mut rho_aug_g, 1)
+            .map_err(Error::Blas)?;
+        drop(tmp_sf);
     }
 
-    // Step 2: C2C inverse FFT ρ_aug(G) → ρ_aug(r)
-    // cuFFT plan dims: (ngx, ngy, ngz) — innermost first, matching scatter formula.
+    // C2C inverse FFT ρ_aug(G) → ρ_aug(r)
     let fft_plan = FftPlan3d::plan_c2c(ngx as i32, ngy as i32, ngz as i32, Arc::clone(stream))?;
     unsafe {
         let ptr = &mut rho_aug_g as *mut CudaSlice<CudaComplex>;
         fft_plan.c2c_inverse(&mut *ptr, &mut *ptr)?;
     }
 
-    // Step 3: D2H, normalize by 1/N_grid (cuFFT is unnormalized), extract real part
     let rho_aug_host: Vec<CudaComplex> = stream.clone_dtoh(&rho_aug_g).map_err(Error::Cuda)?;
     pcie.record_d2h(&rho_aug_g);
 
     let inv_n = 1.0 / n_fine_grid as f64;
-    // RealGrid stores data in Fortran layout (ngz, ngy, ngx).f()
     let rho_arr = Array3::from_shape_fn((ngz, ngy, ngx).f(), |(iz, iy, ix)| {
         let idx = iz + ngz * (iy + ngy * ix);
         rho_aug_host[idx].x as f64 * inv_n
@@ -570,7 +570,7 @@ pub fn compute_aug_density_gpu(
 /// augmentation density paths directly.
 pub mod test_api {
     pub use super::{
-        QSfCache, QSfIonEntry,
+        QSfCache, QSfSpeciesEntry, IonSfEntry,
         build_q_sf_cache,
         compute_aug_density_fine,
         compute_aug_density_gpu,
