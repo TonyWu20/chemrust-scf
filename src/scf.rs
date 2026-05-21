@@ -1335,6 +1335,11 @@ impl<S: SpinPolicy, M: MixingPhase> ScfIteration<S, VEffBuilt, M> {
     pub fn set_v_eff(&mut self, v: S::VEff) {
         self.v_eff = Some(v);
     }
+    /// Access ψ coefficient slice (debug/testing only).
+    #[doc(hidden)]
+    pub fn psi_data(&self) -> &[Complex64] {
+        &self.psi.data
+    }
 }
 
 impl<S: SpinPolicy, M: MixingPhase> ScfIteration<S, WavefunctionsUpdated, M> {
@@ -1348,6 +1353,11 @@ impl<S: SpinPolicy, M: MixingPhase> ScfIteration<S, DensityUpdated<M>, MixingOff
     /// Access the computed density (for testing).
     pub fn density(&self) -> &Density {
         &self.density
+    }
+    /// Access ρ_aug on the fine grid (debug/testing only).
+    #[doc(hidden)]
+    pub fn density_aug_fine(&self) -> Option<&chemrust_hamiltonian_core::fft::RealGrid<f64>> {
+        self.density_aug_fine.as_ref()
     }
 }
 

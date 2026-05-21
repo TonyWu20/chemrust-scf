@@ -173,6 +173,16 @@ impl VnlBatchData {
                 _ => d0_expanded.clone(),
             };
 
+            // Diagnostic: report D magnitudes per ion to catch screening explosions.
+            let d_min = d_screened.iter().cloned().fold(f64::INFINITY, f64::min);
+            let d_max = d_screened.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let d_amax = d_screened.iter().map(|d| d.abs()).fold(0.0_f64, f64::max);
+            let d0_amax = d0_expanded.iter().map(|d| d.abs()).fold(0.0_f64, f64::max);
+            eprintln!(
+                "[D_screened] ion={ion_idx:2} sym={symbol} ne={n_expanded:2}  \
+                 d0_amax={d0_amax:.4e}  d_screen_min={d_min:.4e} d_screen_max={d_max:.4e} d_screen_amax={d_amax:.4e}"
+            );
+
             let beta_flat: Vec<CudaComplex> =
                 beta_g.iter().map(|&c| crate::device::complex_to_cuda(c)).collect();
             let d_flat: Vec<CudaComplex> =

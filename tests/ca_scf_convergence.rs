@@ -307,13 +307,24 @@ fn aug_density_gpu_matches_cpu_cu111_co() {
         c
     };
 
-    // Upload beta_psi_per_ion to GPU for compute_aug_density_gpu
+    // Upload beta_psi_per_ion to GPU for compute_aug_density_gpu.
+    // CRITICAL: compute_aug_density_gpu reinterprets the buffer with
+    // `(n_expanded, n_bands).f()` (col-major / F-order). Production gemm
+    // in rayleigh_ritz produces col-major. Here we have a row-major
+    // Array2 from compute_beta_phi, so we must flatten in col-major
+    // order — `flat[n + b*n_e] = arr[n, b]` — to match production layout.
     let beta_psi_gpu: Vec<CudaSlice<CudaComplex>> = beta_psi_per_ion
         .iter()
         .map(|arr| {
-            let flat: Vec<CudaComplex> = arr.iter()
-                .map(|c| CudaComplex { x: c.re, y: c.im })
-                .collect();
+            let ne = arr.shape()[0];
+            let nb = arr.shape()[1];
+            let mut flat: Vec<CudaComplex> = Vec::with_capacity(ne * nb);
+            for b in 0..nb {
+                for n in 0..ne {
+                    let c = arr[[n, b]];
+                    flat.push(CudaComplex { x: c.re, y: c.im });
+                }
+            }
             stream.clone_htod(&flat).expect("H2D beta_psi")
         })
         .collect();
