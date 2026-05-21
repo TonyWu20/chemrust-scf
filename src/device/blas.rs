@@ -117,6 +117,45 @@ impl BlasHandle {
         unsafe { self.inner.gemv(cfg, a, x, y) }
     }
 
+    /// y = α·A·x + β·y  (complex, ZGEMV).
+    ///
+    /// `trans` controls whether A is used as-is (N), transposed (T), or conjugate-transposed (C).
+    /// `m` = rows of A, `n` = cols of A (before transpose).
+    ///
+    /// # Safety
+    /// A, x, y must point to valid device memory of sufficient dimensions.
+    pub unsafe fn gemv_c64(
+        &self,
+        trans: cublasOperation_t,
+        m: i32,
+        n: i32,
+        alpha: CudaComplex,
+        a: &CudaSlice<CudaComplex>,
+        lda: i32,
+        x: &CudaSlice<CudaComplex>,
+        incx: i32,
+        beta: CudaComplex,
+        y: &mut CudaSlice<CudaComplex>,
+        incy: i32,
+    ) -> Result<(), CublasError> {
+        unsafe {
+            let (a_ptr, _) = a.device_ptr(&self.stream);
+            let (x_ptr, _) = x.device_ptr(&self.stream);
+            let (y_ptr, _) = y.device_ptr_mut(&self.stream);
+            blas_sys::cublasZgemv_v2(
+                self.raw_handle(),
+                trans,
+                m, n,
+                &alpha as *const _ as *const _,
+                a_ptr as *const _, lda,
+                x_ptr as *const _, incx,
+                &beta as *const _ as *const _,
+                y_ptr as *mut _, incy,
+            )
+            .result()
+        }
+    }
+
     // ── AXPY (f64) ──
 
     /// y = α·x + y  (f64)

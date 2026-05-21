@@ -16,12 +16,14 @@ use chemrust_hamiltonian_core::{
     augment::beta_phi::expanded_projector_count,
     augment::q_apply::apply_q_and_sf,
     pseudopotential::{Pseudopotential, HasAugmentationData},
+    fft::RealGrid,
 };
 use cudarc::driver::{CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
-use ndarray::{Array2, Array3};
+use ndarray::{Array2, Array3, ShapeBuilder};
 use num_complex::Complex64;
 
-use crate::device::fft::BatchedFftPlan3d;
+use crate::device::blas::{BlasHandle, op};
+use crate::device::fft::{BatchedFftPlan3d, FftPlan3d};
 use crate::device::{complex_slice_to_cuda, CudaComplex};
 use crate::device::pcie::PcieAccount;
 use crate::eigensolver::chebyshev::CudaKernelSet;
@@ -424,4 +426,149 @@ pub(crate) fn compute_aug_density_fine(
 
     assemble_aug_density_fine(&rho_nm_per_ion, pots, cell, fine_grid)
         .map_err(|_| Error::NotImplemented)
+}
+
+// ---------------------------------------------------------------------------
+// GPU augmentation density: compute_aug_density_gpu
+// ---------------------------------------------------------------------------
+
+/// Compute ρ_aug(r) on the fine grid using GPU-resident QSfCache.
+///
+/// Algorithm:
+/// 1. For each ion I:
+///    a. H2D beta_psi_I (n_expanded × n_bands)
+///    b. gemm: ω^I = conj(βψ) · diag(occ) · βψ^T  (n_expanded × n_expanded)
+///    c. gemv: ρ_aug(G) += Q_cache[I] · ω_flat  (n_fine_grid accumulation)
+/// 2. C2C inverse FFT ρ_aug(G) → ρ_aug(r)
+/// 3. D2H, normalize by 1/N_grid (cuFFT unnormalized), return RealGrid<f64>
+pub(crate) fn compute_aug_density_gpu(
+    q_sf_cache: &QSfCache,
+    beta_psi_per_ion: &[Array2<Complex64>],
+    occupations: &[f64],
+    stream: &Arc<CudaStream>,
+    pcie: &mut PcieAccount,
+) -> Result<RealGrid<f64>, Error> {
+    let [ngz, ngy, ngx] = q_sf_cache.fine_grid;
+    let n_fine_grid = ngz * ngy * ngx;
+    let n_bands = occupations.len();
+
+    let blas = BlasHandle::new(Arc::clone(stream)).map_err(Error::Blas)?;
+
+    // Accumulator: ρ_aug(G) on GPU, shape [n_fine_grid], initialized to zero.
+    let mut rho_aug_g: CudaSlice<CudaComplex> = stream
+        .alloc_zeros(n_fine_grid)
+        .map_err(Error::Cuda)?;
+
+    // H2D occupations once
+    let occ_host: Vec<CudaComplex> = occupations
+        .iter()
+        .map(|&o| CudaComplex { x: o, y: 0.0 })
+        .collect();
+    let occ_dev: CudaSlice<CudaComplex> = stream.clone_htod(&occ_host).map_err(Error::Cuda)?;
+
+    for (ion_idx, entry) in q_sf_cache.entries.iter().enumerate() {
+        let n_pairs = entry.pairs.len();
+        if n_pairs == 0 || entry.q_sf.len() == 0 {
+            continue;
+        }
+        let n_expanded = entry.n_expanded;
+        if n_expanded == 0 {
+            continue;
+        }
+
+        let bp = &beta_psi_per_ion[ion_idx];
+        debug_assert_eq!(bp.shape()[0], n_expanded);
+        debug_assert_eq!(bp.shape()[1], n_bands);
+
+        // H2D beta_psi_I: shape (n_expanded × n_bands), col-major
+        let bp_host: Vec<CudaComplex> = bp
+            .iter()
+            .map(|&c| CudaComplex { x: c.re, y: c.im })
+            .collect();
+        let bp_dev: CudaSlice<CudaComplex> = stream.clone_htod(&bp_host).map_err(Error::Cuda)?;
+        pcie.record_h2d(&bp_dev);
+
+        // Step 1b: ω^I_{nm} = Σ_b occ_b · conj(βψ_I)_{n,b} · (βψ_I)_{m,b}
+        // = (βψ · diag(occ))^H · βψ  — but simpler: scale each column of βψ by sqrt(occ_b),
+        // then ω = scaled_βψ · scaled_βψ^H.
+        // We use: ω = conj(βψ) · diag(occ) · βψ^T
+        // In cuBLAS col-major: ω = βψ^H · diag(occ) · βψ
+        // Implemented as two steps: first scale βψ columns by occ, then gemm.
+        //
+        // Simpler: ω_{nm} = Σ_b occ_b · bp[n,b]* · bp[m,b]
+        // = (bp^H · diag(occ) · bp) where bp is (n_expanded × n_bands) col-major.
+        // cuBLAS ZGEMM: C = α·A^H·B + β·C
+        //   A = bp (n_expanded × n_bands), A^H = (n_bands × n_expanded)
+        //   B = bp (n_expanded × n_bands)
+        //   C = ω (n_expanded × n_expanded)
+        // But we need to weight by occ first. Scale bp columns by occ on GPU via axpy is complex.
+        // Simpler: compute ω on CPU (n_expanded is small, ~18 for Cu).
+        let ne = n_expanded;
+        let mut omega_host: Vec<CudaComplex> = vec![CudaComplex { x: 0.0, y: 0.0 }; ne * ne];
+        for n in 0..ne {
+            for m in 0..ne {
+                let mut acc = Complex64::ZERO;
+                for b in 0..n_bands {
+                    acc += occupations[b] * bp[[n, b]].conj() * bp[[m, b]];
+                }
+                // col-major: omega[m * ne + n]
+                omega_host[m * ne + n] = CudaComplex { x: acc.re, y: acc.im };
+            }
+        }
+        let omega_dev: CudaSlice<CudaComplex> = stream.clone_htod(&omega_host).map_err(Error::Cuda)?;
+
+        // Step 1c: ρ_aug(G) += Σ_{nm} ω_{nm} · Q_{nm}(G)
+        // Q cache: flat [n_pairs × n_fine_grid], row-major (pair_idx * n_fine_grid + g_idx)
+        // ω_flat: [n_pairs] = [n_expanded × n_expanded] in same (n,m) order as pairs
+        // This is: ρ_aug += Q^T · ω_flat  where Q is (n_pairs × n_fine_grid)
+        // = gemv: y = α·A·x + β·y  with A=(n_fine_grid × n_pairs), x=ω_flat, y=ρ_aug
+        // In cuBLAS col-major: A stored as (n_pairs × n_fine_grid) row-major
+        //   = (n_fine_grid × n_pairs) col-major → use CUBLAS_OP_T
+        // gemv: y(n_fine_grid) = α · A^T(n_fine_grid × n_pairs) · x(n_pairs) + β·y
+        //   where A is stored col-major as (n_pairs × n_fine_grid)
+        //   → transa=T, m=n_pairs, n=n_fine_grid → result has n_fine_grid elements
+        let alpha = CudaComplex { x: 1.0, y: 0.0 };
+        let beta  = CudaComplex { x: 1.0, y: 0.0 };
+        // Q cache: [n_pairs × n_fine_grid] row-major = [n_fine_grid × n_pairs] col-major.
+        // gemv: ρ_aug(n_fine_grid) += Q^T(n_fine_grid × n_pairs) · ω_flat(n_pairs)
+        // cublasZgemv: y = α·op(A)·x + β·y
+        //   A stored col-major as (n_pairs × n_fine_grid), trans=T → op(A) is (n_fine_grid × n_pairs)
+        //   m=n_pairs (rows of A), n=n_fine_grid (cols of A), result length = n_fine_grid
+        unsafe {
+            blas.gemv_c64(
+                op::T,
+                n_pairs as i32,
+                n_fine_grid as i32,
+                alpha,
+                &entry.q_sf,
+                n_pairs as i32,
+                &omega_dev,
+                1,
+                beta,
+                &mut rho_aug_g,
+                1,
+            ).map_err(Error::Blas)?;
+        }
+    }
+
+    // Step 2: C2C inverse FFT ρ_aug(G) → ρ_aug(r)
+    // cuFFT plan dims: (ngx, ngy, ngz) — innermost first, matching scatter formula.
+    let fft_plan = FftPlan3d::plan_c2c(ngx as i32, ngy as i32, ngz as i32, Arc::clone(stream))?;
+    unsafe {
+        let ptr = &mut rho_aug_g as *mut CudaSlice<CudaComplex>;
+        fft_plan.c2c_inverse(&mut *ptr, &mut *ptr)?;
+    }
+
+    // Step 3: D2H, normalize by 1/N_grid (cuFFT is unnormalized), extract real part
+    let rho_aug_host: Vec<CudaComplex> = stream.clone_dtoh(&rho_aug_g).map_err(Error::Cuda)?;
+    pcie.record_d2h(&rho_aug_g);
+
+    let inv_n = 1.0 / n_fine_grid as f64;
+    // RealGrid stores data in Fortran layout (ngz, ngy, ngx).f()
+    let rho_arr = Array3::from_shape_fn((ngz, ngy, ngx).f(), |(iz, iy, ix)| {
+        let idx = iz + ngz * (iy + ngy * ix);
+        rho_aug_host[idx].x as f64 * inv_n
+    });
+
+    Ok(RealGrid::from_inner(rho_arr))
 }
