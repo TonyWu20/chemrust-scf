@@ -43,8 +43,10 @@ pub struct VnlBatchData {
     pub screening_h2d_bytes: usize,
     /// Concatenated β-projectors: n_pw × n_total_expanded (col-major).
     pub b_concat: CudaSlice<CudaComplex>,
-    /// Cholesky factor of M = Q⁻¹ + B^H·B (lower triangle, n_total_expanded × n_total_expanded).
-    pub chol_m: CudaSlice<CudaComplex>,
+    /// LU factor (P·L·U) of M = Q⁻¹ + B^H·B (n_total_expanded × n_total_expanded).
+    pub lu_m: CudaSlice<CudaComplex>,
+    /// Pivot indices from LU factorisation (Fortran 1-based).
+    pub lu_ipiv: CudaSlice<i32>,
     /// Sum of all per-ion n_expanded values.
     pub n_total_expanded: i32,
 }
@@ -376,24 +378,35 @@ impl VnlBatchData {
                 m_cpu[i * nte + j] = q_inv_blkdiag.0[i * nte + j] + bh_b_typed.0[i * nte + j];
             }
         }
+        // Vestigial diagonal regularisation: M += ε·I. LU with partial pivoting
+        // does not require positive-definiteness (unlike Cholesky), but a tiny
+        // ε prevents exact-zero pivots for fully zero rows in Q⁻¹. 1e-12 is
+        // negligible compared to O(1) diagonal values from B^H·B.
+        const M_REG: f64 = 1e-12;
+        for i in 0..nte {
+            m_cpu[i * nte + i] += M_REG;
+        }
         let m_mat = MMatrix(m_cpu);
 
-        // 5. Cholesky factor M = L·L^H.
+        // 5. LU factor M = P·L·U (robust against near-singular M where Q⁻¹
+        //    has zero rows for projectors without Q_aug contributions).
         let m_flat: Vec<CudaComplex> = m_mat.0.into_iter().map(|x| CudaComplex { x, y: 0.0 }).collect();
-        let mut chol_m_dev = stream.clone_htod(&m_flat).map_err(Error::Cuda)?;
+        let mut lu_m_dev = stream.clone_htod(&m_flat).map_err(Error::Cuda)?;
         pcie.h2d_bytes += m_flat.len() * std::mem::size_of::<CudaComplex>();
-        let mut chol_info = stream.alloc_zeros::<i32>(1).map_err(Error::Cuda)?;
-        solver.zpotrf(
-            cudarc::cusolver::sys::cublasFillMode_t::CUBLAS_FILL_MODE_LOWER,
+        let mut lu_ipiv_dev = stream.alloc_zeros::<i32>(nte).map_err(Error::Cuda)?;
+        let mut lu_info = stream.alloc_zeros::<i32>(1).map_err(Error::Cuda)?;
+        solver.zgetrf(
             nte as i32,
-            &mut chol_m_dev,
-            &mut chol_info,
+            nte as i32,
+            &mut lu_m_dev,
+            &mut lu_ipiv_dev,
+            &mut lu_info,
         )?;
-        let chol_info_cpu: Vec<i32> = stream.clone_dtoh(&chol_info).map_err(Error::Cuda)?;
-        if chol_info_cpu[0] != 0 {
+        let lu_info_cpu: Vec<i32> = stream.clone_dtoh(&lu_info).map_err(Error::Cuda)?;
+        if lu_info_cpu[0] != 0 {
             return Err(Error::Nvrtc(format!(
-                "global Woodbury M not positive definite: zpotrf info = {} (near-singular M)",
-                chol_info_cpu[0],
+                "global Woodbury M singular: zgetrf info = {} (zero pivot at row {})",
+                lu_info_cpu[0], lu_info_cpu[0],
             )));
         }
 
@@ -401,7 +414,8 @@ impl VnlBatchData {
             entries,
             screening_h2d_bytes,
             b_concat,
-            chol_m: chol_m_dev,
+            lu_m: lu_m_dev,
+            lu_ipiv: lu_ipiv_dev,
             n_total_expanded,
         })
     }

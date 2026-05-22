@@ -25,7 +25,7 @@ use crate::device::pcie::PcieAccount;
 use crate::device::solver::SolverHandle;
 use crate::device::{CudaComplex, Gpu};
 use crate::eigensolver::vnl_data::VnlBatchData;
-use cudarc::cusolver::sys::cublasFillMode_t;
+use cudarc::cusolver::sys::cublasOperation_t;
 
 // ---------------------------------------------------------------------------
 // Helper: call cuFFT C2C in-place (same buffer for input and output)
@@ -861,13 +861,14 @@ unsafe fn apply_s_inverse(
         )?;
     }
 
-    // 2. Solve M·x = temp via Cholesky factor (zpotrs, in-place overwrites temp).
+    // 2. Solve M·x = temp via LU factor (zgetrs, in-place overwrites temp).
     let mut info_dev = stream.alloc_zeros::<i32>(1).map_err(Error::Cuda)?;
-    solver.zpotrs(
-        cublasFillMode_t::CUBLAS_FILL_MODE_LOWER,
+    solver.zgetrs(
+        cublasOperation_t::CUBLAS_OP_N,
         nte,
         n_bands,
-        &vnl_data.chol_m,
+        &vnl_data.lu_m,
+        &vnl_data.lu_ipiv,
         &mut temp,
         &mut info_dev,
     )?;
