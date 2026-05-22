@@ -433,6 +433,16 @@ unsafe fn lanczos_upper_bound(
             )?;
         }
 
+        // Transform H·v → S⁻¹·H·v so Lanczos estimates λ_max(S⁻¹·H),
+        // which is the spectral radius of the generalized eigenproblem H·ψ = ε·S·ψ.
+        unsafe {
+            apply_s_inverse(
+                &mut hv, vnl_data,
+                1, n,   // n_bands=1, n_pw=n
+                blas, stream,
+            )?;
+        }
+
         // alpha[j] = <v_cur | Hv>  (real part; H is Hermitian)
         let dot_aj = blas.dotc_c64(n, &v_cur, 1, &hv, 1).map_err(Error::Blas)?;
         alpha[j] = dot_aj.x;
