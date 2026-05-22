@@ -15,6 +15,9 @@ cudarc = { version = "0.19.7", features = ["cuda-12090", "cublas", "cufft", "cus
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 rand = "0.8"
 
+[features]
+scf_diag = []
+
 [lib]
 name = "chemrust_scf"
 crate-type = ["lib"]

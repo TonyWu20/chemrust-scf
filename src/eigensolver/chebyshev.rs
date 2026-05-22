@@ -436,10 +436,13 @@ unsafe fn lanczos_upper_bound(
         let dot = blas.dotc_c64(n, &v_cur, 1, &v_cur, 1).map_err(Error::Blas)?;
         dot.x.sqrt()
     };
+    #[cfg(feature = "scf_diag")]
     eprintln!("[Lanczos] entry: n_pw={} grid_size={} k_steps={}", n_pw, grid_size, k_steps);
+    #[cfg(feature = "scf_diag")]
     eprintln!("[Lanczos] norm0 = {:.6e}", norm0);
     if norm0 < 1e-30 {
         // Degenerate starting vector — fall back to Gershgorin
+        #[cfg(feature = "scf_diag")]
         eprintln!("[Lanczos] EARLY-RETURN: norm0 < 1e-30 → fallback to (INF, -INF, INF)");
         return Ok((f64::INFINITY, f64::NEG_INFINITY, f64::INFINITY));
     }
@@ -510,7 +513,9 @@ unsafe fn lanczos_upper_bound(
     // Find λ_max and λ_min of the k×k symmetric tridiagonal T_k on CPU
     // via Gershgorin bounds. T_k is at most 6×6 so this is trivial.
     let k = alpha.len();
+    #[cfg(feature = "scf_diag")]
     eprintln!("[Lanczos] alpha = {:?}", alpha);
+    #[cfg(feature = "scf_diag")]
     eprintln!("[Lanczos] beta  = {:?}", beta);
     let lambda_max_tk = (0..k).map(|i| {
         let b_left  = if i > 0   { beta[i].abs() } else { 0.0 };
@@ -526,6 +531,7 @@ unsafe fn lanczos_upper_bound(
     // Rigorous upper bound: λ_max(H) ≤ λ_max(T_k) + ‖r_k‖
     let residual_norm = beta[k - 1];
     let b_up_raw = lambda_max_tk + residual_norm;
+    #[cfg(feature = "scf_diag")]
     eprintln!(
         "[Lanczos] T_k bounds: lambda_min_tk = {:.4} Ha  lambda_max_tk = {:.4} Ha  residual_norm(beta[k-1]) = {:.4e}  → b_up_raw = {:.4} Ha",
         lambda_min_tk, lambda_max_tk, residual_norm, b_up_raw,
@@ -1351,6 +1357,7 @@ pub(crate) fn chebyshev_filter(
             let scaled = b_up_lanczos * 1.1;
             let b_up = scaled.min(gershgorin_b_up);
             let capped_by_gershgorin = scaled >= gershgorin_b_up;
+            #[cfg(feature = "scf_diag")]
             eprintln!(
                 "[Lanczos@call] b_up_lanczos={:.4}  ritz_min={:.4}  ritz_max={:.4}  gershgorin={:.4}  scaled(*1.1)={:.4}  → b_up={:.4}  capped_by_gershgorin={}",
                 b_up_lanczos, ritz_min, ritz_max, gershgorin_b_up, scaled, b_up, capped_by_gershgorin,
@@ -1359,6 +1366,7 @@ pub(crate) fn chebyshev_filter(
             // b_low: use Ritz values from previous RR when available (Alg 4.1 §7.2).
             // On first call (no prior eigenvalues), derive from Lanczos T_k Ritz
             // values per Algorithm 5.1 eq.(13): β=0.5 → midpoint of T_k spectrum.
+            #[allow(unused_variables)]
             let (b_low, b_low_src) = match eigenvalues {
                 Some(eig) if !eig.is_empty() => {
                     // Steady-state: b_low = largest Ritz value from previous RR.
@@ -1371,9 +1379,11 @@ pub(crate) fn chebyshev_filter(
                     (0.5 * ritz_min + 0.5 * ritz_max, "T_k midpoint")
                 }
             };
+            #[cfg(feature = "scf_diag")]
             eprintln!("[Lanczos@call] b_low={:.4}  source={}", b_low, b_low_src);
 
             let guard_pass = b_up.is_finite() && b_up > b_low;
+            #[cfg(feature = "scf_diag")]
             eprintln!(
                 "[Lanczos@call] guard pass={}  (b_up.is_finite()={} && b_up>{:.4}={})",
                 guard_pass,
@@ -1393,6 +1403,7 @@ pub(crate) fn chebyshev_filter(
                 };
             }
         }
+        #[cfg(feature = "scf_diag")]
         eprintln!(
             "[Chebyshev] b_up={:.4} Ha  b_low={:.4} Ha  center={:.4} Ha  half_width={:.4} Ha  lambda_min={:.4} Ha",
             bounds.lambda_max, bounds.eps_cut, bounds.center, bounds.half_width, bounds.lambda_min,
@@ -1611,6 +1622,7 @@ pub(crate) fn chebyshev_filter(
             // Norm check on the newly computed residual R_Y (buf_ry after rotation)
             let norm_curr = compute_frobenius_norm(&buf_ry, n_elem_i32, blas)?;
             let norm_prev = compute_frobenius_norm(&buf_rx, n_elem_i32, blas)?;
+            #[cfg(feature = "scf_diag")]
             eprintln!("[R-ChFSI] k={k}  norm_prev={norm_prev:.6e}  norm_curr={norm_curr:.6e}  ratio={:.4}", norm_curr / norm_prev.max(1e-30));
             check_norm_stability(norm_curr, norm_prev, k)?;
         }
