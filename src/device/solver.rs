@@ -315,7 +315,7 @@ mod tests {
         for i in 0..n as usize {
             for j in 0..n as usize {
                 m[i * n as usize + j] = if i >= j {
-                    (i * n + j) as f64 * 0.1 + 1.0
+                    (i * n as usize + j) as f64 * 0.1 + 1.0
                 } else {
                     0.0
                 };

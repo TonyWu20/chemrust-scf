@@ -6,7 +6,7 @@ use chemrust_hamiltonian_core::augment::beta_phi::{
 use chemrust_hamiltonian_core::nlpot::build_d0_expanded;
 use chemrust_hamiltonian_core::pseudopotential::HasAugmentationData;
 use chemrust_hamiltonian_core::Pseudopotential;
-use cudarc::driver::{CudaSlice, CudaStream, DevicePtr};
+use cudarc::driver::{CudaSlice, CudaStream};
 use ndarray::Array2;
 use num_complex::Complex64;
 

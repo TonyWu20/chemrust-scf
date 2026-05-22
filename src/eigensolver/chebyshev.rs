@@ -1350,6 +1350,7 @@ pub(crate) fn chebyshev_filter(
             // starting vector is nearly invariant (well-converged wavefunctions).
             let scaled = b_up_lanczos * 1.1;
             let b_up = scaled.min(gershgorin_b_up);
+            #[allow(unused_variables)]
             let capped_by_gershgorin = scaled >= gershgorin_b_up;
             #[cfg(feature = "scf_diag")]
             eprintln!(

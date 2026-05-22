@@ -455,11 +455,16 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
             let rho_arr = self.density.as_wave_array();
             let n_grid = rho_arr.len() as f64;
             let rho_sum: f64 = rho_arr.iter().sum();
+            #[allow(unused_variables)]
             let rho_min = rho_arr.iter().cloned().fold(f64::INFINITY, f64::min);
+            #[allow(unused_variables)]
             let rho_max = rho_arr.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            #[allow(unused_variables)]
             let total_e_raw_conv = rho_sum / n_grid;
+            #[allow(unused_variables)]
             let total_e_phys_conv = rho_sum * self.cell.volume / n_grid;
             let psi_data = &self.psi.data;
+            #[allow(unused_variables)]
             let (mut psi_abs_min, mut psi_abs_max) = (f64::INFINITY, 0.0f64);
             for c in psi_data.iter() {
                 let a = c.norm();
@@ -682,11 +687,17 @@ impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated, MixingOff> {
             let rho_arr = new_density.as_wave_array();
             let n_grid = rho_arr.len() as f64;
             let rho_sum: f64 = rho_arr.iter().sum();
+            #[allow(unused_variables)]
             let rho_min = rho_arr.iter().cloned().fold(f64::INFINITY, f64::min);
+            #[allow(unused_variables)]
             let rho_max = rho_arr.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            #[allow(unused_variables)]
             let total_e_raw_conv = rho_sum / n_grid;
+            #[allow(unused_variables)]
             let total_e_phys_conv = rho_sum * self.cell.volume / n_grid;
+            #[allow(unused_variables)]
             let occ_sum: f64 = occupations.0.iter().sum();
+            #[allow(unused_variables)]
             let occ_max = occupations.0.iter().cloned().fold(0.0f64, f64::max);
             #[cfg(feature = "scf_diag")]
             eprintln!(
@@ -710,9 +721,9 @@ impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated, MixingOff> {
                             eprintln!("[QSfCache] built: {} ions, H2D {} bytes", cache.ion_sf.len(), pcie.h2d_bytes);
                             self.q_sf_cache = Some(cache);
                         }
-                        Err(e) => {
+                        Err(_e) => {
                             #[cfg(feature = "scf_diag")]
-                            eprintln!("[QSfCache] build failed ({e:?}), falling back to CPU aug density");
+                            eprintln!("[QSfCache] build failed ({_e:?}), falling back to CPU aug density");
                         }
                     }
                 }
@@ -758,9 +769,13 @@ impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated, MixingOff> {
                 };
                 {
                     let arr = rho_aug.as_real_array();
+                    #[allow(unused_variables)]
                     let aug_sum: f64 = arr.iter().sum();
+                    #[allow(unused_variables)]
                     let aug_min = arr.iter().cloned().fold(f64::INFINITY, f64::min);
+                    #[allow(unused_variables)]
                     let aug_max = arr.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                    #[allow(unused_variables)]
                     let n_grid = arr.len() as f64;
                     #[cfg(feature = "scf_diag")]
                     eprintln!(
