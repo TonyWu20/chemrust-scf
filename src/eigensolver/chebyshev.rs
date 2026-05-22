@@ -755,7 +755,6 @@ unsafe fn apply_v_nl_hamiltonian(
 ///   q = s_inv_mat · p            (small solve)
 ///   hpsi −= beta_g · q           (subtract correction)
 #[allow(clippy::too_many_arguments)]
-#[allow(dead_code)]
 unsafe fn apply_s_inverse(
     hpsi_dev: &mut CudaSlice<CudaComplex>,
     vnl_data: &VnlBatchData,
@@ -1130,7 +1129,14 @@ pub(crate) fn chebyshev_filter(
             )?;
         }
 
-        // sigma(H).psi_0 = (H.psi_0 - c*psi_0) / e
+        // hpsi = S^{-1}.(H.psi_0)  (USPP overlap inverse via Woodbury)
+        unsafe {
+            apply_s_inverse(
+                &mut hpsi_dev, vnl_data, n_bands_i32, n_pw_i32, blas, stream,
+            )?;
+        }
+
+        // sigma(S^{-1}H).psi_0 = (S^{-1}H.psi_0 - c*psi_0) / e
         apply_scaled_hamiltonian_inplace(
             &mut hpsi_dev, &buf_a, n_elem_i32,
             bounds.center, bounds.half_width, blas,
@@ -1151,13 +1157,20 @@ pub(crate) fn chebyshev_filter(
             )?;
         }
 
-        // sigma(H).psi_{k-1}
+        // hpsi = S^{-1}.(H.psi_{k-1})
+        unsafe {
+            apply_s_inverse(
+                &mut hpsi_dev, vnl_data, n_bands_i32, n_pw_i32, blas, stream,
+            )?;
+        }
+
+        // sigma(S^{-1}H).psi_{k-1}
         apply_scaled_hamiltonian_inplace(
             &mut hpsi_dev, &buf_b, n_elem_i32,
             bounds.center, bounds.half_width, blas,
         )?;
 
-        // psi_k = 2 * sigma(H).psi_{k-1} - psi_{k-2}
+        // psi_k = 2 * sigma(S^{-1}H).psi_{k-1} - psi_{k-2}
         // hpsi_dev now = sigma(H).psi_{k-1}
         // buf_a = psi_{k-2}
         // Write result into buf_c

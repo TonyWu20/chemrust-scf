@@ -415,3 +415,62 @@ The unit test gate stays the same (iter-2 V_eff range within 1 Ha of
 iter-1); regression check is `cargo test --release -- --ignored
 iter2_v_eff_range_within_one_ha_of_iter1`.
 
+## 10. Chebyshev filter missing S⁻¹ operator — causes SCF drift after iter-1
+
+**Symptom:** The controlled experiment proves the density code is correct
+(same-input validation passes), but our SCF still drifts away from the
+converged state after iter-1. The Rayleigh–Ritz produces different eigenvalues
+and eigenvectors than CASTEP after the first iteration, leading to progressively
+wrong densities in subsequent iterations.
+
+**Root cause (2026-05-22):** The Chebyshev filter recurrence operates on `H`
+(the bare Hamiltonian) instead of `S⁻¹·H` (the preconditioned operator for
+the generalized USPP eigenproblem H·ψ = ε·S·ψ).
+
+From the reference paper `Parallel-eigensolvers-in-plane-wave-Density-Functional-Theory.tar.gz`
+(`abinit.tex` section 4.1):
+
+> "If we denote by Λ and P the eigenvalues and eigenvectors of the eigenproblem
+> Hψ = λSψ, then we have the decomposition HP = SPΛ, or S⁻¹H = PΛP⁻¹.
+> Therefore, T_n(S⁻¹H)ψ = P T_n(Λ) P⁻¹ ψ will have its eigencomponents
+> filtered by the spectral filter T_n."
+
+The Algorithm (Algorithm 1) explicitly requires:
+> ψⁱ = (2/r)·(S⁻¹·H·ψⁱ⁻¹ - c·ψⁱ⁻¹) - ψⁱ⁻²
+
+**Current code** (`chebyshev.rs:1133-1137, 1155-1158`):
+- `hpsi = H·ψ` via `apply_full_hamiltonian`
+- `hpsi = (H·ψ - c·ψ)/d` via `apply_scaled_hamiltonian_inplace`
+-> NO S⁻¹ applied.
+
+**Fix infrastructure already exists** (`chebyshev.rs:759-838`):
+`apply_s_inverse` is a complete, correct implementation of the Woodbury formula:
+`S⁻¹·v = v - β·(Q⁻¹ + β^H·β)⁻¹·β^H·v`
+
+It uses the precomputed `s_inv_mat` (already built in `VnlBatchData::precompute`
+and stored in `VnlBatchEntry`) and performs 3 gemm calls:
+1. `p = β^H · hpsi` (project H·ψ onto projectors)
+2. `q = s_inv_mat · p` (solve reduced Woodbury system)
+3. `hpsi -= β · q` (subtract correction)
+
+It is currently dead code (`#[allow(dead_code)]`).
+
+**Fix:** Insert `apply_s_inverse(&mut hpsi_dev, vnl_data, ...)?;` after each
+`apply_full_hamiltonian` call inside the recurrence (but NOT after the final
+H·ψ for Rayleigh–Ritz, which needs bare H·ψ for H_sub).
+
+**Secondary issue:** Gram-Schmidt orthonormalization (lines 1209-1253) uses
+the standard inner product (`cublasZdotc`) instead of the S-inner product.
+This could also contribute to drift by producing a subspace that is not
+S-orthonormal, potentially making S_sub ill-conditioned.
+
+**Fix scope:**
+- `src/eigensolver/chebyshev.rs` — 2 lines: call `apply_s_inverse` after
+  `apply_full_hamiltonian` at lines 1131 and 1152
+- The `apply_s_inverse` function needs its `#[allow(dead_code)]` removed
+
+**Validation:**
+- `fixed_point_matches_castep_energy` — should converge instead of drift
+- `iter2_v_eff_range_within_one_ha_of_iter1` — existing regression gate
+- Eigenvalue comparison against CASTEP `.bands` should improve
+
