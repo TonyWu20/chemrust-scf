@@ -6,26 +6,25 @@ use chemrust_hamiltonian_core::augment::beta_phi::{
 use chemrust_hamiltonian_core::nlpot::build_d0_expanded;
 use chemrust_hamiltonian_core::pseudopotential::HasAugmentationData;
 use chemrust_hamiltonian_core::Pseudopotential;
-use cudarc::driver::{CudaSlice, CudaStream};
+use cudarc::driver::{CudaSlice, CudaStream, DevicePtr};
 use ndarray::Array2;
 use num_complex::Complex64;
 
+use crate::device::blas::{self, ZgemmConfig};
 use crate::device::pcie::PcieAccount;
+use crate::device::solver::SolverHandle;
 use crate::device::CudaComplex;
 use crate::eigensolver::d_screening::WaveScreeningCache;
 use crate::types::{Error, KPoint};
 
-/// Working copy during Gauss-Jordan elimination.
-/// Row-reduced to identity after the algorithm completes.
-struct GjWorkingCopy(Vec<f64>);
+/// Block-diagonal Q⁻¹ assembled from per-ion inverses (CPU-side).
+struct QInvBlkDiag(Vec<f64>);
 
-/// Holds the inverse matrix after Gauss-Jordan elimination.
-struct GjResult(Vec<f64>);
+/// B^H·B cross-ion Gram matrix (CPU copy after GPU gemm).
+struct BhB(Vec<f64>);
 
-/// Convert a `GjResult` (M⁻¹ from Gauss-Jordan) to the CUDA upload format.
-fn gj_result_to_cuda(r: GjResult) -> Vec<CudaComplex> {
-    r.0.into_iter().map(|x| CudaComplex { x, y: 0.0 }).collect()
-}
+/// M = Q⁻¹ + B^H·B, consumed by zpotrf (upload then drop).
+struct MMatrix(Vec<f64>);
 
 #[doc(hidden)]
 pub struct VnlIonData {
@@ -33,11 +32,6 @@ pub struct VnlIonData {
     pub d_matrix: CudaSlice<CudaComplex>,
     /// Expanded USPP Q augmentation matrix (n_expanded × n_expanded).
     pub q_matrix: CudaSlice<CudaComplex>,
-    /// `(Q^{-1} + G)^{-1}` where `G = beta_g^H · beta_g` is the projector
-    /// Gram matrix for this ion.  Precomputed on CPU and uploaded to GPU.
-    /// Used to apply `S^{-1}` via the Woodbury formula in the Chebyshev filter:
-    ///   `S^{-1} ψ = ψ - beta_g · s_inv_mat · (beta_g^H · ψ)`
-    pub s_inv_mat: CudaSlice<CudaComplex>,
     pub n_expanded: i32,
 }
 
@@ -47,6 +41,12 @@ pub struct VnlBatchData {
     /// H2D bytes uploaded for GPU D-matrix screening (V_eff FFT + Q cache + SF).
     /// Used by the PCI-E accounting assertion in the hot path.
     pub screening_h2d_bytes: usize,
+    /// Concatenated β-projectors: n_pw × n_total_expanded (col-major).
+    pub b_concat: CudaSlice<CudaComplex>,
+    /// Cholesky factor of M = Q⁻¹ + B^H·B (lower triangle, n_total_expanded × n_total_expanded).
+    pub chol_m: CudaSlice<CudaComplex>,
+    /// Sum of all per-ion n_expanded values.
+    pub n_total_expanded: i32,
 }
 
 /// Build the expanded USPP Q augmentation matrix (n_expanded × n_expanded).
@@ -121,6 +121,7 @@ impl VnlBatchData {
         pcie: &mut PcieAccount,
         blas: &crate::device::blas::BlasHandle,
         kernels: &crate::eigensolver::chebyshev::CudaKernelSet,
+        solver: &SolverHandle,
     ) -> Result<Self, Error> {
         let kf = k_point.coords;
         let recip = cell.recip_lattice.as_array();
@@ -144,6 +145,10 @@ impl VnlBatchData {
         };
 
         let mut entries = Vec::new();
+        // Collectors for the global Woodbury assembly (after the per-ion loop).
+        let mut per_ion_q_inv: Vec<Vec<f64>> = Vec::new();
+        let mut per_ion_beta_flat: Vec<Vec<CudaComplex>> = Vec::new();
+        let mut per_ion_ne: Vec<usize> = Vec::new();
 
         // Precompute V_eff FFT on CPU and upload to GPU for D-matrix screening.
         // The FFT stays on CPU (chemrust-hamiltonian) for now — only the result
@@ -293,54 +298,111 @@ impl VnlBatchData {
                 }
             }
 
-            // Invert M → s_inv_mat using the same Gauss-Jordan.
-            let mut m_inv = GjWorkingCopy(m_mat.clone());
-            // Augment with identity
-            let mut s_inv = GjResult(vec![0.0_f64; ne * ne]);
-            for i in 0..ne { s_inv.0[i * ne + i] = 1.0; }
-            for col in 0..ne {
-                let mut pivot = col;
-                for row in col..ne {
-                    if m_inv.0[row * ne + col].abs() > m_inv.0[pivot * ne + col].abs() {
-                        pivot = row;
-                    }
-                }
-                if m_inv.0[pivot * ne + col].abs() < eps_reg {
-                    continue;
-                }
-                for c in 0..ne {
-                    m_inv.0.swap(col * ne + c, pivot * ne + c);
-                    s_inv.0.swap(col * ne + c, pivot * ne + c);
-                }
-                let piv_val = m_inv.0[col * ne + col];
-                for c in 0..ne {
-                    m_inv.0[col * ne + c] /= piv_val;
-                    s_inv.0[col * ne + c] /= piv_val;
-                }
-                for row in 0..ne {
-                    if row == col { continue; }
-                    let factor = m_inv.0[row * ne + col];
-                    if factor.abs() < eps_reg { continue; }
-                    for c in 0..ne {
-                        m_inv.0[row * ne + c] -= factor * m_inv.0[col * ne + c];
-                        s_inv.0[row * ne + c] -= factor * s_inv.0[col * ne + c];
-                    }
-                }
-            }
-            // s_inv now holds M^{-1}
-
-            let s_inv_flat = gj_result_to_cuda(s_inv);
-            let s_inv_dev = stream.clone_htod(&s_inv_flat).map_err(Error::Cuda)?;
-            pcie.h2d_bytes += s_inv_flat.len() * std::mem::size_of::<CudaComplex>();
+            // Save per-ion Q⁻¹ and beta for global Woodbury assembly.
+            per_ion_q_inv.push(inv);
+            let beta_this_ion = beta_flat.clone();
+            per_ion_beta_flat.push(beta_this_ion);
+            per_ion_ne.push(ne);
 
             entries.push(VnlIonData {
                 beta_g: beta_dev,
                 d_matrix: d_dev,
                 q_matrix: q_dev,
-                s_inv_mat: s_inv_dev,
                 n_expanded,
             });
         }
-        Ok(VnlBatchData { entries, screening_h2d_bytes })
+        // -----------------------------------------------------------------------
+        // Global Woodbury assembly (after per-ion loop)
+        // -----------------------------------------------------------------------
+        let n_total_expanded: i32 = per_ion_ne.iter().map(|&ne| ne as i32).sum();
+
+        // 1. Assemble QInvBlkDiag: block-diagonal Q⁻¹.
+        let nte = n_total_expanded as usize;
+        let mut q_inv_blk = vec![0.0_f64; nte * nte];
+        let mut offset = 0;
+        for (ion_idx, ne) in per_ion_ne.iter().enumerate() {
+            let inv = &per_ion_q_inv[ion_idx];
+            for i in 0..*ne {
+                for j in 0..*ne {
+                    q_inv_blk[(offset + i) * nte + (offset + j)] = inv[i * ne + j];
+                }
+            }
+            offset += ne;
+        }
+        let q_inv_blkdiag = QInvBlkDiag(q_inv_blk);
+
+        // 2. Concatenate B: shape n_pw × n_total_expanded (col-major).
+        let mut b_concat_cpu: Vec<CudaComplex> = Vec::with_capacity(n_pw * nte);
+        for (ion_idx, _ne) in per_ion_ne.iter().enumerate() {
+            let beta_flat = &per_ion_beta_flat[ion_idx];
+            // beta_flat is ne × n_pw in row-major = n_pw × ne in col-major (lda = n_pw).
+            // Concatenate along the column axis → append all ne*n_pw elements.
+            b_concat_cpu.extend_from_slice(beta_flat);
+        }
+        let b_concat = stream.clone_htod(&b_concat_cpu).map_err(Error::Cuda)?;
+        pcie.h2d_bytes += b_concat_cpu.len() * std::mem::size_of::<CudaComplex>();
+
+        // 3. Compute B^H·B on GPU, copy result back to CPU.
+        //    B is n_pw × nte, B^H is nte × n_pw, B^H·B is nte × nte.
+        let mut bh_b_dev: CudaSlice<CudaComplex> =
+            stream.alloc_zeros(nte * nte).map_err(Error::Cuda)?;
+        unsafe {
+            blas.gemm_c64(
+                ZgemmConfig {
+                    transa: blas::op::C, // conj(B^T)
+                    transb: blas::op::N,
+                    m: nte as i32,
+                    n: nte as i32,
+                    k: n_pw as i32,
+                    alpha: CudaComplex { x: 1.0, y: 0.0 },
+                    lda: n_pw as i32,  // B is n_pw × nte col-major, ld = n_pw
+                    ldb: n_pw as i32,  // B is n_pw × nte col-major, ld = n_pw
+                    beta: CudaComplex { x: 0.0, y: 0.0 },
+                    ldc: nte as i32,
+                },
+                &b_concat,
+                &b_concat,
+                &mut bh_b_dev,
+            )?;
+        }
+        let bh_b_cpu: Vec<CudaComplex> = stream.clone_dtoh(&bh_b_dev).map_err(Error::Cuda)?;
+        let bh_b: Vec<f64> = bh_b_cpu.iter().map(|c| c.x).collect();
+        let bh_b_typed = BhB(bh_b);
+
+        // 4. Build M = Q⁻¹ + B^H·B (element-wise, CPU).
+        let mut m_cpu = vec![0.0_f64; nte * nte];
+        for i in 0..nte {
+            for j in 0..nte {
+                m_cpu[i * nte + j] = q_inv_blkdiag.0[i * nte + j] + bh_b_typed.0[i * nte + j];
+            }
+        }
+        let m_mat = MMatrix(m_cpu);
+
+        // 5. Cholesky factor M = L·L^H.
+        let m_flat: Vec<CudaComplex> = m_mat.0.into_iter().map(|x| CudaComplex { x, y: 0.0 }).collect();
+        let mut chol_m_dev = stream.clone_htod(&m_flat).map_err(Error::Cuda)?;
+        pcie.h2d_bytes += m_flat.len() * std::mem::size_of::<CudaComplex>();
+        let mut chol_info = stream.alloc_zeros::<i32>(1).map_err(Error::Cuda)?;
+        solver.zpotrf(
+            cudarc::cusolver::sys::cublasFillMode_t::CUBLAS_FILL_MODE_LOWER,
+            nte as i32,
+            &mut chol_m_dev,
+            &mut chol_info,
+        )?;
+        let chol_info_cpu: Vec<i32> = stream.clone_dtoh(&chol_info).map_err(Error::Cuda)?;
+        if chol_info_cpu[0] != 0 {
+            return Err(Error::Nvrtc(format!(
+                "global Woodbury M not positive definite: zpotrf info = {} (near-singular M)",
+                chol_info_cpu[0],
+            )));
+        }
+
+        Ok(VnlBatchData {
+            entries,
+            screening_h2d_bytes,
+            b_concat,
+            chol_m: chol_m_dev,
+            n_total_expanded,
+        })
     }
 }

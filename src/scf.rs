@@ -496,7 +496,7 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
             &self.wave_grid, &self.k_point,
             &psi_host, n_bands, n_pw, occupations,
             Some(&v_eff_for_d),
-            &stream, &mut pcie, &blas, &kernels,
+            &stream, &mut pcie, &blas, &kernels, &solver,
         )?;
 
         // Clone eigenvalues before moving self
@@ -556,7 +556,7 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
         let fft_idx_bytes = self.pw_fft_indices.len() * std::mem::size_of::<i32>();
         let kinetic_bytes = n_pw * std::mem::size_of::<f64>();
         let vnl_bytes: usize = vnl_data.entries.iter()
-            .map(|e| (e.beta_g.len() + e.d_matrix.len() + e.q_matrix.len() + e.s_inv_mat.len()) * 16)
+            .map(|e| (e.beta_g.len() + e.d_matrix.len() + e.q_matrix.len()) * 16)
             .sum();
         assert_eq!(
             pcie.h2d_bytes,
@@ -585,6 +585,7 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
         let ctx = Arc::new(CudaContext::new(0)?);
         let stream = ctx.default_stream();
         let blas = BlasHandle::new(stream.clone())?;
+        let solver = SolverHandle::new(stream.clone())?;
         let kernels = CudaKernelSet::new(&ctx)?;
 
         // V_eff via SpinPolicy
@@ -608,7 +609,7 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
             &self.wave_grid, &self.k_point,
             &psi_host, n_bands, n_pw, occupations,
             Some(&v_eff_for_d),
-            &stream, &mut pcie, &blas, &kernels,
+            &stream, &mut pcie, &blas, &kernels, &solver,
         )?;
 
         let fft_idx_dev: CudaSlice<i32> = stream.clone_htod(&self.pw_fft_indices)
