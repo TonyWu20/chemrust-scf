@@ -17,15 +17,6 @@ use crate::device::CudaComplex;
 use crate::eigensolver::d_screening::WaveScreeningCache;
 use crate::types::{Error, KPoint};
 
-/// Block-diagonal Q⁻¹ assembled from per-ion inverses (CPU-side).
-struct QInvBlkDiag(Vec<f64>);
-
-/// B^H·B cross-ion Gram matrix (CPU copy after GPU gemm).
-struct BhB(Vec<f64>);
-
-/// M = Q⁻¹ + B^H·B, consumed by zpotrf (upload then drop).
-struct MMatrix(Vec<f64>);
-
 #[doc(hidden)]
 pub struct VnlIonData {
     pub beta_g: CudaSlice<CudaComplex>,
@@ -318,20 +309,19 @@ impl VnlBatchData {
         // -----------------------------------------------------------------------
         let n_total_expanded: i32 = per_ion_ne.iter().map(|&ne| ne as i32).sum();
 
-        // 1. Assemble QInvBlkDiag: block-diagonal Q⁻¹.
+        // 1. Block-diagonal Q⁻¹ as complex (Q is real, so y = 0.0).
         let nte = n_total_expanded as usize;
-        let mut q_inv_blk = vec![0.0_f64; nte * nte];
+        let mut q_inv_blkdiag = vec![CudaComplex { x: 0.0, y: 0.0 }; nte * nte];
         let mut offset = 0;
-        for (ion_idx, ne) in per_ion_ne.iter().enumerate() {
+        for (ion_idx, &ne) in per_ion_ne.iter().enumerate() {
             let inv = &per_ion_q_inv[ion_idx];
-            for i in 0..*ne {
-                for j in 0..*ne {
-                    q_inv_blk[(offset + i) * nte + (offset + j)] = inv[i * ne + j];
+            for i in 0..ne {
+                for j in 0..ne {
+                    q_inv_blkdiag[(offset + i) * nte + (offset + j)].x = inv[i * ne + j];
                 }
             }
             offset += ne;
         }
-        let q_inv_blkdiag = QInvBlkDiag(q_inv_blk);
 
         // 2. Concatenate B: shape n_pw × n_total_expanded (col-major).
         let mut b_concat_cpu: Vec<CudaComplex> = Vec::with_capacity(n_pw * nte);
@@ -344,21 +334,21 @@ impl VnlBatchData {
         let b_concat = stream.clone_htod(&b_concat_cpu).map_err(Error::Cuda)?;
         pcie.h2d_bytes += b_concat_cpu.len() * std::mem::size_of::<CudaComplex>();
 
-        // 3. Compute B^H·B on GPU, copy result back to CPU.
-        //    B is n_pw × nte, B^H is nte × n_pw, B^H·B is nte × nte.
+        // 3. Compute B^H·B on GPU, keep full complex (cross-ion blocks have
+        //    non-zero imaginary parts from structure-factor phase differences).
         let mut bh_b_dev: CudaSlice<CudaComplex> =
             stream.alloc_zeros(nte * nte).map_err(Error::Cuda)?;
         unsafe {
             blas.gemm_c64(
                 ZgemmConfig {
-                    transa: blas::op::C, // conj(B^T)
+                    transa: blas::op::C,
                     transb: blas::op::N,
                     m: nte as i32,
                     n: nte as i32,
                     k: n_pw as i32,
                     alpha: CudaComplex { x: 1.0, y: 0.0 },
-                    lda: n_pw as i32,  // B is n_pw × nte col-major, ld = n_pw
-                    ldb: n_pw as i32,  // B is n_pw × nte col-major, ld = n_pw
+                    lda: n_pw as i32,
+                    ldb: n_pw as i32,
                     beta: CudaComplex { x: 0.0, y: 0.0 },
                     ldc: nte as i32,
                 },
@@ -367,32 +357,23 @@ impl VnlBatchData {
                 &mut bh_b_dev,
             )?;
         }
-        let bh_b_cpu: Vec<CudaComplex> = stream.clone_dtoh(&bh_b_dev).map_err(Error::Cuda)?;
-        let bh_b: Vec<f64> = bh_b_cpu.iter().map(|c| c.x).collect();
-        let bh_b_typed = BhB(bh_b);
+        // D2H: copy full complex B^H·B to CPU for M assembly.
+        let mut m_cpu: Vec<CudaComplex> = stream.clone_dtoh(&bh_b_dev).map_err(Error::Cuda)?;
 
-        // 4. Build M = Q⁻¹ + B^H·B (element-wise, CPU).
-        let mut m_cpu = vec![0.0_f64; nte * nte];
+        // 4. M = Q⁻¹ + B^H·B + ε·I  (complex, in-place on m_cpu).
+        //    Q⁻¹ is real (im part stays 0 from step 1).
         for i in 0..nte {
             for j in 0..nte {
-                m_cpu[i * nte + j] = q_inv_blkdiag.0[i * nte + j] + bh_b_typed.0[i * nte + j];
+                m_cpu[i * nte + j].x += q_inv_blkdiag[i * nte + j].x;
+                // imag stays from B^H·B (no Q⁻¹ imag contribution)
             }
+            // Vestigial regularisation prevents exact-zero pivot from zgetrf.
+            m_cpu[i * nte + i].x += 1e-12;
         }
-        // Vestigial diagonal regularisation: M += ε·I. LU with partial pivoting
-        // does not require positive-definiteness (unlike Cholesky), but a tiny
-        // ε prevents exact-zero pivots for fully zero rows in Q⁻¹. 1e-12 is
-        // negligible compared to O(1) diagonal values from B^H·B.
-        const M_REG: f64 = 1e-12;
-        for i in 0..nte {
-            m_cpu[i * nte + i] += M_REG;
-        }
-        let m_mat = MMatrix(m_cpu);
 
-        // 5. LU factor M = P·L·U (robust against near-singular M where Q⁻¹
-        //    has zero rows for projectors without Q_aug contributions).
-        let m_flat: Vec<CudaComplex> = m_mat.0.into_iter().map(|x| CudaComplex { x, y: 0.0 }).collect();
-        let mut lu_m_dev = stream.clone_htod(&m_flat).map_err(Error::Cuda)?;
-        pcie.h2d_bytes += m_flat.len() * std::mem::size_of::<CudaComplex>();
+        // 5. LU factor M = P·L·U.
+        let mut lu_m_dev = stream.clone_htod(&m_cpu).map_err(Error::Cuda)?;
+        pcie.h2d_bytes += m_cpu.len() * std::mem::size_of::<CudaComplex>();
         let mut lu_ipiv_dev = stream.alloc_zeros::<i32>(nte).map_err(Error::Cuda)?;
         let mut lu_info = stream.alloc_zeros::<i32>(1).map_err(Error::Cuda)?;
         solver.zgetrf(

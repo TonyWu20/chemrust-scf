@@ -31,44 +31,43 @@ transposed concatenation (iterate PWs in outer loop) would require `lda = ne`
 and produce `B·B^H` (nte×nte) instead of `B^H·B` (nte×nte) — wrong dimensions
 unless the GEMM parameters are also changed.
 
-**Hypothesis B (numerical):** M is genuinely near-singular because Q⁻¹ has zero
-rows for projector channels without Q_aug entries (common for higher-l channels
-in USPP), and the remaining B^H·B contribution may be near-singular for nearly
-degenerate projector pairs.
+**Hypothesis B (numerical near-singularity):** M is genuinely near-singular because
+Q⁻¹ has zero rows for projector channels without Q_aug entries.
 
-*Verdict: Accepted.* `info = 2` means the 2×2 leading principal minor (typically
-two m-subshells of the same l-channel, e.g. l=2, m=-1 and m=0) has determinant
-near zero. The per-ion Gauss-Jordan handled this by skipping zero pivots
-(effectively pseudo-inverse), but Cholesky requires strict positive-definiteness.
+*Verdict: Partially accepted.* `info = 2` from zpotrf is indeed caused by near-singular
+M, but switching to LU alone was insufficient. The S⁻¹·S identity test still failed
+at 3.4e-6 with LU because of a second bug.
+
+**Hypothesis C (discarded imaginary parts):** The global Woodbury assembly converted
+B^H·B to `Vec<f64>` by extracting `.x`, discarding off-diagonal imaginary parts.
+Within a single ion, the structure-factor phase `exp(i·(k+g)·R_I)` cancels in
+`conj(β_i)·β_j`, so the per-ion code was unaffected. But cross-ion blocks in the
+global M have non-zero imaginary parts from `exp(i·(k+g)·(R_I−R_J))`.
+
+*Verdict: Accepted.* Discarding imaginary parts corrupts M, preventing the Woodbury
+formula from inverting the correct S. Fix: work in `Vec<CudaComplex>` throughout,
+preserving the full complex B^H·B.
 
 ### Proposed fixes considered
 
-1. **Increase `CHOL_REG`** from `1e-8` to `1e-4`: masks the symptom but
-   introduces O(ε) error in S⁻¹·ψ. For Cu(111)+CO the error is negligible
-   (B^H·B gives full-rank M, so ε·I is a small perturbation), but for a
-   genuinely rank-deficient channel the error could be O(1) (projector norm² × 1/ε
-   amplification in the nullspace). Tuning knob that needs re-verification for
-   each new system.
+1. **Increase `CHOL_REG` / `M_REG`**: masks symptoms but wrong — the problem was
+   structural (discarded imag parts), not a conditioning issue.
 
-2. **LU with partial pivoting** (`zgetrf`/`zgetrs`): does not require positive
-   definiteness. Partial pivoting handles near-singular submatrices naturally.
-   No tuning parameters. Same `_bufferSize`/workspace/DnHandle pattern as
-   existing cuSOLVER wrappers. ~2× slower than Cholesky for nte ≲ 100
-   (negligible in the SCF hot path).
+2. **LU with partial pivoting** (`zgetrf`/`zgetrs`): necessary (Cholesky fails on
+   near-singular M from zero Q⁻¹ rows) but not sufficient — must be combined with
+   keeping full complex B^H·B.
+
+3. **Keep full complex B^H·B**: assemble Q⁻¹ as `Vec<CudaComplex>`, keep B^H·B as
+   complex, build M in-place on `Vec<CudaComplex>`. This is the correctness fix.
 
 ### Decision
 
-**Adopt LU.** Rationale:
+**Adopt LU + full complex B^H·B.** Rationale:
 
-- Robust for all systems without tuning (no `CHOL_REG` to calibrate).
-- Future-proof: a system with genuinely rank-deficient projectors (e.g. O 2p with
-  near-zero Q_aug for certain angular channels) would hit the same `info = k`
-  failure with Cholesky, requiring another debug cycle.
-- LU bindings (`zgetrf`/`zgetrs`) are available in cudarc 0.19.7 sys module
-  with identical calling convention to the existing `zpotrf`/`zpotrs`.
-- A vestigial `1e-12` diagonal regularisation is kept as a floor for exact
-  rank deficiency (safe: 1e-12 below typical O(1) diagonal from B^H·B is
-  negligible, but prevents pivot-exact-zero from zgetrf for a fully zero row).
+- LU handles near-singular M (zero Q⁻¹ rows, Cholesky fails with info=2).
+- Full complex B^H·B preserves cross-ion phase differences (per-ion code was
+  unaffected since the phase cancels within each ion).
+- Vestigial `1e-12` diagonal regularisation kept as floor for exact-zero pivots.
 
 ### Scope of changes
 

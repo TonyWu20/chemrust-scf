@@ -34,6 +34,10 @@
   because Q⁻¹ has zero rows for projector channels without Q_aug (e.g. Cu d-channels).
   `zpotrf` fails with `info = 2` on the Cu(111)+CO fixture; `zgetrf` handles it.
   See `DECISIONS.md` for the full analysis.
+- **Critical: must keep full complex B^H·B.** Cross-ion blocks in the global Gram matrix
+  have non-zero imaginary parts from structure-factor phase differences
+  `exp(i·(k+g)·(R_I−R_J))`. Discarding them (extracting `.x` to `Vec<f64>`) corrupts M
+  → S⁻¹·S identity fails at 3.4e-6. Assembly must stay in `Vec<CudaComplex>`.
 - `Cargo.toml` has no `[features]` section — must be added for `scf_diag`.
 - 11 `eprintln!` sites in `chebyshev.rs` at lines 439, 440, 443, 513, 514, 529,
   1354, 1374, 1377, 1396, 1614. 6 in `scf.rs` at lines 469, 536, 687, 704, 708, 758.
@@ -221,24 +225,13 @@ pub n_total_expanded: i32,
 
 `VnlIonData` struct (around line 19): remove `s_inv_mat` field.
 
-### TASK-G2-2: CPU-side matrix pipeline newtypes
+### TASK-G2-2: CPU-side matrix pipeline — use CudaComplex throughout
 
 **File:** `src/eigensolver/vnl_data.rs`
 
-Add private newtypes for the new CPU-side matrix pipeline (same module as
-`GjWorkingCopy`/`GjResult` from G0):
-
-```rust
-struct QInvBlkDiag(Vec<f64>);  // block-diagonal Q⁻¹ assembled from per-ion inverses
-struct BhB(Vec<f64>);          // B^H·B cross-ion blocks (GPU gemm → CPU copy)
-struct MMatrix(Vec<f64>);      // M = Q⁻¹ + B^H·B, consumed by LU (upload then drop)
-```
-
-Add conversion functions:
-```rust
-fn q_inv_blkdiag_to_cuda(q: &QInvBlkDiag) -> Vec<CudaComplex> { ... }
-fn m_matrix_to_cuda(m: MMatrix) -> Vec<CudaComplex> { ... }
-```
+No `Vec<f64>` newtypes. Cross-ion B^H·B blocks have non-zero imaginary parts
+from structure factors `exp(i·(k+g)·(R_I−R_J))` — discarding them corrupts M.
+Work in `Vec<CudaComplex>` for all global Woodbury intermediates.
 
 ### TASK-G2-3: Update `precompute` — add `SolverHandle`, build global Woodbury
 
@@ -261,18 +254,18 @@ After the per-ion loop, add:
    - `transa = C` (conjugate transpose), `transb = N`
    - `m = n_total_expanded`, `n = n_total_expanded`, `k = n_pw`
    - Result: `n_total_expanded × n_total_expanded` Hermitian matrix on GPU
-   - Copy result to CPU → `BhB`
+   - Copy result to CPU → `Vec<CudaComplex>` (keep full complex).
 
-4. **Build `MMatrix`**: `M[i,j] = QInvBlkDiag[i,j] + BhB[i,j]` (element-wise add;
-   off-diagonal blocks of `QInvBlkDiag` are zero, so this just adds the cross-ion
-   terms from `BhB`).
+4. **Build M**: `M = Q⁻¹ + B^H·B` (element-wise add, in-place on `Vec<CudaComplex>`).
+   Q⁻¹ is pure real (imag part stays zero); B^H·B provides off-diagonal imaginary
+   parts from cross-ion phase differences. These must be preserved for the Woodbury
+   formula to invert the correct S.
 
-5. **LU factor**: upload `MMatrix` to GPU → `m_dev`; call `solver.zgetrf`
-   (m = n_total_expanded, n = n_total_expanded) → `lu_m`, `lu_ipiv`.
-   Check `info[0] == 0`; if not, return `Err(...)` with a message indicating
-   singular M. Add vestigial `1e-12` diagonal regularization as a floor for
-   exact rank deficiency (not needed for Cu(111)+CO but harmless and guards
-   against edge cases). Drop CPU `MMatrix` after upload.
+5. **LU factor**: upload M (`Vec<CudaComplex>`) to GPU → `m_dev`; call
+   `solver.zgetrf` (m = n_total_expanded, n = n_total_expanded) → `lu_m`,
+   `lu_ipiv`. Check `info[0] == 0`; if not, return `Err(...)` with a message
+   indicating singular M. Add `1e-12` diagonal regularization as a floor for
+   exact rank deficiency. Upload counts as H2D for PCI-E tracking.
 
 6. Remove the per-ion `s_inv_mat` upload (lines 320–324).
 
