@@ -1,0 +1,467 @@
+{
+  "/home/tony/programming/chemrust-scf/reference_paper/extracted/das-2025-rchfsi/00README.json": {
+    "mtime": 1773687468.0,
+    "ast_hash": "c30007be350d29fad84f7120b66f3388",
+    "semantic_hash": "c30007be350d29fad84f7120b66f3388"
+  },
+  "/home/tony/programming/chemrust-scf/src/layout.rs": {
+    "mtime": 1779160131.2638495,
+    "ast_hash": "5a1e520e7157e283da87b1c76936037d",
+    "semantic_hash": "5a1e520e7157e283da87b1c76936037d"
+  },
+  "/home/tony/programming/chemrust-scf/src/scf.rs": {
+    "mtime": 1779344510.577577,
+    "ast_hash": "fd98dc357da5ba29c9a9e6a485208998",
+    "semantic_hash": "fd98dc357da5ba29c9a9e6a485208998"
+  },
+  "/home/tony/programming/chemrust-scf/src/lib.rs": {
+    "mtime": 1779252680.794352,
+    "ast_hash": "ebcc82f2fcae89c17cefabab0e1ee2ef",
+    "semantic_hash": "ebcc82f2fcae89c17cefabab0e1ee2ef"
+  },
+  "/home/tony/programming/chemrust-scf/src/types.rs": {
+    "mtime": 1779415096.4747338,
+    "ast_hash": "f7a59371838cee655fa362af506c00ce",
+    "semantic_hash": "f7a59371838cee655fa362af506c00ce"
+  },
+  "/home/tony/programming/chemrust-scf/src/density.rs": {
+    "mtime": 1779417782.9902713,
+    "ast_hash": "5f598bce83609c588a82199ece3bcdd8",
+    "semantic_hash": "5f598bce83609c588a82199ece3bcdd8"
+  },
+  "/home/tony/programming/chemrust-scf/src/mixing.rs": {
+    "mtime": 1779205889.5727654,
+    "ast_hash": "e929a870510068da5541bca805d2b078",
+    "semantic_hash": "e929a870510068da5541bca805d2b078"
+  },
+  "/home/tony/programming/chemrust-scf/src/energy.rs": {
+    "mtime": 1779313495.408567,
+    "ast_hash": "2eaef4da45b918acdb2c99e0750537a7",
+    "semantic_hash": "2eaef4da45b918acdb2c99e0750537a7"
+  },
+  "/home/tony/programming/chemrust-scf/src/eigensolver/rayleigh_ritz.rs": {
+    "mtime": 1779337139.3104856,
+    "ast_hash": "c35531158ae9efaac0dda164f7884912",
+    "semantic_hash": "c35531158ae9efaac0dda164f7884912"
+  },
+  "/home/tony/programming/chemrust-scf/src/eigensolver/mod.rs": {
+    "mtime": 1779177991.5671146,
+    "ast_hash": "7f143f86f9da30151d3f1584ff2e67b5",
+    "semantic_hash": "7f143f86f9da30151d3f1584ff2e67b5"
+  },
+  "/home/tony/programming/chemrust-scf/src/eigensolver/chebyshev.rs": {
+    "mtime": 1779417744.8814402,
+    "ast_hash": "e0a6c7a0de443ca7cceff45c9fce3fa5",
+    "semantic_hash": "e0a6c7a0de443ca7cceff45c9fce3fa5"
+  },
+  "/home/tony/programming/chemrust-scf/src/eigensolver/vnl_data.rs": {
+    "mtime": 1779417774.582307,
+    "ast_hash": "fcd9b2ab59a63c01cae15057f7f108d1",
+    "semantic_hash": "fcd9b2ab59a63c01cae15057f7f108d1"
+  },
+  "/home/tony/programming/chemrust-scf/src/mixing/reciprocal_density.rs": {
+    "mtime": 1779205889.5737653,
+    "ast_hash": "66f6b633f2e85a140c966769616b3e5e",
+    "semantic_hash": "66f6b633f2e85a140c966769616b3e5e"
+  },
+  "/home/tony/programming/chemrust-scf/src/mixing/cuda_kernels.rs": {
+    "mtime": 1779205889.5727654,
+    "ast_hash": "44750ac126a20322ca7dcb7ecd565bd7",
+    "semantic_hash": "44750ac126a20322ca7dcb7ecd565bd7"
+  },
+  "/home/tony/programming/chemrust-scf/src/mixing/kerker.rs": {
+    "mtime": 1779205889.5727654,
+    "ast_hash": "10947316dd43859e293345905fd44da8",
+    "semantic_hash": "10947316dd43859e293345905fd44da8"
+  },
+  "/home/tony/programming/chemrust-scf/src/device/fft.rs": {
+    "mtime": 1779277477.5443475,
+    "ast_hash": "83246e5fd1eab71f68c5ac637c12cbf3",
+    "semantic_hash": "83246e5fd1eab71f68c5ac637c12cbf3"
+  },
+  "/home/tony/programming/chemrust-scf/src/device/mod.rs": {
+    "mtime": 1779328629.3629868,
+    "ast_hash": "ead403443646d61feb4f98ff64ad9ca6",
+    "semantic_hash": "ead403443646d61feb4f98ff64ad9ca6"
+  },
+  "/home/tony/programming/chemrust-scf/src/device/blas.rs": {
+    "mtime": 1779337690.9824717,
+    "ast_hash": "0e7685b3d2350aefbac3f62646755719",
+    "semantic_hash": "0e7685b3d2350aefbac3f62646755719"
+  },
+  "/home/tony/programming/chemrust-scf/src/device/pcie.rs": {
+    "mtime": 1779328704.9246218,
+    "ast_hash": "5ea2b736a63746358fc3c30b3beee0dd",
+    "semantic_hash": "5ea2b736a63746358fc3c30b3beee0dd"
+  },
+  "/home/tony/programming/chemrust-scf/src/device/solver.rs": {
+    "mtime": 1779160131.2628496,
+    "ast_hash": "e890698842371da80d23b44eecc19ec6",
+    "semantic_hash": "e890698842371da80d23b44eecc19ec6"
+  },
+  "/home/tony/programming/chemrust-scf/tests/ca_step_validation.rs": {
+    "mtime": 1779328132.4514666,
+    "ast_hash": "0cc28eea90034f15b37df5d821fdf64a",
+    "semantic_hash": "0cc28eea90034f15b37df5d821fdf64a"
+  },
+  "/home/tony/programming/chemrust-scf/tests/ca_scf_convergence.rs": {
+    "mtime": 1779417830.08107,
+    "ast_hash": "b6044d8b677f09b35b2541afdf55439d",
+    "semantic_hash": "b6044d8b677f09b35b2541afdf55439d"
+  },
+  "/home/tony/programming/chemrust-scf/tests/v_eff_pointwise_compare.rs": {
+    "mtime": 1779343801.8194253,
+    "ast_hash": "22eee23ce9dee3475f7447b109b18f5b",
+    "semantic_hash": "22eee23ce9dee3475f7447b109b18f5b"
+  },
+  "/home/tony/programming/chemrust-scf/tests/aug_density_layout.rs": {
+    "mtime": 1779340139.889121,
+    "ast_hash": "aaf80e66af49fec79e64d683a8215029",
+    "semantic_hash": "aaf80e66af49fec79e64d683a8215029"
+  },
+  "/home/tony/programming/chemrust-scf/tests/backbone_compiles.rs": {
+    "mtime": 1779285266.2771637,
+    "ast_hash": "5aedf4826a6035520a070f4b40907261",
+    "semantic_hash": "5aedf4826a6035520a070f4b40907261"
+  },
+  "/home/tony/programming/chemrust-scf/tests/iter1_density_pointwise.rs": {
+    "mtime": 1779344605.8910754,
+    "ast_hash": "06f4a14e7456962fc22a899b38ad891f",
+    "semantic_hash": "06f4a14e7456962fc22a899b38ad891f"
+  },
+  "/home/tony/programming/chemrust-scf/tests/hamiltonian_hermiticity.rs": {
+    "mtime": 1779341402.5914845,
+    "ast_hash": "c9f786f898aee7f30966246ea85a1e5c",
+    "semantic_hash": "c9f786f898aee7f30966246ea85a1e5c"
+  },
+  "/home/tony/programming/chemrust-scf/tests/fixtures/cu111_co.rs": {
+    "mtime": 1779414796.3763556,
+    "ast_hash": "760099c46d4698294d275738fed80403",
+    "semantic_hash": "760099c46d4698294d275738fed80403"
+  },
+  "/home/tony/programming/chemrust-scf/tests/fixtures/mod.rs": {
+    "mtime": 1779213247.5542462,
+    "ast_hash": "5228a7d835f58e5141602ccdb9a2007a",
+    "semantic_hash": "5228a7d835f58e5141602ccdb9a2007a"
+  },
+  "/home/tony/programming/chemrust-scf/PROJECT_ROOT_PLAN.md": {
+    "mtime": 1779116846.0075374,
+    "ast_hash": "5fa2f9ad3760086ba23e73fb2a3c20dc",
+    "semantic_hash": "5fa2f9ad3760086ba23e73fb2a3c20dc"
+  },
+  "/home/tony/programming/chemrust-scf/CONTEXT.md": {
+    "mtime": 1779328103.8596153,
+    "ast_hash": "6e7ef7d231151ec543ac73cd6fde7722",
+    "semantic_hash": "6e7ef7d231151ec543ac73cd6fde7722"
+  },
+  "/home/tony/programming/chemrust-scf/CLAUDE.md": {
+    "mtime": 1779392981.1912346,
+    "ast_hash": "e6a9d04832caf220bbe16c745eaaf772",
+    "semantic_hash": "e6a9d04832caf220bbe16c745eaaf772"
+  },
+  "/home/tony/programming/chemrust-scf/type_strengthens.md": {
+    "mtime": 1779177991.5671146,
+    "ast_hash": "f4957b13e9e5791157acdfc99a5c24fc",
+    "semantic_hash": "f4957b13e9e5791157acdfc99a5c24fc"
+  },
+  "/home/tony/programming/chemrust-scf/notes/failure-patterns.md": {
+    "mtime": 1779415650.226935,
+    "ast_hash": "3fe7f46976455e7b28f9376d4de8de58",
+    "semantic_hash": "3fe7f46976455e7b28f9376d4de8de58"
+  },
+  "/home/tony/programming/chemrust-scf/notes/open-followups.md": {
+    "mtime": 1779419603.9980414,
+    "ast_hash": "e1a210a5f5a6b2ee18c9494e3ce5e424",
+    "semantic_hash": "e1a210a5f5a6b2ee18c9494e3ce5e424"
+  },
+  "/home/tony/programming/chemrust-scf/notes/pr-reviews/phase-1/deferred.md": {
+    "mtime": 1779127397.8183074,
+    "ast_hash": "72304e466d07f38db9212d64e8480552",
+    "semantic_hash": "72304e466d07f38db9212d64e8480552"
+  },
+  "/home/tony/programming/chemrust-scf/notes/pr-reviews/phase-1/review.md": {
+    "mtime": 1779127397.248312,
+    "ast_hash": "739c1ade619adfe73be2c000eee39c2e",
+    "semantic_hash": "739c1ade619adfe73be2c000eee39c2e"
+  },
+  "/home/tony/programming/chemrust-scf/notes/pr-reviews/phase-2/fix-tasks.md": {
+    "mtime": 1779205889.5727654,
+    "ast_hash": "45ffb5713d7163ca7a28c3f8d9da4479",
+    "semantic_hash": "45ffb5713d7163ca7a28c3f8d9da4479"
+  },
+  "/home/tony/programming/chemrust-scf/notes/pr-reviews/phase-2/deferred.md": {
+    "mtime": 1779205889.5717654,
+    "ast_hash": "64a02f705a585911fd946fb5d229e4f6",
+    "semantic_hash": "64a02f705a585911fd946fb5d229e4f6"
+  },
+  "/home/tony/programming/chemrust-scf/notes/pr-reviews/phase-2/review.md": {
+    "mtime": 1779205889.5727654,
+    "ast_hash": "315193c209d7dac7a0d7cab195800495",
+    "semantic_hash": "315193c209d7dac7a0d7cab195800495"
+  },
+  "/home/tony/programming/chemrust-scf/notes/pr-reviews/phase-2-fixes/fix-tasks.md": {
+    "mtime": 1779177991.5541146,
+    "ast_hash": "2a45271a6cec4bcef4b0ee8f3f1a0abd",
+    "semantic_hash": "2a45271a6cec4bcef4b0ee8f3f1a0abd"
+  },
+  "/home/tony/programming/chemrust-scf/notes/pr-reviews/phase-2-fixes/deferred.md": {
+    "mtime": 1779177991.5541146,
+    "ast_hash": "1ee4fac4b2bb87623d8dccdb41c5ba6a",
+    "semantic_hash": "1ee4fac4b2bb87623d8dccdb41c5ba6a"
+  },
+  "/home/tony/programming/chemrust-scf/notes/pr-reviews/phase-2-fixes/review.md": {
+    "mtime": 1779177991.5541146,
+    "ast_hash": "69b05233e5bdd86f38a0bb0fb82525fa",
+    "semantic_hash": "69b05233e5bdd86f38a0bb0fb82525fa"
+  },
+  "/home/tony/programming/chemrust-scf/notes/plans/phase-1/DECISIONS.md": {
+    "mtime": 1779126802.6028776,
+    "ast_hash": "e24b765f4134bf4d0a56c8a4c6655cd8",
+    "semantic_hash": "e24b765f4134bf4d0a56c8a4c6655cd8"
+  },
+  "/home/tony/programming/chemrust-scf/notes/plans/phase-1/TASKS.md": {
+    "mtime": 1779126842.566691,
+    "ast_hash": "e98ce6ec903e0dd7f18a1e1c1af5c2bb",
+    "semantic_hash": "e98ce6ec903e0dd7f18a1e1c1af5c2bb"
+  },
+  "/home/tony/programming/chemrust-scf/notes/plans/phase-2/DECISIONS.md": {
+    "mtime": 1779130886.4844065,
+    "ast_hash": "4a01ad9e7487d446a735fd699f17c9ae",
+    "semantic_hash": "4a01ad9e7487d446a735fd699f17c9ae"
+  },
+  "/home/tony/programming/chemrust-scf/notes/plans/phase-2/POST_GroupE_TASKS.md": {
+    "mtime": 1779205889.5717654,
+    "ast_hash": "3d2fad6ae3b185e1adbc4c049ca4eb95",
+    "semantic_hash": "3d2fad6ae3b185e1adbc4c049ca4eb95"
+  },
+  "/home/tony/programming/chemrust-scf/notes/plans/phase-2/TASKS.md": {
+    "mtime": 1779313495.407567,
+    "ast_hash": "aec12eb258c6f12a6661c4c93f7edc10",
+    "semantic_hash": "aec12eb258c6f12a6661c4c93f7edc10"
+  },
+  "/home/tony/programming/chemrust-scf/notes/plans/phase-2-fixes/TASKS.md": {
+    "mtime": 1779177991.5541146,
+    "ast_hash": "0cbc1f9cf7fb607d2653bbf974f0ab2e",
+    "semantic_hash": "0cbc1f9cf7fb607d2653bbf974f0ab2e"
+  },
+  "/home/tony/programming/chemrust-scf/notes/plans/phase-rchfsi/DECISIONS.md": {
+    "mtime": 1779421713.8602893,
+    "ast_hash": "9c961ef1cd15281c6de9d7454b366e49",
+    "semantic_hash": "9c961ef1cd15281c6de9d7454b366e49"
+  },
+  "/home/tony/programming/chemrust-scf/notes/plans/phase-rchfsi/TASKS.md": {
+    "mtime": 1779425935.0038533,
+    "ast_hash": "22a4ed56e5ef02cd3bd20956d24dba63",
+    "semantic_hash": "22a4ed56e5ef02cd3bd20956d24dba63"
+  },
+  "/home/tony/programming/chemrust-scf/notes/plans/phase-2-perf-opt/PHASE_PLAN.md": {
+    "mtime": 1779315735.1207266,
+    "ast_hash": "8ac462ab860c890360f24e48be7fe8b9",
+    "semantic_hash": "8ac462ab860c890360f24e48be7fe8b9"
+  },
+  "/home/tony/programming/chemrust-scf/notes/plans/phase-2-perf-opt/DECISIONS.md": {
+    "mtime": 1779316357.9347062,
+    "ast_hash": "d92d3c6274235f02249dab6f835c631b",
+    "semantic_hash": "d92d3c6274235f02249dab6f835c631b"
+  },
+  "/home/tony/programming/chemrust-scf/notes/plans/phase-2-perf-opt/TASKS.md": {
+    "mtime": 1779316774.9647357,
+    "ast_hash": "95c1bf24d62f4db29b9c7385d2db6b93",
+    "semantic_hash": "95c1bf24d62f4db29b9c7385d2db6b93"
+  },
+  "/home/tony/programming/chemrust-scf/notes/debug/debug-20260522-0343/INVESTIGATION.md": {
+    "mtime": 1779392713.983578,
+    "ast_hash": "d5cc2520634b6a7f608c015ef9c26d76",
+    "semantic_hash": "d5cc2520634b6a7f608c015ef9c26d76"
+  },
+  "/home/tony/programming/chemrust-scf/notes/debug/debug-20260522-0343/DIVERGENCE_SURFACE.md": {
+    "mtime": 1779392747.9834058,
+    "ast_hash": "643c8b8ad6ea80fb7b7916440a83301d",
+    "semantic_hash": "643c8b8ad6ea80fb7b7916440a83301d"
+  },
+  "/home/tony/programming/chemrust-scf/notes/debug/debug-20260522-0343/CRITERIA.md": {
+    "mtime": 1779392738.4284542,
+    "ast_hash": "3cd0324f36e8f564e47fc0bbe9a4faea",
+    "semantic_hash": "3cd0324f36e8f564e47fc0bbe9a4faea"
+  },
+  "/home/tony/programming/chemrust-scf/notes/debug/debug-20260522-0343/RESOLUTION.md": {
+    "mtime": 1779415635.4610078,
+    "ast_hash": "73a314af1d3088cea20094d11e0ce56d",
+    "semantic_hash": "73a314af1d3088cea20094d11e0ce56d"
+  },
+  "/home/tony/programming/chemrust-scf/notes/debug/debug-20260520-1311/DIAGNOSTIC_SELFTEST.md": {
+    "mtime": 1779254648.258799,
+    "ast_hash": "58a5c5cfcebdd21e42a923c4e6c4e1e0",
+    "semantic_hash": "58a5c5cfcebdd21e42a923c4e6c4e1e0"
+  },
+  "/home/tony/programming/chemrust-scf/notes/debug/debug-20260520-1311/INVESTIGATION.md": {
+    "mtime": 1779254515.9334366,
+    "ast_hash": "ce6024092b527326c61ee126cee51f9e",
+    "semantic_hash": "ce6024092b527326c61ee126cee51f9e"
+  },
+  "/home/tony/programming/chemrust-scf/notes/debug/debug-20260520-1311/DIVERGENCE_SURFACE.md": {
+    "mtime": 1779254614.315962,
+    "ast_hash": "63c059cebe67e9fd4ed4155987be56b9",
+    "semantic_hash": "63c059cebe67e9fd4ed4155987be56b9"
+  },
+  "/home/tony/programming/chemrust-scf/notes/debug/debug-20260520-1311/CRITERIA.md": {
+    "mtime": 1779254516.879432,
+    "ast_hash": "4d4f362fc1652c706431ba6fe9f5545c",
+    "semantic_hash": "4d4f362fc1652c706431ba6fe9f5545c"
+  },
+  "/home/tony/programming/chemrust-scf/notes/debug/debug-20260520-1311/RESOLUTION.md": {
+    "mtime": 1779273906.206549,
+    "ast_hash": "3dccb2f039f328ee88c5b404e191a771",
+    "semantic_hash": "3dccb2f039f328ee88c5b404e191a771"
+  },
+  "/home/tony/programming/chemrust-scf/notes/debug/debug-20260521-1233-scf-diverges/DIAGNOSTIC_SELFTEST.md": {
+    "mtime": 1779339766.0247977,
+    "ast_hash": "0c1a4bedd02303b585a979bee72feb82",
+    "semantic_hash": "0c1a4bedd02303b585a979bee72feb82"
+  },
+  "/home/tony/programming/chemrust-scf/notes/debug/debug-20260521-1233-scf-diverges/INVESTIGATION.md": {
+    "mtime": 1779339289.4484246,
+    "ast_hash": "80fc32b991e39f154b30e30b2236ca78",
+    "semantic_hash": "80fc32b991e39f154b30e30b2236ca78"
+  },
+  "/home/tony/programming/chemrust-scf/notes/debug/debug-20260521-1233-scf-diverges/DIVERGENCE_SURFACE.md": {
+    "mtime": 1779339549.2481291,
+    "ast_hash": "3edaa3252172b342d0811f59e53e4b8c",
+    "semantic_hash": "3edaa3252172b342d0811f59e53e4b8c"
+  },
+  "/home/tony/programming/chemrust-scf/notes/debug/debug-20260521-1233-scf-diverges/PER_POINT_DUMP.md": {
+    "mtime": 1779340407.1995904,
+    "ast_hash": "9831c9f1959e2be23f689e55f6fa1448",
+    "semantic_hash": "9831c9f1959e2be23f689e55f6fa1448"
+  },
+  "/home/tony/programming/chemrust-scf/notes/debug/debug-20260521-1233-scf-diverges/CRITERIA.md": {
+    "mtime": 1779339289.9134243,
+    "ast_hash": "068c5c9c39fe53a35da60a192880ca5a",
+    "semantic_hash": "068c5c9c39fe53a35da60a192880ca5a"
+  },
+  "/home/tony/programming/chemrust-scf/notes/debug/debug-20260521-1233-scf-diverges/RESOLUTION.md": {
+    "mtime": 1779343442.0355532,
+    "ast_hash": "622cefb8ac152353ff983661455f6aaf",
+    "semantic_hash": "622cefb8ac152353ff983661455f6aaf"
+  },
+  "/home/tony/programming/chemrust-scf/notes/debug/debug-20260520-1923/GRID_SHAPES.md": {
+    "mtime": 1779276695.0391746,
+    "ast_hash": "26e16b706b246afb7c4a4a6645c43a72",
+    "semantic_hash": "26e16b706b246afb7c4a4a6645c43a72"
+  },
+  "/home/tony/programming/chemrust-scf/notes/debug/debug-20260520-1923/PHASE_G_FINDINGS.md": {
+    "mtime": 1779280313.2155392,
+    "ast_hash": "0ad250466dc42b1a52e7efe2ed4338a8",
+    "semantic_hash": "0ad250466dc42b1a52e7efe2ed4338a8"
+  },
+  "/home/tony/programming/chemrust-scf/notes/debug/debug-20260520-1923/CUFFT_LAYOUT_ANALYSIS.md": {
+    "mtime": 1779277104.5540216,
+    "ast_hash": "f52e4ed730f695bee0dd5ff6c358c64e",
+    "semantic_hash": "f52e4ed730f695bee0dd5ff6c358c64e"
+  },
+  "/home/tony/programming/chemrust-scf/notes/debug/debug-20260520-1923/RESOLUTION.md": {
+    "mtime": 1779282330.9808466,
+    "ast_hash": "2183f986e9a13d724e6f810f31545c10",
+    "semantic_hash": "2183f986e9a13d724e6f810f31545c10"
+  },
+  "/home/tony/programming/chemrust-scf/reference_paper/ALGORITHM_RATIONALE.md": {
+    "mtime": 1779419382.9270592,
+    "ast_hash": "172fc46071793cf6a470ffd0803a8a74",
+    "semantic_hash": "172fc46071793cf6a470ffd0803a8a74"
+  },
+  "/home/tony/programming/chemrust-scf/reference_paper/suggested_algorithm.md": {
+    "mtime": 1779265104.2162936,
+    "ast_hash": "e45691e9b5b7e9cb4c6e49c0ad61ab4e",
+    "semantic_hash": "e45691e9b5b7e9cb4c6e49c0ad61ab4e"
+  },
+  "/home/tony/programming/chemrust-scf/reference_paper/extracted/levitt-torrent-2015/filters_data.txt": {
+    "mtime": 1403008279.0,
+    "ast_hash": "e55b233052d0d2cebd218c4ea3733472",
+    "semantic_hash": "e55b233052d0d2cebd218c4ea3733472"
+  },
+  "/home/tony/programming/chemrust-scf/plans/phase-1/PHASE_PLAN.md": {
+    "mtime": 1779123757.607833,
+    "ast_hash": "6c70ae9e0d8c0dba19f41e6d1b1b623d",
+    "semantic_hash": "6c70ae9e0d8c0dba19f41e6d1b1b623d"
+  },
+  "/home/tony/programming/chemrust-scf/plans/phase-2/PHASE_PLAN.md": {
+    "mtime": 1779130891.8833807,
+    "ast_hash": "d306d0f3ce0e14cc4f798c3f08fdf8c7",
+    "semantic_hash": "d306d0f3ce0e14cc4f798c3f08fdf8c7"
+  },
+  "/home/tony/programming/chemrust-scf/docs/adr/0002-pcie-account.md": {
+    "mtime": 1779177991.5531147,
+    "ast_hash": "16399a4552a2cbdd91cab503e75e7e93",
+    "semantic_hash": "16399a4552a2cbdd91cab503e75e7e93"
+  },
+  "/home/tony/programming/chemrust-scf/docs/adr/0003-uspp-density-assembly.md": {
+    "mtime": 1779328103.8596153,
+    "ast_hash": "e9425cc087e962f5ae50f7b06d6a18dd",
+    "semantic_hash": "e9425cc087e962f5ae50f7b06d6a18dd"
+  },
+  "/home/tony/programming/chemrust-scf/docs/adr/0001-type-state-scf-backbone.md": {
+    "mtime": 1779122437.0622272,
+    "ast_hash": "b0dab39e29ddacb7f157680359036e52",
+    "semantic_hash": "b0dab39e29ddacb7f157680359036e52"
+  },
+  "/home/tony/programming/chemrust-scf/reference_paper/extracted/das-2025-rchfsi/toy_convergence_generalized.pdf": {
+    "mtime": 1773687389.0,
+    "ast_hash": "d239d67dd92d3fdc0767ec51971bffa3",
+    "semantic_hash": "d239d67dd92d3fdc0767ec51971bffa3"
+  },
+  "/home/tony/programming/chemrust-scf/reference_paper/extracted/das-2025-rchfsi/toy_eq5_diagnostic.pdf": {
+    "mtime": 1773687389.0,
+    "ast_hash": "135655ff347031ce1df24c72cbd456c8",
+    "semantic_hash": "135655ff347031ce1df24c72cbd456c8"
+  },
+  "/home/tony/programming/chemrust-scf/reference_paper/extracted/das-2025-rchfsi/perf_gpu_real_gep_tot.pdf": {
+    "mtime": 1773687389.0,
+    "ast_hash": "7cdf1fd8c85027e0744424e95752e804",
+    "semantic_hash": "7cdf1fd8c85027e0744424e95752e804"
+  },
+  "/home/tony/programming/chemrust-scf/reference_paper/extracted/das-2025-rchfsi/gep_residuals_real.pdf": {
+    "mtime": 1773687389.0,
+    "ast_hash": "8d194826ba2116dd5b3a683f722344d8",
+    "semantic_hash": "8d194826ba2116dd5b3a683f722344d8"
+  },
+  "/home/tony/programming/chemrust-scf/reference_paper/extracted/das-2025-rchfsi/perf_gpu_complex_gep_tot.pdf": {
+    "mtime": 1773687389.0,
+    "ast_hash": "3a9b38e0bec287c6107f15343fd5f2ba",
+    "semantic_hash": "3a9b38e0bec287c6107f15343fd5f2ba"
+  },
+  "/home/tony/programming/chemrust-scf/reference_paper/extracted/das-2025-rchfsi/gep_residuals_complex.pdf": {
+    "mtime": 1773687389.0,
+    "ast_hash": "121fee8d5be82135f507ec0be6132620",
+    "semantic_hash": "121fee8d5be82135f507ec0be6132620"
+  },
+  "/home/tony/programming/chemrust-scf/reference_paper/extracted/das-2025-rchfsi/toy_convergence_standard.pdf": {
+    "mtime": 1773687389.0,
+    "ast_hash": "8ad4523d00854c4ae1fa80e61031f1ce",
+    "semantic_hash": "8ad4523d00854c4ae1fa80e61031f1ce"
+  },
+  "/home/tony/programming/chemrust-scf/reference_paper/extracted/das-2025-rchfsi/gep_residuals_real_lp.pdf": {
+    "mtime": 1773687389.0,
+    "ast_hash": "ae02239b56e2dd0cb984832684715605",
+    "semantic_hash": "ae02239b56e2dd0cb984832684715605"
+  },
+  "/home/tony/programming/chemrust-scf/reference_paper/extracted/das-2025-rchfsi/perf_gpu_real_gep.pdf": {
+    "mtime": 1773687389.0,
+    "ast_hash": "b90a5eede3ce87be43510a59b46cbbca",
+    "semantic_hash": "b90a5eede3ce87be43510a59b46cbbca"
+  },
+  "/home/tony/programming/chemrust-scf/reference_paper/extracted/das-2025-rchfsi/perf_gpu_complex_gep.pdf": {
+    "mtime": 1773687389.0,
+    "ast_hash": "608829cdb435aa6f9132878b052ab72c",
+    "semantic_hash": "608829cdb435aa6f9132878b052ab72c"
+  },
+  "/home/tony/programming/chemrust-scf/reference_paper/extracted/das-2025-rchfsi/gep_residuals_complex_lp.pdf": {
+    "mtime": 1773687389.0,
+    "ast_hash": "0ed5418ee3c3339465a1d62b117d4d01",
+    "semantic_hash": "0ed5418ee3c3339465a1d62b117d4d01"
+  },
+  "/home/tony/programming/chemrust-scf/reference_paper/extracted/levitt-torrent-2015/gram_projs.pdf": {
+    "mtime": 1403008282.0,
+    "ast_hash": "076022f2506e5033a7ae151bd1573c3e",
+    "semantic_hash": "076022f2506e5033a7ae151bd1573c3e"
+  }
+}

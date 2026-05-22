@@ -836,6 +836,100 @@ unsafe fn apply_s_inverse(
     Ok(())
 }
 
+/// Apply the USPP overlap matrix `S` to each band of `psi`.
+///
+/// S = I + Σ_I β_I · Q_I · β_I^H
+///
+/// For each ion with projectors `beta_g` and `q_matrix`:
+///   p = beta_g^H · psi          (project, ne × n_bands)
+///   q = q_matrix · p            (expand, ne × n_bands)
+///   spsi += beta_g · q          (accumulate, n_pw × n_bands, α = +1)
+///
+/// The caller is responsible for copying `psi_dev` into `spsi_dev` first
+/// (the identity term) before calling this to accumulate the β·Q·β^H·ψ correction.
+#[allow(clippy::too_many_arguments)]
+unsafe fn apply_s_times(
+    psi_dev: &CudaSlice<CudaComplex>,     // input ψ (n_pw × n_bands, col-major)
+    spsi_dev: &mut CudaSlice<CudaComplex>, // output S·ψ (caller pre-copies psi into this)
+    vnl_data: &VnlBatchData,
+    n_bands: i32,
+    n_pw: i32,
+    blas: &BlasHandle,
+    stream: &Arc<CudaStream>,
+) -> Result<(), Error> {
+    for entry in &vnl_data.entries {
+        let ne = entry.n_expanded;
+
+        // p = beta_g^H · psi  (n_expanded × n_bands)
+        let mut p: CudaSlice<CudaComplex> =
+            stream.alloc_zeros(ne as usize * n_bands as usize).map_err(Error::Cuda)?;
+        unsafe {
+            blas.gemm_c64(
+                ZgemmConfig {
+                    transa: blas::op::C,
+                    transb: blas::op::N,
+                    m: ne,
+                    n: n_bands,
+                    k: n_pw,
+                    alpha: CudaComplex { x: 1.0, y: 0.0 },
+                    lda: n_pw,
+                    ldb: n_pw,
+                    beta: CudaComplex { x: 0.0, y: 0.0 },
+                    ldc: ne,
+                },
+                &entry.beta_g,
+                psi_dev,
+                &mut p,
+            )?;
+        }
+
+        // q = q_matrix · p  (n_expanded × n_bands)
+        let mut q: CudaSlice<CudaComplex> =
+            stream.alloc_zeros(ne as usize * n_bands as usize).map_err(Error::Cuda)?;
+        unsafe {
+            blas.gemm_c64(
+                ZgemmConfig {
+                    transa: blas::op::N,
+                    transb: blas::op::N,
+                    m: ne,
+                    n: n_bands,
+                    k: ne,
+                    alpha: CudaComplex { x: 1.0, y: 0.0 },
+                    lda: ne,
+                    ldb: ne,
+                    beta: CudaComplex { x: 0.0, y: 0.0 },
+                    ldc: ne,
+                },
+                &entry.q_matrix,
+                &p,
+                &mut q,
+            )?;
+        }
+
+        // spsi += beta_g · q  (accumulate with α = +1)
+        unsafe {
+            blas.gemm_c64(
+                ZgemmConfig {
+                    transa: blas::op::N,
+                    transb: blas::op::N,
+                    m: n_pw,
+                    n: n_bands,
+                    k: ne,
+                    alpha: CudaComplex { x: 1.0, y: 0.0 },
+                    lda: n_pw,
+                    ldb: ne,
+                    beta: CudaComplex { x: 1.0, y: 0.0 },
+                    ldc: n_pw,
+                },
+                &entry.beta_g,
+                &q,
+                spsi_dev,
+            )?;
+        }
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // S⁻¹·S identity diagnostic
 // ---------------------------------------------------------------------------
