@@ -121,17 +121,17 @@ Decision criterion (locked at plan time, not at experiment time):
 
 *Effort:* small (wiring) + one paired SCF run.
 
-### Goal 2 — cuSOLVER Cholesky bindings in `src/device/solver.rs`
+### Goal 2 — cuSOLVER LU bindings in `src/device/solver.rs`
 
-Add safe wrappers for `cusolverDnZpotrf_bufferSize`, `cusolverDnZpotrf`,
-`cusolverDnZpotrs`. Mirror the existing `Zhegvd` template at
+Add safe wrappers for `cusolverDnZgetrf_bufferSize`, `cusolverDnZgetrf`,
+`cusolverDnZgetrs`. Mirror the existing `Zhegvd` template at
 `src/device/solver.rs:47-95` (handle, buffer-size query, workspace alloc,
-solve, error type). Two added tests:
-- 4×4 HPD round-trip (`Zpotrf` → `Zpotrs` against synthetic RHS) asserting
+solve, error type). Cholesky (`zpotrf`/`zpotrs`) was the original choice but
+fails on near-singular M (zero Q⁻¹ rows). Two added tests:
+- 4×4 full-rank round-trip (`Zgetrf` → `Zgetrs` against synthetic RHS) asserting
   err < 1e-12.
-- n_bands=8 multi-RHS `Zpotrs` against a 16×16 HPD matrix — guards against
-  single-RHS overfitting in the wrapper, since the SCF hot path uses
-  n_bands ≈ 160.
+- n_bands=8 multi-RHS `Zgetrs` against a 16×16 matrix — guards against
+  single-RHS overfitting.
 
 *Effort:* small. Self-contained binding layer.
 
@@ -288,9 +288,14 @@ Within Pascal 8–16 GB budget; well below the SCF state already resident
   correctness, perf, A/B data); demote Goal 4 explosion gate to a
   regression check, document the reframe inline.
 - **Cholesky failure on near-singular M.** `Zpotrf` returns `info > 0` on
-  the failing leading minor. Mitigation: surface `info` as a separate
-  discriminator gate; if it triggers on Cu(111)+CO, fall back to `Zhetrf`
-  (LDL^T) and document.
+  the failing leading minor (observed: info=2 on Cu(111)+CO due to zero Q⁻¹
+  rows making the 2×2 leading minor non-PD). **Resolution:** switch to LU
+  (`zgetrf`/`zgetrs`), which handles any full-rank matrix. See DECISIONS.md.
+- **Cross-ion B^H·B imaginary parts.** The global Gram matrix has non-zero
+  off-diagonal imaginary parts from structure-factor phase differences
+  `exp(i·(k+g)·(R_I−R_J))`. The per-ion code was unaffected (phase cancels
+  within each ion). **Must work in `Vec<CudaComplex>` throughout** — extracting
+  `.x` to `Vec<f64>` corrupts M and breaks S⁻¹·S identity at 3.4e-6.
 - **A/B filter experiment shows no useful difference.** Decision pre-locked
   in Goal 1c: keep bare-H filter; consistent with the bare-H R-ChFSI
   conclusion at §12.

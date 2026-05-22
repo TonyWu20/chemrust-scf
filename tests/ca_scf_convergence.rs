@@ -800,11 +800,10 @@ fn s_inv_s_identity_test() {
     eprintln!("[S⁻¹·S identity] ‖S⁻¹·S·ψ₀ − ψ₀‖_∞ = {:.6e}", max_residual,);
 
     // If > 1e-8: Q convention in s_inv_mat (Woodbury) is inconsistent
-    // with q_matrix (S operator). The S⁻¹·H filter will over-subtract.
+    // Global Woodbury S⁻¹ = I − B·M⁻¹·B^H validated at roundoff.
     assert!(
-        max_residual < 1e-6,
-        "S⁻¹·S·ψ ≠ ψ: max residual = {:.6e} > 1e-6. \
-         Q convention mismatch between s_inv_mat and q_matrix.",
+        max_residual < 1e-10,
+        "S⁻¹·S·ψ ≠ ψ: max residual = {:.6e} > 1e-10.",
         max_residual,
     );
 }
