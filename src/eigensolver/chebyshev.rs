@@ -22,8 +22,10 @@ use cudarc::nvrtc::compile_ptx;
 use crate::device::blas::{self, BlasHandle, ZgemmConfig};
 use crate::device::fft::BatchedFftPlan3d;
 use crate::device::pcie::PcieAccount;
+use crate::device::solver::SolverHandle;
 use crate::device::{CudaComplex, Gpu};
 use crate::eigensolver::vnl_data::VnlBatchData;
+use cudarc::cusolver::sys::cublasFillMode_t;
 
 // ---------------------------------------------------------------------------
 // Helper: call cuFFT C2C in-place (same buffer for input and output)
@@ -811,14 +813,9 @@ unsafe fn apply_v_nl_hamiltonian(
 
 /// Apply the USPP overlap inverse to each band of `hpsi`.
 ///
-/// Uses the Woodbury formula (Levitt & Torrent 2015, §4.1):
-///   S⁻¹ = I − P (D_S⁻¹ + PᵀP)⁻¹ Pᵀ
-///
-/// For each ion with projectors `beta_g` (≡ P) and precomputed
-/// `s_inv_mat = (Q⁻¹ + beta^H·beta)⁻¹`:
-///   p = beta_g^H · hpsi          (project)
-///   q = s_inv_mat · p            (small solve)
-///   hpsi −= beta_g · q           (subtract correction)
+/// Uses the global Woodbury formula (PHASE_PLAN.md):
+///   S⁻¹·v = v − B · M⁻¹ · (B^H · v)
+///   where M = Q⁻¹ + B^H·B (Cholesky-factored in VnlBatchData::precompute).
 ///
 /// Preserved as dead code: used by `check_s_inv_s_identity` diagnostic and
 /// potential TASK-D4 fallback (restore S⁻¹ in Step 4 only). Do not reap.
@@ -831,77 +828,65 @@ unsafe fn apply_s_inverse(
     n_pw: i32,
     blas: &BlasHandle,
     stream: &Arc<CudaStream>,
+    solver: &SolverHandle,
 ) -> Result<(), Error> {
-    for entry in &vnl_data.entries {
-        let ne = entry.n_expanded;
+    let nte = vnl_data.n_total_expanded;
 
-        // p = beta_g^H · hpsi  (n_expanded × n_bands)
-        let mut p: CudaSlice<CudaComplex> =
-            stream.alloc_zeros(ne as usize * n_bands as usize).map_err(Error::Cuda)?;
-        unsafe {
-            blas.gemm_c64(
-                ZgemmConfig {
-                    transa: blas::op::C,
-                    transb: blas::op::N,
-                    m: ne,
-                    n: n_bands,
-                    k: n_pw,
-                    alpha: CudaComplex { x: 1.0, y: 0.0 },
-                    lda: n_pw,
-                    ldb: n_pw,
-                    beta: CudaComplex { x: 0.0, y: 0.0 },
-                    ldc: ne,
-                },
-                &entry.beta_g,
-                hpsi_dev,
-                &mut p,
-            )?;
-        }
-
-        // q = s_inv_mat · p  (n_expanded × n_bands)
-        let mut q: CudaSlice<CudaComplex> =
-            stream.alloc_zeros(ne as usize * n_bands as usize).map_err(Error::Cuda)?;
-        unsafe {
-            blas.gemm_c64(
-                ZgemmConfig {
-                    transa: blas::op::N,
-                    transb: blas::op::N,
-                    m: ne,
-                    n: n_bands,
-                    k: ne,
-                    alpha: CudaComplex { x: 1.0, y: 0.0 },
-                    lda: ne,
-                    ldb: ne,
-                    beta: CudaComplex { x: 0.0, y: 0.0 },
-                    ldc: ne,
-                },
-                &entry.s_inv_mat,
-                &p,
-                &mut q,
-            )?;
-        }
-
-        // hpsi −= beta_g · q  (accumulate with beta = −1)
-        unsafe {
-            blas.gemm_c64(
-                ZgemmConfig {
-                    transa: blas::op::N,
-                    transb: blas::op::N,
-                    m: n_pw,
-                    n: n_bands,
-                    k: ne,
-                    alpha: CudaComplex { x: -1.0, y: 0.0 },
-                    lda: n_pw,
-                    ldb: ne,
-                    beta: CudaComplex { x: 1.0, y: 0.0 },
-                    ldc: n_pw,
-                },
-                &entry.beta_g,
-                &q,
-                hpsi_dev,
-            )?;
-        }
+    // 1. temp = B^H · hpsi  (nte × n_bands)
+    let mut temp: CudaSlice<CudaComplex> =
+        stream.alloc_zeros(nte as usize * n_bands as usize).map_err(Error::Cuda)?;
+    unsafe {
+        blas.gemm_c64(
+            ZgemmConfig {
+                transa: blas::op::C,
+                transb: blas::op::N,
+                m: nte,
+                n: n_bands,
+                k: n_pw,
+                alpha: CudaComplex { x: 1.0, y: 0.0 },
+                lda: n_pw,
+                ldb: n_pw,
+                beta: CudaComplex { x: 0.0, y: 0.0 },
+                ldc: nte,
+            },
+            &vnl_data.b_concat,
+            hpsi_dev,
+            &mut temp,
+        )?;
     }
+
+    // 2. Solve M·x = temp via Cholesky factor (zpotrs, in-place overwrites temp).
+    let mut info_dev = stream.alloc_zeros::<i32>(1).map_err(Error::Cuda)?;
+    solver.zpotrs(
+        cublasFillMode_t::CUBLAS_FILL_MODE_LOWER,
+        nte,
+        n_bands,
+        &vnl_data.chol_m,
+        &mut temp,
+        &mut info_dev,
+    )?;
+
+    // 3. hpsi −= B · x  (accumulate with α = −1)
+    unsafe {
+        blas.gemm_c64(
+            ZgemmConfig {
+                transa: blas::op::N,
+                transb: blas::op::N,
+                m: n_pw,
+                n: n_bands,
+                k: nte,
+                alpha: CudaComplex { x: -1.0, y: 0.0 },
+                lda: n_pw,
+                ldb: nte,
+                beta: CudaComplex { x: 1.0, y: 0.0 },
+                ldc: n_pw,
+            },
+            &vnl_data.b_concat,
+            &temp,
+            hpsi_dev,
+        )?;
+    }
+
     Ok(())
 }
 
@@ -1010,6 +995,7 @@ pub fn check_s_inv_s_identity(
     vnl_data: &VnlBatchData,
     blas: &BlasHandle,
     stream: &Arc<CudaStream>,
+    solver: &SolverHandle,
 ) -> Result<f64, Error> {
     use crate::device::blas::op;
     let n = n_pw as i32;
@@ -1072,7 +1058,7 @@ pub fn check_s_inv_s_identity(
     // 2. Apply S⁻¹ to spsi
     unsafe {
         apply_s_inverse(
-            &mut spsi_dev, vnl_data, 1, n, blas, stream,
+            &mut spsi_dev, vnl_data, 1, n, blas, stream, solver,
         )?;
     }
 

@@ -674,6 +674,8 @@ fn s_inv_baseline_post_typo_fix() {
     let ctx = Arc::new(cudarc::driver::CudaContext::new(0).expect("CUDA context"));
     let stream = ctx.default_stream();
     let blas = BlasHandle::new(stream.clone()).expect("BLAS handle");
+    let solver = chemrust_scf::device::solver::SolverHandle::new(stream.clone())
+        .expect("SolverHandle");
     let kernels = CudaKernelSet::new(&ctx).expect("CUDA kernels");
 
     // Build VnlBatchData (bare D0, no occupations, no V_eff for screening)
@@ -693,13 +695,14 @@ fn s_inv_baseline_post_typo_fix() {
         &mut pcie,
         &blas,
         &kernels,
+        &solver,
     )
     .expect("VnlBatchData::precompute");
 
     // Take band 0 (the converged lowest eigenstate)
     let band0: Vec<Complex64> = psi_data.iter().take(n_pw).copied().collect();
 
-    let zeta = check_s_inv_s_identity(&band0, n_pw, &vnl_data, &blas, &stream)
+    let zeta = check_s_inv_s_identity(&band0, n_pw, &vnl_data, &blas, &stream, &solver)
         .expect("check_s_inv_s_identity");
 
     eprintln!(
@@ -763,6 +766,8 @@ fn s_inv_s_identity_test() {
     let ctx = Arc::new(cudarc::driver::CudaContext::new(0).expect("CUDA context"));
     let stream = ctx.default_stream();
     let blas = BlasHandle::new(stream.clone()).expect("BLAS handle");
+    let solver = chemrust_scf::device::solver::SolverHandle::new(stream.clone())
+        .expect("SolverHandle");
     let kernels = CudaKernelSet::new(&ctx).expect("CUDA kernels");
 
     // Build VnlBatchData (bare D0, no occupations, no V_eff for screening)
@@ -782,13 +787,14 @@ fn s_inv_s_identity_test() {
         &mut pcie,
         &blas,
         &kernels,
+        &solver,
     )
     .expect("VnlBatchData::precompute");
 
     // Take band 0 (the converged lowest eigenstate)
     let band0: Vec<Complex64> = psi_data.iter().take(n_pw).copied().collect();
 
-    let max_residual = check_s_inv_s_identity(&band0, n_pw, &vnl_data, &blas, &stream)
+    let max_residual = check_s_inv_s_identity(&band0, n_pw, &vnl_data, &blas, &stream, &solver)
         .expect("check_s_inv_s_identity");
 
     eprintln!("[S⁻¹·S identity] ‖S⁻¹·S·ψ₀ − ψ₀‖_∞ = {:.6e}", max_residual,);
