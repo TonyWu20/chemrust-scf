@@ -1,12 +1,12 @@
 use std::sync::OnceLock;
 
 use chemrust_hamiltonian_core::{
-    formatted, CastepBin, CastepBinFile, CheckFile, ElectronDensity, GVectorGrid,
-    PseudopotentialSet,
+    CastepBin, CastepBinFile, CheckFile, ElectronDensity, GVectorGrid, PseudopotentialSet,
+    formatted,
 };
 use chemrust_scf::{
-    pw_coords_to_fft_indices, ColumnDistributed, Density, KPoint, ScfIteration, SmearingParams,
-    SmearingScheme, WaveGridArray, WavefunctionSet,
+    ColumnDistributed, Density, KPoint, ScfIteration, SmearingParams, SmearingScheme,
+    WaveGridArray, WavefunctionSet, pw_coords_to_fft_indices,
 };
 
 // ---------------------------------------------------------------------------
@@ -15,7 +15,7 @@ use chemrust_scf::{
 
 /// Path to CASTEP reference output directory.
 /// Override via `CASTEP_FIXTURE_DIR` environment variable.
-pub const FIXTURE_DIR: &str = "/export/public_castep_jobs/tony/Cu111_CO_SinglePoint";
+pub const FIXTURE_DIR: &str = "/export/public_castep_jobs/tony/Cu111_CO_Single_Point_0522_F8";
 
 /// Path to pseudopotential directory.
 /// Override via `CASTEP_POTENTIAL_DIR` environment variable.
@@ -51,7 +51,8 @@ pub fn fixture() -> &'static Cu111CoFixture {
 }
 
 fn load_fixture() -> Result<Cu111CoFixture, Box<dyn std::error::Error>> {
-    let fixture_dir = std::env::var("CASTEP_FIXTURE_DIR").unwrap_or_else(|_| FIXTURE_DIR.to_string());
+    let fixture_dir =
+        std::env::var("CASTEP_FIXTURE_DIR").unwrap_or_else(|_| FIXTURE_DIR.to_string());
     let potential_dir =
         std::env::var("CASTEP_POTENTIAL_DIR").unwrap_or_else(|_| POTENTIAL_DIR.to_string());
 
@@ -152,10 +153,7 @@ pub fn build_scf_state(fx: &Cu111CoFixture) -> ScfIteration {
     let wave_grid = GVectorGrid::new(ngx, ngy, ngz, cell.recip_lattice);
 
     // Fine grid from .check file
-    let fine_grid_dims = fx
-        .check
-        .fine_grid
-        .expect(".check must have fine_grid");
+    let fine_grid_dims = fx.check.fine_grid.expect(".check must have fine_grid");
     let [fgx, fgy, fgz] = fine_grid_dims;
     let fine_grid = GVectorGrid::new(fgx, fgy, fgz, cell.recip_lattice);
 

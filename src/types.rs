@@ -243,11 +243,13 @@ pub struct KineticEnergies(pub(crate) Vec<f64>);
 
 /// Occupation numbers per band (dimensionless, 0–2 per band for spin-degenerate).
 #[derive(Debug, Clone)]
-pub(crate) struct Occupations(pub(crate) Vec<f64>);
+#[doc(hidden)]
+pub struct Occupations(pub Vec<f64>);
 
 /// Chemical potential μ from smearing occupation search (Hartree).
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct ChemicalPotential(pub(crate) f64);
+#[doc(hidden)]
+pub struct ChemicalPotential(pub f64);
 
 // ---------------------------------------------------------------------------
 // Crate-level error type

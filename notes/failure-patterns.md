@@ -23,11 +23,31 @@
 **Counter-example boundary**: This applies when the fix has strong isolated evidence (analytic match, independent reference). A fix supported only by intuition or a single empirical check still warrants reconsideration on regression.
 **Action when triggered**: After a "fix-but-worse" outcome, the next diagnostic should isolate components downstream of the fix (here: H_sub/S_sub dump after gemm, per-band ⟨ψ|H|ψ⟩ decomposition) — not roll back.
 
+## 2026-05-22: spin-deg-wrong-for-erfc-occupations
+**Root cause**: Added `spin_deg=2.0` to ω_{nm} accumulation in `compute_aug_density_fine` and `compute_aug_density_gpu`, matching CASTEP `ion.f90:7114`. But CASTEP's `occ ∈ [0,1]` per spin channel; our `erfc` smearing produces `occ ∈ [0,2]` with spin degeneracy already encoded. The extra factor doubled ρ_aug, breaking the correct total density (pre-fix: rho_PW + rho_aug = CASTEP total ✓; post-fix: 1.75× CASTEP total ✗).
+**Fix**: Reverted `spin_deg * acc` from both CPU (`src/density.rs:425-437`) and GPU (`src/density.rs:504-518`) paths.
+**Pattern**: reference-mismatch — CASTEP reference formula is correct for CASTEP's occupation convention [0,1], but inapplicable when occupations already encode spin degeneracy [0,2]. Always verify the occupation convention before applying a spin_deg factor from a reference implementation.
+
 ## 2026-05-21: range-only-acceptance-misses-pointwise-divergence
 **Root cause**: Issue #8 (ρ_aug wiring) was verified by `iter2_v_eff_range_within_one_ha_of_iter1` — a range-only check (|max - min| of V_eff). Range matched between iter-1 and iter-2 (8.69 vs 8.55 Ha), but V_eff *values at ion centres* did not. ∫Q·V_eff (with Q sharply peaked at ions) is sensitive to V_eff at ion centres, not its global range. Result: D_screened on Cu ions exploded from amax ≈ 5.8 Ha (iter-1) to 49.97 Ha (iter-2) to 318.9 Ha (iter-3) — 5× the bare D_0 amax of 61.6 Ha.
 **Fix**: not yet — investigation localised the cause to ρ_aug spatial distribution at ion centres or V_eff downsampling artefacts there. See `notes/debug/debug-20260521-1233-scf-diverges/RESOLUTION.md`.
 **Pattern**: ANCHOR-WEAK-DISCRIMINATOR. A discriminator metric that aggregates spatial information (range, ‖·‖_∞ on a coarse summary) cannot detect localised pointwise errors. For physics tied to localised operators (β projectors, Q augmentation, V_NL), the acceptance test must compare against the reference at the LOCAL points where the operator acts — not at global summaries. Specifically: if Q is peaked at ion centres, V_eff(ion_centre) and ρ(ion_centre) must be in the criterion set.
 **Diagnostic anchors**: D_screened per-ion amax tracking in `src/eigensolver/vnl_data.rs:175-184`. When D_screened amax > 2× D_0 amax, ∫Q·V_eff is corrupted regardless of what global V_eff range says.
 **Lesson**: range-only and integral-only checks pass for any spatial distribution that preserves the aggregate. They are necessary but not sufficient for operators sensitive to local values.
+
+## 2026-05-22: density-normalization-bug-misattribution
+**Root cause**: Two claims of "normalization bugs" in density construction code
+(rho_PW 32.6% too small, rho_aug 19% too large) were made based on comparing
+our iter-2 density decomposition against CASTEP's converged-state F8 dumps.
+The comparison was between different wavefunction states (different SCF
+iteration), not a controlled same-input comparison.
+**Fix**: A controlled experiment feeding CASTEP's converged wavefunctions
+through our density code showed ratios of 1.000000 (soft) and 1.000084 (aug)
+vs CASTEP F8 dumps. The density code is correct. The real issue is upstream
+(RR produces different eigenvectors than CASTEP's).
+**Pattern**: misattribution — comparing outputs at different SCF states is
+not evidence of a normalization bug. Always validate with same-input
+controlled experiment before asserting a code bug.
+**Anchor**: `tests/ca_scf_convergence.rs::density_decomp_matches_castep_f8_same_inputs`
 
 

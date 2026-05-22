@@ -38,7 +38,7 @@ use crate::types::{ChemicalPotential, Density, Error, Occupations, SmearingParam
 /// occ_b = erfc((ε_b - μ) / w)
 ///
 /// The chemical potential μ satisfies Σ_b occ_b = N_electrons.
-pub(crate) fn compute_occupations(
+pub fn compute_occupations(
     eigenvalues: &[f64],
     smearing: &SmearingParams,
     n_electrons: f64,
@@ -248,8 +248,9 @@ pub fn build_q_sf_cache(
 /// expectations downstream. The `accumulate_density` kernel multiplies by
 /// `inv_omega = 1.0`, i.e. no Ω division (left as a parameter for potential
 /// future Ha/Bohr³ callers, but always 1.0 in this SCF pipeline).
+#[doc(hidden)]
 #[builder]
-pub(crate) fn construct_density_gpu(
+pub fn construct_density_gpu(
     psi_data: &[Complex64],
     occupations: &[f64],
     fft_indices: &[i32],
@@ -422,6 +423,9 @@ pub fn compute_aug_density_fine(
                 n_bands,
                 occupations.len(),
             );
+            // occ[b] ∈ [0,2] via erfc smearing — spin degeneracy already encoded.
+            // CASTEP ion.f90:7114 multiplies by 2.0 because its occ ∈ [0,1].
+            // No extra spin_deg factor here.
             let mut rho_nm = Array2::<Complex64>::zeros((ne, ne));
             for n in 0..ne {
                 for m in 0..ne {
@@ -499,6 +503,8 @@ pub fn compute_aug_density_gpu(
         .map_err(|_| Error::NotImplemented)?;
 
         // ω^I_{nm} on CPU (n_expanded ~18, O(ne² × n_bands) ≈ 18² × 160 = 52k ops)
+        // occ[b] ∈ [0,2] via erfc smearing — spin degeneracy already encoded.
+        // No extra spin_deg factor (CASTEP ion.f90:7114 multiplies by 2 because its occ ∈ [0,1]).
         let mut omega_host: Vec<CudaComplex> = vec![CudaComplex { x: 0.0, y: 0.0 }; n_pairs];
         for n in 0..n_expanded {
             for m in 0..n_expanded {
@@ -588,9 +594,11 @@ pub mod test_api {
         build_q_sf_cache,
         compute_aug_density_fine,
         compute_aug_density_gpu,
+        construct_density_gpu,
         save_q_sf_cache_to_disk,
         load_q_sf_cache_from_disk,
     };
+    pub use crate::eigensolver::chebyshev::CudaKernelSet;
 }
 
 // ---------------------------------------------------------------------------

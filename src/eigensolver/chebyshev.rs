@@ -191,7 +191,8 @@ extern \"C\" __global__ void transpose_row_to_col(
 // ---------------------------------------------------------------------------
 
 /// Handles to all compiled CUDA kernels used in the Chebyshev filter.
-pub(crate) struct CudaKernelSet {
+#[doc(hidden)]
+pub struct CudaKernelSet {
     pub(crate) zero_buffer: CudaFunction,
     #[allow(dead_code)]
     pub(crate) zero_buffer_real: CudaFunction, // reserved for future real-buffer clearing
@@ -207,7 +208,8 @@ pub(crate) struct CudaKernelSet {
 }
 
 impl CudaKernelSet {
-    pub(crate) fn new(ctx: &Arc<CudaContext>) -> Result<Self, Error> {
+    #[doc(hidden)]
+    pub fn new(ctx: &Arc<CudaContext>) -> Result<Self, Error> {
         let ptx = compile_ptx(CUDA_KERNEL_SRC).map_err(|e| Error::Nvrtc(e.to_string()))?;
         let module: Arc<CudaModule> = ctx.load_module(ptx).map_err(Error::Cuda)?;
         let load = |name: &str| -> Result<CudaFunction, Error> {

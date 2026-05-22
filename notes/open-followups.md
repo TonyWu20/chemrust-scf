@@ -301,6 +301,54 @@ Empirical electron-count balance post-fix:
 - Augmentation ρ_aug integral: 3,120,753
 - Total: **4,150,591** — matches iter-1 fixture density exactly (= N_e × Ω).
 
+**Ground-truth decomposition from CASTEP F8 instrumentation (2026-05-22):**
+CASTEP `density_calc_soft_wvfn_real` and `density_augment_complex` were
+instrumented to dump gathered full-grid sums (Cu111_CO, converged, 16 MPI ranks).
+In N_e × Ω convention (same as above):
+- CASTEP soft: **1,527,256** (36.8% of total)
+- CASTEP aug:  **2,623,313** (63.2% of total)
+- Total: 4,150,570 ≈ N_e × Ω ✓
+
+Comparison with our pre-fix values:
+- rho_PW  1,029,480 / CASTEP_soft 1,527,256 = **0.674** (32.6% undercount)
+- rho_aug 3,122,263 / CASTEP_aug  2,623,313 = **1.190** (19.0% overcount)
+
+The pre-fix total matched CASTEP only because the two errors partially cancelled.
+The spin_deg=2 fix was correctly reverted — it made rho_aug 2.38× CASTEP's value.
+
+**RESOLVED (2026-05-22) — density code is correct; "normalization bugs" were a
+misattribution.** The open items above claimed two normalization bugs in the
+density construction code. A controlled experiment feeding CASTEP's own converged
+wavefunctions and eigenvalues through our `construct_density_gpu` and
+`compute_aug_density_fine` showed:
+
+| Component | Our N_e | CASTEP F8 N_e | Ratio |
+|-----------|---------|---------------|-------|
+| Soft ρ_PW | 68.4407 | 68.4407 | 1.000000 |
+| Aug ρ_aug | 117.57  | 117.56  | 1.000084 |
+| Total     | 186.01  | 186.00  | 1.000053 |
+
+Both components match to within 0.0084% (test threshold was 1%). The IFFT
+normalization diagnostic probe also confirms the cuFFT/CASTEP convention match
+(ratio Σ|grid|²/(N·Σ|c|²) = 1.000000).
+
+**The 32.6%/19% discrepancy reported earlier was from comparing our iter-2
+wavefunctions (different ψ after Rayleigh–Ritz) against CASTEP's converged
+state — not from density code normalization errors.** The density code is
+correct; the decomposition discrepancy is purely from wavefunction differences.
+
+The real question becomes: why does our Rayleigh–Ritz produce different
+eigenvectors/eigenvalues than CASTEP? Potential upstream causes:
+- β projector normalization in `compute_beta_phi` (chemrust-hamiltonian)
+- Q function G=0 normalization
+- D matrix screening (D0 + ∫Q·V_eff vs D0)
+- S_sub assembly in RR (Q matrix indexing/projector ordering)
+- Preconditioning or filter quality affecting eigenvector convergence
+
+See `notes/debug/debug-20260522-0343/CRITERIA.md` for the controlled experiment
+and `tests/ca_scf_convergence.rs::density_decomp_matches_castep_f8_same_inputs`
+for the discriminator test.
+
 ## 9. Performance — iter-2 path takes ~531 s (mostly CPU)
 
 **Symptom:** With Issue #8 resolved, the green discriminator test still

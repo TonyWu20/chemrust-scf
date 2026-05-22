@@ -366,3 +366,212 @@ fn aug_density_gpu_matches_cpu_cu111_co() {
         sum_diff,
     );
 }
+
+// ---------------------------------------------------------------------------
+// Controlled experiment: feed CASTEP's converged wavefunctions through our
+// density construction code.  Compare component integrals (soft / aug)
+// against CASTEP F8 instrumented dumps to verify the density code itself
+// is correct (before investigating upstream wavefunction differences).
+//
+// CASTEP F8 dumps (converged, Cu111_CO, 16 MPI ranks):
+//   F8_RHO_SOFT_SUM = 2.99359524940157e7
+//   F8_RHO_AUG_SUM  = 5.14204469948334e7
+// (Source: slurm_output_2291.txt, converged iteration, sum in ρ×Ω convention
+//  on the FINE grid)
+//
+// If our density code is correct, feeding CASTEP's own converged wavefunction
+// coefficients + eigenvalues through our pipeline should reproduce these
+// ratios to within 1%.
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "requires GPU and CASTEP fixture data"]
+fn density_decomp_matches_castep_f8_same_inputs() {
+    if !gpu_available() {
+        eprintln!("SKIP: no GPU available");
+        return;
+    }
+
+    use chemrust_hamiltonian_core::{
+        GVectorGrid, Pseudopotential,
+        augment::beta_phi::compute_beta_phi,
+        pseudopotential::HasAugmentationData,
+    };
+    use chemrust_scf::density::test_api::{
+        CudaKernelSet, compute_aug_density_fine, construct_density_gpu,
+    };
+    use ndarray::Array2;
+    use num_complex::Complex64;
+    use std::sync::Arc;
+
+    // --- F8 anchor values (converged iteration, ρ×Ω convention, FINE grid) ---
+    const F8_SOFT_SUM: f64 = 2.99359524940157e7;
+    const F8_AUG_SUM:  f64 = 5.14204469948334e7;
+    const F8_TOTAL:    f64 = F8_SOFT_SUM + F8_AUG_SUM;
+
+    // 1. Load CASTEP fixture
+    let fx = fixtures::cu111_co::fixture();
+    let cell = &fx.bin.cell;
+    let pots = &fx.pots;
+
+    let wfc = fx.check.wavefunction.as_ref().expect(".check must have wavefunction");
+    let [ngx, ngy, ngz] = wfc.grid; // wave grid dims
+    let wave_grid = GVectorGrid::new(ngx, ngy, ngz, cell.recip_lattice);
+    let n_wave = ngx * ngy * ngz;
+
+    let [fgx, fgy, fgz] = fx.check.fine_grid.expect(".check must have fine_grid");
+    let fine_grid = GVectorGrid::new(fgx, fgy, fgz, cell.recip_lattice);
+    let n_fine = fgx * fgy * fgz;
+
+    // 2. CASTEP eigenvalues from .bands
+    let eigenvalues = &fx.bands_eigenvalues;
+    let n_bands = eigenvalues.len();
+    println!("=== Controlled Experiment: Same-Input Validation ===");
+    println!("Wave grid:  {ngx}×{ngy}×{ngz} = {n_wave}");
+    println!("Fine grid:  {fgx}×{fgy}×{fgz} = {n_fine}");
+    println!("Bands:      {n_bands}");
+    println!("Cell volume: {:.4} Bohr³", cell.volume);
+
+    // 3. Compute occupations from CASTEP eigenvalues (our erfc smearing)
+    let n_electrons: f64 = cell
+        .species_iter()
+        .map(|info| {
+            pots
+                .get(info.symbol)
+                .and_then(|p| p.ionic_charge())
+                .unwrap_or(0.0)
+                * info.num_ions as f64
+        })
+        .sum();
+    let smearing = chemrust_scf::SmearingParams {
+        width: 0.1 * chemrust_scf::EV_TO_HARTREE,
+        electron_temperature: 0.1 * chemrust_scf::EV_TO_HARTREE,
+        scheme: chemrust_scf::SmearingScheme::Gaussian,
+    };
+    let (occupations, chem_pot) = chemrust_scf::density::compute_occupations(eigenvalues, &smearing, n_electrons)
+        .expect("compute_occupations from CASTEP eigenvalues");
+    let occ_sum: f64 = occupations.0.iter().sum();
+    println!("Occupations: Σocc = {occ_sum:.4}  target N_e = {n_electrons:.1}  μ = {:.6} Ha",
+        chem_pot.0);
+
+    // 4. GPU setup
+    let ctx = Arc::new(cudarc::driver::CudaContext::new(0).expect("CUDA context"));
+    let stream = ctx.default_stream();
+    let kernels = CudaKernelSet::new(&ctx).expect("compile CUDA kernels");
+
+    // 5. Extract CASTEP wavefunction coefficients (first k-point, first spin)
+    let kpt_block = &wfc.kpt_data[0];
+    let n_pw = kpt_block.nplw;
+    let psi_flat: Vec<Complex64> = kpt_block.bands.concat();
+    let fft_indices = chemrust_scf::pw_coords_to_fft_indices(&kpt_block.pw_grid_coord, &wave_grid);
+
+    eprintln!("psi shape: {n_bands} bands × {n_pw} PW → FFT grid {n_wave}");
+
+    // 6. Compute soft density (smooth PW term only, on wave grid)
+    let soft_density = construct_density_gpu()
+        .psi_data(&psi_flat)
+        .occupations(&occupations.0)
+        .fft_indices(&fft_indices)
+        .wave_grid(&wave_grid)
+        .cell_volume(cell.volume)
+        .n_bands(n_bands)
+        .n_pw(n_pw)
+        .kernels(&kernels)
+        .stream(&stream)
+        .call()
+        .expect("construct_density_gpu");
+
+    let soft_sum = soft_density.as_wave_array().sum();
+    let n_e_soft = soft_sum / n_wave as f64;
+    let n_e_soft_f8 = F8_SOFT_SUM / n_fine as f64;
+    let ratio_soft = n_e_soft / n_e_soft_f8;
+
+    eprintln!(
+        "[Soft Density] sum_our = {:.6e}  N_e_our = {:.4}  N_e_F8 = {:.4}  ratio = {:.6}",
+        soft_sum, n_e_soft, n_e_soft_f8, ratio_soft,
+    );
+
+    // 7. Compute β·ψ from CASTEP wavefunctions
+    let k_cart = [0.0f64; 3]; // Gamma point
+    let beta_psi_per_ion: Vec<Array2<Complex64>> = (0..cell.num_ions)
+        .map(|ion_idx| {
+            let species_idx = cell.ion_species[ion_idx];
+            let symbol = &cell.species_symbols[species_idx];
+            let pot = pots.get(symbol).expect("pot must exist");
+            let aug: &dyn HasAugmentationData = match pot {
+                Pseudopotential::Usp(d) => d,
+                Pseudopotential::Recpot(_) => {
+                    return Array2::zeros((0, n_bands));
+                }
+            };
+            let gmax_pp = pot.gmax();
+            compute_beta_phi(kpt_block, aug, cell, ion_idx, &wave_grid, gmax_pp, k_cart)
+                .expect("compute_beta_phi")
+        })
+        .collect();
+
+    // 8. Compute augmentation density on fine grid (CPU path)
+    let rho_aug = compute_aug_density_fine(
+        &beta_psi_per_ion,
+        &occupations.0,
+        pots,
+        cell,
+        &fine_grid,
+    )
+    .expect("compute_aug_density_fine");
+
+    let aug_sum: f64 = rho_aug.as_real_array().iter().sum();
+    let n_e_aug = aug_sum / n_fine as f64;
+    let n_e_aug_f8 = F8_AUG_SUM / n_fine as f64;
+    let ratio_aug = n_e_aug / n_e_aug_f8;
+
+    eprintln!(
+        "[Aug Density]  sum_our = {:.6e}  N_e_our = {:.4}  N_e_F8 = {:.4}  ratio = {:.6}",
+        aug_sum, n_e_aug, n_e_aug_f8, ratio_aug,
+    );
+
+    // 9. Total
+    let n_e_total = n_e_soft + n_e_aug;
+    let n_e_total_f8 = F8_TOTAL / n_fine as f64;
+    eprintln!(
+        "[Total] N_e_our = {:.4}  N_e_F8 = {:.4}  ratio = {:.6}",
+        n_e_total, n_e_total_f8, n_e_total / n_e_total_f8,
+    );
+
+    // 10. Decision: soft and aug ratios must be within 1% of F8 values
+    // A "normalization bug" would show ratio ≠ 1.0.
+    // If both within 1%, the density code is correct and the
+    // PW/aug decomposition discrepancy is from wavefunction differences.
+    let soft_ok = (ratio_soft - 1.0).abs() < 0.01;
+    let aug_ok = (ratio_aug - 1.0).abs() < 0.01;
+
+    if soft_ok && aug_ok {
+        eprintln!(
+            "✓ DENSITY CODE IS CORRECT — both soft and aug ratios within 1% of F8. \
+             The PW/aug decomposition discrepancy is from wavefunction differences."
+        );
+    } else if !soft_ok {
+        eprintln!(
+            "✗ SOFT DENSITY BUG — ratio {:.4} ≠ 1.0. \
+             Normalization issue in construct_density_gpu.",
+            ratio_soft,
+        );
+    } else {
+        eprintln!(
+            "✗ AUG DENSITY BUG — ratio {:.4} ≠ 1.0. \
+             Normalization issue in compute_aug_density_*.",
+            ratio_aug,
+        );
+    }
+
+    assert!(
+        soft_ok,
+        "soft density N_e ratio {:.4} differs from 1.0 by > 1% — normalization bug in construct_density_gpu",
+        ratio_soft,
+    );
+    assert!(
+        aug_ok,
+        "aug density N_e ratio {:.4} differs from 1.0 by > 1% — normalization bug in compute_aug_density_*",
+        ratio_aug,
+    );
+}
