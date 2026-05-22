@@ -167,9 +167,9 @@
             {
               name = "claude-fox";
               command = ''
-                ANTHROPIC_BASE_URL=https://code.newcli.com/claude/ultra \
-                ANTHROPIC_AUTH_TOKEN=$FOXCODE_TOKEN \
-                claude
+                ANTHROPIC_BASE_URL=https://code.newcli.com/claude/super \
+                ANTHROPIC_AUTH_TOKEN=$FOXCODE_CLAUDE_TOKEN \
+                claude --model "opus[1m]"
               '';
             }
           ];

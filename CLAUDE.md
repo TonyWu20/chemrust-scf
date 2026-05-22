@@ -17,6 +17,8 @@
 - How to run CASTEP GPU ver: `cd` to a directory with `.cell`, `.param` and
   pseudopotential files stated in `%BLOCK SPECIES_POT` section of `.cell`, then
   run `sbatch slurm_job_*.sh`
+- When testing this crate, always use `--release` for speed, as we're
+  computation heavy
 
 ## Hot tips
 
