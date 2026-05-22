@@ -547,5 +547,28 @@ references to the source papers.
 2. Requires new `apply_s_times` function: S·ψ = ψ + β·q·(β^H·ψ)
    to compute the initial residual Y = H·X - S·X·Λ.
 3. Validation: `fixed_point_matches_castep_energy` should converge
-   monotonically.
+	   monotonically.
 
+**Resolution (2026-05-23, phase-global-woodbury):** The S⁻¹ accuracy problem
+turned out to be two bugs, not one:
+
+1. **m_inv→s_inv typo** (`vnl_data.rs:320`): the per-ion `s_inv_mat` uploaded
+   to GPU was the Gauss-Jordan working copy (identity), not the inverse. This
+   made `apply_s_inverse` compute `hpsi −= β·(β^H·v)` without the Q⁻¹ term,
+   producing the 0.014 identity residual. **Fix:** newtype enforcement
+   (`GjWorkingCopy`/`GjResult`) prevents the confusion at compile time.
+
+2. **Cross-ion B^H·B imaginary parts discarded** (phase-global-woodbury G2):
+   the global M = Q⁻¹ + B^H·B was assembled as `Vec<f64>`, extracting only
+   the real part of B^H·B. Within a single ion the structure-factor phase
+   `exp(i·(k+g)·R_I)` cancels in `conj(β_i)·β_j`, so the per-ion code was
+   unaffected. But cross-ion blocks have non-zero imaginary parts from
+   `exp(i·(k+g)·(R_I−R_J))`. **Fix:** work in `Vec<CudaComplex>` throughout,
+   preserving the full complex B^H·B.
+
+Post-fix identity test: **‖S⁻¹·S·ψ₀ − ψ₀‖_∞ = 3.8e-15** (machine epsilon).
+The exact global Woodbury inverse is now available, making R-ChFSI's
+inexact-inverse tolerance irrelevant — standard ChFSI with exact S⁻¹ is
+algebraically correct. The R-ChFSI implementation remains as a potential
+future simplification (per Das `main.tex:612`, R-ChFSI ≡ ChFSI when ζ = 0)
+but is no longer required for SCF correctness.
