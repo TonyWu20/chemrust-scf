@@ -837,6 +837,96 @@ unsafe fn apply_s_inverse(
 }
 
 // ---------------------------------------------------------------------------
+// S⁻¹·S identity diagnostic
+// ---------------------------------------------------------------------------
+
+#[doc(hidden)]
+pub fn check_s_inv_s_identity(
+    psi_host: &[num_complex::Complex64],
+    n_pw: usize,
+    vnl_data: &VnlBatchData,
+    blas: &BlasHandle,
+    stream: &Arc<CudaStream>,
+) -> Result<f64, Error> {
+    use crate::device::blas::op;
+    let n = n_pw as i32;
+    let psi_cuda: Vec<CudaComplex> = psi_host
+        .iter()
+        .map(|&c| CudaComplex { x: c.re, y: c.im })
+        .collect();
+    let psi_dev: CudaSlice<CudaComplex> = stream
+        .clone_htod(&psi_cuda).map_err(Error::Cuda)?;
+
+    // 1. Build S·psi = psi + Σ β_g · q_matrix · (β_g^H · psi)
+    let mut spsi_dev: CudaSlice<CudaComplex> =
+        stream.alloc_zeros(n_pw).map_err(Error::Cuda)?;
+    stream.memcpy_dtod(&psi_dev, &mut spsi_dev).map_err(Error::Cuda)?;
+
+    for entry in &vnl_data.entries {
+        let ne = entry.n_expanded;
+
+        // c_proj = β_g^H · psi  (ne × 1)
+        let mut c_proj: CudaSlice<CudaComplex> =
+            stream.alloc_zeros(ne as usize).map_err(Error::Cuda)?;
+        unsafe {
+            blas.gemv_c64(
+                op::C, n, ne,
+                CudaComplex { x: 1.0, y: 0.0 },
+                &entry.beta_g, n,
+                &psi_dev, 1,
+                CudaComplex { x: 0.0, y: 0.0 },
+                &mut c_proj, 1,
+            ).map_err(Error::Blas)?;
+        }
+
+        // temp = q_matrix · c_proj  (ne × 1)
+        let mut temp: CudaSlice<CudaComplex> =
+            stream.alloc_zeros(ne as usize).map_err(Error::Cuda)?;
+        unsafe {
+            blas.gemv_c64(
+                op::N, ne, ne,
+                CudaComplex { x: 1.0, y: 0.0 },
+                &entry.q_matrix, ne,
+                &c_proj, 1,
+                CudaComplex { x: 0.0, y: 0.0 },
+                &mut temp, 1,
+            ).map_err(Error::Blas)?;
+        }
+
+        // spsi += β_g · temp  (n_pw × 1)
+        unsafe {
+            blas.gemv_c64(
+                op::N, n, ne,
+                CudaComplex { x: 1.0, y: 0.0 },
+                &entry.beta_g, n,
+                &temp, 1,
+                CudaComplex { x: 1.0, y: 0.0 },
+                &mut spsi_dev, 1,
+            ).map_err(Error::Blas)?;
+        }
+    }
+
+    // 2. Apply S⁻¹ to spsi
+    unsafe {
+        apply_s_inverse(
+            &mut spsi_dev, vnl_data, 1, n, blas, stream,
+        )?;
+    }
+
+    // 3. D2H and compute max residual ‖spsi − psi‖_∞
+    let result: Vec<CudaComplex> = stream.clone_dtoh(&spsi_dev).map_err(Error::Cuda)?;
+    let max_residual = psi_host.iter().zip(result.iter())
+        .map(|(&p, &r)| {
+            let dr = r.x - p.re;
+            let di = r.y - p.im;
+            (dr * dr + di * di).sqrt()
+        })
+        .fold(0.0_f64, f64::max);
+
+    Ok(max_residual)
+}
+
+// ---------------------------------------------------------------------------
 // Scaled Hamiltonian
 // ---------------------------------------------------------------------------
 

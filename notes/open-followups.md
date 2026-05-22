@@ -474,3 +474,78 @@ S-orthonormal, potentially making S_sub ill-conditioned.
 - `iter2_v_eff_range_within_one_ha_of_iter1` — existing regression gate
 - Eigenvalue comparison against CASTEP `.bands` should improve
 
+**Status (2026-05-22, post-fix test):** S⁻¹ fix applied but SCF still drifts.
+Log at `/tmp/scf-diag-0522-1022.log` shows:
+
+| Metric | Iter-1 | Iter-2 | Iter-3 | Reference |
+|--------|--------|--------|--------|-----------|
+| Band-1 eigenvalue | −0.956 Ha | −14.40 Ha | −8.83 Ha | −1.055 Ha |
+| V_eff range | 8.69 Ha | 26.87 Ha | 39.65 Ha | 8.69 Ha |
+| Lanczos α₁ | 7.50 (healthy) | −164.6 (corrupted) | −19.1 (corrupted) | — |
+| Cu D_screened/D0 | 0.09× | 4-7× | 4-7× | < 1× |
+| Smooth ρ (e⁻) | 163 | 181 | 158 | ~68 |
+| Aug ρ (e⁻) | ~23 | ~5 | ~28 | ~118 |
+
+The fix improved iter-2 band-1 from −29 Ha (pre-fix) to −14 Ha, but the
+density decomposition flip (smooth 68→181, aug 118→5) suggests the S⁻¹
+operator is overcorrecting, pushing charge from augmentation into PW
+channels. The S⁻¹ operator's Q matrix convention may not match the
+Woodbury formula's expectation.
+
+Additionally, spectral bounds (Lanczos + Gershgorin) are computed for
+H, not S⁻¹·H. The Lanczos operates on the bare Hamiltonian, b_up
+bounds λ_max(H), but the Chebyshev filter now applies S⁻¹·H whose
+eigenvalue spectrum is the generalized eigenvalue problem — related
+but not identical. Wrong bounds → wrong filter polynomial → poor
+separation of wanted/unwanted eigencomponents.
+
+**Post-fix diagnostic (2026-05-22):** `s_inv_s_identity_test` added to
+`tests/ca_scf_convergence.rs` — feeds CASTEP converged ψ₀ through
+S⁻¹·S·ψ₀ and checks ‖result − ψ₀‖_∞. Result: **0.014 (1.4%) error**.
+The Woodbury S⁻¹ is fundamentally inexact due to Q matrix conditioning
+or Gram matrix precision — not a convention mismatch, since both
+`q_matrix` and `s_inv_mat` come from the same `build_q_expanded` call.
+
+This explains why standard ChFSI fails: the S⁻¹ error (~1.4%) applied
+to O(1) eigenvectors at every Chebyshev step produces persistent O(ε)
+error in the filtered subspace. Das et al. (2025) Theorem 3.2 formally
+proves that standard ChFSI cannot reduce the subspace angle below a
+threshold proportional to the inverse approximation error.
+
+**R-ChFSI solution (2026-05-22):** Das et al. (2025), "Residual-based
+Chebyshev filtered subspace iteration for Hermitian eigenvalue problems
+tolerant to inexact matrix-vector products" (arXiv preprint, see
+`reference_paper/2025-rchfsi-inexact-mv-paper.tar.gz`) introduces
+R-ChFSI (Algorithm 3) which reformulates the Chebyshev recurrence
+to operate on **residuals** instead of eigenvectors:
+
+```
+Standard ChFSI:  ψ_new = C_p(S⁻¹·H) · ψ_old     error ∝ ‖ψ‖ = O(1)
+R-ChFSI:         ψ_new = X·Λ_Y + D⁻¹·R_Y       error ∝ ‖R‖ → 0
+```
+
+The term `H·D⁻¹·R_Y` in the recurrence uses the inexact S⁻¹ applied to
+the current filtered residual R_Y. As the SCF converges, ‖R_Y‖ → 0,
+so the error from the inexact inverse vanishes. Theorem 3.4 proves
+convergence as long as the Chebyshev polynomial contrast exceeds a
+bound that decreases with the subspace angle.
+
+When D⁻¹ = S⁻¹ exactly, R-ChFSI is algebraically equivalent to standard
+ChFSI (proved at `main.tex:612`). It strictly generalizes standard
+ChFSI and never underperforms it.
+
+**Decision:** Implement R-ChFSI Algorithm 3 as a drop-in replacement
+for the current Chebyshev filter body in `chebyshev_filter`. The
+Rayleigh-Ritz step, spectral bounds, density construction, and V_eff
+assembly stay unchanged. Full rationale at
+`reference_paper/ALGORITHM_RATIONALE.md` with precise file:line
+references to the source papers.
+
+**Next steps:**
+1. Implement R-ChFSI Algorithm 3 in `src/eigensolver/chebyshev.rs`
+   (replaces lines 1123-1265 of `chebyshev_filter`).
+2. Requires new `apply_s_times` function: S·ψ = ψ + β·q·(β^H·ψ)
+   to compute the initial residual Y = H·X - S·X·Λ.
+3. Validation: `fixed_point_matches_castep_energy` should converge
+   monotonically.
+

@@ -14,7 +14,8 @@ use crate::device::pcie::PcieAccount;
 use crate::device::CudaComplex;
 use crate::types::{Error, KPoint};
 
-pub(crate) struct VnlIonData {
+#[doc(hidden)]
+pub struct VnlIonData {
     pub beta_g: CudaSlice<CudaComplex>,
     pub d_matrix: CudaSlice<CudaComplex>,
     /// Expanded USPP Q augmentation matrix (n_expanded × n_expanded).
@@ -27,7 +28,8 @@ pub(crate) struct VnlIonData {
     pub n_expanded: i32,
 }
 
-pub(crate) struct VnlBatchData {
+#[doc(hidden)]
+pub struct VnlBatchData {
     pub entries: Vec<VnlIonData>,
 }
 

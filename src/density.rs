@@ -598,7 +598,8 @@ pub mod test_api {
         save_q_sf_cache_to_disk,
         load_q_sf_cache_from_disk,
     };
-    pub use crate::eigensolver::chebyshev::CudaKernelSet;
+    pub use crate::eigensolver::chebyshev::{check_s_inv_s_identity, CudaKernelSet};
+    pub use crate::eigensolver::vnl_data::{VnlBatchData, VnlIonData};
 }
 
 // ---------------------------------------------------------------------------

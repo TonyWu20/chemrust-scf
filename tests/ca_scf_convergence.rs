@@ -575,3 +575,81 @@ fn density_decomp_matches_castep_f8_same_inputs() {
         ratio_aug,
     );
 }
+
+// ---------------------------------------------------------------------------
+// S⁻¹·S identity diagnostic: check that S⁻¹·S·ψ = ψ for the Woodbury
+// formula. If this fails, the Q convention in s_inv_mat is inconsistent
+// with q_matrix, explaining the density decomposition flip in the SCF.
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "requires GPU and CASTEP fixture data"]
+fn s_inv_s_identity_test() {
+    if !gpu_available() {
+        eprintln!("SKIP: no GPU available");
+        return;
+    }
+
+    use chemrust_hamiltonian_core::GVectorGrid;
+    use chemrust_scf::density::test_api::{
+        check_s_inv_s_identity, CudaKernelSet, VnlBatchData,
+    };
+    use chemrust_scf::device::blas::BlasHandle;
+    use chemrust_scf::device::pcie::PcieAccount;
+    use chemrust_scf::KPoint;
+    use num_complex::Complex64;
+    use std::sync::Arc;
+
+    let fx = fixtures::cu111_co::fixture();
+    let cell = &fx.bin.cell;
+    let pots = &fx.pots;
+
+    let wfc = fx.check.wavefunction.as_ref().expect(".check must have wavefunction");
+    let [ngx, ngy, ngz] = wfc.grid;
+    let wave_grid = GVectorGrid::new(ngx, ngy, ngz, cell.recip_lattice);
+
+    let kpt_block = &wfc.kpt_data[0];
+    let n_bands = kpt_block.bands.len();
+    let n_pw = kpt_block.nplw;
+    let k_point = KPoint { coords: kpt_block.coords };
+
+    // Flat psi_data: band-major, col-major layout [band * n_pw + g]
+    let psi_data: Vec<Complex64> = kpt_block.bands.concat();
+
+    let ctx = Arc::new(cudarc::driver::CudaContext::new(0).expect("CUDA context"));
+    let stream = ctx.default_stream();
+    let blas = BlasHandle::new(stream.clone()).expect("BLAS handle");
+    let _kernels = CudaKernelSet::new(&ctx).expect("CUDA kernels");
+
+    // Build VnlBatchData (bare D0, no occupations, no V_eff for screening)
+    let mut pcie = PcieAccount::default();
+    let vnl_data = VnlBatchData::precompute(
+        &kpt_block.pw_grid_coord,
+        pots, cell, &wave_grid, &k_point,
+        &psi_data, n_bands, n_pw,
+        None,   // occupations: bare D0
+        None,   // v_eff: no screening
+        &stream, &mut pcie,
+    ).expect("VnlBatchData::precompute");
+
+    // Take band 0 (the converged lowest eigenstate)
+    let band0: Vec<Complex64> = psi_data.iter().take(n_pw).copied().collect();
+
+    let max_residual = check_s_inv_s_identity(
+        &band0, n_pw, &vnl_data, &blas, &stream,
+    ).expect("check_s_inv_s_identity");
+
+    eprintln!(
+        "[S⁻¹·S identity] ‖S⁻¹·S·ψ₀ − ψ₀‖_∞ = {:.6e}",
+        max_residual,
+    );
+
+    // If > 1e-8: Q convention in s_inv_mat (Woodbury) is inconsistent
+    // with q_matrix (S operator). The S⁻¹·H filter will over-subtract.
+    assert!(
+        max_residual < 1e-6,
+        "S⁻¹·S·ψ ≠ ψ: max residual = {:.6e} > 1e-6. \
+         Q convention mismatch between s_inv_mat and q_matrix.",
+        max_residual,
+    );
+}

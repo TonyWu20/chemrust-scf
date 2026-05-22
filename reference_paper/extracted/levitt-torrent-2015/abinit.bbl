@@ -1,0 +1,173 @@
+\begin{thebibliography}{10}
+
+\bibitem{auckenthaler2011parallel}
+T.~Auckenthaler, V.~Blum, H.-J. Bungartz, T.~Huckle, R.~Johanni, L.~Kr{\"a}mer,
+  B.~Lang, H.~Lederer, and P.~R. Willems.
+\newblock Parallel solution of partial symmetric eigenvalue problems from
+  electronic structure calculations.
+\newblock {\em Parallel Computing}, 37(12):783--794, 2011.
+
+\bibitem{banerjee2014spectral}
+A.~S. Banerjee, R.~S. Elliott, and R.~D. James.
+\newblock A spectral scheme for kohn-sham density functional theory of
+  clusters.
+\newblock {\em arXiv preprint arXiv:1404.3773}, 2014.
+
+\bibitem{bekas2005computing}
+C.~Bekas, Y.~Saad, M.~L. Tiago, and J.~R. Chelikowsky.
+\newblock Computing charge densities with partially reorthogonalized lanczos.
+\newblock {\em Computer Physics Communications}, 171(3):175--186, 2005.
+
+\bibitem{berljafa2014optimized}
+M.~Berljafa, D.~Wortmann, and E.~Di~Napoli.
+\newblock An optimized and scalable eigensolver for sequences of eigenvalue
+  problems.
+\newblock {\em arXiv preprint arXiv:1404.4161}, 2014.
+
+\bibitem{blochl1994projector}
+P.~E. Bl{\"o}chl.
+\newblock Projector augmented-wave method.
+\newblock {\em Physical Review B}, 50(24):17953, 1994.
+
+\bibitem{bottin2008large}
+F.~Bottin, S.~Leroux, A.~Knyazev, and G.~Z{\'e}rah.
+\newblock Large-scale ab initio calculations based on three levels of
+  parallelization.
+\newblock {\em Computational Materials Science}, 42(2):329--336, 2008.
+
+\bibitem{choi1992scalapack}
+J.~Choi, J.~J. Dongarra, R.~Pozo, and D.~W. Walker.
+\newblock {ScaLAPACK}: A scalable linear algebra library for distributed memory
+  concurrent computers.
+\newblock In {\em Frontiers of Massively Parallel Computation, 1992., Fourth
+  Symposium on the}, pages 120--127. IEEE, 1992.
+
+\bibitem{davidson1975iterative}
+E.~R. Davidson.
+\newblock The iterative calculation of a few of the lowest eigenvalues and
+  corresponding eigenvectors of large real-symmetric matrices.
+\newblock {\em Journal of Computational Physics}, 17(1):87--94, 1975.
+
+\bibitem{giannozzi2009quantum}
+P.~Giannozzi, S.~Baroni, N.~Bonini, M.~Calandra, R.~Car, C.~Cavazzoni,
+  D.~Ceresoli, G.~L. Chiarotti, M.~Cococcioni, I.~Dabo, et~al.
+\newblock Quantum espresso: a modular and open-source software project for
+  quantum simulations of materials.
+\newblock {\em Journal of Physics: Condensed Matter}, 21(39):395502, 2009.
+
+\bibitem{gonze2009abinit}
+X.~Gonze, B.~Amadon, P.-M. Anglade, J.-M. Beuken, F.~Bottin, P.~Boulanger,
+  F.~Bruneval, D.~Caliste, R.~Caracas, M.~Cote, et~al.
+\newblock {ABINIT}: First-principles approach to material and nanosystem
+  properties.
+\newblock {\em Computer Physics Communications}, 180(12):2582--2615, 2009.
+
+\bibitem{gygi2006large}
+F.~Gygi, E.~W. Draeger, M.~Schulz, B.~R. De~Supinski, J.~A. Gunnels, V.~Austel,
+  J.~C. Sexton, F.~Franchetti, S.~Kral, C.~W. Ueberhuber, et~al.
+\newblock Large-scale electronic structure calculations of high-z metals on the
+  bluegene/l platform.
+\newblock In {\em Proceedings of the 2006 ACM/IEEE conference on
+  Supercomputing}, page~45. ACM, 2006.
+
+\bibitem{hetmaniuk2006basis}
+U.~Hetmaniuk and R.~Lehoucq.
+\newblock Basis selection in {LOBPCG}.
+\newblock {\em Journal of Computational Physics}, 218(1):324--332, 2006.
+
+\bibitem{hohenberg1964inhomogeneous}
+P.~Hohenberg and W.~Kohn.
+\newblock Inhomogeneous electron gas.
+\newblock {\em Physical review}, 136(3B):B864, 1964.
+
+\bibitem{iwata2010massively}
+J.-I. Iwata, D.~Takahashi, A.~Oshiyama, T.~Boku, K.~Shiraishi, S.~Okada, and
+  K.~Yabana.
+\newblock A massively-parallel electronic-structure calculations based on
+  real-space density functional theory.
+\newblock {\em Journal of Computational Physics}, 229(6):2339--2363, 2010.
+
+\bibitem{knyazev2001toward}
+A.~V. Knyazev.
+\newblock Toward the optimal preconditioned eigensolver: Locally optimal block
+  preconditioned conjugate gradient method.
+\newblock {\em SIAM journal on scientific computing}, 23(2):517--541, 2001.
+
+\bibitem{kohn1965self}
+W.~Kohn and L.~J. Sham.
+\newblock Self-consistent equations including exchange and correlation effects.
+\newblock {\em Physical Review}, 140(4A):A1133, 1965.
+
+\bibitem{kresse1996efficient}
+G.~Kresse and J.~Furthm{\"u}ller.
+\newblock Efficient iterative schemes for ab initio total-energy calculations
+  using a plane-wave basis set.
+\newblock {\em Physical Review B}, 54(16):11169, 1996.
+
+\bibitem{milman2010electron}
+V.~Milman, K.~Refson, S.~Clark, C.~Pickard, J.~Yates, S.-P. Gao, P.~Hasnip,
+  M.~Probert, A.~Perlov, and M.~Segall.
+\newblock Electron and vibrational spectroscopies using dft, plane waves and
+  pseudopotentials: Castep implementation.
+\newblock {\em Journal of Molecular Structure: THEOCHEM}, 954(1):22--35, 2010.
+
+\bibitem{payne1992iterative}
+M.~C. Payne, M.~P. Teter, D.~C. Allan, T.~Arias, and J.~Joannopoulos.
+\newblock Iterative minimization techniques for ab initio total-energy
+  calculations: molecular dynamics and conjugate gradients.
+\newblock {\em Reviews of Modern Physics}, 64(4):1045--1097, 1992.
+
+\bibitem{polizzi}
+E.~Polizzi.
+\newblock Density-matrix-based algorithms for solving eigenvalue problems.
+\newblock {\em Physical Review B}, 79(11):115112--115112, 2009.
+
+\bibitem{poulson2013elemental}
+J.~Poulson, B.~Marker, R.~A. van~de Geijn, J.~R. Hammond, and N.~A. Romero.
+\newblock Elemental: A new framework for distributed memory dense matrix
+  computations.
+\newblock {\em ACM Transactions on Mathematical Software (TOMS)}, 39(2):13,
+  2013.
+
+\bibitem{rutishauser1970simultaneous}
+H.~Rutishauser.
+\newblock Simultaneous iteration method for symmetric matrices.
+\newblock {\em Numerische Mathematik}, 16(3):205--223, 1970.
+
+\bibitem{sakurai2003projection}
+T.~Sakurai and H.~Sugiura.
+\newblock A projection method for generalized eigenvalue problems using
+  numerical integration.
+\newblock {\em Journal of computational and applied mathematics},
+  159(1):119--128, 2003.
+
+\bibitem{slicing}
+G.~Schofield, J.~R. Chelikowsky, and Y.~Saad.
+\newblock A spectrum slicing method for the {K}ohn--{S}ham problem.
+\newblock {\em Computer Physics Communications}, 183(3):497--505, 2012.
+
+\bibitem{torrent2008implementation}
+M.~Torrent, F.~Jollet, F.~Bottin, G.~Z{\'e}rah, and X.~Gonze.
+\newblock Implementation of the projector augmented-wave method in the {ABINIT}
+  code: Application to the study of iron under pressure.
+\newblock {\em Computational Materials Science}, 42(2):337--351, 2008.
+
+\bibitem{woodbury1950inverting}
+M.~A. Woodbury.
+\newblock Inverting modified matrices.
+\newblock {\em Memorandum report 42, Statistical Research Group, Princeton},
+  1950.
+
+\bibitem{parallel_chebfi}
+Y.~Zhou, Y.~Saad, M.~L. Tiago, and J.~R. Chelikowsky.
+\newblock Parallel self-consistent-field calculations via {C}hebyshev-filtered
+  subspace acceleration.
+\newblock {\em Phys. Rev. E}, 74:066704, Dec 2006.
+
+\bibitem{seq_chebfi}
+Y.~Zhou, Y.~Saad, M.~L. Tiago, and J.~R. Chelikowsky.
+\newblock Self-consistent-field calculations using {C}hebyshev-filtered
+  subspace iteration.
+\newblock {\em Journal of Computational Physics}, 219(1):172--184, 2006.
+
+\end{thebibliography}
