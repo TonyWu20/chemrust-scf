@@ -13,6 +13,12 @@
 
 mod fixtures;
 
+/// True per-ion Woodbury baseline after m_inv→s_inv typo fix.
+/// Measured on Cu(111)+CO fixture. Becomes historical after G3 (global Woodbury).
+/// FIXME: replace placeholder with the value from `s_inv_s_identity_test` after
+/// running on GPU hardware (TASK-G0-2).
+const BASELINE_ZETA_PER_ION: f64 = 0.0;
+
 use rand::Rng;
 use std::sync::Once;
 
@@ -617,6 +623,95 @@ fn density_decomp_matches_castep_f8_same_inputs() {
         aug_ok,
         "aug density N_e ratio {:.4} differs from 1.0 by > 1% — normalization bug in compute_aug_density_*",
         ratio_aug,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// S⁻¹·S identity baseline lock (post typo fix)
+// Records the true per-ion Woodbury baseline after m_inv→s_inv correction.
+// Value stored in BASELINE_ZETA_PER_ION for the rest of the phase.
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "requires GPU and CASTEP fixture data"]
+fn s_inv_baseline_post_typo_fix() {
+    if !gpu_available() {
+        eprintln!("SKIP: no GPU available");
+        return;
+    }
+    init_tracing();
+
+    use chemrust_hamiltonian_core::GVectorGrid;
+    use chemrust_scf::KPoint;
+    use chemrust_scf::density::test_api::{CudaKernelSet, VnlBatchData, check_s_inv_s_identity};
+    use chemrust_scf::device::blas::BlasHandle;
+    use chemrust_scf::device::pcie::PcieAccount;
+    use num_complex::Complex64;
+    use std::sync::Arc;
+
+    let fx = fixtures::cu111_co::fixture();
+    let cell = &fx.bin.cell;
+    let pots = &fx.pots;
+
+    let wfc = fx
+        .check
+        .wavefunction
+        .as_ref()
+        .expect(".check must have wavefunction");
+    let [ngx, ngy, ngz] = wfc.grid;
+    let wave_grid = GVectorGrid::new(ngx, ngy, ngz, cell.recip_lattice);
+
+    let kpt_block = &wfc.kpt_data[0];
+    let n_bands = kpt_block.bands.len();
+    let n_pw = kpt_block.nplw;
+    let k_point = KPoint {
+        coords: kpt_block.coords,
+    };
+
+    // Flat psi_data: band-major, col-major layout [band * n_pw + g]
+    let psi_data: Vec<Complex64> = kpt_block.bands.concat();
+
+    let ctx = Arc::new(cudarc::driver::CudaContext::new(0).expect("CUDA context"));
+    let stream = ctx.default_stream();
+    let blas = BlasHandle::new(stream.clone()).expect("BLAS handle");
+    let kernels = CudaKernelSet::new(&ctx).expect("CUDA kernels");
+
+    // Build VnlBatchData (bare D0, no occupations, no V_eff for screening)
+    let mut pcie = PcieAccount::default();
+    let vnl_data = VnlBatchData::precompute(
+        &kpt_block.pw_grid_coord,
+        pots,
+        cell,
+        &wave_grid,
+        &k_point,
+        &psi_data,
+        n_bands,
+        n_pw,
+        None, // occupations: bare D0
+        None, // v_eff: no screening
+        &stream,
+        &mut pcie,
+        &blas,
+        &kernels,
+    )
+    .expect("VnlBatchData::precompute");
+
+    // Take band 0 (the converged lowest eigenstate)
+    let band0: Vec<Complex64> = psi_data.iter().take(n_pw).copied().collect();
+
+    let zeta = check_s_inv_s_identity(&band0, n_pw, &vnl_data, &blas, &stream)
+        .expect("check_s_inv_s_identity");
+
+    eprintln!(
+        "[baseline] per-ion ζ = {:.6e}  (BASELINE_ZETA_PER_ION = {:.6e})",
+        zeta, BASELINE_ZETA_PER_ION,
+    );
+
+    // Assertion: call succeeded. Value is the discriminator, not a threshold.
+    // The recorded value should be updated in BASELINE_ZETA_PER_ION above.
+    eprintln!(
+        "[baseline] RECORDED ζ = {:.6e} — update BASELINE_ZETA_PER_ION constant if this differs.",
+        zeta,
     );
 }
 

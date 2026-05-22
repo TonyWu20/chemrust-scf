@@ -15,6 +15,18 @@ use crate::device::CudaComplex;
 use crate::eigensolver::d_screening::WaveScreeningCache;
 use crate::types::{Error, KPoint};
 
+/// Working copy during Gauss-Jordan elimination.
+/// Row-reduced to identity after the algorithm completes.
+struct GjWorkingCopy(Vec<f64>);
+
+/// Holds the inverse matrix after Gauss-Jordan elimination.
+struct GjResult(Vec<f64>);
+
+/// Convert a `GjResult` (M⁻¹ from Gauss-Jordan) to the CUDA upload format.
+fn gj_result_to_cuda(r: GjResult) -> Vec<CudaComplex> {
+    r.0.into_iter().map(|x| CudaComplex { x, y: 0.0 }).collect()
+}
+
 #[doc(hidden)]
 pub struct VnlIonData {
     pub beta_g: CudaSlice<CudaComplex>,
@@ -282,45 +294,42 @@ impl VnlBatchData {
             }
 
             // Invert M → s_inv_mat using the same Gauss-Jordan.
-            let mut m_inv = m_mat.clone();
+            let mut m_inv = GjWorkingCopy(m_mat.clone());
             // Augment with identity
-            let mut s_inv = vec![0.0_f64; ne * ne];
-            for i in 0..ne { s_inv[i * ne + i] = 1.0; }
+            let mut s_inv = GjResult(vec![0.0_f64; ne * ne]);
+            for i in 0..ne { s_inv.0[i * ne + i] = 1.0; }
             for col in 0..ne {
                 let mut pivot = col;
                 for row in col..ne {
-                    if m_inv[row * ne + col].abs() > m_inv[pivot * ne + col].abs() {
+                    if m_inv.0[row * ne + col].abs() > m_inv.0[pivot * ne + col].abs() {
                         pivot = row;
                     }
                 }
-                if m_inv[pivot * ne + col].abs() < eps_reg {
+                if m_inv.0[pivot * ne + col].abs() < eps_reg {
                     continue;
                 }
                 for c in 0..ne {
-                    m_inv.swap(col * ne + c, pivot * ne + c);
-                    s_inv.swap(col * ne + c, pivot * ne + c);
+                    m_inv.0.swap(col * ne + c, pivot * ne + c);
+                    s_inv.0.swap(col * ne + c, pivot * ne + c);
                 }
-                let piv_val = m_inv[col * ne + col];
+                let piv_val = m_inv.0[col * ne + col];
                 for c in 0..ne {
-                    m_inv[col * ne + c] /= piv_val;
-                    s_inv[col * ne + c] /= piv_val;
+                    m_inv.0[col * ne + c] /= piv_val;
+                    s_inv.0[col * ne + c] /= piv_val;
                 }
                 for row in 0..ne {
                     if row == col { continue; }
-                    let factor = m_inv[row * ne + col];
+                    let factor = m_inv.0[row * ne + col];
                     if factor.abs() < eps_reg { continue; }
                     for c in 0..ne {
-                        m_inv[row * ne + c] -= factor * m_inv[col * ne + c];
-                        s_inv[row * ne + c] -= factor * s_inv[col * ne + c];
+                        m_inv.0[row * ne + c] -= factor * m_inv.0[col * ne + c];
+                        s_inv.0[row * ne + c] -= factor * s_inv.0[col * ne + c];
                     }
                 }
             }
             // s_inv now holds M^{-1}
 
-            let s_inv_flat: Vec<CudaComplex> = m_inv
-                .iter()
-                .map(|&x| CudaComplex { x, y: 0.0 })
-                .collect();
+            let s_inv_flat = gj_result_to_cuda(s_inv);
             let s_inv_dev = stream.clone_htod(&s_inv_flat).map_err(Error::Cuda)?;
             pcie.h2d_bytes += s_inv_flat.len() * std::mem::size_of::<CudaComplex>();
 
