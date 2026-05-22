@@ -188,8 +188,8 @@ extern \"C\" __global__ void transpose_row_to_col(
 // dst[b*n_pw + g] += alpha * src[b*n_pw + g] * scale[b]
 // Used for: Y·Λ_Y term (Step 3), S·X·Λ subtraction (Step 1), X·Λ_Y reconstruction (Step 4)
 extern \"C\" __global__ void band_scale_axpy(
-    cuDoubleComplex* dst,
-    const cuDoubleComplex* src,
+    double2* dst,
+    const double2* src,
     const double* scale,
     double alpha,
     int n_pw, int n_bands
