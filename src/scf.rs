@@ -564,9 +564,13 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
         let vnl_bytes: usize = vnl_data.entries.iter()
             .map(|e| (e.beta_g.len() + e.d_matrix.len() + e.q_matrix.len()) * 16)
             .sum();
+        let b_concat_bytes = n_pw * vnl_data.n_total_expanded as usize * 16;
+        let lu_m_bytes = vnl_data.n_total_expanded as usize * vnl_data.n_total_expanded as usize * 16;
         assert_eq!(
             pcie.h2d_bytes,
-            psi_bytes + veff_bytes + fft_idx_bytes + kinetic_bytes + vnl_bytes + vnl_data.screening_h2d_bytes,
+            psi_bytes + veff_bytes + fft_idx_bytes + kinetic_bytes + vnl_bytes
+                + vnl_data.screening_h2d_bytes
+                + b_concat_bytes + lu_m_bytes,
             "H2D tracking check failed",
         );
 
