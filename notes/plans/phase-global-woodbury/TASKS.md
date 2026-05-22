@@ -26,9 +26,14 @@
 - `apply_s_times` at `chebyshev.rs:914` is the structural mirror of `apply_s_inverse`
   (same per-ion GEMM pattern, uses `q_matrix` instead of `s_inv_mat`). Use as
   correctness reference when writing the global Woodbury body.
-- `solver.rs` `zhegvd` (lines 47–95) is the exact template for Zpotrf/Zpotrs:
+- `solver.rs` `zhegvd` (lines 47–95) is the exact template for cuSOLVER wrappers:
   `DnHandle`, `SolverError`, buffer-size query, `alloc_zeros` workspace,
   `device_ptr_mut` cast to `*mut sys::cuDoubleComplex`, `.result()?`.
+- Switched from Cholesky (`zpotrf`/`zpotrs`) to LU (`zgetrf`/`zgetrs`) for the global
+  Woodbury M factorization. M = Q⁻¹ + B^H·B is not guaranteed positive-definite
+  because Q⁻¹ has zero rows for projector channels without Q_aug (e.g. Cu d-channels).
+  `zpotrf` fails with `info = 2` on the Cu(111)+CO fixture; `zgetrf` handles it.
+  See `DECISIONS.md` for the full analysis.
 - `Cargo.toml` has no `[features]` section — must be added for `scf_diag`.
 - 11 `eprintln!` sites in `chebyshev.rs` at lines 439, 440, 443, 513, 514, 529,
   1354, 1374, 1377, 1396, 1614. 6 in `scf.rs` at lines 469, 536, 687, 704, 708, 758.
@@ -123,68 +128,76 @@ Tightening to `< 1e-10` belongs in G3 (discriminator for global Woodbury).
 
 ---
 
-## Group G1 — cuSOLVER Cholesky bindings
+## Group G1 — cuSOLVER LU bindings (global Woodbury factorisation)
 
 **kind:** direct  
 **depends on:** nothing  
 **blocks:** G2
 
-### TASK-G1-1: Add `zpotrf` / `zpotrs` methods to `SolverHandle`
+**Decision context:** The global Woodbury matrix M = Q⁻¹ + B^H·B is not
+guaranteed positive-definite because Q⁻¹ has zero rows for projector channels
+where Q_aug has no entries (e.g. Cu d-channels). Cholesky (`zpotrf`) fails
+with `info = 2` on the Cu(111)+CO fixture. Switched to LU with partial
+pivoting (`zgetrf`/`zgetrs`), which handles any full-rank M. A vestigial
+`CHOL_REG = 1e-12` is kept as a floor for exact singularity, but no larger
+regularisation is needed. See `DECISIONS.md` for the full analysis.
+
+### TASK-G1-1: Add `zgetrf` / `zgetrs` methods to `SolverHandle`
 
 **File:** `src/device/solver.rs` (append after line 96)
 
-Template: `zhegvd` method at lines 47–95. Same `DnHandle`, `SolverError`,
-`device_ptr_mut` cast, `alloc_zeros` workspace, `.result()?` pattern.
-
-Add three methods:
+Template: `zpotrf` method (same `DnHandle`, `SolverError`,
+`device_ptr_mut` cast, `alloc_zeros` workspace, `.result()?` pattern).
 
 ```rust
-pub fn zpotrf(
+pub fn zgetrf(
     &self,
-    uplo: cublasFillMode_t,
+    m: i32,
     n: i32,
     a: &mut CudaSlice<CudaComplex>,
+    ipiv: &mut CudaSlice<i32>,
     info: &mut CudaSlice<i32>,
 ) -> Result<(), SolverError>
 ```
-- Query buffer size via `sys::cusolverDnZpotrf_bufferSize`
+- Query buffer size via `sys::cusolverDnZgetrf_bufferSize`
 - Allocate workspace via `self.stream.alloc_zeros::<CudaComplex>(lwork)`
-- Call `sys::cusolverDnZpotrf` — factors `a` in-place (lower or upper triangle)
+- Call `sys::cusolverDnZgetrf` — factors A = P·L·U, stores L (unit lower)
+  and U in `a`, pivot indices in `ipiv`
 
 ```rust
-pub fn zpotrs(
+pub fn zgetrs(
     &self,
-    uplo: cublasFillMode_t,
+    trans: cublasOperation_t,
     n: i32,
     nrhs: i32,
-    a: &CudaSlice<CudaComplex>,   // Cholesky factor (read-only)
+    a: &CudaSlice<CudaComplex>,   // LU factor (read-only)
+    ipiv: &CudaSlice<i32>,         // pivot indices from zgetrf
     b: &mut CudaSlice<CudaComplex>, // RHS in, solution out
     info: &mut CudaSlice<i32>,
 ) -> Result<(), SolverError>
 ```
-- `zpotrs` does not need a workspace buffer (unlike `zpotrf`)
-- Call `sys::cusolverDnZpotrs` directly
+- `zgetrs` does not need a workspace buffer
+- Call `sys::cusolverDnZgetrs` directly
 
-### TASK-G1-2: Tests for Cholesky bindings
+### TASK-G1-2: Tests for LU bindings
 
 **File:** `src/device/solver.rs` `#[cfg(test)]` block
 
 ```rust
 #[test]
-fn zpotrs_round_trip() {
-    // 4×4 HPD matrix A, RHS b = A·x_exact, solve → x, assert ‖x − x_exact‖ < 1e-12
+fn zgetrs_round_trip() {
+    // 4×4 full-rank matrix A, RHS b = A·x_exact, LU solve → x, assert ‖x − x_exact‖ < 1e-12
 }
 
 #[test]
-fn zpotrs_multi_rhs() {
-    // 16×16 HPD matrix, 8 RHS columns, assert max err < 1e-12
-    // Guards against single-RHS overfitting; SCF hot path uses n_bands ≈ 160
+fn zgetrs_multi_rhs() {
+    // 16×16 matrix, 8 RHS columns, assert max err < 1e-12
 }
 ```
 
-**Acceptance:** `cargo test --release -p chemrust-scf -- zpotrs_round_trip zpotrs_multi_rhs`
+**Acceptance:** `cargo test --release -p chemrust-scf -- zgetrs_round_trip zgetrs_multi_rhs`
 
-**Commit:** `feat(solver): zpotrf/zpotrs cuSOLVER bindings with round-trip tests`
+**Commit:** `feat(solver): zgetrf/zgetrs cuSOLVER bindings with round-trip tests`
 
 ---
 
@@ -201,7 +214,8 @@ fn zpotrs_multi_rhs() {
 `VnlBatchData` struct (around line 28): add fields:
 ```rust
 pub b_concat: CudaSlice<CudaComplex>,      // n_pw × n_total_expanded, col-major
-pub chol_m: CudaSlice<CudaComplex>,        // n_total_expanded × n_total_expanded
+pub lu_m: CudaSlice<CudaComplex>,           // LU factor of M = Q⁻¹ + B^H·B
+pub lu_ipiv: CudaSlice<i32>,               // pivot indices from zgetrf
 pub n_total_expanded: i32,
 ```
 
@@ -217,7 +231,7 @@ Add private newtypes for the new CPU-side matrix pipeline (same module as
 ```rust
 struct QInvBlkDiag(Vec<f64>);  // block-diagonal Q⁻¹ assembled from per-ion inverses
 struct BhB(Vec<f64>);          // B^H·B cross-ion blocks (GPU gemm → CPU copy)
-struct MMatrix(Vec<f64>);      // M = Q⁻¹ + B^H·B, consumed by zpotrf (upload then drop)
+struct MMatrix(Vec<f64>);      // M = Q⁻¹ + B^H·B, consumed by LU (upload then drop)
 ```
 
 Add conversion functions:
@@ -253,10 +267,12 @@ After the per-ion loop, add:
    off-diagonal blocks of `QInvBlkDiag` are zero, so this just adds the cross-ion
    terms from `BhB`).
 
-5. **Cholesky factor**: upload `MMatrix` to GPU → `m_dev`; call `solver.zpotrf`
-   (lower triangle, in-place) → `chol_m`. Check `info[0] == 0`; if not, return
-   `Err(...)` with a message indicating near-singular M (follow-up: LDL^T fallback).
-   Drop CPU `MMatrix` after upload.
+5. **LU factor**: upload `MMatrix` to GPU → `m_dev`; call `solver.zgetrf`
+   (m = n_total_expanded, n = n_total_expanded) → `lu_m`, `lu_ipiv`.
+   Check `info[0] == 0`; if not, return `Err(...)` with a message indicating
+   singular M. Add vestigial `1e-12` diagonal regularization as a floor for
+   exact rank deficiency (not needed for Cu(111)+CO but harmless and guards
+   against edge cases). Drop CPU `MMatrix` after upload.
 
 6. Remove the per-ion `s_inv_mat` upload (lines 320–324).
 
@@ -266,7 +282,7 @@ After the per-ion loop, add:
 
 **Acceptance:** `cargo check --workspace` green.
 
-**Commit:** `feat(vnl-data): global Woodbury precompute — B_concat, Cholesky M, SolverHandle`
+**Commit:** `feat(vnl-data): global Woodbury precompute — B_concat, LU M, SolverHandle`
 
 ---
 
@@ -290,8 +306,8 @@ Replace the per-ion loop body with global Woodbury:
    m=n_total_expanded, n=n_bands, k=n_pw
    A=b_concat, B=hpsi_dev → t (n_total_expanded × n_bands)
 
-2. solver.zpotrs(lower, n_total_expanded, n_bands, &chol_m, &mut t, &mut info)
-   Solves chol_m \ t in-place (triangular solve)
+2. solver.zgetrs(nte, n_bands, &lu_m, &lu_ipiv, &mut t, &mut info)
+   Solves the LU system P·L·U · t = rhs in-place
 
 3. v -= B · t
    cublasZgemm_v2: transa=N, transb=N, alpha=-1, beta=1
@@ -299,7 +315,7 @@ Replace the per-ion loop body with global Woodbury:
    A=b_concat, B=t → hpsi_dev (accumulate)
 ```
 
-Access `vnl_data.b_concat`, `vnl_data.chol_m`, `vnl_data.n_total_expanded`.
+Access `vnl_data.b_concat`, `vnl_data.lu_m`, `vnl_data.lu_ipiv`, `vnl_data.n_total_expanded`.
 
 ### TASK-G3-2: Thread `SolverHandle` to `check_s_inv_s_identity`
 
@@ -469,8 +485,8 @@ Default call sites pass `use_sinv_filter: false` — no behaviour change.
 |------|--------:|-------:|------|
 | `cargo check --workspace` | green | green | all |
 | `cargo clippy --workspace -- -D warnings` | green | green | all |
-| `zpotrs_round_trip` | not present | err < 1e-12 | G1 |
-| `zpotrs_multi_rhs` | not present | err < 1e-12 | G1 |
+| `zgetrs_round_trip` | not present | err < 1e-12 | G1 |
+| `zgetrs_multi_rhs` | not present | err < 1e-12 | G1 |
 | `s_inv_baseline_post_typo_fix` | 0.014 (contaminated) | **measured, recorded** | G0 |
 | `s_inv_s_identity_test` ‖S⁻¹·S·ψ−ψ‖_∞ | `< 1e-6` | `< 1e-10` | G3 |
 | Lanczos `b_up` delta (iter-1) | n/a | logged, sign matches expected | G4 |
@@ -502,7 +518,7 @@ Default call sites pass `use_sinv_filter: false` — no behaviour change.
 ```
 G0 (typo fix) ────────────────┐
                                ├──> G2 (VnlBatchData + SolverHandle param)
-G1 (Cholesky bindings) ───────┘         └──> G3 (apply_s_inverse body + 1e-10)
+G1 (LU bindings) ────────────────────┘         └──> G3 (apply_s_inverse body + 1e-10)
                                                 ├──> G4 (Lanczos wiring)
                                                 └──> G5 (filter A/B gate)
 G6 (scf_diag) — independent
