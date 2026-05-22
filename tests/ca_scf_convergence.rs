@@ -14,6 +14,22 @@
 mod fixtures;
 
 use rand::Rng;
+use std::sync::Once;
+
+static INIT: Once = Once::new();
+
+fn init_tracing() {
+    INIT.call_once(|| {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+            )
+            .with_target(false)
+            .try_init()
+            .ok();
+    });
+}
 
 /// Returns `true` if a CUDA-capable GPU is available at device 0.
 fn gpu_available() -> bool {
@@ -39,6 +55,7 @@ fn fixed_point_matches_castep_energy() {
         eprintln!("SKIP: no GPU available");
         return;
     }
+    init_tracing();
 
     let fx = fixtures::cu111_co::fixture();
     let state = fixtures::cu111_co::build_scf_state(fx);
@@ -48,7 +65,10 @@ fn fixed_point_matches_castep_energy() {
     let diff_ev = (computed_ev - fixtures::cu111_co::REFERENCE_ENERGY_EV).abs();
 
     println!("Computed total energy: {:.8} eV", computed_ev);
-    println!("Reference total energy: {:.8} eV", fixtures::cu111_co::REFERENCE_ENERGY_EV);
+    println!(
+        "Reference total energy: {:.8} eV",
+        fixtures::cu111_co::REFERENCE_ENERGY_EV
+    );
     println!("Absolute difference:    {:.8} eV", diff_ev);
 
     assert!(
@@ -70,6 +90,7 @@ fn perturbation_recovers_castep_energy() {
         eprintln!("SKIP: no GPU available");
         return;
     }
+    init_tracing();
 
     let fx = fixtures::cu111_co::fixture();
     let mut state = fixtures::cu111_co::build_scf_state(fx);
@@ -90,17 +111,23 @@ fn perturbation_recovers_castep_energy() {
         *v *= scale;
     }
 
-    *state.density_mut() = chemrust_scf::Density::from_inner(chemrust_scf::WaveGridArray::from_inner(
-        noisy_arr,
-    ));
+    *state.density_mut() =
+        chemrust_scf::Density::from_inner(chemrust_scf::WaveGridArray::from_inner(noisy_arr));
 
-    let result = chemrust_scf::run_scf_with_energy(state, 8, 1e-8).expect("SCF converged after perturbation");
+    let result = chemrust_scf::run_scf_with_energy(state, 8, 1e-8)
+        .expect("SCF converged after perturbation");
 
     let computed_ev = result.total_energy * chemrust_scf::HARTREE_TO_EV;
     let diff_ev = (computed_ev - fixtures::cu111_co::REFERENCE_ENERGY_EV).abs();
 
-    println!("Computed total energy (after perturbation): {:.8} eV", computed_ev);
-    println!("Reference total energy: {:.8} eV", fixtures::cu111_co::REFERENCE_ENERGY_EV);
+    println!(
+        "Computed total energy (after perturbation): {:.8} eV",
+        computed_ev
+    );
+    println!(
+        "Reference total energy: {:.8} eV",
+        fixtures::cu111_co::REFERENCE_ENERGY_EV
+    );
     println!("Absolute difference:    {:.8} eV", diff_ev);
 
     assert!(
@@ -132,6 +159,7 @@ fn iter2_v_eff_range_within_one_ha_of_iter1() {
         eprintln!("SKIP: no GPU available");
         return;
     }
+    init_tracing();
 
     let fx = fixtures::cu111_co::fixture();
     let state = fixtures::cu111_co::build_scf_state(fx);
@@ -154,13 +182,10 @@ fn iter2_v_eff_range_within_one_ha_of_iter1() {
         .construct_density_off()
         .expect("iter-1 construct_density");
     let iter1_mixed = iter1_dens.mix();
-    let iter2_init = match iter1_mixed
-        .check(1e-8)
-        .expect("iter-1 check")
-    {
-        chemrust_scf::CheckOutcome::Converged(_) => panic!(
-            "iter-1 unexpectedly converged — iter-2 V_eff cannot be measured",
-        ),
+    let iter2_init = match iter1_mixed.check(1e-8).expect("iter-1 check") {
+        chemrust_scf::CheckOutcome::Converged(_) => {
+            panic!("iter-1 unexpectedly converged — iter-2 V_eff cannot be measured",)
+        }
         chemrust_scf::CheckOutcome::NotConverged { state, .. } => state,
     };
 
@@ -177,7 +202,10 @@ fn iter2_v_eff_range_within_one_ha_of_iter1() {
 
     println!("iter-1 V_eff range: {iter1_range:.4} Ha");
     println!("iter-2 V_eff range: {iter2_range:.4} Ha");
-    println!("|Δrange|:           {:.4} Ha", (iter2_range - iter1_range).abs());
+    println!(
+        "|Δrange|:           {:.4} Ha",
+        (iter2_range - iter1_range).abs()
+    );
 
     // Anchor: pre-fix iter-1 ≈ 8.69 Ha, iter-2 ≈ 39.95 Ha.
     // Post-fix iter-2 should land within ±1 Ha of iter-1.
@@ -199,18 +227,18 @@ fn aug_density_gpu_matches_cpu_cu111_co() {
         eprintln!("SKIP: no GPU available");
         return;
     }
+    init_tracing();
 
     use chemrust_hamiltonian_core::{
-        GVectorGrid, Pseudopotential,
-        augment::beta_phi::compute_beta_phi,
+        GVectorGrid, Pseudopotential, augment::beta_phi::compute_beta_phi,
         pseudopotential::HasAugmentationData,
     };
     use chemrust_scf::density::test_api::{
-        build_q_sf_cache, compute_aug_density_fine, compute_aug_density_gpu,
-        save_q_sf_cache_to_disk, load_q_sf_cache_from_disk,
+        CudaKernelSet, build_q_sf_cache, compute_aug_density_fine, compute_aug_density_gpu,
+        load_q_sf_cache_from_disk, save_q_sf_cache_to_disk,
     };
-    use chemrust_scf::device::pcie::PcieAccount;
     use chemrust_scf::device::CudaComplex;
+    use chemrust_scf::device::pcie::PcieAccount;
     use cudarc::driver::CudaSlice;
     use ndarray::Array2;
     use num_complex::Complex64;
@@ -220,7 +248,11 @@ fn aug_density_gpu_matches_cpu_cu111_co() {
     let cell = &fx.bin.cell;
     let pots = &fx.pots;
 
-    let wfc = fx.check.wavefunction.as_ref().expect(".check must have wavefunction");
+    let wfc = fx
+        .check
+        .wavefunction
+        .as_ref()
+        .expect(".check must have wavefunction");
     let [ngx, ngy, ngz] = wfc.grid;
     let wave_grid = GVectorGrid::new(ngx, ngy, ngz, cell.recip_lattice);
 
@@ -260,24 +292,21 @@ fn aug_density_gpu_matches_cpu_cu111_co() {
         eprintln!("[CPU aug] loading from disk: {}", cpu_cache_path.display());
         let bytes = std::fs::read(cpu_cache_path).expect("read cpu cache");
         let n = bytes.len() / 8;
-        let vals: Vec<f64> = (0..n).map(|i| {
-            f64::from_le_bytes(bytes[i*8..(i+1)*8].try_into().unwrap())
-        }).collect();
+        let vals: Vec<f64> = (0..n)
+            .map(|i| f64::from_le_bytes(bytes[i * 8..(i + 1) * 8].try_into().unwrap()))
+            .collect();
         // Shape is (ngx, ngy, ngz) C-order — same as fft_inverse_3d output.
         let [fgx, fgy, fgz] = [fgx, fgy, fgz];
         chemrust_hamiltonian_core::fft::RealGrid::from_inner(
-            ndarray::Array3::from_shape_vec((fgx, fgy, fgz), vals).expect("shape")
+            ndarray::Array3::from_shape_vec((fgx, fgy, fgz), vals).expect("shape"),
         )
     } else {
         eprintln!("[CPU aug] computing (first run, will save to disk)...");
-        let r = compute_aug_density_fine(
-            &beta_psi_per_ion,
-            &occupations,
-            pots,
-            cell,
-            &fine_grid,
-        ).expect("CPU aug density");
-        let bytes: Vec<u8> = r.as_real_array().iter()
+        let r = compute_aug_density_fine(&beta_psi_per_ion, &occupations, pots, cell, &fine_grid)
+            .expect("CPU aug density");
+        let bytes: Vec<u8> = r
+            .as_real_array()
+            .iter()
             .flat_map(|&v| v.to_le_bytes())
             .collect();
         std::fs::write(cpu_cache_path, &bytes).expect("write cpu cache");
@@ -288,6 +317,7 @@ fn aug_density_gpu_matches_cpu_cu111_co() {
     // GPU path — load cache from disk if available, build and save otherwise.
     let ctx = Arc::new(cudarc::driver::CudaContext::new(0).expect("CUDA context"));
     let stream = ctx.default_stream();
+    let kernels = CudaKernelSet::new(&ctx).expect("compile CUDA kernels");
     let cache_path = std::path::Path::new("/tmp/cu111_co_q_sf_cache.bin");
 
     let cache = if cache_path.exists() {
@@ -300,9 +330,13 @@ fn aug_density_gpu_matches_cpu_cu111_co() {
     } else {
         eprintln!("[QSfCache] building (first run, will save to disk)...");
         let mut pcie = PcieAccount::default();
-        let c = build_q_sf_cache(pots, cell, &fine_grid, &stream, &mut pcie)
-            .expect("build_q_sf_cache");
-        eprintln!("[QSfCache] built, H2D {} bytes — saving to {}", pcie.h2d_bytes, cache_path.display());
+        let c =
+            build_q_sf_cache(pots, cell, &fine_grid, &stream, &mut pcie).expect("build_q_sf_cache");
+        eprintln!(
+            "[QSfCache] built, H2D {} bytes — saving to {}",
+            pcie.h2d_bytes,
+            cache_path.display()
+        );
         save_q_sf_cache_to_disk(&c, &stream, cache_path).expect("save_q_sf_cache_to_disk");
         c
     };
@@ -336,7 +370,9 @@ fn aug_density_gpu_matches_cpu_cu111_co() {
         &occupations,
         &stream,
         &mut pcie2,
-    ).expect("GPU aug density");
+        &kernels,
+    )
+    .expect("GPU aug density");
 
     // Compare
     let cpu_arr = rho_aug_cpu.as_real_array();
@@ -344,7 +380,9 @@ fn aug_density_gpu_matches_cpu_cu111_co() {
 
     assert_eq!(cpu_arr.shape(), gpu_arr.shape(), "shape mismatch");
 
-    let max_diff = cpu_arr.iter().zip(gpu_arr.iter())
+    let max_diff = cpu_arr
+        .iter()
+        .zip(gpu_arr.iter())
         .map(|(a, b)| (a - b).abs())
         .fold(0.0_f64, f64::max);
 
@@ -353,7 +391,10 @@ fn aug_density_gpu_matches_cpu_cu111_co() {
     let sum_diff = (cpu_sum - gpu_sum).abs();
 
     println!("‖ρ_aug_gpu − ρ_aug_cpu‖_∞ = {:.4e}", max_diff);
-    println!("∫ρ_aug_cpu = {:.6e}  ∫ρ_aug_gpu = {:.6e}  |Δ| = {:.4e}", cpu_sum, gpu_sum, sum_diff);
+    println!(
+        "∫ρ_aug_cpu = {:.6e}  ∫ρ_aug_gpu = {:.6e}  |Δ| = {:.4e}",
+        cpu_sum, gpu_sum, sum_diff
+    );
 
     assert!(
         max_diff < 1e-6,
@@ -391,10 +432,10 @@ fn density_decomp_matches_castep_f8_same_inputs() {
         eprintln!("SKIP: no GPU available");
         return;
     }
+    init_tracing();
 
     use chemrust_hamiltonian_core::{
-        GVectorGrid, Pseudopotential,
-        augment::beta_phi::compute_beta_phi,
+        GVectorGrid, Pseudopotential, augment::beta_phi::compute_beta_phi,
         pseudopotential::HasAugmentationData,
     };
     use chemrust_scf::density::test_api::{
@@ -406,15 +447,19 @@ fn density_decomp_matches_castep_f8_same_inputs() {
 
     // --- F8 anchor values (converged iteration, ρ×Ω convention, FINE grid) ---
     const F8_SOFT_SUM: f64 = 2.99359524940157e7;
-    const F8_AUG_SUM:  f64 = 5.14204469948334e7;
-    const F8_TOTAL:    f64 = F8_SOFT_SUM + F8_AUG_SUM;
+    const F8_AUG_SUM: f64 = 5.14204469948334e7;
+    const F8_TOTAL: f64 = F8_SOFT_SUM + F8_AUG_SUM;
 
     // 1. Load CASTEP fixture
     let fx = fixtures::cu111_co::fixture();
     let cell = &fx.bin.cell;
     let pots = &fx.pots;
 
-    let wfc = fx.check.wavefunction.as_ref().expect(".check must have wavefunction");
+    let wfc = fx
+        .check
+        .wavefunction
+        .as_ref()
+        .expect(".check must have wavefunction");
     let [ngx, ngy, ngz] = wfc.grid; // wave grid dims
     let wave_grid = GVectorGrid::new(ngx, ngy, ngz, cell.recip_lattice);
     let n_wave = ngx * ngy * ngz;
@@ -436,8 +481,7 @@ fn density_decomp_matches_castep_f8_same_inputs() {
     let n_electrons: f64 = cell
         .species_iter()
         .map(|info| {
-            pots
-                .get(info.symbol)
+            pots.get(info.symbol)
                 .and_then(|p| p.ionic_charge())
                 .unwrap_or(0.0)
                 * info.num_ions as f64
@@ -448,11 +492,14 @@ fn density_decomp_matches_castep_f8_same_inputs() {
         electron_temperature: 0.1 * chemrust_scf::EV_TO_HARTREE,
         scheme: chemrust_scf::SmearingScheme::Gaussian,
     };
-    let (occupations, chem_pot) = chemrust_scf::density::compute_occupations(eigenvalues, &smearing, n_electrons)
-        .expect("compute_occupations from CASTEP eigenvalues");
+    let (occupations, chem_pot) =
+        chemrust_scf::density::compute_occupations(eigenvalues, &smearing, n_electrons)
+            .expect("compute_occupations from CASTEP eigenvalues");
     let occ_sum: f64 = occupations.0.iter().sum();
-    println!("Occupations: Σocc = {occ_sum:.4}  target N_e = {n_electrons:.1}  μ = {:.6} Ha",
-        chem_pot.0);
+    println!(
+        "Occupations: Σocc = {occ_sum:.4}  target N_e = {n_electrons:.1}  μ = {:.6} Ha",
+        chem_pot.0
+    );
 
     // 4. GPU setup
     let ctx = Arc::new(cudarc::driver::CudaContext::new(0).expect("CUDA context"));
@@ -511,14 +558,9 @@ fn density_decomp_matches_castep_f8_same_inputs() {
         .collect();
 
     // 8. Compute augmentation density on fine grid (CPU path)
-    let rho_aug = compute_aug_density_fine(
-        &beta_psi_per_ion,
-        &occupations.0,
-        pots,
-        cell,
-        &fine_grid,
-    )
-    .expect("compute_aug_density_fine");
+    let rho_aug =
+        compute_aug_density_fine(&beta_psi_per_ion, &occupations.0, pots, cell, &fine_grid)
+            .expect("compute_aug_density_fine");
 
     let aug_sum: f64 = rho_aug.as_real_array().iter().sum();
     let n_e_aug = aug_sum / n_fine as f64;
@@ -535,7 +577,9 @@ fn density_decomp_matches_castep_f8_same_inputs() {
     let n_e_total_f8 = F8_TOTAL / n_fine as f64;
     eprintln!(
         "[Total] N_e_our = {:.4}  N_e_F8 = {:.4}  ratio = {:.6}",
-        n_e_total, n_e_total_f8, n_e_total / n_e_total_f8,
+        n_e_total,
+        n_e_total_f8,
+        n_e_total / n_e_total_f8,
     );
 
     // 10. Decision: soft and aug ratios must be within 1% of F8 values
@@ -589,14 +633,13 @@ fn s_inv_s_identity_test() {
         eprintln!("SKIP: no GPU available");
         return;
     }
+    init_tracing();
 
     use chemrust_hamiltonian_core::GVectorGrid;
-    use chemrust_scf::density::test_api::{
-        check_s_inv_s_identity, CudaKernelSet, VnlBatchData,
-    };
+    use chemrust_scf::KPoint;
+    use chemrust_scf::density::test_api::{CudaKernelSet, VnlBatchData, check_s_inv_s_identity};
     use chemrust_scf::device::blas::BlasHandle;
     use chemrust_scf::device::pcie::PcieAccount;
-    use chemrust_scf::KPoint;
     use num_complex::Complex64;
     use std::sync::Arc;
 
@@ -604,14 +647,20 @@ fn s_inv_s_identity_test() {
     let cell = &fx.bin.cell;
     let pots = &fx.pots;
 
-    let wfc = fx.check.wavefunction.as_ref().expect(".check must have wavefunction");
+    let wfc = fx
+        .check
+        .wavefunction
+        .as_ref()
+        .expect(".check must have wavefunction");
     let [ngx, ngy, ngz] = wfc.grid;
     let wave_grid = GVectorGrid::new(ngx, ngy, ngz, cell.recip_lattice);
 
     let kpt_block = &wfc.kpt_data[0];
     let n_bands = kpt_block.bands.len();
     let n_pw = kpt_block.nplw;
-    let k_point = KPoint { coords: kpt_block.coords };
+    let k_point = KPoint {
+        coords: kpt_block.coords,
+    };
 
     // Flat psi_data: band-major, col-major layout [band * n_pw + g]
     let psi_data: Vec<Complex64> = kpt_block.bands.concat();
@@ -619,30 +668,35 @@ fn s_inv_s_identity_test() {
     let ctx = Arc::new(cudarc::driver::CudaContext::new(0).expect("CUDA context"));
     let stream = ctx.default_stream();
     let blas = BlasHandle::new(stream.clone()).expect("BLAS handle");
-    let _kernels = CudaKernelSet::new(&ctx).expect("CUDA kernels");
+    let kernels = CudaKernelSet::new(&ctx).expect("CUDA kernels");
 
     // Build VnlBatchData (bare D0, no occupations, no V_eff for screening)
     let mut pcie = PcieAccount::default();
     let vnl_data = VnlBatchData::precompute(
         &kpt_block.pw_grid_coord,
-        pots, cell, &wave_grid, &k_point,
-        &psi_data, n_bands, n_pw,
-        None,   // occupations: bare D0
-        None,   // v_eff: no screening
-        &stream, &mut pcie,
-    ).expect("VnlBatchData::precompute");
+        pots,
+        cell,
+        &wave_grid,
+        &k_point,
+        &psi_data,
+        n_bands,
+        n_pw,
+        None, // occupations: bare D0
+        None, // v_eff: no screening
+        &stream,
+        &mut pcie,
+        &blas,
+        &kernels,
+    )
+    .expect("VnlBatchData::precompute");
 
     // Take band 0 (the converged lowest eigenstate)
     let band0: Vec<Complex64> = psi_data.iter().take(n_pw).copied().collect();
 
-    let max_residual = check_s_inv_s_identity(
-        &band0, n_pw, &vnl_data, &blas, &stream,
-    ).expect("check_s_inv_s_identity");
+    let max_residual = check_s_inv_s_identity(&band0, n_pw, &vnl_data, &blas, &stream)
+        .expect("check_s_inv_s_identity");
 
-    eprintln!(
-        "[S⁻¹·S identity] ‖S⁻¹·S·ψ₀ − ψ₀‖_∞ = {:.6e}",
-        max_residual,
-    );
+    eprintln!("[S⁻¹·S identity] ‖S⁻¹·S·ψ₀ − ψ₀‖_∞ = {:.6e}", max_residual,);
 
     // If > 1e-8: Q convention in s_inv_mat (Woodbury) is inconsistent
     // with q_matrix (S operator). The S⁻¹·H filter will over-subtract.

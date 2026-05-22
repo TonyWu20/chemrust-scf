@@ -495,7 +495,7 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
             &self.wave_grid, &self.k_point,
             &psi_host, n_bands, n_pw, occupations,
             Some(&v_eff_for_d),
-            &stream, &mut pcie,
+            &stream, &mut pcie, &blas, &kernels,
         )?;
 
         // Clone eigenvalues before moving self
@@ -558,7 +558,7 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
             .sum();
         assert_eq!(
             pcie.h2d_bytes,
-            psi_bytes + veff_bytes + fft_idx_bytes + kinetic_bytes + vnl_bytes,
+            psi_bytes + veff_bytes + fft_idx_bytes + kinetic_bytes + vnl_bytes + vnl_data.screening_h2d_bytes,
             "H2D tracking check failed",
         );
 
@@ -606,7 +606,7 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
             &self.wave_grid, &self.k_point,
             &psi_host, n_bands, n_pw, occupations,
             Some(&v_eff_for_d),
-            &stream, &mut pcie,
+            &stream, &mut pcie, &blas, &kernels,
         )?;
 
         let fft_idx_dev: CudaSlice<i32> = stream.clone_htod(&self.pw_fft_indices)
@@ -718,6 +718,7 @@ impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated, MixingOff> {
                         &occupations.0,
                         &stream,
                         &mut pcie,
+                        &kernels,
                     )?
                 } else {
                     // QSfCache build failed — fall back to CPU path.

@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use chemrust_hamiltonian_core::{CellGeometry, GVectorGrid, PseudopotentialSet};
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, DevicePtrMut,
+    CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, DevicePtr, DevicePtrMut,
     LaunchConfig, PushKernelArg,
 };
 use cudarc::nvrtc::compile_ptx;
@@ -202,6 +202,34 @@ extern \"C\" __global__ void band_scale_axpy(
     dst[idx].x += s * src[idx].x;
     dst[idx].y += s * src[idx].y;
 }
+
+// a[i] *= b[i]  (element-wise complex multiply, in-place)
+extern \"C\" __global__ void cpx_mul_inplace(
+    double2* a, const double2* b, int n
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+    for (int i = tid; i < n; i += stride) {
+        double ax = a[i].x, ay = a[i].y;
+        double bx = b[i].x, by = b[i].y;
+        a[i].x = ax * bx - ay * by;
+        a[i].y = ax * by + ay * bx;
+    }
+}
+
+// dst[i] = a[i] * conj(b[i])  (element-wise complex multiply with conjugate)
+extern \"C\" __global__ void cpx_conj_mul(
+    double2* dst, const double2* a, const double2* b, int n
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+    for (int i = tid; i < n; i += stride) {
+        double ax = a[i].x, ay = a[i].y;
+        double bx = b[i].x, by = b[i].y;
+        dst[i].x = ax * bx + ay * by;   // Re(a * conj(b))
+        dst[i].y = ay * bx - ax * by;   // Im(a * conj(b))
+    }
+}
 ";
 
 // ---------------------------------------------------------------------------
@@ -224,6 +252,8 @@ pub struct CudaKernelSet {
     #[allow(dead_code)]
     pub(crate) transpose_row_to_col: CudaFunction,
     pub(crate) band_scale_axpy: CudaFunction,
+    pub(crate) cpx_mul_inplace: CudaFunction,
+    pub(crate) cpx_conj_mul: CudaFunction,
 }
 
 impl CudaKernelSet {
@@ -245,6 +275,8 @@ impl CudaKernelSet {
             transpose_col_to_row: load("transpose_col_to_row")?,
             transpose_row_to_col: load("transpose_row_to_col")?,
             band_scale_axpy: load("band_scale_axpy")?,
+            cpx_mul_inplace: load("cpx_mul_inplace")?,
+            cpx_conj_mul: load("cpx_conj_mul")?,
         })
     }
 }
@@ -385,7 +417,6 @@ unsafe fn lanczos_upper_bound(
     let mut v_prev: CudaSlice<CudaComplex> = stream.alloc_zeros(n_pw).map_err(Error::Cuda)?;
     let mut hv: CudaSlice<CudaComplex> = stream.alloc_zeros(n_pw).map_err(Error::Cuda)?;
     let mut grid1: CudaSlice<CudaComplex> = stream.alloc_zeros(grid_size).map_err(Error::Cuda)?;
-
     // Use a deterministic pseudo-random starting vector so Lanczos explores
     // the full spectrum. Using the first band (lowest eigenstate) as start
     // causes Lanczos to converge to λ_min, giving b_up ≈ λ_min + ε << λ_max.
@@ -419,7 +450,8 @@ unsafe fn lanczos_upper_bound(
             .result().map_err(Error::Blas)?;
     }
 
-    // Tridiagonal matrix entries
+    // Tridiagonal matrix entries for standard L2-Lanczos on bare H.
+    // The L2 norm at lines 405-423 already normalizes ‖v₀‖₂ = 1.
     let mut alpha = vec![0.0_f64; k_steps]; // diagonal
     let mut beta  = vec![0.0_f64; k_steps]; // sub-diagonal (beta[0] unused)
 
@@ -433,17 +465,7 @@ unsafe fn lanczos_upper_bound(
             )?;
         }
 
-        // Transform H·v → S⁻¹·H·v so Lanczos estimates λ_max(S⁻¹·H),
-        // which is the spectral radius of the generalized eigenproblem H·ψ = ε·S·ψ.
-        unsafe {
-            apply_s_inverse(
-                &mut hv, vnl_data,
-                1, n,   // n_bands=1, n_pw=n
-                blas, stream,
-            )?;
-        }
-
-        // alpha[j] = <v_cur | Hv>  (real part; H is Hermitian)
+        // alpha[j] = <v_cur, H·v_cur>  (standard L2 dot product)
         let dot_aj = blas.dotc_c64(n, &v_cur, 1, &hv, 1).map_err(Error::Blas)?;
         alpha[j] = dot_aj.x;
 
@@ -458,13 +480,13 @@ unsafe fn lanczos_upper_bound(
         }
 
         if j + 1 == k_steps {
-            // Last step: record ‖r‖ as beta for the bound, then stop
+            // Last step: record ‖r‖_2 as beta for the bound, then stop.
             let dot_r = blas.dotc_c64(n, &hv, 1, &hv, 1).map_err(Error::Blas)?;
-            beta[j] = dot_r.x.sqrt(); // ‖r_k‖ stored in beta[k-1]
+            beta[j] = dot_r.x.sqrt();
             break;
         }
 
-        // beta[j+1] = ‖Hv‖
+        // beta[j+1] = ‖Hv‖_2  (standard L2 norm)
         let dot_b = blas.dotc_c64(n, &hv, 1, &hv, 1).map_err(Error::Blas)?;
         beta[j + 1] = dot_b.x.sqrt();
 
@@ -791,7 +813,11 @@ unsafe fn apply_v_nl_hamiltonian(
 ///   p = beta_g^H · hpsi          (project)
 ///   q = s_inv_mat · p            (small solve)
 ///   hpsi −= beta_g · q           (subtract correction)
+///
+/// Preserved as dead code: used by `check_s_inv_s_identity` diagnostic and
+/// potential TASK-D4 fallback (restore S⁻¹ in Step 4 only). Do not reap.
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 unsafe fn apply_s_inverse(
     hpsi_dev: &mut CudaSlice<CudaComplex>,
     vnl_data: &VnlBatchData,
@@ -1373,18 +1399,16 @@ pub(crate) fn chebyshev_filter(
         );
     }
 
-    // ---- R-ChFSI Algorithm 3 recurrence body ----
+    // ---- R-ChFSI Algorithm 3 recurrence body (bare-H variant) ----
     //
     // Reference: Das & al. (2025), Algorithm 3 (main.tex:586-610).
-    // Replaces the standard Chebyshev recurrence with the residual-based
-    // formulation that is robust to inexact S⁻¹ (USPP overlap inverse).
-
-    // Spectral parameters (source: main.tex:597)
-    let e = bounds.half_width;                // e = (λ_max − λ_T)/2
-    let c = bounds.center;                    // c = (λ_max + λ_T)/2
-    let sigma_rchfsi = e / (bounds.lambda_min - c);   // σ = e/(λ_min − c)
-    let sigma1 = sigma_rchfsi;
-    let gamma = 2.0 / sigma1;
+    // The filter operates on bare H (not S⁻¹·H), enriching the subspace
+    // with H-eigenvectors. RR (ZHEGVD on H_sub, S_sub) converts to
+    // generalized eigenvectors. S appears only in the residual definition
+    // (Step 1) and Gram-Schmidt.
+    //
+    // Spectral parameters (σ, c, e, γ) are computed AFTER Step 1 so we can
+    // use per-band H-eigenvalues ⟨ψ_j, H·ψ_j⟩ for the Λ shifts.
 
     // Pre-allocate lam_y_dev (updated each step, no re-allocation)
     let mut lam_y_dev: CudaSlice<f64> = stream.alloc_zeros(n_bands).map_err(Error::Cuda)?;
@@ -1427,6 +1451,53 @@ pub(crate) fn chebyshev_filter(
         }
         // else: eigenvalues=None → Λ=0 → Y = H·X already in buf_y
 
+        // Compute per-band H-eigenvalues ⟨ψ_j, H·ψ_j⟩ for Λ shifts.
+        // These are approximate H-Rayleigh quotients (‖ψ_j‖_S = 1 ≈ ‖ψ_j‖_2
+        // for USPP). Used in place of generalized eigenvalues throughout
+        // the recurrence to maintain a consistent H-spectrum framing.
+        // Block-scoped: device_ptr borrows must be released before the
+        // recurrence loop (which mutably borrows hpsi_dev).
+        let h_eig: Vec<f64> = {
+            let (ptr_psi_base, _sync_psi) = psi_input.device_ptr(stream);
+            let (ptr_hpsi_base, _sync_hpsi) = hpsi_dev.device_ptr(stream);
+            (0..n_bands)
+                .map(|b| -> Result<f64, Error> {
+                    let mut result: cudarc::cublas::sys::cuDoubleComplex =
+                        cudarc::cublas::sys::cuDoubleComplex { x: 0.0, y: 0.0 };
+                    unsafe {
+                        let ptr_psi = (ptr_psi_base
+                            as *const cudarc::cublas::sys::cuDoubleComplex)
+                            .add(b * n_pw);
+                        let ptr_hpsi = (ptr_hpsi_base
+                            as *const cudarc::cublas::sys::cuDoubleComplex)
+                            .add(b * n_pw);
+                        cudarc::cublas::sys::cublasZdotc_v2(
+                            blas.raw_handle(),
+                            n_pw as i32,
+                            ptr_psi as *const _,
+                            1,
+                            ptr_hpsi as *const _,
+                            1,
+                            &mut result as *mut _,
+                        )
+                        .result()
+                        .map_err(Error::Blas)?;
+                    }
+                    Ok(result.x)
+                })
+                .collect::<Result<Vec<_>, Error>>()?
+        };
+
+        // Spectral parameters (bare-H framing).
+        // b_up, b_low, lambda_min from Lanczos/Gershgorin on bare H.
+        // eps_cut (= b_low) is a generalized eigenvalue used as an approximate
+        // H-spectrum cutoff (error O(‖S − I‖), small for USPP).
+        let e = bounds.half_width;
+        let c = bounds.center;
+        let sigma_rchfsi = e / (bounds.lambda_min - c);
+        let sigma1 = sigma_rchfsi;
+        let gamma = 2.0 / sigma1;
+
         // ------------------------------------------------------------
         // Step 2: Initialize recurrence (main.tex:599-600)
         // ------------------------------------------------------------
@@ -1450,9 +1521,11 @@ pub(crate) fn chebyshev_filter(
 
         // Λ_X = I (CPU)
         let mut lam_x: Vec<f64> = vec![1.0; n_bands];
-        // Λ_Y = (σ₁/e)·(Λ − c·I)  or  −σ₁·c/e if eigenvalues is None
-        let mut lam_y: Vec<f64> = if let Some(eig) = eigenvalues {
-            eig.iter().map(|l| sigma1_over_e * (l - c)).collect()
+        // Λ_Y = (σ₁/e)·(h_eig − c·I)  or  −σ₁·c/e if eigenvalues is None
+        // Uses H-eigenvalues (h_eig), not generalized eigenvalues, for
+        // consistency with the bare-H Chebyshev polynomial.
+        let mut lam_y: Vec<f64> = if eigenvalues.is_some() {
+            h_eig.iter().map(|l| sigma1_over_e * (l - c)).collect()
         } else {
             let val = -sigma1 * c / e;
             vec![val; n_bands]
@@ -1469,21 +1542,17 @@ pub(crate) fn chebyshev_filter(
             let coeff_c = -coeff * c;
             let sigma_sigma2 = -sigma_cur * sigma2;
 
-            // H·S⁻¹·R_Y (main.tex:603 first term: A·D⁻¹·R_Y)
-            stream.memcpy_dtod(&buf_ry, &mut buf_c).map_err(Error::Cuda)?;
-            unsafe {
-                apply_s_inverse(&mut buf_c, vnl_data, n_bands_i32, n_pw_i32, blas, stream)?;
-            }
+            // H·R_Y (bare-H operator, no S⁻¹ in recurrence)
             unsafe {
                 apply_full_hamiltonian(
-                    &buf_c, v_eff_dev, &kinetic_dev, fft_idx_dev,
+                    &buf_ry, v_eff_dev, &kinetic_dev, fft_idx_dev,
                     n_pw, n_bands, grid_size, inv_ntotal,
                     &fft_plan, &mut hpsi_dev, &mut grid_dev, vnl_data, blas, kernels, stream,
                 )?;
             }
 
-            // R_new = (2σ₂/e)·H·S⁻¹·R_Y − (2σ₂/e)·c·R_Y − σ·σ₂·R_X + (2σ₂/e)·Y·Λ_Y
-            // First: buf_c = coeff * H·S⁻¹·R_Y
+            // R_new = (2σ₂/e)·H·R_Y − (2σ₂/e)·c·R_Y − σ·σ₂·R_X + (2σ₂/e)·Y·Λ_Y
+            // First: buf_c = coeff * H·R_Y
             stream.memcpy_dtod(&hpsi_dev, &mut buf_c).map_err(Error::Cuda)?;
             {
                 let alpha_cf = CudaComplex { x: coeff, y: 0.0 };
@@ -1517,9 +1586,9 @@ pub(crate) fn chebyshev_filter(
                 n_pw, n_bands, kernels, stream,
             )?;
 
-            // Λ_X_new on CPU (main.tex:604)
-            let new_lam_x: Vec<f64> = if let Some(eig) = eigenvalues {
-                lam_y.iter().zip(eig.iter()).zip(lam_x.iter())
+            // Λ_X_new on CPU (main.tex:604), uses H-eigenvalues h_eig
+            let new_lam_x: Vec<f64> = if eigenvalues.is_some() {
+                lam_y.iter().zip(h_eig.iter()).zip(lam_x.iter())
                     .map(|((ly, l), lx)| coeff * ly * l + coeff_c * ly + sigma_sigma2 * lx)
                     .collect()
             } else {
@@ -1547,13 +1616,15 @@ pub(crate) fn chebyshev_filter(
         }
 
         // ------------------------------------------------------------
-        // Step 4: Reconstruct X_new (main.tex:607)
-        //   X ← D⁻¹·R_Y + X·Λ_Y
+        // Step 4: Reconstruct X_new (main.tex:607, bare-H variant)
+        //   X_new = R_Y + X·Λ_Y (no S⁻¹ — see Risk §2 in plan)
+        //
+        // R_Y carries an implicit S-factor from Y = H·X − S·X·Λ (Step 1)
+        // that X·Λ_Y does not. S-Gram-Schmidt re-normalizes in S-norm
+        // afterwards, masking this. If iter-3 diverges, TASK-D4 restores
+        // S⁻¹ here (apply_s_inverse on buf_a before band_scale_axpy).
         // ------------------------------------------------------------
         stream.memcpy_dtod(&buf_ry, &mut buf_a).map_err(Error::Cuda)?;
-        unsafe {
-            apply_s_inverse(&mut buf_a, vnl_data, n_bands_i32, n_pw_i32, blas, stream)?;
-        }
         launch_band_scale_axpy(
             &mut buf_a, &psi_input, &lam_y_dev, 1.0,
             n_pw, n_bands, kernels, stream,
@@ -1566,20 +1637,50 @@ pub(crate) fn chebyshev_filter(
     // The Chebyshev filter amplifies the wanted subspace but does not
     // orthonormalize it. Without this step, S_sub = ψ†ψ is ill-conditioned
     // and ZHEGVD fails. Two passes of classical Gram-Schmidt for stability.
+    //
+    // Uses S-inner product ⟨x,y⟩_S = x†·S·y for USPP. For each column b:
+    //   1. Compute S·col_b once (apply_s_times into gs_s_col)
+    //   2. For j<b: dotⱼ = ⟨col_j, S·col_b⟩_S; col_b -= dotⱼ·col_j
+    //   3. ‖col_b_new‖²_S = ‖col_b_init‖²_S − Σⱼ|dotⱼ|² (S-orthonormal vⱼ)
+    //   4. col_b /= √(‖col_b_new‖²_S)
+    //
+    // Scratch: gs_col holds col_b(initial); gs_s_col holds S·col_b(initial).
+    let mut gs_col: CudaSlice<CudaComplex> = stream.alloc_zeros(n_pw).map_err(Error::Cuda)?;
+    let mut gs_s_col: CudaSlice<CudaComplex> = stream.alloc_zeros(n_pw).map_err(Error::Cuda)?;
     unsafe {
         let (psi_ptr, _) = final_psi_buf.device_ptr_mut(stream);
+        let (gs_col_ptr, _) = gs_col.device_ptr_mut(stream);
         for _pass in 0..2 {
             for b in 0..n_bands {
                 let col_b = (psi_ptr as *mut CudaComplex).add(b * n_pw);
-                // Subtract projections onto all previous orthonormal columns
+                // Copy col_b → gs_col (device-to-device)
+                cudarc::cublas::sys::cublasZcopy_v2(
+                    blas.raw_handle(), n_pw_i32,
+                    col_b as *const _, 1,
+                    gs_col_ptr as *mut _, 1,
+                ).result().map_err(Error::Blas)?;
+                // gs_s_col = S · gs_col
+                stream.memcpy_dtod(&gs_col, &mut gs_s_col).map_err(Error::Cuda)?;
+                apply_s_times(&gs_col, &mut gs_s_col, vnl_data, 1, n_pw_i32, blas, stream)?;
+                // Get device pointer from gs_s_col after mutable ops complete
+                let (gs_s_col_ptr, _) = gs_s_col.device_ptr_mut(stream);
+                // ‖col_b‖²_S = ⟨col_b, S·col_b⟩  (real part; S is Hermitian)
+                let mut norm_sq_s = CudaComplex { x: 0.0, y: 0.0 };
+                cudarc::cublas::sys::cublasZdotc_v2(
+                    blas.raw_handle(), n_pw_i32,
+                    col_b as *const _, 1,
+                    gs_s_col_ptr as *const _, 1,
+                    &mut norm_sq_s as *mut _ as *mut _,
+                ).result().map_err(Error::Blas)?;
+                // Subtract projections onto all previous S-orthonormal columns
                 for j in 0..b {
                     let col_j = (psi_ptr as *mut CudaComplex).add(j * n_pw);
-                    // dot = <col_j | col_b>
+                    // dot = ⟨col_j, col_b⟩_S = ⟨col_j, S·col_b⟩
                     let mut dot = CudaComplex { x: 0.0, y: 0.0 };
                     cudarc::cublas::sys::cublasZdotc_v2(
                         blas.raw_handle(), n_pw_i32,
                         col_j as *const _, 1,
-                        col_b as *const _, 1,
+                        gs_s_col_ptr as *const _, 1,
                         &mut dot as *mut _ as *mut _,
                     ).result().map_err(Error::Blas)?;
                     // col_b -= dot * col_j
@@ -1590,18 +1691,13 @@ pub(crate) fn chebyshev_filter(
                         col_j as *const _, 1,
                         col_b as *mut _, 1,
                     ).result().map_err(Error::Blas)?;
+                    // ‖col_b‖²_S -= |dot|²  (S-orthonormal col_j ⇒ projection energy removed)
+                    norm_sq_s.x -= dot.x * dot.x + dot.y * dot.y;
                 }
-                // Normalize col_b
-                let mut norm_sq = CudaComplex { x: 0.0, y: 0.0 };
-                cudarc::cublas::sys::cublasZdotc_v2(
-                    blas.raw_handle(), n_pw_i32,
-                    col_b as *const _, 1,
-                    col_b as *const _, 1,
-                    &mut norm_sq as *mut _ as *mut _,
-                ).result().map_err(Error::Blas)?;
-                let norm = norm_sq.x.sqrt();
-                if norm > 1e-30 {
-                    let inv_norm = CudaComplex { x: 1.0 / norm, y: 0.0 };
+                // Normalize col_b with S-norm
+                let norm_s = norm_sq_s.x.sqrt();
+                if norm_s > 1e-30 {
+                    let inv_norm = CudaComplex { x: 1.0 / norm_s, y: 0.0 };
                     cudarc::cublas::sys::cublasZscal_v2(
                         blas.raw_handle(), n_pw_i32,
                         &inv_norm as *const _ as *const _,

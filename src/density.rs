@@ -465,6 +465,7 @@ pub fn compute_aug_density_gpu(
     occupations: &[f64],
     stream: &Arc<CudaStream>,
     pcie: &mut PcieAccount,
+    kernels: &CudaKernelSet,
 ) -> Result<RealGrid<f64>, Error> {
     let [ngz, ngy, ngx] = q_sf_cache.fine_grid;
     let n_fine_grid = ngz * ngy * ngx;
@@ -543,26 +544,20 @@ pub fn compute_aug_density_gpu(
             ).map_err(Error::Blas)?;
         }
 
-        // tmp[g] *= exp(-iG·R_I)  (element-wise, using ion_sf cache)
-        // Implemented as axpy-style: no dedicated kernel, use the multiply kernel
-        // via a custom CUDA kernel or do it on CPU. Since we don't have a
-        // pointwise-multiply kernel yet, do it via D2H → multiply → H2D.
-        // This is a temporary fallback — a proper GPU kernel would avoid the roundtrip.
-        let tmp_host: Vec<CudaComplex> = stream.clone_dtoh(&tmp).map_err(Error::Cuda)?;
-        let sf_host: Vec<CudaComplex> = stream.clone_dtoh(&q_sf_cache.ion_sf[ion_idx].sf).map_err(Error::Cuda)?;
-        let multiplied: Vec<CudaComplex> = tmp_host.iter().zip(sf_host.iter()).map(|(t, s)| {
-            // (a + ib)(c + id) = (ac - bd) + i(ad + bc)
-            CudaComplex {
-                x: t.x * s.x - t.y * s.y,
-                y: t.x * s.y + t.y * s.x,
-            }
-        }).collect();
-        let tmp_sf: CudaSlice<CudaComplex> = stream.clone_htod(&multiplied).map_err(Error::Cuda)?;
+        // tmp[g] *= exp(-iG·R_I)  (element-wise, using ion_sf cache on GPU)
+        unsafe {
+            stream
+                .launch_builder(&kernels.cpx_mul_inplace)
+                .arg(&mut tmp)
+                .arg(&q_sf_cache.ion_sf[ion_idx].sf)
+                .arg(&(n_fine_grid as i32))
+                .launch(LaunchConfig::for_num_elems(n_fine_grid as u32))
+        }
+        .map_err(Error::Cuda)?;
 
-        // ρ_aug(G) += tmp_sf
-        blas.axpy_c64(n_fine_grid as i32, one, &tmp_sf, 1, &mut rho_aug_g, 1)
+        // ρ_aug(G) += tmp
+        blas.axpy_c64(n_fine_grid as i32, one, &tmp, 1, &mut rho_aug_g, 1)
             .map_err(Error::Blas)?;
-        drop(tmp_sf);
     }
 
     // C2C inverse FFT ρ_aug(G) → ρ_aug(r)

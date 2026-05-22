@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use chemrust_hamiltonian_core::augment::beta_phi::{
@@ -8,10 +7,12 @@ use chemrust_hamiltonian_core::nlpot::build_d0_expanded;
 use chemrust_hamiltonian_core::pseudopotential::HasAugmentationData;
 use chemrust_hamiltonian_core::Pseudopotential;
 use cudarc::driver::{CudaSlice, CudaStream};
+use ndarray::Array2;
 use num_complex::Complex64;
 
 use crate::device::pcie::PcieAccount;
 use crate::device::CudaComplex;
+use crate::eigensolver::d_screening::WaveScreeningCache;
 use crate::types::{Error, KPoint};
 
 #[doc(hidden)]
@@ -28,9 +29,12 @@ pub struct VnlIonData {
     pub n_expanded: i32,
 }
 
-#[doc(hidden)]
+/// GPU-resident batch V_NL data with metadata for PCI-E tracking.
 pub struct VnlBatchData {
     pub entries: Vec<VnlIonData>,
+    /// H2D bytes uploaded for GPU D-matrix screening (V_eff FFT + Q cache + SF).
+    /// Used by the PCI-E accounting assertion in the hot path.
+    pub screening_h2d_bytes: usize,
 }
 
 /// Build the expanded USPP Q augmentation matrix (n_expanded × n_expanded).
@@ -103,6 +107,8 @@ impl VnlBatchData {
         v_eff_wave: Option<&chemrust_hamiltonian_core::EffectivePotential>,
         stream: &Arc<CudaStream>,
         pcie: &mut PcieAccount,
+        blas: &crate::device::blas::BlasHandle,
+        kernels: &crate::eigensolver::chebyshev::CudaKernelSet,
     ) -> Result<Self, Error> {
         let kf = k_point.coords;
         let recip = cell.recip_lattice.as_array();
@@ -127,27 +133,26 @@ impl VnlBatchData {
 
         let mut entries = Vec::new();
 
-        // Precompute Q-on-grid once per species and FFT V_eff once total.
-        // For Cu111_CO: 18 Cu ions × 171 Q-pairs × 437k grid points = ~1.3B ops
-        // if done per-ion. Caching reduces Q to one call per species and FFT to one call.
-        let v_eff_fft = v_eff_wave.and_then(|v_eff| {
-            chemrust_hamiltonian_core::fft_forward_3d(v_eff.as_real_grid()).ok()
-        });
+        // Precompute V_eff FFT on CPU and upload to GPU for D-matrix screening.
+        // The FFT stays on CPU (chemrust-hamiltonian) for now — only the result
+        // is uploaded. Build the wave-grid screening cache (Q per species, SF per ion).
+        let screening_h2d_start = pcie.h2d_bytes;
+        let (v_eff_fft_dev, mut screening_cache): (Option<CudaSlice<CudaComplex>>, Option<WaveScreeningCache>) =
+            v_eff_wave.and_then(|v_eff| {
+                let fft = chemrust_hamiltonian_core::fft_forward_3d(v_eff.as_real_grid()).ok()?;
+                let v_flat: Vec<CudaComplex> = fft.as_recip_array().iter()
+                    .map(|&c| CudaComplex { x: c.re, y: c.im })
+                    .collect();
+                let v_dev = stream.clone_htod(&v_flat).ok()?;
+                pcie.record_h2d(&v_dev);
 
-        let q_on_grid_cache: HashMap<String, Option<chemrust_hamiltonian_core::QOnGrid>> =
-            if v_eff_fft.is_some() {
-                cell.species_symbols.iter().filter_map(|symbol| {
-                    let pot = pots.get(symbol)?;
-                    let aug: &dyn HasAugmentationData = match pot {
-                        Pseudopotential::Usp(d) => d,
-                        _ => return None,
-                    };
-                    let q = chemrust_hamiltonian_core::precompute_q_on_grid(aug, wave_grid).ok();
-                    Some((symbol.clone(), q))
-                }).collect()
-            } else {
-                HashMap::new()
-            };
+                let cache = crate::eigensolver::d_screening::build_wave_screening_cache(
+                    pots, cell, wave_grid, stream, pcie,
+                ).ok()?;
+
+                Some((v_dev, cache))
+            }).unzip();
+        let screening_h2d_bytes = pcie.h2d_bytes - screening_h2d_start;
 
         for ion_idx in 0..cell.num_ions {
             let species_idx = cell.ion_species[ion_idx];
@@ -164,13 +169,16 @@ impl VnlBatchData {
                 .map_err(|_| Error::Nvrtc(format!("compute_beta_g failed for ion {ion_idx}")))?;
             let d0_expanded = build_d0_expanded(aug);
             let n_expanded = beta_g.shape()[0] as i32;
+            let n_wave = wave_grid.grid().iter().product::<usize>();
 
-            // Compute screened D matrix: D = D0 + ∫ Q(r)·V_eff(r) dr
-            let d_screened = match (&v_eff_fft, q_on_grid_cache.get(symbol).and_then(|o| o.as_ref())) {
-                (Some(fft), Some(q_on_grid)) => {
-                    chemrust_hamiltonian_core::compute_screened_d_from_fft(
-                        q_on_grid, fft, cell, ion_idx, wave_grid, &d0_expanded,
-                    )
+            // Compute screened D matrix: D = D0 + (1/N) · Re{Σ V_eff_fft · exp(+iG·R) · conj(Q)}
+            let d_screened: Array2<f64> = match (&v_eff_fft_dev, screening_cache.as_mut()) {
+                (Some(v_dev), Some(cache)) => {
+                    crate::eigensolver::d_screening::screen_d_gpu(
+                        cache, v_dev, ion_idx, species_idx,
+                        d0_expanded.as_slice().expect("d0_expanded must be contiguous"),
+                        n_wave, kernels, blas, stream,
+                    ).unwrap_or(d0_expanded.clone())
                 }
                 _ => d0_expanded.clone(),
             };
@@ -324,6 +332,6 @@ impl VnlBatchData {
                 n_expanded,
             });
         }
-        Ok(VnlBatchData { entries })
+        Ok(VnlBatchData { entries, screening_h2d_bytes })
     }
 }
