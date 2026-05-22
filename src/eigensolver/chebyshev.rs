@@ -403,6 +403,7 @@ unsafe fn lanczos_upper_bound(
     ngx: usize, ngy: usize, ngz: usize,
     vnl_data: &VnlBatchData,
     blas: &BlasHandle,
+    solver: &SolverHandle,
     kernels: &CudaKernelSet,
     stream: &Arc<CudaStream>,
     k_steps: usize,
@@ -467,6 +468,11 @@ unsafe fn lanczos_upper_bound(
                 &v_cur, v_eff_dev, kinetic_dev, fft_idx_dev,
                 n_pw, 1, grid_size, inv_ntotal,
                 &plan1, &mut hv, &mut grid1, vnl_data, blas, kernels, stream,
+            )?;
+            // Apply S⁻¹·H (global Woodbury) — wires S⁻¹ into the Lanczos
+            // estimator so b_up reflects the preconditioned spectrum.
+            apply_s_inverse(
+                &mut hv, vnl_data, 1, n_pw as i32, blas, stream, solver,
             )?;
         }
 
@@ -1258,8 +1264,10 @@ pub(crate) fn chebyshev_filter(
     eigenvalues: Option<&[f64]>,
     ndeg: usize,
     blas: &BlasHandle,
+    solver: &SolverHandle,
     stream: &Arc<CudaStream>,
     ctx: &Arc<CudaContext>,
+    use_sinv_filter: bool,
 ) -> ChebyshevResult {
     // ---- Dimensions ----
     let n_bands = psi_gpu.shape()[0];
@@ -1329,7 +1337,7 @@ pub(crate) fn chebyshev_filter(
                 v_eff_dev, &kinetic_dev, fft_idx_dev,
                 n_pw, grid_size, inv_ntotal,
                 ngx, ngy, ngz,
-                vnl_data, blas, kernels, stream,
+                vnl_data, blas, solver, kernels, stream,
                 6, // k_steps
             )
         };
@@ -1539,13 +1547,18 @@ pub(crate) fn chebyshev_filter(
             let coeff_c = -coeff * c;
             let sigma_sigma2 = -sigma_cur * sigma2;
 
-            // H·R_Y (bare-H operator, no S⁻¹ in recurrence)
+            // H·R_Y (bare-H operator, with optional S⁻¹ preconditioning)
             unsafe {
                 apply_full_hamiltonian(
                     &buf_ry, v_eff_dev, &kinetic_dev, fft_idx_dev,
                     n_pw, n_bands, grid_size, inv_ntotal,
                     &fft_plan, &mut hpsi_dev, &mut grid_dev, vnl_data, blas, kernels, stream,
                 )?;
+                if use_sinv_filter {
+                    apply_s_inverse(
+                        &mut hpsi_dev, vnl_data, n_bands_i32, n_pw_i32, blas, stream, solver,
+                    )?;
+                }
             }
 
             // R_new = (2σ₂/e)·H·R_Y − (2σ₂/e)·c·R_Y − σ·σ₂·R_X + (2σ₂/e)·Y·Λ_Y

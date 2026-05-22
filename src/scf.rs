@@ -515,7 +515,8 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
             &self.wave_grid, &self.k_point, &self.cell,
             &self.pw_coords,
             &vnl_data, &fft_idx_dev, min_veff, max_veff,
-            &kernels, &mut pcie, eig, ndeg, &blas, &stream, &ctx,
+            &kernels, &mut pcie, eig, ndeg, &blas, &solver, &stream, &ctx,
+            false, // use_sinv_filter: bare-H (default)
         )?;
 
         // Rayleigh-Ritz
