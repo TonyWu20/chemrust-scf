@@ -770,3 +770,46 @@ lines 598-604) contribute 64% of iter-2 last-band overshoot when enabled. With e
 global Woodbury S⁻¹ (ζ = 3.8e-15), the per-band machinery provides zero benefit but
 introduces numerical weak points. Consider always passing `eigenvalues=None` to the
 filter (effectively run standard ChFSI with no per-band shifts).
+
+## 13. SCF diverges due to eigenvector rotation cascade — hypothesised fix via D-screening comparison
+
+**Symptom (2026-05-23):** Even with all known bugs fixed (global Woodbury, Mode B filter,
+§11a per-band branches disabled, diagnostic volume factor), the SCF diverges by iter-3.
+Iter-1 eigenvalues match CASTEP within 0.05 Ha but eigenvectors are rotated within
+degenerate Cu 3d manifolds (avg overlap with CASTEP = 0.252 at ndeg=0, 0.108 at ndeg=8).
+
+**Cascade mechanism confirmed by `cascade_iter3_diagnostic`**:
+- Iter-1: eigenvalues ✓ (band-0 -1.046 Ha), density split wrong (soft_frac 29.7% vs F8 36.8%)
+- Iter-2: density split INVERTS (soft_frac 69.9%), eigenvalues drift (band-0 -0.869 Ha)
+- Iter-3: collapse (band-0 -11.94 Ha, eigenvectors orthogonal to CASTEP)
+
+**Key diagnostic finding**: The eigenvector overlap at ndeg=0 (no Chebyshev filter, just
+Gram-Schmidt + RR) is only 0.252. Gram-Schmidt re-S-orthonormalization + Rayleigh-Ritz
+eigenvector selection alone rotates eigenvectors from CASTEP's within degenerate manifolds
+(without any Chebyshev filtering). This is inherent to subspace methods vs CASTEP's
+band-by-band CG electronic minimization. The filter adds additional rotation at the
+subspace boundary (avg overlap drops from 0.252 to 0.108).
+
+**Hypothesised next step — D-screening comparison**:
+The cascade is driven by V_eff change at ion centres between iter-1 (CASTEP converged
+V_eff from .pot_fmt) and iter-2 (our V_eff from rotated eigenvectors). The D-screening
+integral `D_screened = D_0 + ∫ Q·V_eff` is where V_eff differences at ion centres
+are amplified and feed into S⁻¹·H via the Woodbury formula.
+
+Proposed diagnostic: Run `VnlBatchData::precompute` with both CASTEP V_eff (from fixture
+`.pot_fmt`) and our iter-1 V_eff (from `build_v_eff_with_energy` after iter-1 density
+construction). Compare per-ion D_screened matrices element-by-element. If they differ
+significantly (>10%), V_eff change at ion centres is the amplification point and the
+fix should target D-screening stability (e.g., stronger damping, or using CASTEP V_eff
+for more iterations).
+
+**Related diagnostics added this session**:
+- `eigenvector_overlap_vs_castep_after_filter` — measures eigenvector rotation
+- `subspace_overlap_diagnostic` — isolates GS+RR rotation (ndeg=0) from filter+RR (ndeg=8)
+- `cascade_iter3_diagnostic` — measures SCF cascade over 3 iterations
+- ``epsprintln!` diagnostics in `scf.rs::compute_density_from_wavefunctions` — DensitySplit
+  at each iteration (soft N_e, aug N_e, ratio vs F8)
+
+**Resolution**: `notes/debug/debug-20260523-1915/RESOLUTION.md`
+**Session artifacts**: `notes/debug/debug-20260523-1915/INVESTIGATION.md`, `CRITERIA.md`,
+`DIVERGENCE_SURFACE.md`, `EIGENVECTOR_OVERLAP.md`

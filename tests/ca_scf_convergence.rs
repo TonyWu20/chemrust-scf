@@ -1938,3 +1938,301 @@ fn issue_11a_iter2_lastband_does_not_overshoot() {
 
     eprintln!("[issue_11a_iter2_lastband_does_not_overshoot] PASS");
 }
+
+// ---------------------------------------------------------------------------
+// Eigenvector overlap test: compare our post-filter psi against CASTEP .check
+// wavefunctions to measure eigenvector rotation.
+//
+// If the filter+Rotation produces the same eigenvectors as CASTEP, the overlap
+// ⟨our_psi_b | castep_psi_b'⟩ should be identity (O[bb] ≈ 1, O[bb'] ≈ 0 for b≠b').
+// If eigenvectors have rotated, diagonal elements will be < 1 and off-diagonal
+// elements will appear.
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "requires GPU and CASTEP fixture data"]
+fn eigenvector_overlap_vs_castep_after_filter() {
+    if !gpu_available() {
+        eprintln!("SKIP: no GPU available");
+        return;
+    }
+    init_tracing();
+
+    use num_complex::Complex64;
+
+    let fx = fixtures::cu111_co::fixture();
+
+    // 1. Load CASTEP reference psi from .check (pre-filter)
+    let wfc = fx
+        .check
+        .wavefunction
+        .as_ref()
+        .expect(".check must have wavefunction");
+    let kpt_block = &wfc.kpt_data[0];
+    let n_bands = kpt_block.bands.len();
+    let n_pw = kpt_block.nplw;
+    let castep_psi: Vec<Complex64> = kpt_block.bands.concat(); // col-major: [band * n_pw + g]
+    eprintln!("[Overlap] n_bands={n_bands} n_pw={n_pw}");
+
+    // 2. Run our iter-1 pipeline (build_v_eff → filter+RR with ndeg=8)
+    let state = fixtures::cu111_co::build_scf_state(fx);
+    let diag = state
+        .build_v_eff()
+        .expect("build_v_eff")
+        .diagonalize(8, None)
+        .expect("diagonalize with ndeg=8");
+
+    let our_psi = diag.psi_data(); // col-major: [band * n_pw + g]
+    eprintln!("[Overlap] our_psi len = {}", our_psi.len());
+
+    // 3. Compute overlap matrix O[b][b'] = ⟨our_b | castep_b'⟩ (L2 dot)
+    //    Only compute for first 20 bands (full 160×160 = 25600 pairs is ~2ms)
+    let n_check = 20usize.min(n_bands);
+    let mut diag_align: Vec<f64> = Vec::with_capacity(n_check);
+    let mut max_off_diag: Vec<f64> = Vec::with_capacity(n_check);
+
+    for b_our in 0..n_check {
+        let our_start = b_our * n_pw;
+        let our_slice = &our_psi[our_start..our_start + n_pw];
+
+        // Diagonal: |⟨our_b | castep_b⟩|
+        let diag_dot: Complex64 = our_slice
+            .iter()
+            .zip(castep_psi[our_start..our_start + n_pw].iter())
+            .map(|(a, b)| a.conj() * b)
+            .sum();
+        diag_align.push(diag_dot.norm_sqr());
+
+        // Max off-diagonal: max_{b'≠b} |⟨our_b | castep_b'⟩|
+        let mut max_od = 0.0f64;
+        for b_cas in 0..n_check {
+            if b_cas == b_our { continue; }
+            let dot: Complex64 = our_slice
+                .iter()
+                .zip(castep_psi[b_cas * n_pw..(b_cas + 1) * n_pw].iter())
+                .map(|(a, b)| a.conj() * b)
+                .sum();
+            let od = dot.norm_sqr();
+            if od > max_od { max_od = od; }
+        }
+        max_off_diag.push(max_od);
+    }
+
+    // 4. Report
+    eprintln!("\n[Overlap] Per-band |⟨our_b|castep_b⟩|^2 (diagonal alignment, 0=rotated 90°, 1=identical):");
+    eprintln!("{:>5}  {:>15}  {:>15}  {:>15}", "band", "diag|⟨·|·⟩|²", "max_offdiag", "rotation_angle°");
+    for b in 0..n_check {
+        let angle_deg = diag_align[b].acos().to_degrees();
+        eprintln!(
+            "{:>5}  {:>15.8}  {:>15.8}  {:>12.2}°",
+            b, diag_align[b], max_off_diag[b], angle_deg,
+        );
+    }
+
+    // Summary
+    let min_diag = diag_align.iter().cloned().fold(f64::INFINITY, f64::min);
+    let avg_diag = diag_align.iter().sum::<f64>() / n_check as f64;
+    eprintln!(
+        "\n[Overlap] Summary: min|⟨our|castep⟩|² = {:.6}, avg = {:.6}, avg_max_offdiag = {:.6}",
+        min_diag,
+        avg_diag,
+        max_off_diag.iter().sum::<f64>() / n_check as f64,
+    );
+
+    // If alignment is poor (avg |⟨our|castep⟩|² < 0.9), eigenvectors have rotated.
+    if avg_diag > 0.9 {
+        eprintln!("[Overlap] DIAGNOSIS: eigenvectors ALIGNED with CASTEP (avg <our|castep>² = {avg_diag:.4} > 0.9)");
+    } else if avg_diag > 0.5 {
+        eprintln!("[Overlap] DIAGNOSIS: eigenvectors PARTIALLY ROTATED (avg <our|castep>² = {avg_diag:.4}, 0.5-0.9)");
+    } else {
+        eprintln!("[Overlap] DIAGNOSIS: eigenvectors SIGNIFICANTLY ROTATED (avg <our|castep>² = {avg_diag:.4} < 0.5)");
+    }
+
+    // No hard assertion — this is a diagnostic test. The report tells us what to investigate.
+}
+
+// ---------------------------------------------------------------------------
+// Subspace density diagnostic: compare RR eigenvectors from ndeg=0 (no filter)
+// vs ndeg=8 (with filter). If ndeg=0 produces good overlap with CASTEP while
+// ndeg=8 produces bad overlap, the Chebyshev filter is the cause of the
+// eigenvector rotation (not the RR step itself).
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "requires GPU and CASTEP fixture data"]
+fn subspace_overlap_diagnostic() {
+    if !gpu_available() {
+        eprintln!("SKIP: no GPU available");
+        return;
+    }
+    init_tracing();
+
+    use num_complex::Complex64;
+
+    let fx = fixtures::cu111_co::fixture();
+    let wfc = fx.check.wavefunction.as_ref().expect(".check wavefunction");
+    let kpt_block = &wfc.kpt_data[0];
+    let n_bands = kpt_block.bands.len();
+    let n_pw = kpt_block.nplw;
+    let castep_psi: Vec<Complex64> = kpt_block.bands.concat();
+
+    let n_check = 20usize.min(n_bands);
+
+    // Helper: run diagonalize with given ndeg, compute overlap with CASTEP
+    let run_and_measure = |ndeg: usize, label: &str| -> (f64, Option<Vec<f64>>) {
+        let state = fixtures::cu111_co::build_scf_state(fx);
+        let diag = state
+            .build_v_eff()
+            .expect("build_v_eff")
+            .diagonalize(ndeg, None)
+            .expect(&format!("diagonalize ndeg={ndeg}"));
+
+        let our_psi = diag.psi_data();
+
+        let mut diag_align = Vec::with_capacity(n_check);
+        for b in 0..n_check {
+            let our_start = b * n_pw;
+            let dot: Complex64 = our_psi[our_start..our_start + n_pw].iter()
+                .zip(castep_psi[our_start..our_start + n_pw].iter())
+                .map(|(a, b)| a.conj() * b)
+                .sum();
+            diag_align.push(dot.norm_sqr());
+        }
+        let avg = diag_align.iter().sum::<f64>() / n_check as f64;
+        (avg, Some(diag_align))
+    };
+
+    // Run ndeg=0 (no filter, just Gram-Schmidt + RR)
+    let (avg_0, details_0) = run_and_measure(0, "ndeg=0");
+
+    // Run ndeg=8 (filter + Gram-Schmidt + RR)
+    let (avg_8, details_8) = run_and_measure(8, "ndeg=8");
+
+    // Report
+    eprintln!("\n[SubspaceDiagnostic] Eigenvector overlap vs CASTEP");
+    eprintln!("{:>5}  {:>15}  {:>15}", "band", "ndeg=0 |⟨·|·⟩|²", "ndeg=8 |⟨·|·⟩|²");
+    for b in 0..n_check {
+        let d0 = details_0.as_ref().map(|d| d[b]).unwrap_or(0.0);
+        let d8 = details_8.as_ref().map(|d| d[b]).unwrap_or(0.0);
+        eprintln!("{:>5}  {:>15.8}  {:>15.8}", b, d0, d8);
+    }
+    eprintln!("\n[SubspaceDiagnostic] avg ndeg=0: {avg_0:.6}  avg ndeg=8: {avg_8:.6}");
+
+    if avg_0 > 0.99 {
+        eprintln!("[SubspaceDiagnostic] DIAGNOSIS: ndeg=0 preserves eigenvectors (avg {avg_0:.4}). ndeg=8 rotates them (avg {avg_8:.4}). Bug is in Chebyshev filter or Gram-Schmidt.");
+    } else {
+        eprintln!("[SubspaceDiagnostic] DIAGNOSIS: RR itself rotates eigenvectors even without filter (avg {avg_0:.4} < 0.99). Bug is downstream of filter.");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Multi-iteration cascade diagnostic: run iter-1 → iter-2 → iter-3 and capture
+// DensitySplit, eigenvalues, and eigenvector overlap at each step.
+//
+// This measures the self-consistency cascade: rotated eigenvectors → different
+// density → different V_eff → more rotation → drift acceleration.
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "requires GPU and CASTEP fixture data"]
+fn cascade_iter3_diagnostic() {
+    if !gpu_available() {
+        eprintln!("SKIP: no GPU available");
+        return;
+    }
+    init_tracing();
+
+    use num_complex::Complex64;
+
+    let fx = fixtures::cu111_co::fixture();
+
+    // CASTEP reference psi from .check
+    let wfc = fx.check.wavefunction.as_ref().expect(".check wavefunction");
+    let kpt_block = &wfc.kpt_data[0];
+    let n_bands = kpt_block.bands.len();
+    let n_pw = kpt_block.nplw;
+    let castep_psi: Vec<Complex64> = kpt_block.bands.concat();
+
+    let n_check = 20usize.min(n_bands);
+
+    // Helper: compute eigenvector overlap report
+    let report_overlap = |label: &str, our_psi: &[Complex64]| {
+        let mut diag_align = Vec::with_capacity(n_check);
+        for b in 0..n_check {
+            let our_start = b * n_pw;
+            let our_slice = &our_psi[our_start..our_start + n_pw];
+            let diag_dot: Complex64 = our_slice.iter()
+                .zip(castep_psi[our_start..our_start + n_pw].iter())
+                .map(|(a, b)| a.conj() * b)
+                .sum();
+            diag_align.push(diag_dot.norm_sqr());
+        }
+        let min_od = diag_align.iter().cloned().fold(f64::INFINITY, f64::min);
+        let avg_od = diag_align.iter().sum::<f64>() / n_check as f64;
+        eprintln!("[Cascade {label}] eigenvector overlap vs CASTEP: min|⟨·|·⟩|² = {min_od:.6}  avg = {avg_od:.6}");
+    };
+
+    // ---- Iter 1 ----
+    eprintln!("\n[Cascade] === Iter 1 ===");
+    let state = fixtures::cu111_co::build_scf_state(fx);
+    let iter1_state = state.build_v_eff_with_energy().expect("iter-1 build_v_eff");
+    let iter1_diag = iter1_state.diagonalize(8, None).expect("iter-1 diagonalize");
+    let psi_1 = iter1_diag.psi_data().to_vec();
+    let eigs_1 = iter1_diag.eigenvalues().to_vec();
+    report_overlap("iter-1", &psi_1);
+    eprintln!("[Cascade iter-1] eigenvalues: first={:.4} Ha last={:.4} Ha",
+        eigs_1.first().copied().unwrap_or(f64::NAN),
+        eigs_1.last().copied().unwrap_or(f64::NAN));
+
+    let iter1_dens = iter1_diag.construct_density_off().expect("iter-1 construct_density");
+    let iter1_mixed = iter1_dens.mix();
+    let iter2_state = match iter1_mixed.check(1e-8).expect("iter-1 check") {
+        chemrust_scf::CheckOutcome::Converged(_) => panic!("iter-1 converged"),
+        chemrust_scf::CheckOutcome::NotConverged { state, .. } => state,
+    };
+
+    // ---- Iter 2 ----
+    eprintln!("\n[Cascade] === Iter 2 ===");
+    let iter2_veff = iter2_state.build_v_eff_with_energy().expect("iter-2 build_v_eff");
+    let iter2_diag = iter2_veff.diagonalize(8, None).expect("iter-2 diagonalize");
+    let psi_2 = iter2_diag.psi_data().to_vec();
+    let eigs_2 = iter2_diag.eigenvalues().to_vec();
+    report_overlap("iter-2", &psi_2);
+    eprintln!("[Cascade iter-2] eigenvalues: first={:.4} Ha last={:.4} Ha",
+        eigs_2.first().copied().unwrap_or(f64::NAN),
+        eigs_2.last().copied().unwrap_or(f64::NAN));
+
+    let iter2_dens = iter2_diag.construct_density_off().expect("iter-2 construct_density");
+    let iter2_mixed = iter2_dens.mix();
+    let iter3_state = match iter2_mixed.check(1e-8).expect("iter-2 check") {
+        chemrust_scf::CheckOutcome::Converged(_) => panic!("iter-2 converged"),
+        chemrust_scf::CheckOutcome::NotConverged { state, .. } => state,
+    };
+
+    // ---- Iter 3 ----
+    eprintln!("\n[Cascade] === Iter 3 ===");
+    let iter3_veff = iter3_state.build_v_eff_with_energy().expect("iter-3 build_v_eff");
+    let iter3_diag = iter3_veff.diagonalize(8, None).expect("iter-3 diagonalize");
+    let psi_3 = iter3_diag.psi_data().to_vec();
+    let eigs_3 = iter3_diag.eigenvalues().to_vec();
+    report_overlap("iter-3", &psi_3);
+    eprintln!("[Cascade iter-3] eigenvalues: first={:.4} Ha last={:.4} Ha",
+        eigs_3.first().copied().unwrap_or(f64::NAN),
+        eigs_3.last().copied().unwrap_or(f64::NAN));
+
+    // ---- Summary table ----
+    eprintln!("\n[Cascade] Summary: eigenvector overlap |⟨our|castep⟩|²  (first {n_check} bands)");
+    eprintln!("{:>5}  {:>12}  {:>12}  {:>12}", "band", "iter-1", "iter-2", "iter-3");
+    for b in 0..n_check {
+        let o1: Complex64 = psi_1[b*n_pw..(b+1)*n_pw].iter()
+            .zip(castep_psi[b*n_pw..(b+1)*n_pw].iter())
+            .map(|(a, b)| a.conj() * b).sum();
+        let o2: Complex64 = psi_2[b*n_pw..(b+1)*n_pw].iter()
+            .zip(castep_psi[b*n_pw..(b+1)*n_pw].iter())
+            .map(|(a, b)| a.conj() * b).sum();
+        let o3: Complex64 = psi_3[b*n_pw..(b+1)*n_pw].iter()
+            .zip(castep_psi[b*n_pw..(b+1)*n_pw].iter())
+            .map(|(a, b)| a.conj() * b).sum();
+        eprintln!("{:>5}  {:>12.8}  {:>12.8}  {:>12.8}", b, o1.norm_sqr(), o2.norm_sqr(), o3.norm_sqr());
+    }
+}
