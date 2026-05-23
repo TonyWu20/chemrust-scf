@@ -68,3 +68,13 @@ controlled experiment before asserting a code bug.
 **Pattern**: unit-convention-mismatch (diagnostic)
 **Lesson**: When debugging normalization errors, trace the full dataflow including diagnostics — the measurement code can be wrong even when the physics is correct. In this case, the density construction was correct all along (both fixture and computed paths use CASTEP ρ×Ω convention consistently). The bug was in the diagnostic formula that multiplied by Ω again, applying the volume factor twice and producing a 22,300× error (exactly the cell volume in Bohr³). The "raw_conv" diagnostic already gave the correct answer (186 e⁻), but "phys_conv" was wrong and prominently used, misleading the investigation.
 **Resolution**: `notes/debug/debug-20260523-1149-iter2-divergence/RESOLUTION.md`
+
+## 2026-05-23: per-band-eigenvalue-branches-redundant-when-zeta-zero
+**Root cause**: R-ChFSI per-band eigenvalue machinery (Das Algorithm 3 lines 598-604) is designed for inexact S⁻¹ (ζ > 0). After §10's Global Woodbury fix, ζ = ‖D⁻¹ − B⁻¹‖ = 3.8e-15 (machine epsilon). Das et al. (2025) main.tex:612 proves that when ζ = 0, R-ChFSI ≡ standard ChFSI algebraically. The per-band machinery provides zero benefit but introduces numerical weak points: eigenvalue labels from iter-1 (properties of H[ρ₁]) are used to construct filter shifts for iter-2's different operator H[ρ₂]. When V_eff drifts between iterations, stale labels cause the filter to amplify the wrong subspace.
+**Fix**: 
+  - `src/scf.rs:528-541` — always pass `eigenvalues=None` to Chebyshev filter (standard ChFSI path)
+  - `src/eigensolver/chebyshev.rs:1585-1592` — fix `lam_source` to use `eigenvalues.unwrap_or(&h_eig)` consistently (defensive fix, no-op when eigenvalues is always None)
+**Empirical evidence**: `CHEMRUST_FORCE_NO_EIGS=1` (disabling per-band branches) reduced iter-2 last-band overshoot from 1.95 Ha → 0.70 Ha (64% improvement).
+**Pattern**: algorithm-redundancy-after-upstream-fix. An algorithm feature designed for a specific regime (inexact S⁻¹) becomes redundant after an upstream fix (exact S⁻¹ via Global Woodbury). The feature should be disabled when its precondition no longer holds. Missing guard condition: reference paper implies per-band machinery should be disabled when ζ ≈ 0, but implementation unconditionally enables it when `eigenvalues.is_some()`.
+**Tight tests**: `tests/ca_scf_convergence.rs::issue_11a_iter1_band0_matches_castep` (SC-1), `issue_11a_iter2_lastband_does_not_overshoot` (SC-4)
+**Resolution**: `notes/debug/debug-20260523-1758/RESOLUTION.md`

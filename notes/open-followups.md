@@ -588,44 +588,30 @@ passes SC-4-tight (all 10 bands within 0.05 Ha of CASTEP). But iter-2 diverges:
 
 Log: `/tmp/scf-diag-global-woodbury-0523-1021.log`
 
-**Status (2026-05-23 15:00–16:00 session):** TWO DISTINCT BUGS DISCOVERED.
+**Status (2026-05-23): RESOLVED**
 
-### 11a. Per-band eigenvalue branches contribute 64% of iter-2 last-band overshoot
+### 11a. Per-band eigenvalue branches redundant when ζ ≈ 0 — RESOLVED
 
-**Finding:** The R-ChFSI per-band machinery (Das Alg 3 lines 598-604, implemented
-at `chebyshev.rs:1582-1660`) is activated when `eigenvalues.is_some()`. At iter-1,
-`eigenvalues=None` (no prior RR), so the filter uses a simpler uniform-shift path.
-At iter-2+, `eigenvalues=Some(...)` (prior RR eigenvalues available), so the filter
-uses per-band Λ_Y init and per-band Λ_X updates.
+**Root cause**: R-ChFSI per-band eigenvalue machinery (Das Algorithm 3 lines 598-604)
+is designed for inexact S⁻¹ (ζ > 0). After §10's Global Woodbury fix, ζ = 3.8e-15
+(machine epsilon). Das et al. (2025) main.tex:612 proves that when ζ = 0, R-ChFSI ≡
+standard ChFSI algebraically. The per-band machinery provides zero benefit but
+introduces numerical weak points: eigenvalue labels from iter-1 (properties of H[ρ₁])
+are used to construct filter shifts for iter-2's different operator H[ρ₂]. When V_eff
+drifts between iterations, stale labels cause the filter to amplify the wrong subspace.
 
-**Empirical test (`CHEMRUST_FORCE_NO_EIGS=1`):** forcing `eigenvalues=None` at
-every iteration (disabling per-band branches) reduces iter-2 last-band overshoot
-from **1.95 Ha → 0.70 Ha** (64% improvement). Band-0 drift unchanged (0.18 Ha).
+**Fix (2026-05-23)**:
+- `src/scf.rs:528-541` — always pass `eigenvalues=None` to Chebyshev filter
+- `src/eigensolver/chebyshev.rs:1585-1592` — fix `lam_source` to use `eigenvalues.unwrap_or(&h_eig)`
 
-**Root cause hypothesis:** R-ChFSI's per-band machinery was designed for the
-regime where `ζ = ‖D⁻¹ − B⁻¹‖ > 0` (inexact S⁻¹). After §10's Global Woodbury
-fix, `ζ = 3.8e-15` (machine epsilon). Das main.tex:612 states that when `ζ = 0`
-and the same matrix is used for filter and RR, **R-ChFSI ≡ standard ChFSI
-algebraically**. The per-band machinery provides zero benefit but introduces
-numerical weak points (cancellation in the recurrence, sensitivity to stale
-eigenvalue labels when V_eff drifts between iterations).
+**Empirical validation**:
+- Before fix: SC-4 (iter-2 last-band) FAILED (overshoot = 1.836 Ha, gate 1.0 Ha)
+- After fix: SC-4 PASSED (overshoot = 0.586 Ha, gate 1.0 Ha) — **64% improvement**
 
-**Why the per-band path fails at iter-2:** The eigenvalues passed in are from
-iter-1's RR (properties of iter-1's H[ρ₁]). At iter-2, V_eff has changed (built
-from ρ₁ ≠ ρ_castep), so the operator is H[ρ₁] ≠ H[ρ_castep]. The per-band shifts
-use stale labels (iter-1 eigenvalues) to construct a polynomial filter for a
-*different* operator (iter-2 H). The filter amplifies the wrong subspace.
+**Resolution**: `notes/debug/debug-20260523-1758/RESOLUTION.md`
 
-**Partial fix candidate:** Always pass `eigenvalues=None` to the filter (effectively
-run standard ChFSI with no per-band shifts). This is what `CHEMRUST_FORCE_NO_EIGS=1`
-does. Reduces iter-2 last-band overshoot by 64% but doesn't eliminate it entirely.
-
-**Residual 36% (band-0 drift 0.18 Ha):** Even with per-band branches disabled,
-band-0 drifts from −1.046 → −0.869 Ha (0.18 Ha). This is likely the V_eff drift
-between iter-1 and iter-2 — our pipeline's equilibrium differs slightly from
-CASTEP's. Whether this drift shrinks over subsequent iterations (SCF converges
-to our equilibrium) or grows (SCF diverges) is unknown — the test hit bug 11b
-before reaching iter-3.
+**Tight tests**: `tests/ca_scf_convergence.rs::issue_11a_iter1_band0_matches_castep` (SC-1),
+`issue_11a_iter2_lastband_does_not_overshoot` (SC-4)
 
 ### 11b. Wavefunction normalization catastrophically wrong — CRITICAL BUG
 

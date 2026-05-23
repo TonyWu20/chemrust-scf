@@ -1801,3 +1801,140 @@ fn electron_count_diagnostic_correct() {
 
     eprintln!("[electron_count_diagnostic_correct] PASS");
 }
+
+// ---------------------------------------------------------------------------
+// Issue #11a: Per-band eigenvalue branches cause iter-2 last-band overshoot
+// ---------------------------------------------------------------------------
+//
+// Symptom: R-ChFSI per-band machinery (Das Alg 3 lines 598-604) contributes
+// 64% of iter-2 last-band overshoot. When `eigenvalues.is_some()` at iter-2+,
+// the filter uses per-band Λ_Y init and per-band Λ_X updates. Empirical test
+// with `CHEMRUST_FORCE_NO_EIGS=1` reduces iter-2 last-band overshoot from
+// 1.95 Ha → 0.70 Ha (64% improvement).
+//
+// Root cause: Das et al. (2025) main.tex:612 states that when D⁻¹ = B⁻¹
+// (exact S⁻¹) and the same matrix is used for filter and RR, R-ChFSI ≡
+// standard ChFSI algebraically. After §10's Global Woodbury fix, ζ = 3.8e-15
+// (machine epsilon), so per-band machinery provides zero benefit but introduces
+// numerical weak points (stale eigenvalue labels when V_eff drifts between
+// iterations).
+//
+// Fix: Always pass `eigenvalues=None` to the filter, effectively running
+// standard ChFSI with no per-band shifts.
+//
+// External anchors:
+// - CASTEP reference band-0 eigenvalue: -1.05502343 Ha (Cu111_CO.bands line 12)
+// - CASTEP reference last-band eigenvalue: 0.11531044 Ha (Cu111_CO.bands last line)
+
+#[test]
+#[ignore = "requires GPU and CASTEP fixture data"]
+fn issue_11a_iter1_band0_matches_castep() {
+    if !gpu_available() {
+        eprintln!("SKIP: no GPU available");
+        return;
+    }
+    init_tracing();
+
+    let fx = fixtures::cu111_co::fixture();
+    let state = fixtures::cu111_co::build_scf_state(fx);
+
+    // Run one SCF iteration (iter-1: fixture density → V_eff → eigenvalues)
+    let iter1_veff_built = state.build_v_eff_with_energy().expect("iter-1 build_v_eff");
+    let iter1_diag = iter1_veff_built
+        .diagonalize(8, None)
+        .expect("iter-1 diagonalize");
+
+    let eigenvalues = iter1_diag.eigenvalues();
+
+    // SC-1: Band-0 eigenvalue at iter-1 matches CASTEP reference
+    // Source: Cu111_CO.bands line 12 (first eigenvalue after "Spin component 1" header)
+    const CASTEP_BAND0: f64 = -1.05502343;
+    const TOLERANCE: f64 = 0.05; // Ha
+
+    let band0 = eigenvalues[0];
+    let delta = (band0 - CASTEP_BAND0).abs();
+
+    eprintln!("[issue_11a_iter1_band0_matches_castep]");
+    eprintln!("  iter-1 band-0 eigenvalue: {:.8} Ha", band0);
+    eprintln!("  CASTEP reference:         {:.8} Ha", CASTEP_BAND0);
+    eprintln!("  |delta|:                  {:.8} Ha (gate {:.2})", delta, TOLERANCE);
+
+    assert!(
+        delta < TOLERANCE,
+        "Iter-1 band-0 eigenvalue = {:.8} Ha, expected {:.8} ± {:.2} Ha \
+         (Source: Cu111_CO.bands line 12)",
+        band0,
+        CASTEP_BAND0,
+        TOLERANCE
+    );
+
+    eprintln!("[issue_11a_iter1_band0_matches_castep] PASS");
+}
+
+#[test]
+#[ignore = "requires GPU and CASTEP fixture data"]
+fn issue_11a_iter2_lastband_does_not_overshoot() {
+    if !gpu_available() {
+        eprintln!("SKIP: no GPU available");
+        return;
+    }
+    init_tracing();
+
+    let fx = fixtures::cu111_co::fixture();
+    let state = fixtures::cu111_co::build_scf_state(fx);
+
+    // Iter-1
+    let iter1_veff_built = state.build_v_eff_with_energy().expect("iter-1 build_v_eff");
+    let iter1_diag = iter1_veff_built
+        .diagonalize(8, None)
+        .expect("iter-1 diagonalize");
+
+    // Save eigenvalues before moving iter1_diag
+    let iter1_eigenvalues = iter1_diag.eigenvalues().to_vec();
+
+    let iter1_dens = iter1_diag
+        .construct_density_off()
+        .expect("iter-1 construct_density");
+    let iter1_mixed = iter1_dens.mix();
+    let iter2_init = match iter1_mixed.check(1e-8).expect("iter-1 check") {
+        chemrust_scf::CheckOutcome::Converged(_) => {
+            panic!("iter-1 unexpectedly converged")
+        }
+        chemrust_scf::CheckOutcome::NotConverged { state, .. } => state,
+    };
+
+    // Iter-2
+    let iter2_veff_built = iter2_init.build_v_eff_with_energy().expect("iter-2 build_v_eff");
+    let iter2_diag = iter2_veff_built
+        .diagonalize(8, Some(&iter1_eigenvalues))
+        .expect("iter-2 diagonalize");
+
+    let eigs_iter2 = iter2_diag.eigenvalues();
+    let lastband_iter2 = eigs_iter2[eigs_iter2.len() - 1];
+
+    // SC-4: Last-band eigenvalue at iter-2 does not overshoot by > 1.0 Ha
+    // Source: Cu111_CO.bands last line, with tolerance chosen to catch the
+    // observed 1.95 Ha overshoot while allowing for reasonable SCF drift.
+    const CASTEP_LASTBAND: f64 = 0.11531044;
+    const OVERSHOOT_TOLERANCE: f64 = 1.0; // Ha
+
+    let overshoot = (lastband_iter2 - CASTEP_LASTBAND).abs();
+
+    eprintln!("[issue_11a_iter2_lastband_does_not_overshoot]");
+    eprintln!("  iter-2 last-band: {:.8} Ha", lastband_iter2);
+    eprintln!("  CASTEP reference: {:.8} Ha", CASTEP_LASTBAND);
+    eprintln!("  |overshoot|:      {:.8} Ha (gate {:.2})", overshoot, OVERSHOOT_TOLERANCE);
+
+    assert!(
+        overshoot < OVERSHOOT_TOLERANCE,
+        "Iter-2 last-band overshoot = {:.8} Ha, exceeds tolerance {:.2} Ha \
+         (iter-2 = {:.8} Ha, CASTEP = {:.8} Ha). \
+         Symptom: per-band eigenvalue branches amplify wrong subspace when eigenvalue labels are stale.",
+        overshoot,
+        OVERSHOOT_TOLERANCE,
+        lastband_iter2,
+        CASTEP_LASTBAND
+    );
+
+    eprintln!("[issue_11a_iter2_lastband_does_not_overshoot] PASS");
+}

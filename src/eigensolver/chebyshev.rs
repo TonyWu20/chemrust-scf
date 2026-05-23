@@ -1582,14 +1582,11 @@ pub(crate) fn chebyshev_filter(
         // the passed-in `eigenvalues` (matching Mode C's catch-all). This is a
         // diagnostic flag for the iter-2-divergence debug session, not a
         // production knob.
-        let force_eig_for_lam_source = std::env::var("CHEMRUST_LAMSOURCE_EIG")
-            .map(|v| v == "1")
-            .unwrap_or(false);
-        let lam_source: &[f64] = match filter_mode {
-            FilterMode::SinvHFullDas => eigenvalues.unwrap_or(&h_eig),
-            _ if force_eig_for_lam_source => eigenvalues.unwrap_or(&h_eig),
-            _ => &h_eig,
-        };
+        // Λ_Y initial value: use generalized eigenvalues from previous RR when
+        // available (Das Alg 3 §3.2), fall back to h_eig (H-Rayleigh quotients)
+        // on iter-1 (eigenvalues=None). After §11a fix, eigenvalues is always
+        // None in production (standard ChFSI path), so lam_source = h_eig always.
+        let lam_source: &[f64] = eigenvalues.unwrap_or(&h_eig);
         let mut lam_y: Vec<f64> = if eigenvalues.is_some() || matches!(filter_mode, FilterMode::SinvHFullDas) {
             lam_source.iter().map(|l| sigma1_over_e * (l - c)).collect()
         } else {

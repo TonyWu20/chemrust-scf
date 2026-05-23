@@ -525,20 +525,13 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
             &stream, &mut pcie, &blas, &solver,
         )?;
 
-        // Clone eigenvalues before moving self
-        let eig_clone = self.eigenvalues.clone();
-        // CHEMRUST_FORCE_NO_EIGS=1 forces the iter-1-like filter path at every
-        // iteration by ignoring any prior eigenvalues. Diagnostic flag for the
-        // iter-2-divergence debug session — confirms whether the per-band
-        // eigenvalue branches in chebyshev.rs:1582-1660 contain the bug.
-        let force_no_eigs = std::env::var("CHEMRUST_FORCE_NO_EIGS")
-            .map(|v| v == "1")
-            .unwrap_or(false);
-        let eig = if eig_clone.is_empty() || force_no_eigs {
-            None
-        } else {
-            Some(eig_clone.as_slice())
-        };
+        // Always pass eigenvalues=None. Das et al. (2025) main.tex:612 proves
+        // that when ζ = ‖D⁻¹ − B⁻¹‖ = 0 (exact S⁻¹), R-ChFSI ≡ standard ChFSI
+        // algebraically. After §10's Global Woodbury fix, ζ = 3.8e-15 (machine
+        // epsilon). Per-band eigenvalue machinery is provably redundant and
+        // introduces numerical weak points from stale eigenvalue labels when
+        // V_eff drifts between SCF iterations.
+        let eig: Option<&[f64]> = None;
 
         // Upload PW-to-FFT index map to GPU
         let fft_idx_dev: CudaSlice<i32> = stream
