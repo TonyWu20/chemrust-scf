@@ -78,3 +78,10 @@ controlled experiment before asserting a code bug.
 **Pattern**: algorithm-redundancy-after-upstream-fix. An algorithm feature designed for a specific regime (inexact S⁻¹) becomes redundant after an upstream fix (exact S⁻¹ via Global Woodbury). The feature should be disabled when its precondition no longer holds. Missing guard condition: reference paper implies per-band machinery should be disabled when ζ ≈ 0, but implementation unconditionally enables it when `eigenvalues.is_some()`.
 **Tight tests**: `tests/ca_scf_convergence.rs::issue_11a_iter1_band0_matches_castep` (SC-1), `issue_11a_iter2_lastband_does_not_overshoot` (SC-4)
 **Resolution**: `notes/debug/debug-20260523-1758/RESOLUTION.md`
+
+## 2026-05-23: scf-gate-electron-count-diagnostic-double-volume
+**Root cause**: SCF gate diagnostic at `src/scf.rs:1414` applied cell volume to density already in CASTEP raw units (ρ×Ω), producing a 15,000× error (2.9M electrons vs expected 186). This is the SAME bug as the `[NewDensity]` diagnostic fixed in commit `5a6f598`, but the SCF gate diagnostic was added in that same commit with the bug still present.
+**Fix**: `src/scf.rs:1414` — change `rho_arr.iter().sum::<f64>() * cell_volume / n_grid` to `rho_arr.iter().sum::<f64>() / n_grid`
+**Pattern**: diagnostic-copy-paste-error. When adding a new diagnostic that computes the same quantity as an existing one, the new diagnostic must use the same unit convention. In this case, the `[NewDensity]` diagnostic was fixed to remove `* cell_volume`, but the SCF gate diagnostic (added in the same commit) still had it.
+**Lesson**: When fixing a unit-convention bug in one diagnostic, audit ALL diagnostics that compute the same quantity. A grep for the quantity name (e.g., "electron count", "total_e") would have caught this.
+**After fix**: Electron count diagnostic now reports correct values (55–130 e⁻ range vs expected 186 e⁻), revealing a REAL physics bug (135% drift from iter-1 to iter-2) that was hidden by the 15,000× measurement error.

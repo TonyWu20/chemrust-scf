@@ -1408,10 +1408,11 @@ pub fn run_scf_with_energy_gated(
                             }
                         }
                         // Total electron count from the new (post-mix) density.
+                        // Density is stored in CASTEP raw units (ρ×Ω), so the correct
+                        // formula is sum/N, not sum*Ω/N (which would apply Ω twice).
                         let rho_arr = next.density.as_wave_array();
-                        let cell_volume = next.cell.volume;
                         let n_grid = rho_arr.len() as f64;
-                        let n_electrons_now = rho_arr.iter().sum::<f64>() * cell_volume / n_grid;
+                        let n_electrons_now = rho_arr.iter().sum::<f64>() / n_grid;
                         if iter1_n_electrons.is_none() {
                             iter1_n_electrons = Some(n_electrons_now);
                         }
