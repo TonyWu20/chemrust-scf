@@ -113,6 +113,44 @@ impl VnlBatchData {
         blas: &crate::device::blas::BlasHandle,
         solver: &SolverHandle,
     ) -> Result<Self, Error> {
+        Self::precompute_with_d_override(
+            pw_coords, pots, cell, wave_grid, k_point,
+            psi_data, n_bands, n_pw, _occupations, v_eff_wave,
+            None,
+            stream, pcie, blas, solver,
+        )
+    }
+
+    /// Test-only / scf_diag variant of [`precompute`] that allows injecting
+    /// externally-supplied per-ion D matrices in place of the screened D
+    /// computed from V_eff. Used by the T-prime discriminator test
+    /// (`iter2_band0_with_castep_d_injection`) to determine whether the
+    /// SCF cascade is D-driven or eigensolver-rotation-driven.
+    ///
+    /// `d_override`: optional slice of length `cell.num_ions`. Entry `i`
+    /// contains an `Option<Vec<f64>>` — when `Some`, the inner Vec is a
+    /// flat row-major (n_expanded × n_expanded) D matrix that replaces
+    /// our computed screened D for ion `i`; when `None`, the per-ion D
+    /// is computed normally from V_eff. Passing `None` for the outer
+    /// `Option` is equivalent to calling [`precompute`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn precompute_with_d_override(
+        pw_coords: &[[i32; 3]],
+        pots: &chemrust_hamiltonian_core::PseudopotentialSet,
+        cell: &chemrust_hamiltonian_core::CellGeometry,
+        wave_grid: &chemrust_hamiltonian_core::GVectorGrid,
+        k_point: &KPoint,
+        psi_data: &[Complex64],
+        n_bands: usize,
+        n_pw: usize,
+        _occupations: Option<&[f64]>,
+        v_eff_wave: Option<&chemrust_hamiltonian_core::EffectivePotential>,
+        d_override: Option<&[Option<Vec<f64>>]>,
+        stream: &Arc<CudaStream>,
+        pcie: &mut PcieAccount,
+        blas: &crate::device::blas::BlasHandle,
+        solver: &SolverHandle,
+    ) -> Result<Self, Error> {
         let kf = k_point.coords;
         let recip = cell.recip_lattice.as_array();
         let mut k_cart = [0.0; 3];
@@ -179,11 +217,31 @@ impl VnlBatchData {
             let n_expanded = beta_g.shape()[0] as i32;
 
             // Compute screened D matrix: D = D0 + ∫ Q(r)·V_eff(r) dr  (CPU path)
-            let d_screened = match (&v_eff_fft, q_on_grid_cache.get(symbol).and_then(|o| o.as_ref())) {
-                (Some(fft), Some(q_on_grid)) => {
-                    compute_screened_d_from_fft(q_on_grid, fft, cell, ion_idx, wave_grid, &d0_expanded)
+            //
+            // T-prime override path: when `d_override[ion_idx]` is `Some`, replace
+            // our computed D_screened with externally-supplied values (e.g. parsed
+            // from CASTEP's `D_band_debug.dat`) to discriminate whether the SCF
+            // cascade is D-driven or eigensolver-rotation-driven.
+            let d_screened = match d_override.and_then(|o| o.get(ion_idx).and_then(|d| d.as_ref())) {
+                Some(d_inj) => {
+                    let n_exp = n_expanded as usize;
+                    if d_inj.len() != n_exp * n_exp {
+                        return Err(Error::Nvrtc(format!(
+                            "d_override for ion {ion_idx} has length {} but expected {n_exp}×{n_exp} = {}",
+                            d_inj.len(), n_exp * n_exp,
+                        )));
+                    }
+                    ndarray::Array2::from_shape_vec((n_exp, n_exp), d_inj.clone())
+                        .map_err(|e| Error::Nvrtc(format!(
+                            "d_override reshape failed for ion {ion_idx}: {e}"
+                        )))?
                 }
-                _ => d0_expanded.clone(),
+                None => match (&v_eff_fft, q_on_grid_cache.get(symbol).and_then(|o| o.as_ref())) {
+                    (Some(fft), Some(q_on_grid)) => {
+                        compute_screened_d_from_fft(q_on_grid, fft, cell, ion_idx, wave_grid, &d0_expanded)
+                    }
+                    _ => d0_expanded.clone(),
+                },
             };
 
             // Diagnostic: report D magnitudes per ion to catch screening explosions.

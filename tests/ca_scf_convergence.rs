@@ -51,11 +51,28 @@ fn v_eff_range(v: &chemrust_hamiltonian_core::EffectivePotential) -> f64 {
 }
 
 // ---------------------------------------------------------------------------
-// Test 3a: Fixed-point stability
+// Test 3a: Fixed-point stability — DEPRECATED (tolerance-conflation, 2026-05-24)
 // ---------------------------------------------------------------------------
+//
+// This test asserts |E_total - CASTEP| < 2e-4 eV (≈ 7 µHa) after running 8
+// SCF iterations from CASTEP's converged state. That tolerance is fixed-point-
+// stability tight: it demands CASTEP's converged ψ be a fixed point of OUR SCF
+// operator, which it is not. Our subspace-RR + Chebyshev filter rotates ψ
+// within degenerate Cu 3d manifolds (overlap 0.252 at ndeg=0 from CASTEP ψ;
+// `notes/failure-patterns.md:89-93`). A bug-free implementation would still
+// fail this test at 2e-4 eV.
+//
+// The empirical answer to "is the eigensolver rotation the cascade source?"
+// comes from the T-prime D-injection discriminator (FAIL at 197 mHa,
+// `notes/debug/debug-20260524-tprime-d-injection/RESOLUTION.md`), not from
+// this test. Q1 (iter1_drift_from_castep_state_is_bounded) and Q2
+// (scf_converges_to_castep_energy_at_castep_tolerance) replace this test.
+//
+// Kept as `#[ignore]` deprecation artefact for forensic history; do not delete
+// without recording in failure-patterns.md.
 
 #[test]
-#[ignore = "requires GPU and CASTEP fixture data"]
+#[ignore = "deprecated: tolerance-conflation; see Q1/Q2 and notes/debug/debug-20260524-tprime-d-injection/RESOLUTION.md"]
 fn fixed_point_matches_castep_energy() {
     if !gpu_available() {
         eprintln!("SKIP: no GPU available");
@@ -2235,4 +2252,873 @@ fn cascade_iter3_diagnostic() {
             .map(|(a, b)| a.conj() * b).sum();
         eprintln!("{:>5}  {:>12.8}  {:>12.8}  {:>12.8}", b, o1.norm_sqr(), o2.norm_sqr(), o3.norm_sqr());
     }
+}
+
+// ---------------------------------------------------------------------------
+// §13 Debug: T1 — H operator falsification on CASTEP eigenvectors
+// ---------------------------------------------------------------------------
+//
+// If our H operator, applied to CASTEP's exact ψ with CASTEP's exact V_eff,
+// reproduces CASTEP's eigenvalue spectrum, then:
+//  - H operator is correct on the un-rotated basis
+//  - The cascade cannot be a pure "subspace rotation cascade"
+//  - Bug is downstream of the operator (density assembly, mixing, etc.)
+//
+// EXTERNAL anchor: Cu111_CO.bands band-0 = −1.05502310 Ha (A1)
+
+#[test]
+#[ignore = "requires GPU and CASTEP fixture data"]
+fn h_on_castep_psi_matches_bands() {
+    if !gpu_available() {
+        eprintln!("SKIP: no GPU available");
+        return;
+    }
+    init_tracing();
+
+    use num_complex::Complex64;
+
+    let fx = fixtures::cu111_co::fixture();
+
+    // Build state from CASTEP ψ + CASTEP V_eff
+    let state = fixtures::cu111_co::build_scf_state(fx);
+    let veff_state = state.build_v_eff_with_energy().expect("build_v_eff");
+
+    // apply_h_components_for_test reads self.psi (CASTEP ψ after build_scf_state)
+    // and applies H[V_eff] to each band. hpsi_full[b] = H|ψ_b⟩.
+    let hcomp = veff_state
+        .apply_h_components_for_test(None)
+        .expect("apply_h_components");
+
+    // The original CASTEP ψ is still accessible via veff_state.psi_data()
+    let psi_original = veff_state.psi_data();
+    let n_bands = hcomp.n_bands;
+    let n_pw = hcomp.n_pw;
+
+    let mut sum_sq = 0.0_f64;
+    let mut max_err = 0.0_f64;
+
+    for b in 0..n_bands {
+        let psi_b = &psi_original[b * n_pw..(b + 1) * n_pw];
+        let h_psi_b = &hcomp.hpsi_full[b * n_pw..(b + 1) * n_pw];
+
+        // ⟨ψ_b | H | ψ_b⟩
+        let expect: Complex64 = psi_b
+            .iter()
+            .zip(h_psi_b.iter())
+            .map(|(p, h)| p.conj() * h)
+            .sum();
+        let expect_val = expect.re;
+
+        let ref_val = fx.bands_eigenvalues[b];
+        let err = (expect_val - ref_val).abs();
+        sum_sq += err * err;
+        max_err = max_err.max(err);
+
+        if b < 10 {
+            eprintln!(
+                "  band {:3}: ⟨ψ|H|ψ⟩ = {:.8}  ref = {:.8}  |Δ| = {:.2e}",
+                b, expect_val, ref_val, err
+            );
+        }
+    }
+
+    let rms = (sum_sq / n_bands as f64).sqrt();
+
+    eprintln!(
+        "[T1] H-on-CASTEP-ψ: {} bands, RMS err = {:.6} Ha, max err = {:.6} Ha",
+        n_bands, rms, max_err
+    );
+
+    // Discriminators (A1): RMS ≤ 0.05 Ha, per-band max ≤ 0.10 Ha
+    assert!(
+        rms < 0.05,
+        "T1 FAIL: H-on-CASTEP-ψ RMS error {:.6} Ha > 0.05 Ha threshold",
+        rms
+    );
+    assert!(
+        max_err < 0.10,
+        "T1 FAIL: H-on-CASTEP-ψ max per-band error {:.6} Ha > 0.10 Ha threshold",
+        max_err
+    );
+    eprintln!("[T1] PASS: H operator matches CASTEP spectrum on CASTEP eigenvectors");
+}
+
+// ---------------------------------------------------------------------------
+// §13 Debug: T2 — D-screening element-by-element comparison against CASTEP dump
+// ---------------------------------------------------------------------------
+//
+// Feeds CASTEP V_eff into our `compute_screened_d` and compares every (n,m)
+// element against the CASTEP `D_band_debug.dat` dump.
+//
+// EXTERNAL anchor: D_band_debug.dat (E8/A2), ES24.16 precision
+// Discriminator: per-ion max|D_ours[n,m] − D_castep[n,m]| ≤ 5e-4 Ha
+
+#[test]
+#[ignore = "requires GPU and CASTEP fixture data"]
+fn d_screened_matches_castep_dump_on_castep_veff() {
+    if !gpu_available() {
+        eprintln!("SKIP: no GPU available");
+        return;
+    }
+    init_tracing();
+
+    use chemrust_hamiltonian_core::nlpot::{build_d0_expanded, compute_screened_d, precompute_q_on_grid};
+    use chemrust_hamiltonian_core::pseudopotential::HasAugmentationData;
+    use chemrust_hamiltonian_core::GVectorGrid;
+
+    let fx = fixtures::cu111_co::fixture();
+    let cell = &fx.bin.cell;
+    let pots = &fx.pots;
+
+    // Wavefunction grid
+    let wfc = fx.check.wavefunction.as_ref().expect(".check wavefunction");
+    let [ngx, ngy, ngz] = wfc.grid;
+    let wave_grid = GVectorGrid::new(ngx, ngy, ngz, cell.recip_lattice);
+
+    // CASTEP V_eff from fixture (fine grid ≡ wave grid for Cu111_CO: both 54×90×90)
+    let v_eff_castep = fixtures::cu111_co::castep_veff_as_effective(fx);
+
+    // Load CASTEP D dump
+    let d_dump_path = format!(
+        "{}/D_band_debug.dat",
+        std::env::var("CASTEP_FIXTURE_DIR")
+            .unwrap_or_else(|_| fixtures::cu111_co::FIXTURE_DIR.to_string())
+    );
+    let d_castep_map = fixtures::cu111_co::load_castep_d_screened(&d_dump_path, 1.0)
+        .expect("failed to parse D_band_debug.dat");
+
+    // Map to global ion indices
+    let d_castep_by_ion = fixtures::cu111_co::d_screened_by_global_ion(
+        &d_castep_map,
+        cell.num_ions,
+        &cell.ion_species,
+    );
+
+    // Cache QOnGrid per species (expensive, compute once)
+    let mut q_on_grid_cache: std::collections::HashMap<usize, _> =
+        std::collections::HashMap::new();
+    let mut d0_cache: std::collections::HashMap<usize, _> = std::collections::HashMap::new();
+
+    let mut per_ion_max_delta = Vec::with_capacity(cell.num_ions);
+    let mut all_pass = true;
+
+    for global_ion in 0..cell.num_ions {
+        let species_idx = cell.ion_species[global_ion];
+        let symbol = &cell.species_symbols[species_idx];
+        let pot = pots.get(symbol).expect("pot not found");
+
+        let aug: &dyn HasAugmentationData = match pot {
+            chemrust_hamiltonian_core::Pseudopotential::Usp(d) => d,
+            _ => {
+                eprintln!("  Ion {global_ion} ({symbol}): not USPP, skipping");
+                per_ion_max_delta.push(0.0);
+                continue;
+            }
+        };
+
+        // Cache QOnGrid and D0 per species
+        let q_on_grid = q_on_grid_cache.entry(species_idx).or_insert_with(|| {
+            precompute_q_on_grid(aug, &wave_grid).expect("precompute_q_on_grid")
+        });
+        let d0 = d0_cache.entry(species_idx).or_insert_with(|| build_d0_expanded(aug));
+
+        // Our D_screened computation
+        let d_ours = compute_screened_d(q_on_grid, &v_eff_castep, cell, global_ion, &wave_grid, d0)
+            .expect("compute_screened_d");
+
+        // Compare against CASTEP dump
+        let d_castep_opt = &d_castep_by_ion[global_ion];
+        match d_castep_opt {
+            None => {
+                eprintln!(
+                    "  Ion {global_ion} ({symbol}): no CASTEP D data, skipping"
+                );
+                per_ion_max_delta.push(0.0);
+            }
+            Some(d_castep) => {
+                let n_exp = d_ours.shape()[0];
+                let n_castep = d_castep.shape()[0];
+                assert_eq!(
+                    n_exp, n_castep,
+                    "Ion {global_ion}: our n_exp={} vs CASTEP n_exp={}",
+                    n_exp, n_castep
+                );
+
+                let mut ion_max_delta = 0.0_f64;
+                for i in 0..n_exp {
+                    for j in 0..n_exp {
+                        let delta = (d_ours[[i, j]] - d_castep[[i, j]]).abs();
+                        ion_max_delta = ion_max_delta.max(delta);
+                    }
+                }
+
+                let threshold = 5e-4;
+                let pass = ion_max_delta < threshold;
+                if !pass {
+                    all_pass = false;
+
+                    // Compute screening term: screening = D_screened - D0
+                    let d_screening = &d_ours - &*d0;
+
+                    eprintln!(
+                        "  Ion {global_ion} ({symbol}) sp={species_idx}: max|Δ| = {:.6e} Ha  FAIL (threshold {:.1e} Ha)",
+                        ion_max_delta, threshold
+                    );
+                    // Dump D0, screening, and D_screened comparison for worst elements
+                    eprintln!("    D0 max|element| = {:.6e}", d0.iter().map(|v| v.abs()).fold(0.0_f64, f64::max));
+                    eprintln!("    D_screening max|element| = {:.6e}", d_screening.iter().map(|v| v.abs()).fold(0.0_f64, f64::max));
+
+                    // For the first failing ion, print raw sum vs screening for element (0,0)
+                    if global_ion == 0 {
+                        // Recreate the raw screening computation for element (0,0) without division
+                        let n_total = (ngz * ngy * ngx) as f64;
+                        let v_eff_fft_raw = chemrust_hamiltonian_core::fft::fft_forward_3d(
+                            v_eff_castep.as_real_grid(),
+                        )
+                        .expect("FFT");
+                        let q_first = &q_on_grid.pairs[0];
+                        let ((ne, me), q_arr) = q_first;
+                        let sum_re_raw: f64 = ndarray::Zip::from(v_eff_fft_raw.as_recip_array())
+                            .and(q_arr)
+                            .and(wave_grid.gvecs())
+                            .fold(0.0_f64, |acc, v, q, gf| {
+                                if q.norm_sqr() < 1e-60 { return acc; }
+                                let tau = 2.0 * std::f64::consts::PI;
+                                let pos = cell.ionic_positions.row(global_ion);
+                                let phase_arg = tau * (gf[0] * pos[0] + gf[1] * pos[1] + gf[2] * pos[2]);
+                                let sf = num_complex::Complex64::from_polar(1.0, phase_arg);
+                                acc + (v * sf * q.conj()).re
+                            });
+                        eprintln!("    DEBUG elem ({ne},{me}): sum_re_raw={:.6e}  sum_re_raw/N={:.6e}  D0[{ne},{me}]={:.6e}  D_ours[{ne},{me}]={:.6e}  D_castep[{ne},{me}]={:.6e}",
+                            sum_re_raw, sum_re_raw / n_total,
+                            d0[[*ne, *me]], d_ours[[*ne, *me]], d_castep[[*ne, *me]]);
+                    }
+                    // Dump worst elements
+                    let mut deltas: Vec<(usize, usize, f64)> = Vec::new();
+                    for i in 0..n_exp {
+                        for j in 0..n_exp {
+                            let delta = (d_ours[[i, j]] - d_castep[[i, j]]).abs();
+                            deltas.push((i, j, delta));
+                        }
+                    }
+                    deltas.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
+                    eprintln!("    Worst 5 elements:");
+                    for (i, j, d) in deltas.iter().take(5) {
+                        eprintln!(
+                            "      D[{i},{j}]: ours={:14.8e}  castep={:14.8e}  |Δ|={:.4e}",
+                            d_ours[[*i, *j]], d_castep[[*i, *j]], d
+                        );
+                    }
+                } else {
+                    eprintln!(
+                        "  Ion {global_ion:2} ({symbol:2}) sp={species_idx}: max|Δ| = {:.6e} Ha  PASS",
+                        ion_max_delta
+                    );
+                }
+                per_ion_max_delta.push(ion_max_delta);
+            }
+        }
+    }
+
+    // Summary
+    let overall_max = per_ion_max_delta
+        .iter()
+        .cloned()
+        .fold(0.0_f64, f64::max);
+    eprintln!(
+        "\n[T2] D-screening vs CASTEP dump: overall max|Δ| = {:.6e} Ha",
+        overall_max
+    );
+
+    assert!(
+        all_pass,
+        "T2 FAIL: at least one ion exceeds 5e-4 Ha per-element tolerance"
+    );
+    eprintln!("[T2] PASS: compute_screened_d matches CASTEP dump element-by-element");
+}
+
+// ---------------------------------------------------------------------------
+// §13 Debug: T3 — V_eff substitution (CASTEP V_eff injected before iter-2)
+// ---------------------------------------------------------------------------
+//
+// After iter-1's density mixing, substitute CASTEP V_eff for our V_eff before
+// iter-2's diagonalization. If the cascade vanishes, the bug is in V_eff
+// assembly. If it persists, the bug is downstream of V_eff.
+//
+// EXTERNAL anchor: Cu111_CO.bands band-0 = −1.05502310 Ha (A1)
+
+#[test]
+#[ignore = "requires GPU and CASTEP fixture data"]
+fn cascade_with_castep_veff_substitution() {
+    if !gpu_available() {
+        eprintln!("SKIP: no GPU available");
+        return;
+    }
+    init_tracing();
+
+    let fx = fixtures::cu111_co::fixture();
+
+    // ---- Iter 1 (identical to cascade_iter3_diagnostic) ----
+    eprintln!("\n[T3] === Iter 1 (normal) ===");
+    let state = fixtures::cu111_co::build_scf_state(fx);
+    let iter1_state = state.build_v_eff_with_energy().expect("iter-1 build_v_eff");
+    let iter1_diag = iter1_state.diagonalize(8, None).expect("iter-1 diagonalize");
+    let eigs_1 = iter1_diag.eigenvalues().to_vec();
+    eprintln!(
+        "[T3 iter-1] band-0 = {:.4} Ha  ref = -1.055 Ha",
+        eigs_1.first().copied().unwrap_or(f64::NAN)
+    );
+
+    let iter1_dens = iter1_diag.construct_density_off().expect("iter-1 construct_density");
+    let iter1_mixed = iter1_dens.mix();
+    let iter2_state = match iter1_mixed.check(1e-8).expect("iter-1 check") {
+        chemrust_scf::CheckOutcome::Converged(_) => panic!("iter-1 converged"),
+        chemrust_scf::CheckOutcome::NotConverged { state, .. } => state,
+    };
+
+    // ---- Iter 2 with CASTEP V_eff substitution ----
+    eprintln!("\n[T3] === Iter 2 (CASTEP V_eff injected) ===");
+    let mut iter2_veff = iter2_state.build_v_eff_with_energy().expect("iter-2 build_v_eff");
+
+    // Override V_eff with CASTEP's converged V_eff from .pot_fmt
+    let castep_veff = fixtures::cu111_co::castep_veff_as_effective(fx);
+    iter2_veff.set_v_eff(castep_veff);
+
+    let iter2_diag = iter2_veff.diagonalize(8, None).expect("iter-2 diagonalize");
+    let eigs_2 = iter2_diag.eigenvalues().to_vec();
+    let band0_iter2 = eigs_2.first().copied().unwrap_or(f64::NAN);
+    eprintln!(
+        "[T3 iter-2] band-0 = {:.4} Ha  ref = -1.055 Ha",
+        band0_iter2
+    );
+
+    // ---- Iter 3 (continue with substituted V_eff's density) ----
+    eprintln!("\n[T3] === Iter 3 (after V_eff substitution) ===");
+    let iter2_dens = iter2_diag.construct_density_off().expect("iter-2 construct_density");
+    let iter2_mixed = iter2_dens.mix();
+    let iter3_state = match iter2_mixed.check(1e-8).expect("iter-2 check") {
+        chemrust_scf::CheckOutcome::Converged(_) => panic!("iter-2 converged"),
+        chemrust_scf::CheckOutcome::NotConverged { state, .. } => state,
+    };
+    let iter3_veff = iter3_state.build_v_eff_with_energy().expect("iter-3 build_v_eff");
+    let iter3_diag = iter3_veff.diagonalize(8, None).expect("iter-3 diagonalize");
+    let eigs_3 = iter3_diag.eigenvalues().to_vec();
+    let band0_iter3 = eigs_3.first().copied().unwrap_or(f64::NAN);
+    eprintln!(
+        "[T3 iter-3] band-0 = {:.4} Ha",
+        band0_iter3
+    );
+
+    // Discriminator: iter-2 band-0 within 0.05 Ha of CASTEP band-0 (−1.055 Ha)
+    let ref_band0 = -1.05502310;
+    let delta = (band0_iter2 - ref_band0).abs();
+    assert!(
+        delta < 0.05,
+        "T3 FAIL: iter-2 band-0 = {:.4} Ha, |Δ| = {:.4} Ha > 0.05 Ha threshold. V_eff substitution did NOT stop the cascade.",
+        band0_iter2, delta
+    );
+    eprintln!(
+        "[T3] PASS: with CASTEP V_eff, iter-2 band-0 = {:.4} Ha (|Δ| = {:.4} Ha < 0.05 Ha). Cascade stopped — bug is in V_eff assembly.",
+        band0_iter2, delta
+    );
+}
+
+// ---------------------------------------------------------------------------
+// §13 Debug: T4 — Density substitution (CASTEP density injected before iter-2)
+// ---------------------------------------------------------------------------
+//
+// After iter-1's density mixing, substitute CASTEP density for our density
+// before iter-2's V_eff rebuild. If iter-2 stays correct, density construction
+// from our (rotated) ψ is the cause.
+//
+// EXTERNAL anchor: Cu111_CO.bands band-0 = −1.05502310 Ha (A1)
+
+#[test]
+#[ignore = "requires GPU and CASTEP fixture data"]
+fn cascade_with_castep_density_substitution() {
+    if !gpu_available() {
+        eprintln!("SKIP: no GPU available");
+        return;
+    }
+    init_tracing();
+
+    let fx = fixtures::cu111_co::fixture();
+
+    // ---- Iter 1 (identical to cascade_iter3_diagnostic) ----
+    eprintln!("\n[T4] === Iter 1 (normal) ===");
+    let state = fixtures::cu111_co::build_scf_state(fx);
+    let iter1_state = state.build_v_eff_with_energy().expect("iter-1 build_v_eff");
+    let iter1_diag = iter1_state.diagonalize(8, None).expect("iter-1 diagonalize");
+    let eigs_1 = iter1_diag.eigenvalues().to_vec();
+    eprintln!(
+        "[T4 iter-1] band-0 = {:.4} Ha  ref = -1.055 Ha",
+        eigs_1.first().copied().unwrap_or(f64::NAN)
+    );
+
+    let iter1_dens = iter1_diag.construct_density_off().expect("iter-1 construct_density");
+    let iter1_mixed = iter1_dens.mix();
+    let mut iter2_state = match iter1_mixed.check(1e-8).expect("iter-1 check") {
+        chemrust_scf::CheckOutcome::Converged(_) => panic!("iter-1 converged"),
+        chemrust_scf::CheckOutcome::NotConverged { state, .. } => state,
+    };
+
+    // ---- Iter 2 with CASTEP density substitution ----
+    eprintln!("\n[T4] === Iter 2 (CASTEP density injected) ===");
+
+    // Replace density with CASTEP's converged density from .castep_bin (wave grid)
+    let castep_density = chemrust_scf::Density::from_inner(
+        chemrust_scf::WaveGridArray::from_inner(
+            fx.bin.density.charge.as_real_grid().as_real_array().clone(),
+        ),
+    );
+    *iter2_state.density_mut() = castep_density;
+    // Clear stale aug density from iter-1 (our rotated ψ produced wrong ρ_aug)
+    iter2_state.clear_density_aug_fine();
+
+    let iter2_veff = iter2_state.build_v_eff_with_energy().expect("iter-2 build_v_eff");
+    let iter2_diag = iter2_veff.diagonalize(8, None).expect("iter-2 diagonalize");
+    let eigs_2 = iter2_diag.eigenvalues().to_vec();
+    let band0_iter2 = eigs_2.first().copied().unwrap_or(f64::NAN);
+    eprintln!(
+        "[T4 iter-2] band-0 = {:.4} Ha  ref = -1.055 Ha",
+        band0_iter2
+    );
+
+    // ---- Iter 3 ----
+    eprintln!("\n[T4] === Iter 3 (after density substitution) ===");
+    let iter2_dens = iter2_diag.construct_density_off().expect("iter-2 construct_density");
+    let iter2_mixed = iter2_dens.mix();
+    let iter3_state = match iter2_mixed.check(1e-8).expect("iter-2 check") {
+        chemrust_scf::CheckOutcome::Converged(_) => panic!("iter-2 converged"),
+        chemrust_scf::CheckOutcome::NotConverged { state, .. } => state,
+    };
+    let iter3_veff = iter3_state.build_v_eff_with_energy().expect("iter-3 build_v_eff");
+    let iter3_diag = iter3_veff.diagonalize(8, None).expect("iter-3 diagonalize");
+    let eigs_3 = iter3_diag.eigenvalues().to_vec();
+    let band0_iter3 = eigs_3.first().copied().unwrap_or(f64::NAN);
+    eprintln!(
+        "[T4 iter-3] band-0 = {:.4} Ha",
+        band0_iter3
+    );
+
+    // Discriminator: iter-2 band-0 within 0.05 Ha of CASTEP band-0
+    let ref_band0 = -1.05502310;
+    let delta = (band0_iter2 - ref_band0).abs();
+    assert!(
+        delta < 0.05,
+        "T4 FAIL: iter-2 band-0 = {:.4} Ha, |Δ| = {:.4} Ha > 0.05 Ha threshold. Density substitution did NOT stop the cascade.",
+        band0_iter2, delta
+    );
+    eprintln!(
+        "[T4] PASS: with CASTEP density, iter-2 band-0 = {:.4} Ha (|Δ| = {:.4} Ha < 0.05 Ha). Cascade stopped — bug is in density assembly from rotated ψ.",
+        band0_iter2, delta
+    );
+}
+
+// ---------------------------------------------------------------------------
+// §13 Debug: Density split comparison — CASTEP ψ vs our post-RR ψ
+// ---------------------------------------------------------------------------
+//
+// If the density is rotation-invariant within the occupied 3d manifold,
+// the soft/aug density split should be identical between CASTEP ψ and our ψ.
+// This test captures the split from our iter-1 ψ and compares occupations.
+
+#[test]
+#[ignore = "requires GPU and CASTEP fixture data"]
+fn density_split_castep_psi_vs_our_psi() {
+    if !gpu_available() {
+        eprintln!("SKIP: no GPU available");
+        return;
+    }
+    init_tracing();
+
+    use num_complex::Complex64;
+
+    let fx = fixtures::cu111_co::fixture();
+
+    // Compute occupations from CASTEP eigenvalues (from .bands)
+    let n_electrons: f64 = fx.bin.cell.species_iter()
+        .map(|info| {
+            fx.pots.get(info.symbol)
+                .and_then(|p| p.ionic_charge())
+                .unwrap_or(0.0) * info.num_ions as f64
+        })
+        .sum();
+    let smearing = chemrust_scf::SmearingParams {
+        width: 0.1 * chemrust_scf::EV_TO_HARTREE,
+        electron_temperature: 0.1 * chemrust_scf::EV_TO_HARTREE,
+        scheme: chemrust_scf::SmearingScheme::Gaussian,
+    };
+    let (occ_castep, _) = chemrust_scf::density::compute_occupations(
+        &fx.bands_eigenvalues, &smearing, n_electrons,
+    ).expect("occ castep");
+
+    // ---- Run iter-1 to get our ψ and density ----
+    let state = fixtures::cu111_co::build_scf_state(fx);
+    let veff_state = state.build_v_eff_with_energy().expect("build_v_eff");
+    let diag = veff_state.diagonalize(8, None).expect("diagonalize");
+    let eig_ours = diag.eigenvalues().to_vec();
+
+    // Compare eigenvalues: CASTEP vs ours
+    eprintln!("[SplitDiag] Eigenvalue comparison (first 20 bands):");
+    eprintln!("  {:>5} {:>14} {:>14} {:>12}", "band", "castep", "ours", "|Δ|");
+    for b in 0..20usize.min(eig_ours.len()) {
+        eprintln!(
+            "  {:>5} {:>14.8} {:>14.8} {:>12.2e}",
+            b, fx.bands_eigenvalues[b], eig_ours[b],
+            (fx.bands_eigenvalues[b] - eig_ours[b]).abs()
+        );
+    }
+
+    // Compute occupations from our eigenvalues
+    let (occ_ours, _) = chemrust_scf::density::compute_occupations(
+        &eig_ours, &smearing, n_electrons,
+    ).expect("occ ours");
+
+    eprintln!("\n[SplitDiag] Occupation comparison (first 20 bands):");
+    eprintln!("  {:>5} {:>12} {:>12} {:>12}", "band", "occ_castep", "occ_ours", "|Δ|");
+    let mut max_occ_delta = 0.0f64;
+    for b in 0..20usize.min(eig_ours.len()) {
+        let d = (occ_castep.0[b] - occ_ours.0[b]).abs();
+        max_occ_delta = max_occ_delta.max(d);
+        eprintln!(
+            "  {:>5} {:>12.6} {:>12.6} {:>12.2e}",
+            b, occ_castep.0[b], occ_ours.0[b], d
+        );
+    }
+    eprintln!("  max occ |Δ| over all {} bands = {:.2e}", eig_ours.len(), max_occ_delta);
+
+    // Construct density from our ψ
+    let dens = diag.construct_density_off().expect("construct_density");
+
+    let rho_soft = dens.density().as_wave_array();
+    let n_grid_soft = rho_soft.len() as f64;
+    let soft_charge: f64 = rho_soft.iter().sum::<f64>() / n_grid_soft;
+
+    let aug_charge = match dens.density_aug_fine() {
+        Some(aug) => {
+            let arr = aug.as_real_array();
+            let n = arr.len() as f64;
+            arr.iter().sum::<f64>() / n
+        }
+        None => 0.0,
+    };
+
+    let total = soft_charge + aug_charge;
+    let soft_pct = 100.0 * soft_charge / total;
+    let aug_pct = 100.0 * aug_charge / total;
+
+    eprintln!(
+        "\n[SplitDiag] Density split from OUR ψ: soft={:.1}%  aug={:.1}%  total_e={:.2}",
+        soft_pct, aug_pct, total
+    );
+    eprintln!(
+        "[SplitDiag] CASTEP F8 reference:            soft=36.8%  aug=63.2%"
+    );
+    eprintln!(
+        "[SplitDiag] Difference: Δsoft={:+.1} pp  Δaug={:+.1} pp",
+        soft_pct - 36.8, aug_pct - 63.2
+    );
+
+    // Also print the occupations sum to verify
+    let occ_sum: f64 = occ_ours.0.iter().sum();
+    eprintln!(
+        "[SplitDiag] Σocc_ours={:.4}  target_n_e={:.1}",
+        occ_sum, n_electrons,
+    );
+}
+
+// ===========================================================================
+// T-prime: D-injection discriminator (eigensolver-rotation vs D-screening blocker)
+// ===========================================================================
+//
+// Symmetric to T3 (V_eff substitution): T3 stops the cascade by feeding CASTEP
+// V_eff into iter-2; T-prime tests whether the cascade also stops when CASTEP
+// converged D matrices are injected into iter-2 (with our V_eff).
+//
+// Discriminates two interpretations of the SCF cascade:
+// - PASS (iter-2 band-0 ≈ CASTEP −1.055 Ha within 50 mHa):
+//     D-screening is the dominant blocker post-rotation. Egg-or-chicken
+//     deadlock with chemrust-hamiltonian is real; fix lives there (in-SCF
+//     iterative D refinement).
+// - FAIL (cascade continues with CASTEP D):
+//     Eigensolver rotation drives the cascade independently of D quality.
+//     Deadlock dissolves; fix lives here (Gram-Schmidt + RR stabilization
+//     against degenerate-manifold rotation).
+//
+// EXTERNAL anchor: Cu111_CO.bands:12 → band-0 = -1.05502310 Ha
+// EXTERNAL anchor: D_band_debug.dat last 18 blocks (converged-iter D_screened)
+
+#[test]
+#[ignore = "requires GPU and CASTEP fixture data"]
+fn iter2_band0_with_castep_d_injection() {
+    if !gpu_available() {
+        eprintln!("SKIP: no GPU available");
+        return;
+    }
+    init_tracing();
+
+    let fx = fixtures::cu111_co::fixture();
+    let cell_num_ions = fx.bin.cell.num_ions;
+    let cell_ion_species = fx.bin.cell.ion_species.clone();
+
+    // ---- Load CASTEP converged D from D_band_debug.dat ----
+    let d_dump_path = format!(
+        "{}/D_band_debug.dat",
+        std::env::var("CASTEP_FIXTURE_DIR")
+            .unwrap_or_else(|_| fixtures::cu111_co::FIXTURE_DIR.to_string()),
+    );
+    let d_castep_map =
+        fixtures::cu111_co::load_castep_d_screened(&d_dump_path, 1.0)
+            .expect("parse D_band_debug.dat");
+    let d_castep_by_ion = fixtures::cu111_co::d_screened_by_global_ion(
+        &d_castep_map,
+        cell_num_ions,
+        &cell_ion_species,
+    );
+
+    // Convert to Vec<Option<Vec<f64>>> (row-major flat per ion) for VnlBatchData.
+    // n_expanded == num_ps_projectors for Cu111_CO USPP — D matrices come straight
+    // through. Recpot ions (which have no augmentation) get None and fall through
+    // to D0 in vnl_data.precompute_with_d_override.
+    let d_override: Vec<Option<Vec<f64>>> = d_castep_by_ion
+        .iter()
+        .map(|opt_mat| {
+            opt_mat.as_ref().map(|mat| {
+                let n = mat.shape()[0];
+                let mut flat = Vec::with_capacity(n * n);
+                for i in 0..n {
+                    for j in 0..n {
+                        flat.push(mat[[i, j]]);
+                    }
+                }
+                flat
+            })
+        })
+        .collect();
+
+    let injected_count = d_override.iter().filter(|o| o.is_some()).count();
+    eprintln!(
+        "[T-prime] Injecting CASTEP D for {}/{} ions",
+        injected_count, cell_num_ions
+    );
+    assert_eq!(
+        injected_count, cell_num_ions,
+        "expected CASTEP D for all 18 ions (1 C + 1 O + 16 Cu)",
+    );
+
+    // ---- Drive iter-1 normally ----
+    let state = fixtures::cu111_co::build_scf_state(fx);
+    let iter1_v = state.build_v_eff_with_energy().expect("iter-1 build_v_eff");
+    let iter1_diag = iter1_v.diagonalize(8, None).expect("iter-1 diagonalize");
+    let iter1_band0 = iter1_diag.eigenvalues()[0];
+    eprintln!("[T-prime] iter-1 band-0 (no D injection): {:.6} Ha", iter1_band0);
+
+    let iter1_dens = iter1_diag.construct_density_off().expect("construct_density");
+    let iter1_mixed = iter1_dens.mix();
+    let iter2_init = match iter1_mixed.check(1e-8).expect("iter-1 check") {
+        chemrust_scf::CheckOutcome::Converged(_) => {
+            panic!("iter-1 unexpectedly converged — T-prime cannot run")
+        }
+        chemrust_scf::CheckOutcome::NotConverged { state, .. } => state,
+    };
+
+    // ---- Iter-2: build_v_eff (our V_eff) → diagonalize WITH CASTEP D injected ----
+    let iter2_v = iter2_init
+        .build_v_eff_with_energy()
+        .expect("iter-2 build_v_eff");
+    let iter2_diag = iter2_v
+        .diagonalize_with_d_override(8, None, &d_override)
+        .expect("iter-2 diagonalize with D injection");
+    let iter2_band0 = iter2_diag.eigenvalues()[0];
+
+    // Reference: CASTEP converged band-0 = -1.05502310 Ha
+    const CASTEP_BAND0: f64 = -1.05502310;
+    let delta = (iter2_band0 - CASTEP_BAND0).abs();
+
+    eprintln!("[T-prime] iter-2 band-0 (CASTEP D injected): {:.6} Ha", iter2_band0);
+    eprintln!("[T-prime] CASTEP reference band-0:          {:.6} Ha", CASTEP_BAND0);
+    eprintln!("[T-prime] |Δ| vs CASTEP:                    {:.4e} Ha", delta);
+
+    // ---- Discriminator (50 mHa, 2× margin over T3's |Δ| = 9.8 mHa) ----
+    //
+    // T3 (V_eff substitution) achieves |Δ| ≈ 9.8 mHa per REVIEW_PROMPT.md. If
+    // T-prime's D injection is a similarly clean substitution, |Δ| should be
+    // in the same ballpark (≤ 50 mHa with discriminator margin).
+    //
+    // PASS interpretation: D-screening is the post-rotation blocker, fix is
+    //                      iterative D refinement (chemrust-hamiltonian side).
+    // FAIL interpretation: eigensolver rotation drives cascade independently
+    //                      of D quality; fix is GS+RR stabilization here.
+    let pass = delta < 0.05;
+    if pass {
+        eprintln!(
+            "[T-prime] PASS — cascade stopped with CASTEP D. \
+             D-screening is the post-rotation blocker."
+        );
+    } else {
+        eprintln!(
+            "[T-prime] FAIL — cascade continues with CASTEP D. \
+             Eigensolver rotation drives cascade independently of D quality."
+        );
+    }
+
+    // The test does not assert; it records the discriminator outcome.
+    // RESOLUTION.md captures the empirical answer.
+    eprintln!(
+        "[T-prime] DISCRIMINATOR_RESULT: {} delta={:.6e}",
+        if pass { "PASS" } else { "FAIL" },
+        delta
+    );
+}
+
+// ===========================================================================
+// Q1: Algorithm-fidelity probe — per-iteration noise floor
+// ===========================================================================
+//
+// Replaces `fixed_point_matches_castep_energy` (deprecated) with a single-
+// iteration drift test calibrated to the empirical iter-1 noise floor of our
+// subspace-RR + Chebyshev pipeline.
+//
+// Setup: load CASTEP fixture, run exactly ONE SCF iteration. Measure:
+// - A1: |E_iter1 − CASTEP_REFERENCE| < DRIFT_TOLERANCE_HA (= 20 mHa)
+// - A2: electron count preserved within 0.01 e⁻ of N_e = 186
+//
+// The 20 mHa threshold is calibrated at 2× the observed iter-1 drift of
+// 9.8 mHa (T3 in REVIEW_PROMPT.md) per the ODD discriminator rule. As
+// eigensolver rotation is reduced (F3a/F3b/F3c), this threshold should
+// ratchet down.
+//
+// EXTERNAL anchors: Cu111_CO.castep total energy, Cu111+CO 186 valence e⁻
+
+#[test]
+#[ignore = "requires GPU and CASTEP fixture data"]
+fn iter1_drift_from_castep_state_is_bounded() {
+    if !gpu_available() {
+        eprintln!("SKIP: no GPU available");
+        return;
+    }
+    init_tracing();
+
+    let fx = fixtures::cu111_co::fixture();
+    let state = fixtures::cu111_co::build_scf_state(fx);
+
+    // Drive iter-1: build_v_eff_with_energy → diagonalize → density → mix → check.
+    // Energy is populated inside check() when (e_xc, e_hartree, rho_vxc) are all
+    // present, which they are after build_v_eff_with_energy.
+    let v_eff = state.build_v_eff_with_energy().expect("iter-1 build_v_eff");
+    let diag = v_eff.diagonalize(8, None).expect("iter-1 diagonalize");
+    let dens = diag.construct_density_off().expect("iter-1 construct_density");
+    let mixed = dens.mix();
+
+    // check() converts Mixed → CheckOutcome. NotConverged carries the post-iter-1
+    // state in Initialized phase, with total_energy populated.
+    let post_iter1 = match mixed.check(1e-8).expect("iter-1 check") {
+        chemrust_scf::CheckOutcome::Converged(_) => {
+            panic!("iter-1 unexpectedly converged — Q1 cannot measure single-iter drift");
+        }
+        chemrust_scf::CheckOutcome::NotConverged { state, .. } => state,
+    };
+
+    let e_iter1_ha = post_iter1
+        .total_energy()
+        .expect("total_energy populated by check() with energy components");
+    let e_iter1_ev = e_iter1_ha * chemrust_scf::HARTREE_TO_EV;
+
+    let castep_ev = fixtures::cu111_co::REFERENCE_ENERGY_EV;
+    let castep_ha = castep_ev / chemrust_scf::HARTREE_TO_EV;
+    let drift_ha = (e_iter1_ha - castep_ha).abs();
+    let drift_ev = drift_ha * chemrust_scf::HARTREE_TO_EV;
+
+    eprintln!("[Q1] iter-1 total energy: {:.8} Ha = {:.6} eV", e_iter1_ha, e_iter1_ev);
+    eprintln!("[Q1] CASTEP reference:    {:.8} Ha = {:.6} eV", castep_ha, castep_ev);
+    eprintln!(
+        "[Q1] drift |Δ|: {:.4e} Ha = {:.4e} eV  (gate {:.4e} Ha)",
+        drift_ha, drift_ev, fixtures::cu111_co::DRIFT_TOLERANCE_HA,
+    );
+
+    // A1: per-iteration drift bound.
+    assert!(
+        drift_ha < fixtures::cu111_co::DRIFT_TOLERANCE_HA,
+        "iter-1 drift {:.4e} Ha exceeds gate {:.4e} Ha",
+        drift_ha, fixtures::cu111_co::DRIFT_TOLERANCE_HA,
+    );
+
+    // A2: electron count preservation. Mixed density holds the post-mixing ρ
+    // in CASTEP raw units (ρ × Ω). N_e = sum / N_grid.
+    let rho_arr = post_iter1.density().as_wave_array();
+    let n_grid = rho_arr.len() as f64;
+    let n_e: f64 = rho_arr.iter().sum::<f64>() / n_grid;
+    const N_E_EXPECTED: f64 = 186.0;
+    let n_e_drift = (n_e - N_E_EXPECTED).abs();
+    eprintln!("[Q1] electron count: {:.6} (expected {:.1}, drift {:.4e})", n_e, N_E_EXPECTED, n_e_drift);
+    assert!(
+        n_e_drift < 0.01,
+        "iter-1 electron count drift {:.4e} exceeds 0.01 e⁻ — charge not conserved",
+        n_e_drift,
+    );
+}
+
+// ===========================================================================
+// Q2: Drop-in fidelity ship-gate — convergence to CASTEP at CASTEP tolerance
+// ===========================================================================
+//
+// This is the actual ship gate for chemrust-scf as a CASTEP backend (via C
+// bindings): the SCF, starting from CASTEP's converged state as its initial
+// density, must converge back to within CASTEP's own ELEC_ENERGY_TOL (= 1e-5 eV).
+//
+// Expected to FAIL today. The current cascade mechanism (`SUMMARY.md` 2026-05-23,
+// T-prime FAIL 2026-05-24) is eigensolver rotation in the Cu 3d degenerate
+// manifold, propagating through ρ_aug to V_eff. Fix lever lives entirely in
+// chemrust-scf eigensolver (F3a/F3b/F3c per `notes/open-followups.md` §14).
+//
+// The failure message records the actual final-energy delta so progress can
+// be tracked across fix iterations.
+//
+// EXTERNAL anchor: Cu111_CO.castep total energy = -24110.96665069 eV
+// EXTERNAL anchor: Cu111_CO.param ELEC_ENERGY_TOL = 1e-5 eV
+
+#[test]
+#[ignore = "requires GPU and CASTEP fixture data; expected-fail until eigensolver F3 stabilization"]
+fn scf_converges_to_castep_energy_at_castep_tolerance() {
+    if !gpu_available() {
+        eprintln!("SKIP: no GPU available");
+        return;
+    }
+    init_tracing();
+
+    let fx = fixtures::cu111_co::fixture();
+    let state = fixtures::cu111_co::build_scf_state(fx);
+
+    // 64-iter budget at 1e-7 Ha SCF convergence tolerance leaves headroom for
+    // the unit conversion (1e-5 eV ≈ 3.7e-7 Ha) plus a small numerical buffer.
+    // The divergence gate stays default — if the SCF cascades, we want the run
+    // to abort early rather than burn 30 minutes.
+    let result = chemrust_scf::run_scf_with_energy_gated(
+        state,
+        8,
+        1e-7,
+        Some(chemrust_scf::ScfDivergenceGate::default()),
+    )
+    .expect("SCF run completed (may not have converged)");
+
+    let computed_ev = result.total_energy * chemrust_scf::HARTREE_TO_EV;
+    let castep_ev = fixtures::cu111_co::REFERENCE_ENERGY_EV;
+    let diff_ev = (computed_ev - castep_ev).abs();
+
+    eprintln!("[Q2] Computed total energy: {:.8} eV", computed_ev);
+    eprintln!("[Q2] CASTEP reference:      {:.8} eV", castep_ev);
+    eprintln!(
+        "[Q2] |Δ|: {:.6e} eV  (gate {:.6e} eV)",
+        diff_ev, fixtures::cu111_co::CASTEP_TOLERANCE_EV,
+    );
+
+    assert!(
+        diff_ev < fixtures::cu111_co::CASTEP_TOLERANCE_EV,
+        "Q2 ship-gate FAIL: total energy differs by {:.6e} eV, exceeds CASTEP \
+         ELEC_ENERGY_TOL = {:.6e} eV. Until F3 (eigensolver rotation \
+         stabilization) lands, this test is expected-fail; record the actual \
+         delta so progress can be tracked across fix iterations.",
+        diff_ev, fixtures::cu111_co::CASTEP_TOLERANCE_EV,
+    );
 }

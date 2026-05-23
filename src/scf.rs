@@ -452,6 +452,38 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
         occupations: Option<&[f64]>,
         filter_mode: FilterMode,
     ) -> Result<ScfIteration<S, WavefunctionsUpdated, MixingOff>, Error> {
+        self.diagonalize_inner(ndeg, occupations, filter_mode, None)
+    }
+
+    /// Test-only / scf_diag variant of [`diagonalize_with_mode`] that injects
+    /// externally-supplied per-ion D matrices instead of computing screened D
+    /// from V_eff. See [`crate::eigensolver::vnl_data::VnlBatchData::precompute_with_d_override`]
+    /// for the override-slice format.
+    ///
+    /// Used by the T-prime discriminator test
+    /// (`iter2_band0_with_castep_d_injection`) to determine whether the SCF
+    /// cascade is D-driven or eigensolver-rotation-driven.
+    #[doc(hidden)]
+    pub fn diagonalize_with_d_override(
+        self,
+        ndeg: usize,
+        occupations: Option<&[f64]>,
+        d_override_per_ion: &[Option<Vec<f64>>],
+    ) -> Result<ScfIteration<S, WavefunctionsUpdated, MixingOff>, Error> {
+        self.diagonalize_inner(
+            ndeg, occupations,
+            FilterMode::SinvHKeepHEig,
+            Some(d_override_per_ion),
+        )
+    }
+
+    fn diagonalize_inner(
+        self,
+        ndeg: usize,
+        occupations: Option<&[f64]>,
+        filter_mode: FilterMode,
+        d_override_per_ion: Option<&[Option<Vec<f64>>]>,
+    ) -> Result<ScfIteration<S, WavefunctionsUpdated, MixingOff>, Error> {
         let ctx = Arc::new(CudaContext::new(0)?);
         let stream = ctx.default_stream();
         let blas = BlasHandle::new(stream.clone())?;
@@ -519,11 +551,12 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
         let v_eff_for_d = chemrust_hamiltonian_core::EffectivePotential::from_inner(
             chemrust_hamiltonian_core::fft::RealGrid::from_inner(v_eff_wave.as_fine_array().clone()),
         );
-        let vnl_data = VnlBatchData::precompute(
+        let vnl_data = VnlBatchData::precompute_with_d_override(
             &pw_coords, &self.pots, &self.cell,
             &self.wave_grid, &self.k_point,
             &psi_host, n_bands, n_pw, occupations,
             Some(&v_eff_for_d),
+            d_override_per_ion,
             &stream, &mut pcie, &blas, &solver,
         )?;
 
@@ -1658,6 +1691,20 @@ impl<S: SpinPolicy> ScfIteration<S, Initialized, MixingOff> {
     /// Mutable access to density (for perturbation testing).
     pub fn density_mut(&mut self) -> &mut Density {
         &mut self.density
+    }
+    /// Clear the cached augmentation density (debug/testing only).
+    /// The next `build_v_eff_with_energy` call will use ρ_PW only.
+    #[doc(hidden)]
+    pub fn clear_density_aug_fine(&mut self) {
+        self.density_aug_fine = None;
+    }
+    /// Read the total energy populated by the most recent `check()` call
+    /// (debug/testing only). Returns `None` if `check()` has not yet run with
+    /// energy components populated. Used by Q1 (iter1_drift_from_castep_state_is_bounded)
+    /// to peek at iter-1's energy before iter-2 takes over the state.
+    #[doc(hidden)]
+    pub fn total_energy(&self) -> Option<f64> {
+        self.total_energy
     }
 }
 

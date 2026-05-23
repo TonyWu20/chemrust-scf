@@ -1,8 +1,9 @@
+use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use chemrust_hamiltonian_core::{
-    CastepBin, CastepBinFile, CheckFile, ElectronDensity, GVectorGrid, PseudopotentialSet,
-    formatted,
+    CastepBin, CastepBinFile, CheckFile, EffectivePotential, ElectronDensity, GVectorGrid,
+    PseudopotentialSet, formatted,
 };
 use chemrust_scf::{
     ColumnDistributed, Density, KPoint, ScfIteration, SmearingParams, SmearingScheme,
@@ -24,8 +25,26 @@ pub const POTENTIAL_DIR: &str = "/export/Potentials";
 /// CASTEP reference total energy in eV (Cu111_CO.castep line 326).
 pub const REFERENCE_ENERGY_EV: f64 = -24110.96665069;
 
-/// Validation tolerance for total energy (eV).
+/// Legacy fixed-point tolerance (eV), used by the deprecated
+/// `fixed_point_matches_castep_energy` test. Empirically chosen before SCF
+/// behavior was characterized; it conflates algorithm-fidelity (does CASTEP's
+/// ψ stay fixed under our operator?) with convergence (does our SCF reach
+/// 1e-5 eV?). See `notes/failure-patterns.md` § tolerance-conflation.
 pub const TOLERANCE_EV: f64 = 2e-4;
+
+/// Q1 (algorithm-fidelity probe) tolerance: per-iteration energy drift after
+/// **one** SCF iteration starting from CASTEP's converged state. Calibrated
+/// at 2× the empirical iter-1 noise floor (~9.8 mHa from T3, REVIEW_PROMPT.md
+/// `cascade_with_castep_veff_substitution`) per ODD discriminator rule.
+/// Acts as a regression bar; ratchet down as eigensolver rotation is reduced.
+pub const DRIFT_TOLERANCE_HA: f64 = 2e-2;
+
+/// Q2 (drop-in fidelity ship-gate) tolerance: total-energy convergence to
+/// CASTEP's `ELEC_ENERGY_TOL` (`Cu111_CO.param:39`). This is the actual
+/// drop-in-replacement quality target: the chemrust-scf SCF, used as a
+/// CASTEP backend via C bindings, must deliver this tolerance for downstream
+/// CASTEP code (forces, stress, properties).
+pub const CASTEP_TOLERANCE_EV: f64 = 1e-5;
 
 // ---------------------------------------------------------------------------
 // Cached fixture
@@ -205,4 +224,110 @@ pub fn build_scf_state(fx: &Cu111CoFixture) -> ScfIteration {
         .smearing(smearing)
         .max_history(8)
         .build()
+}
+
+// ---------------------------------------------------------------------------
+// T0: D_band_debug.dat parser (D-screening EXTERNAL anchor)
+// ---------------------------------------------------------------------------
+
+/// Parse `D_band_debug.dat` and return the **converged** (last) D_screened
+/// matrix per `(species_idx, ion_idx_in_species)`.
+///
+/// File format (CASTEP `nlpot.f90:531-544`, append mode):
+/// ```text
+///   nsp  num_ps_projectors(nsp)
+///   dn  dm  nl_d(dm,dn,ni,nsp,ns)
+///   ...
+/// ```
+/// where `nsp` is the 1-based species index, `num_ps_projectors` is the
+/// number of β projectors for that species, and the following
+/// `num_proj·(num_proj+1)/2` lines are upper-triangular (dn ≤ dm) elements.
+///
+/// The file accumulates over SCF iterations in append mode. Taking the
+/// **last** block per `(species, ion)` yields the converged-iteration value.
+///
+/// `mixture_weight` (from VCA) is assumed 1.0 for Cu111+CO; the parser
+/// divides by `mixture_weight` for each ion if a non-1.0 value is provided.
+pub fn load_castep_d_screened(
+    d_dump_path: &str,
+    mixture_weight: f64,
+) -> Result<HashMap<(usize, usize), ndarray::Array2<f64>>, Box<dyn std::error::Error>> {
+    let text = std::fs::read_to_string(d_dump_path)?;
+    let lines: Vec<&str> = text.lines().collect();
+
+    let mut result: HashMap<(usize, usize), ndarray::Array2<f64>> = HashMap::new();
+    let mut i = 0usize;
+
+    while i < lines.len() {
+        let header = lines[i].trim();
+        let parts: Vec<&str> = header.split_whitespace().collect();
+        if parts.len() != 2 {
+            i += 1;
+            continue;
+        }
+        let species_idx: usize = parts[0].parse::<usize>()? - 1; // CASTEP 1-based → 0-based
+        let num_proj: usize = parts[1].parse()?;
+        let n_pairs = num_proj * (num_proj + 1) / 2;
+        i += 1;
+
+        // Read upper-triangular pairs
+        let mut mat = ndarray::Array2::<f64>::zeros((num_proj, num_proj));
+        for _ in 0..n_pairs {
+            if i >= lines.len() {
+                return Err("unexpected EOF in D_band_debug.dat data block".into());
+            }
+            let data_parts: Vec<&str> = lines[i].trim().split_whitespace().collect();
+            if data_parts.len() != 3 {
+                i += 1;
+                continue;
+            }
+            let dn: usize = data_parts[0].parse::<usize>()? - 1; // 0-based
+            let dm: usize = data_parts[1].parse::<usize>()? - 1;
+            let raw: f64 = data_parts[2].parse()?;
+            let val = raw / mixture_weight;
+            mat[[dn, dm]] = val;
+            mat[[dm, dn]] = val; // symmetric (nlpot.f90:526)
+            i += 1;
+        }
+
+        // Track ion index within species: count how many blocks of this species
+        // we've seen so far (before overwriting)
+        let ion_in_species = result
+            .keys()
+            .filter(|(s, _)| *s == species_idx)
+            .count()
+            + 1;
+
+        // Last-write-wins = converged iteration
+        result.insert((species_idx, ion_in_species), mat);
+    }
+
+    Ok(result)
+}
+
+/// Convert the D-dump `(species_idx, ion_in_species)` key to a per-global-ion
+/// `Vec`, using the cell's `ion_species` mapping to count ions per species.
+pub fn d_screened_by_global_ion(
+    d_map: &HashMap<(usize, usize), ndarray::Array2<f64>>,
+    num_ions: usize,
+    ion_species: &[usize],
+) -> Vec<Option<ndarray::Array2<f64>>> {
+    // Count how many ions of each species have been seen so far
+    let mut species_counters = vec![0usize; ion_species.iter().max().copied().unwrap_or(0) + 1];
+    let mut result: Vec<Option<ndarray::Array2<f64>>> = Vec::with_capacity(num_ions);
+
+    for global_ion in 0..num_ions {
+        let sp = ion_species[global_ion];
+        species_counters[sp] += 1;
+        let ion_in_sp = species_counters[sp];
+        result.push(d_map.get(&(sp, ion_in_sp)).cloned());
+    }
+
+    result
+}
+
+/// Wrap the fixture's `.pot_fmt` array as an `EffectivePotential`.
+pub fn castep_veff_as_effective(fx: &Cu111CoFixture) -> EffectivePotential {
+    use chemrust_hamiltonian_core::fft::RealGrid;
+    EffectivePotential::from_inner(RealGrid::from_inner(fx.pot_fmt.clone()))
 }
