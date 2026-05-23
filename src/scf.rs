@@ -13,7 +13,7 @@ use crate::device::blas::BlasHandle;
 use crate::device::solver::SolverHandle;
 use crate::device::pcie::PcieAccount;
 use crate::device::{CudaComplex, Gpu};
-use crate::eigensolver::chebyshev::{chebyshev_filter, CudaKernelSet};
+use crate::eigensolver::chebyshev::{FilterMode, chebyshev_filter, CudaKernelSet};
 use crate::eigensolver::rayleigh_ritz::rayleigh_ritz;
 use crate::eigensolver::vnl_data::VnlBatchData;
 use crate::layout::{ColumnDistributed, Cpu, WavefunctionSet};
@@ -424,10 +424,21 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
     /// `ndeg` is the Chebyshev polynomial degree.
     /// `occupations` — if `Some`, use for D-matrix screening (debug/testing only).
     ///   `None` uses bare D0 (standard SCF path where screening emerges iteratively).
+    /// `filter_mode` — controls the filter operator (A/B/C sweep); defaults to `BareH`.
     pub fn diagonalize(
         self,
         ndeg: usize,
         occupations: Option<&[f64]>,
+    ) -> Result<ScfIteration<S, WavefunctionsUpdated, MixingOff>, Error> {
+        self.diagonalize_with_mode(ndeg, occupations, FilterMode::SinvHKeepHEig)
+    }
+
+    /// Like `diagonalize` but with an explicit `FilterMode` for the A/B/C diagnostic sweep.
+    pub fn diagonalize_with_mode(
+        self,
+        ndeg: usize,
+        occupations: Option<&[f64]>,
+        filter_mode: FilterMode,
     ) -> Result<ScfIteration<S, WavefunctionsUpdated, MixingOff>, Error> {
         let ctx = Arc::new(CudaContext::new(0)?);
         let stream = ctx.default_stream();
@@ -501,7 +512,7 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
             &self.wave_grid, &self.k_point,
             &psi_host, n_bands, n_pw, occupations,
             Some(&v_eff_for_d),
-            &stream, &mut pcie, &blas, &kernels, &solver,
+            &stream, &mut pcie, &blas, &solver,
         )?;
 
         // Clone eigenvalues before moving self
@@ -521,7 +532,7 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
             &self.pw_coords,
             &vnl_data, &fft_idx_dev, min_veff, max_veff,
             &kernels, &mut pcie, eig, ndeg, &blas, &solver, &stream, &ctx,
-            false, // use_sinv_filter: bare-H (default)
+            filter_mode,
         )?;
 
         // Rayleigh-Ritz
@@ -569,7 +580,6 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
         assert_eq!(
             pcie.h2d_bytes,
             psi_bytes + veff_bytes + fft_idx_bytes + kinetic_bytes + vnl_bytes
-                + vnl_data.screening_h2d_bytes
                 + b_concat_bytes + lu_m_bytes,
             "H2D tracking check failed",
         );
@@ -619,7 +629,7 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
             &self.wave_grid, &self.k_point,
             &psi_host, n_bands, n_pw, occupations,
             Some(&v_eff_for_d),
-            &stream, &mut pcie, &blas, &kernels, &solver,
+            &stream, &mut pcie, &blas, &solver,
         )?;
 
         let fft_idx_dev: CudaSlice<i32> = stream.clone_htod(&self.pw_fft_indices)

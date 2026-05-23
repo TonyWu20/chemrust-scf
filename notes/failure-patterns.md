@@ -50,4 +50,14 @@ not evidence of a normalization bug. Always validate with same-input
 controlled experiment before asserting a code bug.
 **Anchor**: `tests/ca_scf_convergence.rs::density_decomp_matches_castep_f8_same_inputs`
 
-
+## 2026-05-23: iter1-filter-operator-mismatch
+**Root cause**: Three compounding bugs masked by each other:
+  1. GPU D-screening (`screen_d_gpu`) produced near-zero screening terms for non-origin ions, causing `d_screened ≈ d0_expanded` (10–50× too large). Ion at origin was immune, masking the bug.
+  2. `b_low` bootstrap on iter-1 used `max_veff + 2.0 = 2.09 Ha`, placing the filter cutoff above all 160 tracked bands (highest ≈ 0.13 Ha), making the filter non-selective.
+  3. Chebyshev recurrence used bare H (Mode A) while Lanczos bounds were on S⁻¹·H — filter window/operator mismatch.
+**Fix**:
+  - `src/eigensolver/vnl_data.rs` — reverted D-screening to CPU `compute_screened_d_from_fft`.
+  - `src/eigensolver/chebyshev.rs` — b_low: `max_veff + 2.0` → `max_veff`; production filter: `FilterMode::BareH` → `FilterMode::SinvHKeepHEig`.
+  - `src/scf.rs:433` — production default updated to Mode B.
+**Pattern**: gpu-port-silent-correctness-regression. GPU port of a CPU function produced wrong results for all non-trivial inputs (non-origin ions) while passing for the trivial case (origin ion). The trivial case was the first ion processed, masking the bug in all diagnostic logs. Always include a non-trivial test case when porting numerical code to GPU.
+**Resolution**: `notes/debug/debug-20260523-0916-iter1-filter-operator-mismatch/RESOLUTION.md`

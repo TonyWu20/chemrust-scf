@@ -694,7 +694,6 @@ fn s_inv_baseline_post_typo_fix() {
         &stream,
         &mut pcie,
         &blas,
-        &kernels,
         &solver,
     )
     .expect("VnlBatchData::precompute");
@@ -786,7 +785,6 @@ fn s_inv_s_identity_test() {
         &stream,
         &mut pcie,
         &blas,
-        &kernels,
         &solver,
     )
     .expect("VnlBatchData::precompute");
@@ -805,5 +803,150 @@ fn s_inv_s_identity_test() {
         max_residual < 1e-10,
         "S⁻¹·S·ψ ≠ ψ: max residual = {:.6e} > 1e-10.",
         max_residual,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Iter-1 filter-operator A/B/C discriminator sweep
+//
+// Runs one Chebyshev+RR iteration under three filter modes and compares the
+// lowest-10 RR band energies against the CASTEP .bands reference.
+//
+// Gate (SC-4-tight): |band_j_iter1 − band_j_castep| < 0.05 Ha for j ∈ [0,10)
+//
+// Self-test (D6): Mode A must reproduce band-1 ≈ −1.69 Ha within 0.1 Ha
+// before B/C results are read. If D6 fails, the harness itself is broken.
+//
+// See notes/debug/debug-20260523-0916-iter1-filter-operator-mismatch/FIX_PLAN.md
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "requires GPU and CASTEP fixture data; diagnostic sweep for filter-operator selection"]
+fn iter1_filter_mode_sweep() {
+    if !gpu_available() {
+        eprintln!("SKIP: no GPU available");
+        return;
+    }
+    init_tracing();
+
+    use chemrust_scf::density::test_api::FilterMode;
+
+    let fx = fixtures::cu111_co::fixture();
+    let castep_bands = &fx.bands_eigenvalues;
+
+    // Print fixture context: n_bands, n_pw, and .check eigenvalues for first 10 bands
+    {
+        let wfc = fx.check.wavefunction.as_ref().expect(".check wavefunction");
+        let kpt = &wfc.kpt_data[0];
+        eprintln!("[fixture] n_bands={} n_pw={}", kpt.bands.len(), kpt.nplw);
+        let check_eigs = &fx.check.eigenvalues.kpoints[0].spins[0].eigenvalues;
+        eprintln!("[fixture] .check eigenvalues (first 10): {:?}", &check_eigs[..10.min(check_eigs.len())]);
+        eprintln!("[fixture] .bands eigenvalues (first 10): {:?}", &castep_bands[..10.min(castep_bands.len())]);
+    }
+
+    // Run one iter under a given mode; returns the RR eigenvalues.
+    let run_mode = |mode: FilterMode| -> Vec<f64> {
+        let state = fixtures::cu111_co::build_scf_state(fx);
+        state
+            .build_v_eff()
+            .expect("build_v_eff")
+            .diagonalize_with_mode(8, None, mode)
+            .expect("diagonalize_with_mode")
+            .eigenvalues()
+            .to_vec()
+    };
+
+    // --- Mode A (bare-H, current production path) ---
+    let eig_a = run_mode(FilterMode::BareH);
+
+    // D6 self-test: Mode A band-0 must be within 0.1 Ha of CASTEP reference −1.055 Ha.
+    // This verifies the harness is computing the correct Hamiltonian (CPU D-screening).
+    // If this fails, the D_screened values are wrong — do not read B/C.
+    let band0_a = eig_a.get(0).copied().unwrap_or(f64::NAN);
+    let castep_band0 = castep_bands.first().copied().unwrap_or(f64::NAN);
+    assert!(
+        (band0_a - castep_band0).abs() < 0.1,
+        "D6 self-test FAILED: Mode A band-0 = {:.4} Ha, CASTEP = {:.4} Ha (|Δ| = {:.4} Ha > 0.1). \
+         Hamiltonian may be wrong — do not interpret B/C results.",
+        band0_a, castep_band0, (band0_a - castep_band0).abs(),
+    );
+    eprintln!("[D6] Mode A band-0 = {:.4} Ha, CASTEP = {:.4} Ha — self-test PASSED", band0_a, castep_band0);
+
+    // --- Modes B and C ---
+    let eig_b = run_mode(FilterMode::SinvHKeepHEig);
+    let eig_c = run_mode(FilterMode::SinvHFullDas);
+
+    // --- Per-band table (stderr) ---
+    let n_check = 10.min(eig_a.len()).min(castep_bands.len());
+    eprintln!("\n[iter1_filter_mode_sweep] Per-band |Δ| vs CASTEP .bands (Ha)");
+    eprintln!("{:>5}  {:>12}  {:>10}  {:>10}  {:>10}  {:>10}",
+        "band", "CASTEP", "Mode-A", "|ΔA|", "|ΔB|", "|ΔC|");
+    for j in 0..n_check {
+        let ref_e = castep_bands[j];
+        let da = (eig_a.get(j).copied().unwrap_or(f64::NAN) - ref_e).abs();
+        let db = (eig_b.get(j).copied().unwrap_or(f64::NAN) - ref_e).abs();
+        let dc = (eig_c.get(j).copied().unwrap_or(f64::NAN) - ref_e).abs();
+        eprintln!("{:>5}  {:>12.6}  {:>10.6}  {:>10.6}  {:>10.6}  {:>10.6}",
+            j, ref_e,
+            eig_a.get(j).copied().unwrap_or(f64::NAN),
+            da, db, dc);
+    }
+
+    // Write CSV for follow-on analysis
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let csv_path = format!("/tmp/iter1-mode-sweep-{ts}.csv");
+    let mut csv = String::from("band,castep_ha,mode_a_ha,mode_b_ha,mode_c_ha,delta_a,delta_b,delta_c\n");
+    for j in 0..n_check {
+        let ref_e = castep_bands[j];
+        let ea = eig_a.get(j).copied().unwrap_or(f64::NAN);
+        let eb = eig_b.get(j).copied().unwrap_or(f64::NAN);
+        let ec = eig_c.get(j).copied().unwrap_or(f64::NAN);
+        csv.push_str(&format!("{},{:.8},{:.8},{:.8},{:.8},{:.8},{:.8},{:.8}\n",
+            j, ref_e, ea, eb, ec,
+            (ea - ref_e).abs(), (eb - ref_e).abs(), (ec - ref_e).abs()));
+    }
+    if let Err(e) = std::fs::write(&csv_path, &csv) {
+        eprintln!("[iter1_filter_mode_sweep] WARNING: could not write CSV to {csv_path}: {e}");
+    } else {
+        eprintln!("[iter1_filter_mode_sweep] CSV written to {csv_path}");
+    }
+
+    // --- SC-4-tight gate: report all modes, assert Mode B (discriminator winner) ---
+    const SC4_GATE: f64 = 0.05; // Ha
+    let mut mode_b_failures: Vec<String> = Vec::new();
+    for mode_label in ["A", "B", "C"] {
+        let eig = match mode_label {
+            "A" => &eig_a,
+            "B" => &eig_b,
+            _ => &eig_c,
+        };
+        let mut mode_failures: Vec<String> = Vec::new();
+        for j in 0..n_check {
+            let delta = (eig.get(j).copied().unwrap_or(f64::NAN) - castep_bands[j]).abs();
+            if delta >= SC4_GATE {
+                mode_failures.push(format!("  band {j}: |Δ| = {delta:.4} Ha ≥ {SC4_GATE} Ha"));
+            }
+        }
+        if mode_failures.is_empty() {
+            eprintln!("[SC-4-tight] Mode {mode_label}: PASS (all {n_check} bands within {SC4_GATE} Ha)");
+        } else {
+            eprintln!("[SC-4-tight] Mode {mode_label}: FAIL ({} bands out of {n_check})", mode_failures.len());
+            for f in &mode_failures {
+                eprintln!("{f}");
+            }
+            if mode_label == "B" {
+                mode_b_failures = mode_failures;
+            }
+        }
+    }
+
+    assert!(
+        mode_b_failures.is_empty(),
+        "iter1_filter_mode_sweep: Mode B (discriminator winner) failed SC-4-tight.\n\
+         See /tmp/iter1-mode-sweep-{ts}.csv for full data.\n\n{}",
+        mode_b_failures.join("\n"),
     );
 }

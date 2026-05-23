@@ -4,6 +4,11 @@
 //
 // D_nm = D0_nm + (1/N) · Re{ Σ_G V_eff_fft(G) · exp(+iG·R) · conj(Q_nm(G)) }
 //
+// NOTE: This module is currently unused — the GPU D-screening path was reverted
+// to the CPU `compute_screened_d_from_fft` path due to a bug producing near-zero
+// screening terms for non-origin ions. Kept for future debugging.
+#![allow(dead_code)]
+//
 // Algorithm:
 //   1. w = V_eff_fft · conj(ion_sf)     via cpx_conj_mul kernel (grid-parallel)
 //   2. tmp = Q^H · w                     via cuBLAS gemv (single launch)

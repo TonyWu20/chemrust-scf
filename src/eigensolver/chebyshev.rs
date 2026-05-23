@@ -28,6 +28,27 @@ use crate::eigensolver::vnl_data::VnlBatchData;
 use cudarc::cusolver::sys::cublasOperation_t;
 
 // ---------------------------------------------------------------------------
+// Filter operator mode for the Chebyshev recurrence (A/B/C diagnostic sweep)
+// ---------------------------------------------------------------------------
+
+/// Controls which operator is applied in the Chebyshev recurrence (Step 3)
+/// and how the band-shift eigenvalues (Λ) are sourced.
+///
+/// Used by the `iter1_filter_mode_sweep` diagnostic test to pick the correct
+/// production path. After the discriminator selects a winner, this enum and
+/// the losing branches are deleted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FilterMode {
+    /// Mode A — current bare-H path: Step 3 applies H, Step 4 no S⁻¹, Λ from h_eig.
+    BareH,
+    /// Mode B — minimal flip: Step 3 applies S⁻¹·H, Step 4 no S⁻¹, Λ from h_eig.
+    SinvHKeepHEig,
+    /// Mode C — full Das Alg 3: Step 3 applies S⁻¹·H, Step 4 applies S⁻¹,
+    /// Λ from generalized eigenvalues (falls back to h_eig on iter-1 when None).
+    SinvHFullDas,
+}
+
+// ---------------------------------------------------------------------------
 // Helper: call cuFFT C2C in-place (same buffer for input and output)
 // ---------------------------------------------------------------------------
 
@@ -255,6 +276,7 @@ pub struct CudaKernelSet {
     pub(crate) transpose_row_to_col: CudaFunction,
     pub(crate) band_scale_axpy: CudaFunction,
     pub(crate) cpx_mul_inplace: CudaFunction,
+    #[allow(dead_code)]
     pub(crate) cpx_conj_mul: CudaFunction,
 }
 
@@ -1268,7 +1290,7 @@ pub(crate) fn chebyshev_filter(
     solver: &SolverHandle,
     stream: &Arc<CudaStream>,
     ctx: &Arc<CudaContext>,
-    use_sinv_filter: bool,
+    filter_mode: FilterMode,
 ) -> ChebyshevResult {
     // ---- Dimensions ----
     let n_bands = psi_gpu.shape()[0];
@@ -1343,6 +1365,8 @@ pub(crate) fn chebyshev_filter(
             )
         };
         if let Ok((b_up_lanczos, ritz_min, ritz_max)) = lanczos_result {
+            #[cfg(not(feature = "scf_diag"))]
+            let _ = ritz_max; // used only in scf_diag eprintln below
             let gershgorin_b_up = {
                 let gmax = wave_grid.gmax();
                 0.5 * gmax * gmax + (max_veff - min_veff)
@@ -1360,8 +1384,24 @@ pub(crate) fn chebyshev_filter(
             );
 
             // b_low: use Ritz values from previous RR when available (Alg 4.1 §7.2).
-            // On first call (no prior eigenvalues), derive from Lanczos T_k Ritz
-            // values per Algorithm 5.1 eq.(13): β=0.5 → midpoint of T_k spectrum.
+            // On first call (no prior eigenvalues), use the Gershgorin-based estimate
+            // max_veff + 2.0 Ha — this places b_low just above the physical potential
+            // maximum, which is a tighter and more physically grounded separator between
+            // occupied states (below Fermi ≈ max_veff) and unoccupied states.
+            //
+            // The T_k midpoint (Zhou Alg 5.1 eq.13) was previously used here but
+            // produces b_low ≈ 7.34 Ha for Cu111+CO — the midpoint of the full S⁻¹·H
+            // spectrum, not the occupied/unoccupied boundary. This makes the filter
+            // amplify ~half the spectrum indiscriminately, causing the 5×/step norm
+            // growth observed in the iter-1 log (2026-05-23).
+            //
+            // max_veff+2.0 = 2.09 Ha is also too high: it sits above all 160 tracked
+            // bands (highest band ≈ 0.13 Ha), so the filter amplifies the entire
+            // subspace uniformly with no discrimination. The correct b_low for iter-1
+            // is just above the highest tracked band — max_veff itself (≈ 0.089 Ha for
+            // Cu111+CO) is a tighter and physically correct separator, since the Fermi
+            // level of a metal sits near max_veff and the highest occupied state is
+            // below it.
             #[allow(unused_variables)]
             let (b_low, b_low_src) = match eigenvalues {
                 Some(eig) if !eig.is_empty() => {
@@ -1371,8 +1411,10 @@ pub(crate) fn chebyshev_filter(
                     (eig[eig.len() - 1], "eig[last]")
                 }
                 _ => {
-                    // First call: eq.(13) with β=0.5 → midpoint of T_k spectrum.
-                    (0.5 * ritz_min + 0.5 * ritz_max, "T_k midpoint")
+                    // First call: use max_veff as b_low. For a metal, the Fermi level
+                    // sits near max_veff, so this places b_low just above the highest
+                    // tracked band. The +2.0 offset was too large (above all 160 bands).
+                    (max_veff.max(0.0), "max_veff")
                 }
             };
             #[cfg(feature = "scf_diag")]
@@ -1528,11 +1570,17 @@ pub(crate) fn chebyshev_filter(
 
         // Λ_X = I (CPU)
         let mut lam_x: Vec<f64> = vec![1.0; n_bands];
-        // Λ_Y = (σ₁/e)·(h_eig − c·I)  or  −σ₁·c/e if eigenvalues is None
-        // Uses H-eigenvalues (h_eig), not generalized eigenvalues, for
-        // consistency with the bare-H Chebyshev polynomial.
-        let mut lam_y: Vec<f64> = if eigenvalues.is_some() {
-            h_eig.iter().map(|l| sigma1_over_e * (l - c)).collect()
+        // Λ_Y initial value depends on filter mode:
+        //   Modes A/B: use h_eig (H-Rayleigh quotients) for consistency with
+        //              the bare-H or S⁻¹·H-but-h_eig-shift framing.
+        //   Mode C:    use generalized eigenvalues from previous RR when available
+        //              (Das Alg 3 §3.2); fall back to h_eig on iter-1 (eigenvalues=None).
+        let lam_source: &[f64] = match filter_mode {
+            FilterMode::SinvHFullDas => eigenvalues.unwrap_or(&h_eig),
+            _ => &h_eig,
+        };
+        let mut lam_y: Vec<f64> = if eigenvalues.is_some() || matches!(filter_mode, FilterMode::SinvHFullDas) {
+            lam_source.iter().map(|l| sigma1_over_e * (l - c)).collect()
         } else {
             let val = -sigma1 * c / e;
             vec![val; n_bands]
@@ -1549,14 +1597,14 @@ pub(crate) fn chebyshev_filter(
             let coeff_c = -coeff * c;
             let sigma_sigma2 = -sigma_cur * sigma2;
 
-            // H·R_Y (bare-H operator, with optional S⁻¹ preconditioning)
+            // H·R_Y then optionally S⁻¹·H·R_Y depending on filter mode
             unsafe {
                 apply_full_hamiltonian(
                     &buf_ry, v_eff_dev, &kinetic_dev, fft_idx_dev,
                     n_pw, n_bands, grid_size, inv_ntotal,
                     &fft_plan, &mut hpsi_dev, &mut grid_dev, vnl_data, blas, kernels, stream,
                 )?;
-                if use_sinv_filter {
+                if matches!(filter_mode, FilterMode::SinvHKeepHEig | FilterMode::SinvHFullDas) {
                     apply_s_inverse(
                         &mut hpsi_dev, vnl_data, n_bands_i32, n_pw_i32, blas, stream, solver,
                     )?;
@@ -1598,9 +1646,11 @@ pub(crate) fn chebyshev_filter(
                 n_pw, n_bands, kernels, stream,
             )?;
 
-            // Λ_X_new on CPU (main.tex:604), uses H-eigenvalues h_eig
-            let new_lam_x: Vec<f64> = if eigenvalues.is_some() {
-                lam_y.iter().zip(h_eig.iter()).zip(lam_x.iter())
+            // Λ_X_new on CPU (main.tex:604)
+            // Modes A/B: use h_eig; Mode C: use generalized eigenvalues (lam_source)
+            let has_eig = eigenvalues.is_some() || matches!(filter_mode, FilterMode::SinvHFullDas);
+            let new_lam_x: Vec<f64> = if has_eig {
+                lam_y.iter().zip(lam_source.iter()).zip(lam_x.iter())
                     .map(|((ly, l), lx)| coeff * ly * l + coeff_c * ly + sigma_sigma2 * lx)
                     .collect()
             } else {
@@ -1629,15 +1679,16 @@ pub(crate) fn chebyshev_filter(
         }
 
         // ------------------------------------------------------------
-        // Step 4: Reconstruct X_new (main.tex:607, bare-H variant)
-        //   X_new = R_Y + X·Λ_Y (no S⁻¹ — see Risk §2 in plan)
-        //
-        // R_Y carries an implicit S-factor from Y = H·X − S·X·Λ (Step 1)
-        // that X·Λ_Y does not. S-Gram-Schmidt re-normalizes in S-norm
-        // afterwards, masking this. If iter-3 diverges, TASK-D4 restores
-        // S⁻¹ here (apply_s_inverse on buf_a before band_scale_axpy).
+        // Step 4: Reconstruct X_new (main.tex:607)
+        //   Modes A/B: X_new = R_Y + X·Λ_Y  (no S⁻¹)
+        //   Mode C:    X_new = S⁻¹·R_Y + X·Λ_Y  (Das Alg 3 line 607)
         // ------------------------------------------------------------
         stream.memcpy_dtod(&buf_ry, &mut buf_a).map_err(Error::Cuda)?;
+        if matches!(filter_mode, FilterMode::SinvHFullDas) {
+            unsafe {
+                apply_s_inverse(&mut buf_a, vnl_data, n_bands_i32, n_pw_i32, blas, stream, solver)?;
+            }
+        }
         launch_band_scale_axpy(
             &mut buf_a, &psi_input, &lam_y_dev, 1.0,
             n_pw, n_bands, kernels, stream,
