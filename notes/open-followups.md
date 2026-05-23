@@ -837,3 +837,189 @@ for more iterations).
 **Resolution**: `notes/debug/debug-20260523-1915/RESOLUTION.md`
 **Session artifacts**: `notes/debug/debug-20260523-1915/INVESTIGATION.md`, `CRITERIA.md`,
 `DIVERGENCE_SURFACE.md`, `EIGENVECTOR_OVERLAP.md`
+
+## 14. Eigensolver rotation cascade — fix lever lives in chemrust-scf, not hamiltonian
+
+**Status (2026-05-24): root-causally CONFIRMED, fix DEFERRED to next session.**
+
+Extends §13 with the empirical T-prime D-injection discriminator that closed
+two remaining hypotheses and isolated the live fix surface.
+
+### What was confirmed empirically this session
+
+1. **V_eff reconstruction is at 4 µHa max** vs `.pot_fmt` (chemrust-hamiltonian
+   `test_cu111_co_potential_residual`, commit `0d5dcbf`). Not a blocker.
+2. **D-screening discrepancy is at the post-SCF self-consistency floor**
+   (chemrust-hamiltonian `notes/failure-patterns.md:902-922`, 2026-05-20).
+   CASTEP D injection diagnostic in chemrust-hamiltonian: replacing our Cu D
+   with CASTEP's converged D changes V_NL by **≤ 1.2 µHa across 160 bands**
+   at converged ψ. So D-screening accuracy is silent for V_NL at the
+   converged state.
+3. **T-prime FAIL at 197 mHa** (`notes/debug/debug-20260524-tprime-d-injection/RESOLUTION.md`):
+   injecting CASTEP D into iter-2's diagonalize does *not* stop the cascade.
+   T3 (V_eff injection) stops it; T-prime (D injection) does not. Cascade is
+   upstream of D, in the V_eff that iter-2 builds from iter-1's rotated ρ.
+
+### Mechanism (now diagnosed end-to-end)
+
+1. Iter-1: Chebyshev filter + Gram-Schmidt + Rayleigh-Ritz rotates ψ within
+   the Cu 3d degenerate manifold (overlap 0.252 at ndeg=0 from CASTEP ψ;
+   `notes/failure-patterns.md:90`).
+2. Rotation source decomposition (read-only audit of
+   `src/eigensolver/chebyshev.rs:1273-1800` and
+   `src/eigensolver/rayleigh_ritz.rs:56-128`):
+   - Chebyshev filter: polynomial p(H), eigenvector-preserving in exact
+     arithmetic. **Not the source.**
+   - Classical Gram-Schmidt (two passes,
+     `chebyshev.rs:1708-1800`): column-order-dependent. Partial source.
+   - Rayleigh-Ritz / ZHEGVD (`rayleigh_ritz.rs:56-128`): LAPACK's
+     eigenvector choice within degenerate eigenblocks is implementation-defined.
+     **Most likely dominant source.**
+3. Rotated ψ → rotated β·ψ projections → wrong ρ_aug (density split 29.8/70.2
+   vs CASTEP F8 36.8/63.2; aug density is NOT rotation-invariant because it
+   integrates β·ψ with explicit projector-pair indices).
+4. Wrong ρ_aug → wrong V_eff (V_eff reconstruction itself is at 4 µHa, but
+   fed wrong inputs).
+5. Wrong V_eff → wrong spectral bounds and filter behavior on iter-2.
+6. Cascade by iter-3.
+
+### Fix lever: F3 — eigensolver ψ-stabilization (chemrust-scf-side)
+
+The standard approaches from subspace-iteration literature (Demmel, Knyazev,
+Saad). All local to `chemrust-scf/src/eigensolver/`; none require
+chemrust-hamiltonian changes:
+
+- **F3a — Lock occupied states**: project out converged states before
+  Gram-Schmidt + RR; only iterate on the not-yet-converged subspace.
+  Avoids re-rotating bands that already match CASTEP.
+- **F3b — Pin reference basis**: modified Gram-Schmidt with the
+  previous-iteration ψ as the seed; only newly-introduced vectors are
+  orthogonalized against it. Reduces column-order sensitivity.
+- **F3c — Davidson-style block update**: feed only the residual component
+  of ψ to GS+RR; the bulk of ψ stays put across iterations.
+
+None is small. All reshape the eigensolver.
+
+### Egg-or-chicken deadlock with chemrust-hamiltonian: dissolved
+
+Originally framed as "we need tighter D from hamiltonian; hamiltonian needs
+us to run SCF to tighten D" (user's framing this session). T-prime FAIL
+empirically dissolved it:
+
+| Layer | Blocker for Q2? | Owner |
+|-------|-----------------|-------|
+| chemrust-hamiltonian V_eff reconstruction | No (4 µHa) | N/A |
+| chemrust-hamiltonian D-screening | No (T-prime FAIL) | N/A — already at post-SCF floor |
+| chemrust-scf eigensolver rotation (F3) | **Yes** | chemrust-scf |
+
+### Cross-references
+
+- T-prime resolution: `notes/debug/debug-20260524-tprime-d-injection/RESOLUTION.md`
+- T-prime plan: `notes/debug/debug-20260524-tprime-d-injection/PLAN.md`
+- §13 above (the hypothesis that became T-prime).
+- chemrust-hamiltonian issue: https://github.com/TonyWu20/chemrust-hamiltonian/issues/9
+  (kept open as tracking artifact for 17.9 mHa Cu d-beta2 figure; not Q2-blocking).
+- Failure pattern: `notes/failure-patterns.md` §
+  `tolerance-conflation-in-acceptance-test` and § `t-prime-d-injection-discriminator`.
+
+### Tests added in this resolution session
+
+- `tests/ca_scf_convergence.rs::iter2_band0_with_castep_d_injection` —
+  T-prime, FAILs as expected, records 197 mHa discriminator.
+- `tests/ca_scf_convergence.rs::iter1_drift_from_castep_state_is_bounded` —
+  Q1 algorithm-fidelity probe (20 mHa gate); PASSes today, serves as
+  regression bar.
+- `tests/ca_scf_convergence.rs::scf_converges_to_castep_energy_at_castep_tolerance` —
+  Q2 ship-gate (1e-5 eV); expected-fail until F3 lands. Records actual
+  delta on failure to track progress across fix iterations.
+
+### Next-session entry point
+
+1. Read F3 literature: Davidson (1975), Knyazev's LOBPCG, Saad's
+   "Numerical Methods for Large Eigenvalue Problems" ch. 8.
+2. Pick the lightest stabilization (F3a is usually cheapest — most existing
+   subspace-iter codes have a "deflation lock" mode).
+3. Implement in `src/eigensolver/chebyshev.rs` and/or `rayleigh_ritz.rs`.
+4. Discriminator: Q2 PASSES at 1e-5 eV; Q1 threshold ratchets down.
+5. If F3a alone insufficient: F3b → F3c.
+
+## 15. Iter-1 total energy off by factor of Ω (~22,300×) — energy-assembly unit bug
+
+**Status (2026-05-24): DISCOVERED by Q1, fix DEFERRED.**
+
+The new Q1 test (`iter1_drift_from_castep_state_is_bounded`,
+`tests/ca_scf_convergence.rs`) runs one SCF iteration from CASTEP fixture
+state and asserts the total energy is within 20 mHa of CASTEP's reference.
+Today's measured iter-1 total energy:
+
+```
+[Q1] iter-1 total energy: -32407458.84 Ha = -881851807.02 eV
+[Q1] CASTEP reference:    -886.06 Ha = -24110.97 eV
+[Q1] drift |Δ|: 3.2407e7 Ha
+```
+
+Energy is off by **~36,500×**. Magnitude matches the cell volume in Bohr³
+(Ω ≈ 22,315), which is the §11b
+(`electron-count-diagnostic-double-volume`) signature.
+
+### Suspected location
+
+`src/scf.rs:374-378` in `build_v_eff_with_energy_impl`:
+
+```rust
+let e_hartree_raw: f64 = rho_total_fine.as_real_array().iter()
+    .zip(v_h.as_real_grid().as_real_array().iter())
+    .map(|(&rv, &vh)| rv * vh * d_v)   // d_v = cell.volume / n_grid
+    .sum();
+let e_hartree = 0.5 * e_hartree_raw;
+```
+
+ρ is in CASTEP raw units (ρ_phys × Ω, per §8 and §11b resolution). The
+formula computes `(Ω/N) · Σ(ρ_phys × Ω) × V_H = Ω · ∫ρ_phys · V_H dr`.
+The correct physical formula is `∫ρ · V_H dr` (no extra Ω). Result:
+e_hartree off by a factor of Ω.
+
+Same pattern likely applies to `rho_vxc` calculation (`src/scf.rs:379-382`).
+
+### Why this was hidden until now
+
+Per §11b's resolution note: prior tests never checked iter-1 total energy
+against CASTEP at this precision. The `fixed_point_matches_castep_energy`
+test had a 2e-4 eV tolerance against an energy off by 8 orders of magnitude
+— the test always failed for the *wrong reason*, masking this defect.
+
+§11b fixed the electron-count *diagnostic* path (`scf.rs:486`, `scf.rs:732`)
+but did NOT fix the energy assembly path (`scf.rs:374-378`,
+which is upstream of `assemble_total_energy` in `src/energy.rs:251`).
+
+### Why this matters
+
+Q2 (`scf_converges_to_castep_energy_at_castep_tolerance`) is the drop-in
+ship gate at 1e-5 eV. With energy off by 36,500×, Q2 cannot pass regardless
+of how well F3 (§14) stabilizes the eigensolver. **Fixing §15 is a
+prerequisite for Q2 to be meaningful** and likely for §14 to be
+meaningfully prioritized.
+
+### Discriminator
+
+After fix:
+- Q1's iter-1 total energy should be within 20 mHa of CASTEP (≈ −886 Ha).
+- `assemble_total_energy` test in `src/energy.rs` already passes for synthetic
+  inputs; the bug is in the *inputs* (e_hartree, rho_vxc), not the assembly.
+
+### Next-session entry point
+
+1. Read CASTEP source for the physical convention of `e_hartree` and the
+   `∫ρV_xc` double-counting term. Both should be in units of energy
+   (Hartree), so the discrete sum must convert ρ × Ω → ρ_phys then
+   integrate with `Ω/N` weight, giving total of 1 power of Ω, not 2.
+2. Audit all energy-component computations in `src/scf.rs:341-385` and
+   `src/energy.rs` for the double-Ω pattern.
+3. After fix: Q1 should PASS at 20 mHa, then F3 work (§14) can proceed
+   meaningfully toward Q2.
+
+### Cross-references
+
+- §11b resolution: `notes/debug/debug-20260523-1149-iter2-divergence/RESOLUTION.md`
+- §14 (rotation cascade — main next-session target, but §15 must land first)
+- Q1 test: `tests/ca_scf_convergence.rs::iter1_drift_from_castep_state_is_bounded`

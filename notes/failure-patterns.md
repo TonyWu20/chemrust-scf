@@ -103,3 +103,103 @@ controlled experiment before asserting a code bug.
 **Fix**: `tests/rayleigh_ritz_validation.rs` — replace `|‖ψ‖²_PW - 1| < 1e-6` assertion with physical bounds `‖ψ‖²_PW ∈ (1e-6, 2.0)` (no ghost modes, no explosion).
 **Pattern**: ncpp-assumption-in-uspp-code. When porting validation logic from norm-conserving PP literature, audit every statement of the form "⟨ψ|ψ⟩ = 1" — in USPP this is `⟨ψ|S|ψ⟩ = 1`, which is a strictly weaker constraint on the bare PW norm.
 **Resolution**: `notes/debug/debug-20260523-1927/RESOLUTION.md`
+
+## 2026-05-24: stale-aug-density-cascade
+
+**Root cause**: ρ_aug from subspace-rotated ψ leaks into next SCF iteration's V_eff via `into_phase()`. The stale ρ_aug (computed with ψ that differs from CASTEP's within degenerate 3d manifolds) contaminates the total density used for Hartree/XC. Removing ρ_aug accelerates divergence — it provides needed damping at ion cores. T3 proves the cascade stops with CASTEP V_eff. T2 reveals a secondary issue: D-screening diverges from CASTEP dump by 0.1–2 Ha per element.
+
+**Fix**: Not yet. Two directions: fix D-screening element-by-element (reduces ψ rotation), or damp aug contribution to V_eff.
+
+**Pattern**: stale-state-propagation. A cached intermediate from iteration N is consumed in iteration N+1 where the underlying state (ψ) has already changed. The reference implementation (CASTEP CG) avoids this because its ψ stays closer to the fixed point; our subspace RR rotates more.
+
+**Diagnostic anchors**: T1 (RMS 0.0046 Ha), T2 (max|Δ| 2.13 Ha), T3 (PASS, cascade stopped), T4 (PASS with cleared aug).
+
+**Resolution**: `notes/debug/debug-20260523-2314/RESOLUTION.md`
+
+## 2026-05-24: tolerance-conflation-in-acceptance-test
+
+**Symptom**: `fixed_point_matches_castep_energy` (`tests/ca_scf_convergence.rs:59`)
+asserted `|E_total - CASTEP| < 2e-4 eV` after 8 SCF iterations from CASTEP's
+converged state. The test drove days of debugging into the SCF cascade as if
+it were a single-cause bug. The cascade is real (iter-3 band-0 = -11.94 Ha)
+and indicates real symptoms, but the test as written cannot distinguish two
+fundamentally different questions:
+
+- algorithm-fidelity: does our eigensolver preserve CASTEP's converged ψ?
+  (Answer: no — subspace-RR + Chebyshev rotates within Cu 3d degenerate
+  manifolds; this is intrinsic to the algorithm, not a code bug. A bug-free
+  port still fails at 2e-4 eV.)
+- convergence: does our SCF reach CASTEP's `ELEC_ENERGY_TOL = 1e-5 eV` from a
+  generic starting density? (Answer: blocked by F3 — eigensolver rotation
+  stabilization, see open-followups §14.)
+
+**Pattern**: `tolerance-conflation`. A single test with a single threshold
+cannot probe both algorithm-fidelity (operator-preservation) and convergence
+(energy-functional reaching a target) simultaneously. The thresholds for
+those two questions differ by orders of magnitude in this regime, and the
+acceptance criterion that conflates them defaults to the tighter of the two,
+making the loose-question failure look like a code bug.
+
+**Lesson**: When porting between eigensolvers (band-by-band CG → subspace
+Rayleigh-Ritz here), the acceptance test must be formulated in
+operator-invariant quantities (total energy, electron count, band-RMS in
+non-degenerate manifolds) at appropriate per-question thresholds. Avoid
+"do everything correctly to 2e-4 eV" tests for any pipeline whose
+algorithmic fixed point is not bitwise-identical to the reference.
+
+**Provenance**: The 2e-4 eV tolerance was chosen empirically before the SCF's
+behavior was characterized — a "leave it loose, we don't know yet" placeholder
+that became a load-bearing acceptance criterion.
+
+**Resolution**: split into Q1 (`iter1_drift_from_castep_state_is_bounded`,
+20 mHa per-iter drift bound, regression bar) and Q2
+(`scf_converges_to_castep_energy_at_castep_tolerance`, 1e-5 eV ship gate,
+expected-fail until F3).
+
+**Discriminator anchors**: T-prime FAIL at 197 mHa
+(`notes/debug/debug-20260524-tprime-d-injection/RESOLUTION.md`) — confirms
+chemrust-hamiltonian is not the blocker, F3 is.
+
+## 2026-05-24: t-prime-d-injection-discriminator
+
+**Symptom**: chemrust-scf SCF cascade had three plausible attribution candidates:
+(a) chemrust-hamiltonian D-screening accuracy, (b) chemrust-scf V_eff assembly
+drift, (c) chemrust-scf eigensolver rotation. (a) and (b) form an apparent
+egg-or-chicken deadlock — chemrust-hamiltonian's "post-SCF self-consistency
+floor" can't tighten without running SCF, but our SCF can't run if it requires
+tight D.
+
+**Pattern**: `cross-repo-deadlock-dissolved-by-symmetric-substitution`. T3
+(V_eff substitution from `.pot_fmt`) had already shown the cascade stops with
+externally-correct V_eff. T-prime adds the symmetric experiment: inject CASTEP
+converged D from `D_band_debug.dat` into iter-2 (`diagonalize_with_d_override`
+in `src/scf.rs`, `precompute_with_d_override` in
+`src/eigensolver/vnl_data.rs`).
+
+**Result**: T-prime FAIL at 197 mHa. Cascade continues with CASTEP-injected D.
+Comparison:
+
+| Substitution | Iter-2 band-0 | \|Δ\| vs CASTEP |
+|--------------|---------------|------------------|
+| Natural cascade | −0.87 Ha | 184 mHa |
+| T-prime (CASTEP D) | −0.86 Ha | 197 mHa |
+| T3 (CASTEP V_eff) | −1.0452 Ha | 9.8 mHa |
+
+V_eff injection stops the cascade; D injection does not. The cascade is
+upstream of D, in the V_eff that iter-2 builds from iter-1's rotated density.
+
+**Lesson**: When two repos appear deadlocked through "I need your tighter
+output to validate mine," try **symmetric substitution** of each repo's
+output into the other. If only one substitution stops the failure, that
+side owns the cause and the deadlock is illusory. Cross-repo coupling
+through "tightness" alone is a sign that the actual mechanism hasn't been
+isolated yet.
+
+**Lesson 2**: `chemrust-hamiltonian`'s 4 µHa V_eff residual against `.pot_fmt`
+(`test_cu111_co_potential_residual`) and the 17.9 mHa Cu d-beta2 D-screening
+drift are both real but **not the cascade's source**. The cascade comes from
+chemrust-scf eigensolver rotation in degenerate manifolds, full stop.
+
+**Resolution**: `notes/debug/debug-20260524-tprime-d-injection/RESOLUTION.md`.
+chemrust-hamiltonian issue #9 left open as tracking artifact (per user
+direction) but flagged as not-blocking for Q2.
