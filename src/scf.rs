@@ -15,6 +15,8 @@ use crate::device::pcie::PcieAccount;
 use crate::device::{CudaComplex, Gpu};
 use crate::eigensolver::chebyshev::{FilterMode, chebyshev_filter, CudaKernelSet};
 use crate::eigensolver::rayleigh_ritz::rayleigh_ritz;
+#[cfg(any(test, feature = "scf_diag"))]
+use crate::eigensolver::rayleigh_ritz::rayleigh_ritz_with_matrices;
 use crate::eigensolver::vnl_data::VnlBatchData;
 use crate::layout::{ColumnDistributed, Cpu, WavefunctionSet};
 use crate::mixing::{DensityHistory, Kerker, MixingOff, MixingPhase, Pulay};
@@ -565,28 +567,6 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
             .sum();
         let Cpu(psi_new) = psi_new_gpu.sync_to_host_with(&stream, &mut pcie)?;
         let eigenvalues = eigenvalues_cpu.into_inner();
-
-        // Per-band |c_G|^2 normalization diagnostic
-        #[cfg(feature = "scf_diag")]
-        {
-            let mut sum_norms: Vec<f64> = Vec::with_capacity(n_bands);
-            for b in 0..n_bands {
-                let start = b * n_pw;
-                let end = (b + 1) * n_pw;
-                let band_slice = &psi_new.data[start..end];
-                let norm_sq: f64 = band_slice.iter().map(|c| c.norm_sqr()).sum();
-                sum_norms.push(norm_sq);
-            }
-            let min_norm = sum_norms.iter().cloned().fold(f64::INFINITY, f64::min);
-            let max_norm = sum_norms.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-            let avg_norm = sum_norms.iter().sum::<f64>() / n_bands as f64;
-            eprintln!(
-                "[RRNorm] per-band Σ|c_G|^2: min={:.6e} max={:.6e} avg={:.6e}  first_10={:.4?}  last_10={:.4?}",
-                min_norm, max_norm, avg_norm,
-                &sum_norms[..10.min(n_bands)],
-                &sum_norms[n_bands.saturating_sub(10)..],
-            );
-        }
         #[cfg(feature = "scf_diag")]
         eprintln!("[RR] eigenvalues: first={:.4e} Ha  last={:.4e} Ha  count={}",
             eigenvalues.first().copied().unwrap_or(f64::NAN),
@@ -627,7 +607,81 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
         Ok(next)
     }
 
-    /// Diagnostic-only: run one application of H = T + V_loc + V_NL on the
+    /// Test-only: run Chebyshev + Rayleigh-Ritz and return the internal subspace matrices
+    /// H_sub, S_sub, X alongside the normal RR outputs.
+    ///
+    /// Returns: `(eigenvalues, H_sub_cpu, S_sub_cpu, X_cpu)` — all col-major (n_bands × n_bands).
+    #[cfg(any(test, feature = "scf_diag"))]
+    #[doc(hidden)]
+    pub fn diagonalize_with_rr_matrices(
+        self,
+        ndeg: usize,
+    ) -> Result<(Vec<f64>, Vec<CudaComplex>, Vec<CudaComplex>, Vec<CudaComplex>), Error> {
+        let ctx = Arc::new(CudaContext::new(0)?);
+        let stream = ctx.default_stream();
+        let blas = BlasHandle::new(stream.clone())?;
+        let solver = SolverHandle::new(stream.clone())?;
+        let kernels = CudaKernelSet::new(&ctx)?;
+
+        let v_eff_ref = self.v_eff.as_ref().expect("VEffBuilt phase guarantees v_eff is Some");
+        let v_eff_spin = S::v_eff_for_spin(v_eff_ref, 0);
+        let v_eff_arr = v_eff_spin.as_real_grid().as_real_array();
+
+        let mut pcie = PcieAccount::default();
+
+        let v_eff_wave = downsample_array_to_wave_grid(v_eff_arr, &self.fine_grid, &self.wave_grid)?;
+        let (min_veff, max_veff) = {
+            let arr = v_eff_wave.as_fine_array();
+            let min = arr.iter().cloned().fold(f64::INFINITY, f64::min);
+            let max = arr.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            (min, max)
+        };
+
+        let v_eff_gpu = Gpu::from_host_with(&v_eff_wave, &stream, &mut pcie)?;
+
+        let pw_coords = self.pw_coords.clone();
+        let psi_host = self.psi.data.clone();
+        let n_bands = self.psi.n_bands;
+        let n_pw = self.psi.n_pw;
+
+        let psi_gpu = Gpu::from_host_with(&self.psi, &stream, &mut pcie)?;
+
+        let v_eff_for_d = chemrust_hamiltonian_core::EffectivePotential::from_inner(
+            chemrust_hamiltonian_core::fft::RealGrid::from_inner(v_eff_wave.as_fine_array().clone()),
+        );
+        let vnl_data = VnlBatchData::precompute(
+            &pw_coords, &self.pots, &self.cell,
+            &self.wave_grid, &self.k_point,
+            &psi_host, n_bands, n_pw, None,
+            Some(&v_eff_for_d),
+            &stream, &mut pcie, &blas, &solver,
+        )?;
+
+        let eig: Option<&[f64]> = None;
+
+        let fft_idx_dev: CudaSlice<i32> = stream
+            .clone_htod(&self.pw_fft_indices)
+            .map_err(Error::Cuda)?;
+        pcie.h2d_bytes += self.pw_fft_indices.len() * std::mem::size_of::<i32>();
+
+        let (psi_filtered_row, hpsi_row) = chebyshev_filter(
+            &psi_gpu, &v_eff_gpu, &self.pots,
+            &self.wave_grid, &self.k_point, &self.cell,
+            &self.pw_coords,
+            &vnl_data, &fft_idx_dev, min_veff, max_veff,
+            &kernels, &mut pcie, eig, ndeg, &blas, &solver, &stream, &ctx,
+            FilterMode::SinvHKeepHEig,
+        )?;
+
+        let (_, eigenvalues_cpu, _, h_sub_cpu, s_sub_cpu, x_cpu) = rayleigh_ritz_with_matrices(
+            &psi_filtered_row, &hpsi_row, &vnl_data,
+            n_bands, n_pw, &kernels,
+            &mut pcie,
+            &solver, &blas, &stream, &ctx,
+        )?;
+
+        Ok((eigenvalues_cpu.into_inner(), h_sub_cpu.into_inner(), s_sub_cpu.into_inner(), x_cpu.into_inner()))
+    }
     /// current `psi` (no Chebyshev recurrence, no Rayleigh-Ritz mixing) and
     /// return per-band components useful for direct ⟨ψ_b|H|ψ_b⟩ analysis.
     ///
@@ -733,11 +787,6 @@ impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated, MixingOff> {
             .call()?;
 
         stream.synchronize()?;
-        // F8 anchor values for density split diagnostic (CASTEP converged, Cu111+CO)
-        #[allow(unused)]
-        const F8_SOFT_SUM: f64 = 2.99359524940157e7;
-        #[allow(unused)]
-        const F8_AUG_SUM: f64 = 5.14204469948334e7;
         {
             let rho_arr = new_density.as_wave_array();
             let n_grid = rho_arr.len() as f64;
@@ -761,22 +810,6 @@ impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated, MixingOff> {
                 total_e_raw_conv, total_e_phys_conv,
                 occ_sum, occ_max, n_electrons, chem_pot.0,
             );
-            // F8-anchored soft density split
-            #[cfg(feature = "scf_diag")]
-            {
-                let [nz, ny, nx] = self.wave_grid.grid();
-                let n_wave = (nx * ny * nz) as f64;
-                let [nz_f, ny_f, nx_f] = self.fine_grid.grid();
-                let n_fine = (nx_f * ny_f * nz_f) as f64;
-                let n_e_our = rho_sum / n_wave;
-                let n_e_f8 = F8_SOFT_SUM / n_fine;
-                let ratio = n_e_our / n_e_f8;
-                eprintln!(
-                    "[DensitySplit] soft: N_e_our={:.6}  N_e_F8={:.6}  ratio={:.8}  wave_grid={} fine_grid={}",
-                    n_e_our, n_e_f8, ratio,
-                    n_wave as u64, n_fine as u64,
-                );
-            }
         }
 
         // USPP augmentation density on the fine grid (only when β·ψ is cached
@@ -854,31 +887,6 @@ impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated, MixingOff> {
                         aug_sum, aug_min, aug_max,
                         aug_sum * self.cell.volume / n_grid,
                     );
-                    #[cfg(feature = "scf_diag")]
-                    {
-                        let [nz_f, ny_f, nx_f] = self.fine_grid.grid();
-                        let n_fine = (nx_f * ny_f * nz_f) as f64;
-                        let n_e_our = aug_sum / n_fine;
-                        let n_e_f8 = F8_AUG_SUM / n_fine;
-                        let ratio = n_e_our / n_e_f8;
-                        eprintln!(
-                            "[DensitySplit] aug:  N_e_our={:.6}  N_e_F8={:.6}  ratio={:.8}",
-                            n_e_our, n_e_f8, ratio,
-                        );
-                        // Combined total
-                        let [nz_w, ny_w, nx_w] = self.wave_grid.grid();
-                        let n_wave = (nx_w * ny_w * nz_w) as f64;
-                        let soft_sum: f64 = new_density.as_wave_array().iter().sum();
-                        let n_e_soft_wave = soft_sum / n_wave;
-                        let n_e_aug_fine = aug_sum / n_fine;
-                        let n_e_total_our = n_e_soft_wave + n_e_aug_fine;
-                        let n_e_total_f8 = (F8_SOFT_SUM + F8_AUG_SUM) / n_fine;
-                        eprintln!(
-                            "[DensitySplit] total: N_e_our={:.6}  N_e_F8={:.6}  ratio={:.8}  soft_frac={:.6}  aug_frac={:.6}",
-                            n_e_total_our, n_e_total_f8, n_e_total_our / n_e_total_f8,
-                            n_e_soft_wave / n_e_total_our, n_e_aug_fine / n_e_total_our,
-                        );
-                    }
                 }
                 Some(rho_aug)
             }
@@ -1631,15 +1639,10 @@ impl<S: SpinPolicy, M: MixingPhase> ScfIteration<S, WavefunctionsUpdated, M> {
     pub fn eigenvalues(&self) -> &[f64] {
         &self.eigenvalues
     }
-    /// Access ψ coefficient slice (debug/testing only).
+    /// Access ψ coefficient slice after diagonalization (debug/testing only).
     #[doc(hidden)]
     pub fn psi_data(&self) -> &[Complex64] {
         &self.psi.data
-    }
-    /// Access (n_bands, n_pw) shape (debug/testing only).
-    #[doc(hidden)]
-    pub fn psi_shape(&self) -> (usize, usize) {
-        (self.psi.n_bands, self.psi.n_pw)
     }
 }
 

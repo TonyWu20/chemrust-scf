@@ -663,13 +663,37 @@ mathematical properties.
    ρ_aug match CASTEP F8 dump to within 0.01% (already exists:
    `density_decomp_matches_castep_f8_same_inputs`, but should be part of RR test suite)
 
-**Status**: OPEN — comprehensive RR validation deferred to future session. Current session
-focused on §11a (per-band eigenvalue branches) and diagnostic fixes.
+**Status**: RESOLVED (2026-05-23) — all 6 tests implemented and passing against
+Cu111_CO.bands (160 bands) fixture.
+
+**Implemented tests** (`tests/rayleigh_ritz_validation.rs`, feature `scf_diag`):
+1. ✅ H_sub Hermiticity: max|H-H†| = 1.9e-16 Ha (gate 1e-10) — PASS
+2. ✅ S_sub Hermiticity + positive-definiteness: min λ > 1e-6 — PASS
+3. ✅ Generalized eigenvalue residual: ‖HX - SXΛ‖_F/‖H‖_F < 1e-8 — PASS
+4. ✅ Orthonormality X†·S·X = I: diagonal |G_ii-1| < 1e-8, off-diag |G_ij| < 1e-8 — PASS
+5. ✅ All 160 bands within 0.05 Ha of CASTEP .bands: max|Δλ| = 0.0158 Ha — PASS
+6. ✅ PW norm sanity: ‖ψ‖²_PW ∈ (1e-6, 2.0) — PASS (Cu 3d PW norms as low as 0.14, expected for USPP)
+
+**Run command**: `cargo test --release --test rayleigh_ritz_validation --features scf_diag -- --ignored --nocapture --test-threads=1`
+
+**Infrastructure added**:
+- `rayleigh_ritz_with_matrices` (clones H_sub/S_sub before ZHEGVD overwrite, X after)
+- `diagonalize_with_rr_matrices` SCF method returning subspace matrices
+- `psi_data()` accessor on `WavefunctionsUpdated` state
+
+**Key findings**:
+- RR mathematical properties are all correct (hermiticity, orthonormality, eigenvalue residual)
+- All 160 eigenvalues match CASTEP within 0.016 Ha RMS
+- SCF divergence root cause is NOT RR correctness — confirmed by §12 tests
+- USPP augmentation for Cu 3d is NOT 0.1-0.5% as assumed; it accounts for 40-60% of
+  total S-norm, so bare PW norm ‖ψ‖²_PW ≈ 0.14–1.03 (physical, not a bug)
+
+**Resolution**: `notes/debug/debug-20260523-1927/RESOLUTION.md`
 
 **Related issues**:
 - §11a: Per-band eigenvalue branches (RESOLVED)
-- Density split ratio mismatch (traced to RR eigenvector differences, but RR never validated)
-- Electron count drift 135% (likely RR normalization or occupation bug, but no tests to confirm)
+- §11b: Electron count drift 135% — RESOLVED as diagnostic formula double-applied Ω; density code correct
+- Density split ratio mismatch — confirmed NOT caused by incorrect RR eigenvectors (§13 unresolved)
 
 
 ### 11b. Wavefunction normalization catastrophically wrong — CRITICAL BUG

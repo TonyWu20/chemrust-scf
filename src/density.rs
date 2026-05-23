@@ -595,6 +595,8 @@ pub mod test_api {
     };
     pub use crate::eigensolver::chebyshev::{check_s_inv_s_identity, CudaKernelSet, FilterMode};
     pub use crate::eigensolver::vnl_data::{VnlBatchData, VnlIonData};
+    #[cfg(any(test, feature = "scf_diag"))]
+    pub use crate::eigensolver::rayleigh_ritz::rayleigh_ritz_with_matrices;
 }
 
 // ---------------------------------------------------------------------------

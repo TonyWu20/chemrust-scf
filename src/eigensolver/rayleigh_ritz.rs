@@ -321,3 +321,269 @@ pub(crate) fn rayleigh_ritz(
 
     Ok((psi_new_gpu, Cpu(eigenvalues), beta_psi_per_ion))
 }
+
+/// Test-only variant that also returns H_sub, S_sub, and X for mathematical validation.
+///
+/// Identical to `rayleigh_ritz` but captures the n×n subspace matrices before ZHEGVD
+/// consumes them, and the eigenvector matrix X after ZHEGVD writes it into `h_sub_dev`.
+///
+/// Return tuple: (psi_new, eigenvalues, beta_psi_per_ion, H_sub, S_sub, X)
+/// All matrices are col-major (n_bands × n_bands) on the host.
+#[cfg(any(test, feature = "scf_diag"))]
+#[allow(clippy::too_many_arguments)]
+pub fn rayleigh_ritz_with_matrices(
+    psi_row: &Gpu<WavefunctionSet<RowDistributed>>,
+    hpsi_row: &Gpu<WavefunctionSet<RowDistributed>>,
+    vnl_data: &VnlBatchData,
+    n_bands: usize,
+    n_pw: usize,
+    _kernels: &CudaKernelSet,
+    pcie: &mut PcieAccount,
+    solver: &SolverHandle,
+    blas: &BlasHandle,
+    stream: &Arc<CudaStream>,
+    ctx: &Arc<CudaContext>,
+) -> Result<
+    (
+        Gpu<WavefunctionSet<ColumnDistributed>>,
+        Cpu<Vec<f64>>,
+        Vec<CudaSlice<CudaComplex>>,
+        Cpu<Vec<CudaComplex>>,
+        Cpu<Vec<CudaComplex>>,
+        Cpu<Vec<CudaComplex>>,
+    ),
+    Error,
+> {
+    let n = n_bands as i32;
+    let k = n_pw as i32;
+
+    // ---- Step 1: H_sub = psi^dag * hpsi ----
+    let mut h_sub_dev: CudaSlice<CudaComplex> =
+        stream.alloc_zeros(n_bands * n_bands).map_err(Error::Cuda)?;
+
+    unsafe {
+        blas.gemm_c64(
+            ZgemmConfig {
+                transa: op::C,
+                transb: op::N,
+                m: n,
+                n,
+                k,
+                alpha: CudaComplex { x: 1.0, y: 0.0 },
+                lda: k,
+                ldb: k,
+                beta: CudaComplex { x: 0.0, y: 0.0 },
+                ldc: n,
+            },
+            psi_row.as_device_slice(),
+            hpsi_row.as_device_slice(),
+            &mut h_sub_dev,
+        )?;
+    }
+
+    // ---- Step 2: S_sub = psi^dag * psi ----
+    let mut s_sub_dev: CudaSlice<CudaComplex> =
+        stream.alloc_zeros(n_bands * n_bands).map_err(Error::Cuda)?;
+
+    unsafe {
+        blas.gemm_c64(
+            ZgemmConfig {
+                transa: op::C,
+                transb: op::N,
+                m: n,
+                n,
+                k,
+                alpha: CudaComplex { x: 1.0, y: 0.0 },
+                lda: k,
+                ldb: k,
+                beta: CudaComplex { x: 0.0, y: 0.0 },
+                ldc: n,
+            },
+            psi_row.as_device_slice(),
+            psi_row.as_device_slice(),
+            &mut s_sub_dev,
+        )?;
+    }
+
+    // ---- Step 2b: Add USPP S-augmentation ----
+    let psi_slice = psi_row.as_device_slice();
+    for entry in &vnl_data.entries {
+        let ne = entry.n_expanded;
+        let mut c_proj: CudaSlice<CudaComplex> =
+            stream.alloc_zeros(ne as usize * n_bands).map_err(Error::Cuda)?;
+        unsafe {
+            blas.gemm_c64(
+                ZgemmConfig {
+                    transa: op::C,
+                    transb: op::N,
+                    m: ne,
+                    n,
+                    k,
+                    alpha: CudaComplex { x: 1.0, y: 0.0 },
+                    lda: k,
+                    ldb: k,
+                    beta: CudaComplex { x: 0.0, y: 0.0 },
+                    ldc: ne,
+                },
+                &entry.beta_g,
+                psi_slice,
+                &mut c_proj,
+            )?;
+        }
+
+        let mut temp: CudaSlice<CudaComplex> =
+            stream.alloc_zeros(ne as usize * n_bands).map_err(Error::Cuda)?;
+        unsafe {
+            blas.gemm_c64(
+                ZgemmConfig {
+                    transa: op::N,
+                    transb: op::N,
+                    m: ne,
+                    n,
+                    k: ne,
+                    alpha: CudaComplex { x: 1.0, y: 0.0 },
+                    lda: ne,
+                    ldb: ne,
+                    beta: CudaComplex { x: 0.0, y: 0.0 },
+                    ldc: ne,
+                },
+                &entry.q_matrix,
+                &c_proj,
+                &mut temp,
+            )?;
+        }
+
+        unsafe {
+            blas.gemm_c64(
+                ZgemmConfig {
+                    transa: op::C,
+                    transb: op::N,
+                    m: n,
+                    n,
+                    k: ne,
+                    alpha: CudaComplex { x: 1.0, y: 0.0 },
+                    lda: ne,
+                    ldb: ne,
+                    beta: CudaComplex { x: 1.0, y: 0.0 },
+                    ldc: n,
+                },
+                &c_proj,
+                &temp,
+                &mut s_sub_dev,
+            )?;
+        }
+    }
+
+    // ---- Save H_sub and S_sub before ZHEGVD overwrites them ----
+    stream.synchronize().map_err(Error::Cuda)?;
+    let h_sub_host_pre = stream.clone_dtoh(&h_sub_dev).map_err(Error::Cuda)?;
+    let s_sub_host_pre = stream.clone_dtoh(&s_sub_dev).map_err(Error::Cuda)?;
+
+    // ---- Step 3: ZHEGVD ----
+    let mut eigenvalues_dev: CudaSlice<f64> =
+        stream.alloc_zeros(n_bands).map_err(Error::Cuda)?;
+    let mut info_dev: CudaSlice<i32> = stream.alloc_zeros(1).map_err(Error::Cuda)?;
+
+    solver.zhegvd(
+        cusolverEigMode_t::CUSOLVER_EIG_MODE_VECTOR,
+        cublasFillMode_t::CUBLAS_FILL_MODE_LOWER,
+        n,
+        &mut h_sub_dev,
+        &mut s_sub_dev,
+        &mut eigenvalues_dev,
+        &mut info_dev,
+    )?;
+
+    stream.synchronize().map_err(Error::Cuda)?;
+    let info: Vec<i32> = stream.clone_dtoh(&info_dev).map_err(Error::Cuda)?;
+    if info[0] != 0 {
+        return Err(Error::RayleighRitzFailed { info: info[0] });
+    }
+
+    // ---- Save X (h_sub_dev now contains eigenvectors) ----
+    let x_host = stream.clone_dtoh(&h_sub_dev).map_err(Error::Cuda)?;
+
+    // ---- Step 4-5: Rotate psi_new = psi_row · X ----
+    let mut psi_new_dev: CudaSlice<CudaComplex> =
+        stream.alloc_zeros(n_bands * n_pw).map_err(Error::Cuda)?;
+
+    unsafe {
+        blas.gemm_c64(
+            ZgemmConfig {
+                transa: op::N,
+                transb: op::N,
+                m: k,
+                n,
+                k: n,
+                alpha: CudaComplex { x: 1.0, y: 0.0 },
+                lda: k,
+                ldb: n,
+                beta: CudaComplex { x: 0.0, y: 0.0 },
+                ldc: k,
+            },
+            psi_row.as_device_slice(),
+            &h_sub_dev,
+            &mut psi_new_dev,
+        )?;
+    }
+
+    // ---- Step 5b: β_g^H · ψ_new per ion ----
+    let mut beta_psi_per_ion: Vec<CudaSlice<CudaComplex>> =
+        Vec::with_capacity(vnl_data.entries.len());
+    let psi_new_slice: &CudaSlice<CudaComplex> = &psi_new_dev;
+    for entry in &vnl_data.entries {
+        let ne = entry.n_expanded;
+        let mut bp_dev: CudaSlice<CudaComplex> =
+            stream.alloc_zeros(ne as usize * n_bands).map_err(Error::Cuda)?;
+        unsafe {
+            blas.gemm_c64(
+                ZgemmConfig {
+                    transa: op::C,
+                    transb: op::N,
+                    m: ne,
+                    n,
+                    k,
+                    alpha: CudaComplex { x: 1.0, y: 0.0 },
+                    lda: k,
+                    ldb: k,
+                    beta: CudaComplex { x: 0.0, y: 0.0 },
+                    ldc: ne,
+                },
+                &entry.beta_g,
+                psi_new_slice,
+                &mut bp_dev,
+            )?;
+        }
+        beta_psi_per_ion.push(bp_dev);
+    }
+
+    // ---- Step 6: D2H eigenvalues ----
+    let eigenvalues: Vec<f64> = stream
+        .clone_dtoh(&eigenvalues_dev)
+        .map_err(Error::Cuda)?;
+    pcie.d2h_bytes += eigenvalues.len() * 8;
+
+    stream.synchronize().map_err(Error::Cuda)?;
+
+    let psi_new_gpu = Gpu::<WavefunctionSet<ColumnDistributed>> {
+        slice: psi_new_dev,
+        shape: vec![n_bands, n_pw],
+        ctx: ctx.clone(),
+        _marker: PhantomData,
+    };
+
+    Ok((
+        psi_new_gpu,
+        Cpu(eigenvalues),
+        beta_psi_per_ion,
+        Cpu(h_sub_host_pre),
+        Cpu(s_sub_host_pre),
+        Cpu(x_host),
+    ))
+}
+
+/// Test-only: expose `rayleigh_ritz_with_matrices` through the density test_api path.
+#[cfg(test)]
+pub(crate) mod test_api {
+    pub use super::rayleigh_ritz_with_matrices;
+}

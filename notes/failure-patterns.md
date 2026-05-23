@@ -91,3 +91,15 @@ controlled experiment before asserting a code bug.
 **Fix**: Not yet — hypothesised fix is to compare D-screening between iter-1 (CASTEP V_eff) and iter-2 (our V_eff) to identify the amplification point.
 **Pattern**: subspace-vs-CG-algorithm-mismatch. Chebyshev filter + subspace Rayleigh-Ritz is a fundamentally different eigensolver than CASTEP's band-by-band conjugate gradient minimization. Subspace methods rotate eigenvectors within degenerate manifolds, which CG preserves naturally. This is expected algorithmic behaviour, not a code bug.
 **Resolution**: `notes/debug/debug-20260523-1915/RESOLUTION.md`
+
+## 2026-05-23: rr-validation-infrastructure-cfg-boundary
+**Root cause**: `#[cfg(test)]` on library items (`rayleigh_ritz_with_matrices`, its import in `scf.rs`) is invisible to integration tests in `tests/` which compile as a separate crate. All test-only infrastructure that integration tests need must be gated with `#[cfg(any(test, feature = "scf_diag"))]`, not just `#[cfg(test)]`. Simultaneously, `psi_data()` existed only on the `VEffBuilt` phase impl, not on `WavefunctionsUpdated`, despite accessing the same struct field.
+**Fix**: `src/scf.rs:18` — change `#[cfg(test)]` to `#[cfg(any(test, feature = "scf_diag"))]` on import; `src/scf.rs:1637` — add `psi_data()` to `WavefunctionsUpdated` impl block.
+**Pattern**: cfg-boundary-mismatch. The rule: any test-only item accessed from `tests/` needs `any(test, feature = "...")`, not bare `#[cfg(test)]`. The typestate pattern means phase-specific impl blocks don't share methods even when accessing the same field.
+**Resolution**: `notes/debug/debug-20260523-1927/RESOLUTION.md`
+
+## 2026-05-23: uspp-pw-norm-not-unit-ncpp-assumption
+**Root cause**: Test 6 assumed `‖ψ‖²_PW ≈ 1` for USPP wavefunctions. In USPP the constraint is `⟨ψ|S|ψ⟩ = 1` where `S = 1 + Σ_ion |β_I⟩ Q_I ⟨β_I|`. For Cu 3d states Q contributes 40–60% of total norm so `‖ψ‖²_PW` ranges 0.14–1.03. Additionally Q can be negative for shallow s/p states, allowing `‖ψ‖²_PW` slightly above 1. The `≤ 1` upper bound is a norm-conserving PP assumption that does not hold for USPP.
+**Fix**: `tests/rayleigh_ritz_validation.rs` — replace `|‖ψ‖²_PW - 1| < 1e-6` assertion with physical bounds `‖ψ‖²_PW ∈ (1e-6, 2.0)` (no ghost modes, no explosion).
+**Pattern**: ncpp-assumption-in-uspp-code. When porting validation logic from norm-conserving PP literature, audit every statement of the form "⟨ψ|ψ⟩ = 1" — in USPP this is `⟨ψ|S|ψ⟩ = 1`, which is a strictly weaker constraint on the bare PW norm.
+**Resolution**: `notes/debug/debug-20260523-1927/RESOLUTION.md`
