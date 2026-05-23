@@ -613,6 +613,65 @@ drifts between iterations, stale labels cause the filter to amplify the wrong su
 **Tight tests**: `tests/ca_scf_convergence.rs::issue_11a_iter1_band0_matches_castep` (SC-1),
 `issue_11a_iter2_lastband_does_not_overshoot` (SC-4)
 
+## 12. Rayleigh-Ritz has zero comprehensive validation
+
+**Symptom (2026-05-23):** After fixing §11a (per-band eigenvalue branches), the full
+SCF test still fails with 135% electron count drift (55 e⁻ → 130 e⁻ vs expected 186 e⁻).
+Investigation revealed that Rayleigh-Ritz, the core eigensolver with ~300 lines of
+complex CUDA/BLAS code, has essentially zero validation tests.
+
+**Current RR validation (extremely weak)**:
+- `h_sub_off_diagonal_magnitude` — prints H_sub/S_sub matrices, **no assertions**
+- `issue_11a_iter1_band0_matches_castep` — checks **one eigenvalue** (band-0) at iter-1
+- `issue_11a_iter2_lastband_does_not_overshoot` — checks **one eigenvalue** (last-band) at iter-2
+- Total: 2 out of 10 bands checked, no mathematical property validation
+
+**Missing validation**:
+1. ❌ H_sub Hermiticity: H_sub = H_sub† (should be exact for Hermitian H)
+2. ❌ S_sub Hermiticity and positive-definiteness: S_sub = S_sub†, eigenvalues > 0
+3. ❌ Generalized eigenvalue equation: ‖H·X - S·X·Λ‖ < ε (residual test)
+4. ❌ Orthonormality: X†·S·X = I (off-diagonal < ε, diagonal = 1)
+5. ❌ All eigenvalues: compare all 10 bands against CASTEP, not just 2
+6. ❌ Wavefunction normalization: ⟨ψ_new|S|ψ_new⟩ = 1 after RR
+7. ❌ Occupation sum: Σ occ_i = N_e = 186 (electron count conservation)
+8. ❌ Density decomposition: ρ_PW + ρ_aug split ratio matches CASTEP (when using same ψ)
+
+**Why this matters**:
+- Density split ratio wrong (ρ_PW 67.4% of CASTEP, ρ_aug 119% of CASTEP) — traced to
+  different eigenvectors from RR, but never validated that RR eigenvectors are correct
+- Electron count drifts 135% between iterations — could be RR not preserving normalization,
+  or occupations not summing to N_e, but we have no tests to check
+- Multiple "downstream" bugs (density construction, mixing, augmentation) turned out to
+  be upstream (eigensolver) issues, but we kept debugging downstream because we assumed
+  RR was correct
+
+**Root cause**: RR implementation was ported from a working reference but never validated
+with comprehensive unit tests. We only added end-to-end eigenvalue checks (SC-1, SC-4)
+after discovering SCF divergence, but these only check 2 bands and don't validate
+mathematical properties.
+
+**Recommended validation suite** (deferred to future session):
+1. **Hermiticity test**: Compute H_sub and S_sub from CASTEP fixture ψ, verify H_sub = H_sub†
+   and S_sub = S_sub† to machine precision (< 1e-14)
+2. **Eigenvalue equation test**: After zhegvd, verify ‖H_sub·X - S_sub·X·Λ‖_F < 1e-10
+3. **Orthonormality test**: Verify X†·S_sub·X = I (diagonal = 1 ± 1e-10, off-diagonal < 1e-10)
+4. **All-bands eigenvalue test**: Compare all 10 bands against CASTEP .bands file (not just 2)
+5. **Wavefunction normalization test**: After psi_new = psi_row · X, verify ⟨ψ_i|S|ψ_i⟩ = 1
+   for all bands
+6. **Occupation sum test**: After compute_occupations, verify Σ occ_i = N_e ± 1e-6
+7. **Density decomposition test**: Feed CASTEP ψ through our density code, verify ρ_PW and
+   ρ_aug match CASTEP F8 dump to within 0.01% (already exists:
+   `density_decomp_matches_castep_f8_same_inputs`, but should be part of RR test suite)
+
+**Status**: OPEN — comprehensive RR validation deferred to future session. Current session
+focused on §11a (per-band eigenvalue branches) and diagnostic fixes.
+
+**Related issues**:
+- §11a: Per-band eigenvalue branches (RESOLVED)
+- Density split ratio mismatch (traced to RR eigenvector differences, but RR never validated)
+- Electron count drift 135% (likely RR normalization or occupation bug, but no tests to confirm)
+
+
 ### 11b. Wavefunction normalization catastrophically wrong — CRITICAL BUG
 
 **Finding (2026-05-23 15:50):** When the `ScfDivergenceGate` was added to catch
