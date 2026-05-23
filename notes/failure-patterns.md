@@ -61,3 +61,10 @@ controlled experiment before asserting a code bug.
   - `src/scf.rs:433` — production default updated to Mode B.
 **Pattern**: gpu-port-silent-correctness-regression. GPU port of a CPU function produced wrong results for all non-trivial inputs (non-origin ions) while passing for the trivial case (origin ion). The trivial case was the first ion processed, masking the bug in all diagnostic logs. Always include a non-trivial test case when porting numerical code to GPU.
 **Resolution**: `notes/debug/debug-20260523-0916-iter1-filter-operator-mismatch/RESOLUTION.md`
+
+## 2026-05-23: electron-count-diagnostic-double-volume
+**Root cause**: Diagnostic formula applied cell volume to density already in CASTEP raw units (ρ×Ω)
+**Fix**: src/scf.rs:486 and src/scf.rs:732 — remove extra `* cell.volume` factor
+**Pattern**: unit-convention-mismatch (diagnostic)
+**Lesson**: When debugging normalization errors, trace the full dataflow including diagnostics — the measurement code can be wrong even when the physics is correct. In this case, the density construction was correct all along (both fixture and computed paths use CASTEP ρ×Ω convention consistently). The bug was in the diagnostic formula that multiplied by Ω again, applying the volume factor twice and producing a 22,300× error (exactly the cell volume in Bohr³). The "raw_conv" diagnostic already gave the correct answer (186 e⁻), but "phys_conv" was wrong and prominently used, misleading the investigation.
+**Resolution**: `notes/debug/debug-20260523-1149-iter2-divergence/RESOLUTION.md`

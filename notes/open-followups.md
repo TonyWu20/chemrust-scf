@@ -588,80 +588,140 @@ passes SC-4-tight (all 10 bands within 0.05 Ha of CASTEP). But iter-2 diverges:
 
 Log: `/tmp/scf-diag-global-woodbury-0523-1021.log`
 
-**What is known:**
+**Status (2026-05-23 15:00–16:00 session):** TWO DISTINCT BUGS DISCOVERED.
 
-1. **Iter-1 density is correct in total.** `rho_sum=2.42e7` (soft) +
-   `aug_sum=5.71e7` ≈ `8.13e7` = fixture value. The density going into
-   iter-2 V_eff assembly is physically correct.
+### 11a. Per-band eigenvalue branches contribute 64% of iter-2 last-band overshoot
 
-2. **Iter-2 V_eff range = 20.26 Ha** (vs iter-1 8.69 Ha). This is a 2.3×
-   increase, not the 4–5× explosion seen before the §8 fix. The density
-   is not the primary cause — the V_eff is moderately wrong, not catastrophically.
+**Finding:** The R-ChFSI per-band machinery (Das Alg 3 lines 598-604, implemented
+at `chebyshev.rs:1582-1660`) is activated when `eigenvalues.is_some()`. At iter-1,
+`eigenvalues=None` (no prior RR), so the filter uses a simpler uniform-shift path.
+At iter-2+, `eigenvalues=Some(...)` (prior RR eigenvalues available), so the filter
+uses per-band Λ_Y init and per-band Λ_X updates.
 
-3. **Iter-2 RR produces `last band = 1.95 Ha`** (vs 0.13 Ha at iter-1).
-   The subspace has drifted upward by ~1.8 Ha in one step. This means the
-   Chebyshev filter at iter-2 is not keeping the subspace near the converged
-   eigenvectors — it's amplifying higher-energy states.
+**Empirical test (`CHEMRUST_FORCE_NO_EIGS=1`):** forcing `eigenvalues=None` at
+every iteration (disabling per-band branches) reduces iter-2 last-band overshoot
+from **1.95 Ha → 0.70 Ha** (64% improvement). Band-0 drift unchanged (0.18 Ha).
 
-4. **Iter-2 b_low = eig[last] = 0.130 Ha** (correct per Alg 4.1 §7.2).
-   The filter window `[0.130, 20.80]` Ha should damp everything above 0.130 Ha.
-   But the iter-2 RR last band is 1.95 Ha — well above b_low. This means
-   the filter is not damping the high-energy components effectively in 8 steps.
+**Root cause hypothesis:** R-ChFSI's per-band machinery was designed for the
+regime where `ζ = ‖D⁻¹ − B⁻¹‖ > 0` (inexact S⁻¹). After §10's Global Woodbury
+fix, `ζ = 3.8e-15` (machine epsilon). Das main.tex:612 states that when `ζ = 0`
+and the same matrix is used for filter and RR, **R-ChFSI ≡ standard ChFSI
+algebraically**. The per-band machinery provides zero benefit but introduces
+numerical weak points (cancellation in the recurrence, sensitivity to stale
+eigenvalue labels when V_eff drifts between iterations).
 
-5. **Iter-2 D_screened amax = 8–31 Ha** (vs 2–6 Ha at iter-1). This is
-   elevated but not catastrophic. The D_screened explosion at iter-3 (75–315 Ha)
-   is a consequence of the wrong iter-2 wavefunctions producing wrong density,
-   not a primary cause.
+**Why the per-band path fails at iter-2:** The eigenvalues passed in are from
+iter-1's RR (properties of iter-1's H[ρ₁]). At iter-2, V_eff has changed (built
+from ρ₁ ≠ ρ_castep), so the operator is H[ρ₁] ≠ H[ρ_castep]. The per-band shifts
+use stale labels (iter-1 eigenvalues) to construct a polynomial filter for a
+*different* operator (iter-2 H). The filter amplifies the wrong subspace.
 
-**Hypothesis:** The Chebyshev filter degree (ndeg=8) is insufficient to
-separate the wanted subspace (below 0.13 Ha) from the unwanted spectrum
-(above 0.13 Ha) when starting from a non-converged wavefunction. At iter-1
-we start from the CASTEP converged wavefunction, so the filter only needs
-to refine a nearly-correct subspace. At iter-2 we start from the iter-1
-RR output, which has drifted — the filter needs to do more work.
+**Partial fix candidate:** Always pass `eigenvalues=None` to the filter (effectively
+run standard ChFSI with no per-band shifts). This is what `CHEMRUST_FORCE_NO_EIGS=1`
+does. Reduces iter-2 last-band overshoot by 64% but doesn't eliminate it entirely.
 
-The filter polynomial `T_8(x)` with window `[0.13, 20.80]` Ha has a
-contrast ratio of `T_8(20.80/10.47) / T_8(0.13/10.47)` ≈ `T_8(1.99) /
-T_8(0.012)`. `T_8(1.99) ≈ 2^7 × 1.99^8 ≈ 3.2e4` and `T_8(0.012) ≈ 1`.
-So the filter should amplify the wanted subspace by ~32,000× relative to
-the unwanted. That should be more than enough for 8 steps.
+**Residual 36% (band-0 drift 0.18 Ha):** Even with per-band branches disabled,
+band-0 drifts from −1.046 → −0.869 Ha (0.18 Ha). This is likely the V_eff drift
+between iter-1 and iter-2 — our pipeline's equilibrium differs slightly from
+CASTEP's. Whether this drift shrinks over subsequent iterations (SCF converges
+to our equilibrium) or grows (SCF diverges) is unknown — the test hit bug 11b
+before reaching iter-3.
 
-**Alternative hypothesis:** The iter-2 wavefunction after RR rotation is
-not S-orthonormal. The Gram-Schmidt step uses S-inner product, but the
-RR rotation `ψ_new = ψ_row · X` does not re-orthonormalize. If the
-eigenvectors X from ZHEGVD are not exactly S-orthonormal (due to numerical
-precision in S_sub assembly), the iter-2 starting wavefunction has
-non-trivial S-overlap, which corrupts the residual `Y = H·X − S·X·Λ` in
-Step 1 of R-ChFSI.
+### 11b. Wavefunction normalization catastrophically wrong — CRITICAL BUG
 
-**Diagnostic plan:**
+**Finding (2026-05-23 15:50):** When the `ScfDivergenceGate` was added to catch
+runaway SCF, the electron-count check fired at iter-2:
 
-1. **Check S-orthonormality of iter-1 RR output.** After `diagonalize()`,
-   compute `S_sub = ψ_new† · S · ψ_new` and check `‖S_sub − I‖_∞`. If
-   this is > 1e-6, the RR output is not S-orthonormal and the iter-2
-   filter starts from a corrupted subspace.
+```
+[SCF gate] iter 2: electron count 2900904.7860 drifted 134.79% from iter-1 baseline 1235557.8631, exceeds gate 5.00%
+  likely cause: augmentation density or mixing broken
+```
 
-2. **Check iter-2 residual norm at k=1.** The R-ChFSI Step 1 residual
-   `Y = H·X − S·X·Λ` should be small if X is close to the eigenvectors.
-   If `‖Y‖` is large at iter-2 (much larger than at iter-1), the starting
-   wavefunction has drifted significantly.
+For Cu111+CO (18 atoms, 186 valence electrons), the electron count should be ~186.
+Instead:
+- Iter-1: **1,235,558 electrons** (6,600× too many)
+- Iter-2: **2,900,905 electrons** (15,600× too many, 2.35× iter-1)
 
-3. **Try ndeg=16 or ndeg=32 at iter-2.** If the filter degree is the
-   bottleneck, increasing it should stabilize iter-2. This is a quick
-   diagnostic, not a production fix.
+The total energy is correspondingly wrong:
+- Production iter-1: **−881 million eV** (logged at `scf.rs:1339`)
+- CASTEP reference: **−24,111 eV** (from `Cu111_CO.castep`)
+- Error: **36,500× too negative**
 
-4. **Check whether iter-2 V_eff range of 20.26 Ha is causing the problem.**
-   The D_screened at iter-2 is 8–31 Ha (vs 2–6 Ha at iter-1). This is
-   elevated but not catastrophic. The question is whether this elevation
-   is enough to corrupt the iter-2 Hamiltonian sufficiently to cause the
-   iter-3 explosion.
+**Root cause:** Gram-Schmidt at `chebyshev.rs:1743-1780` normalizes wavefunctions
+using `cublasZdotc`, which computes `Σ_i ψ*[i]·(S·ψ)[i]` — a **dimensionless grid
+sum**. For continuous normalization `∫ ψ*(r)·(S·ψ)(r) d³r = 1`, the discrete form
+is `(Ω/N_grid)·Σ_i ψ*[i]·(S·ψ)[i] = 1`, so the target for the dimensionless sum
+is `N_grid/Ω`, not 1.
+
+Currently Gram-Schmidt normalizes to `Σ = 1`. For Cu111+CO with Ω ≈ 162.4 Bohr³
+and N_grid = 437,400, the correct target is `Σ = 437400/162.4 ≈ 2,693`. The
+wavefunction is off by √(2693) ≈ 52× too small, which squares to 2,700× in the
+density, compounding with other factors (occupations, grid conventions) to produce
+the observed 6,600× electron-count error.
+
+**Attempted fix (incomplete):** Added `norm_sq_s /= (cell.volume / n_pw)` at
+`chebyshev.rs:1753-1754` and `dot /= (cell.volume / n_pw)` at `chebyshev.rs:1770-1771`
+to scale the Gram-Schmidt norm computation. Diagnostic print confirms the fix runs
+(iter-1 scaled norm²_S = 137.3 vs raw 51.0), but the `[ConstructDensity]` log
+still shows `Σ|grid[r]|² = 4.499210e5` (unchanged across all test runs).
+
+**Why the fix didn't propagate:** Rayleigh-Ritz (ZHEGVD) runs *after* Gram-Schmidt
+and produces eigenvectors X that satisfy `X†·S_sub·X = I` in the subspace. ZHEGVD's
+output normalization convention overwrites whatever Gram-Schmidt did. The issue is
+likely a **unit convention mismatch** in how S_sub and H_sub are assembled from
+the Gram-Schmidt-normalized ψ, or in how the RR eigenvectors are rotated back to
+the full space.
+
+**Impact:** This bug has been present since the beginning. Every SCF run has had
+wrong electron counts and energies by 4–5 orders of magnitude. Prior tests didn't
+catch it because:
+- §8's `density_decomp_matches_castep_f8_same_inputs` used CASTEP's ψ (correctly
+  normalized), so our density code passed when given correct input.
+- Eigenvalue tests (iter-1 SC-4-tight, ndeg=0 baseline) only checked eigenvalues,
+  which are scale-invariant under the generalized eigenproblem.
+- The SCF never ran long enough to accumulate the error visibly before the gate
+  was added.
+
+**Next steps:**
+1. Trace the full normalization chain: Gram-Schmidt → S_sub/H_sub assembly → ZHEGVD
+   → RR rotation → density construction. Identify where the `(Ω/N_grid)` factor
+   is missing or applied incorrectly.
+2. Check CASTEP's wavefunction normalization convention in the `.check` file —
+   does CASTEP store ψ with `Σ|ψ|² = 1` or `(Ω/N)·Σ|ψ|² = 1`? If the former,
+   our fixture loader may need to rescale on load.
+3. Verify that `construct_density_gpu` uses the correct convention for converting
+   `|ψ|²` (grid values) to ρ (charge density in e⁻/Bohr³).
+
+**Discriminator for fix:** After fixing, `[ConstructDensity] band-0 Σ|grid[r]|²`
+should be O(1), not O(10⁵). Electron count should be ~186, not ~10⁶. Total energy
+should be O(−10⁴ eV), not O(−10⁸ eV).
 
 **Entry point for next session:**
-- Read `notes/debug/debug-20260523-0916-iter1-filter-operator-mismatch/RESOLUTION.md`
-  for context on what was fixed.
-- Run `fixed_point_matches_castep_energy` with `--nocapture` and check
-  iter-2 `[NewDensity] rho_sum` and `[RR] eigenvalues: last=` to confirm
-  the pattern above.
-- The discriminator for this issue is iter-2 `last band < 0.5 Ha` (vs
-  current 1.95 Ha). If the last band stays near 0.13 Ha after iter-2,
-  the SCF has a chance of converging.
+- Read `notes/debug/debug-20260523-1149-iter2-divergence/analysis.html` for the
+  per-band eigenvalue branch analysis (bug 11a).
+- Focus on bug 11b (normalization) first — it's more fundamental and affects every
+  iteration. Bug 11a is a secondary issue that only matters once 11b is fixed.
+- The normalization fix is in `chebyshev.rs:1753-1754` and `1770-1771` but doesn't
+  propagate. Check RR's `rayleigh_ritz.rs` for where ZHEGVD's output gets rotated
+  back and whether a volume factor is missing there.
+
+**RESOLVED (2026-05-23):** Bug 11b was NOT a wavefunction normalization bug. The
+density construction was correct all along — both fixture and computed paths use
+CASTEP ρ×Ω convention consistently. The bug was in the **diagnostic formula** at
+`scf.rs:486` and `scf.rs:732` that multiplied by cell volume when the density was
+already in CASTEP raw units (ρ×Ω), applying Ω twice and producing a 22,300× error
+(exactly the cell volume in Bohr³).
+
+**Fix:** Changed `total_e_phys_conv = rho_sum * Ω / n_grid` to `total_e_phys_conv = rho_sum / n_grid`
+
+**Resolution:** `notes/debug/debug-20260523-1149-iter2-divergence/RESOLUTION.md`
+
+**Discriminator test:** `tests/ca_scf_convergence.rs::electron_count_diagnostic_correct`
+- Before fix: `total_e_raw_conv = 186 e⁻` (correct), `total_e_phys_conv = 4.15M e⁻` (wrong)
+- After fix: both diagnostics = 186 e⁻
+
+**Bug 11a status:** Still open. The per-band eigenvalue branches in R-ChFSI (Das Alg 3
+lines 598-604) contribute 64% of iter-2 last-band overshoot when enabled. With exact
+global Woodbury S⁻¹ (ζ = 3.8e-15), the per-band machinery provides zero benefit but
+introduces numerical weak points. Consider always passing `eigenvalues=None` to the
+filter (effectively run standard ChFSI with no per-band shifts).

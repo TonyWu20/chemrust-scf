@@ -1575,8 +1575,19 @@ pub(crate) fn chebyshev_filter(
         //              the bare-H or S⁻¹·H-but-h_eig-shift framing.
         //   Mode C:    use generalized eigenvalues from previous RR when available
         //              (Das Alg 3 §3.2); fall back to h_eig on iter-1 (eigenvalues=None).
+        // Per Das Alg 3 §3.2, Λ⁽ⁱ⁾ in the recurrence is the prior iteration's
+        // eigenvalue estimate. Mode B's catch-all uses h_eig (Rayleigh quotient
+        // on current ψ) which only equals Λ⁽ⁱ⁾ when ψ is exactly an eigenvector.
+        // The CHEMRUST_LAMSOURCE_EIG env-var lets a test force Mode B to use
+        // the passed-in `eigenvalues` (matching Mode C's catch-all). This is a
+        // diagnostic flag for the iter-2-divergence debug session, not a
+        // production knob.
+        let force_eig_for_lam_source = std::env::var("CHEMRUST_LAMSOURCE_EIG")
+            .map(|v| v == "1")
+            .unwrap_or(false);
         let lam_source: &[f64] = match filter_mode {
             FilterMode::SinvHFullDas => eigenvalues.unwrap_or(&h_eig),
+            _ if force_eig_for_lam_source => eigenvalues.unwrap_or(&h_eig),
             _ => &h_eig,
         };
         let mut lam_y: Vec<f64> = if eigenvalues.is_some() || matches!(filter_mode, FilterMode::SinvHFullDas) {
@@ -1729,6 +1740,11 @@ pub(crate) fn chebyshev_filter(
                 // Get device pointer from gs_s_col after mutable ops complete
                 let (gs_s_col_ptr, _) = gs_s_col.device_ptr_mut(stream);
                 // ‖col_b‖²_S = ⟨col_b, S·col_b⟩  (real part; S is Hermitian)
+                // cublasZdotc computes Σ_i conj(x[i])·y[i], a dimensionless grid sum.
+                // For continuous normalization ∫ψ*(r)·(S·ψ)(r) d³r = 1, the discrete
+                // form is (Ω/N_grid)·Σ_i ψ*[i]·(S·ψ)[i] = 1, so the target for the
+                // dimensionless sum is N_grid/Ω. We divide by (Ω/N_grid) to convert
+                // the integral-normalized value back to the grid-sum target.
                 let mut norm_sq_s = CudaComplex { x: 0.0, y: 0.0 };
                 cudarc::cublas::sys::cublasZdotc_v2(
                     blas.raw_handle(), n_pw_i32,
@@ -1736,10 +1752,22 @@ pub(crate) fn chebyshev_filter(
                     gs_s_col_ptr as *const _, 1,
                     &mut norm_sq_s as *mut _ as *mut _,
                 ).result().map_err(Error::Blas)?;
+                // Divide by (Ω/N_grid) to convert integral → grid-sum normalization
+                let volume_factor = _cell.volume / n_pw as f64;
+                norm_sq_s.x /= volume_factor;
+                norm_sq_s.y /= volume_factor;
+                if b == 0 && _pass == 0 {
+                    eprintln!(
+                        "[GramSchmidt] band-0 pass-0: raw norm²_S = {:.6e}, volume_factor = {:.6e}, scaled norm²_S = {:.6e}",
+                        norm_sq_s.x * volume_factor, volume_factor, norm_sq_s.x
+                    );
+                }
                 // Subtract projections onto all previous S-orthonormal columns
                 for j in 0..b {
                     let col_j = (psi_ptr as *mut CudaComplex).add(j * n_pw);
                     // dot = ⟨col_j, col_b⟩_S = ⟨col_j, S·col_b⟩
+                    // cublasZdotc computes grid sum; divide by (Ω/N_grid) to match
+                    // the grid-sum normalization target.
                     let mut dot = CudaComplex { x: 0.0, y: 0.0 };
                     cudarc::cublas::sys::cublasZdotc_v2(
                         blas.raw_handle(), n_pw_i32,
@@ -1747,6 +1775,8 @@ pub(crate) fn chebyshev_filter(
                         gs_s_col_ptr as *const _, 1,
                         &mut dot as *mut _ as *mut _,
                     ).result().map_err(Error::Blas)?;
+                    dot.x /= _cell.volume / n_pw as f64;
+                    dot.y /= _cell.volume / n_pw as f64;
                     // col_b -= dot * col_j
                     let neg_dot = CudaComplex { x: -dot.x, y: -dot.y };
                     cudarc::cublas::sys::cublasZaxpy_v2(

@@ -16,7 +16,8 @@ pub mod energy;
 pub use energy::{EV_TO_HARTREE, HARTREE_TO_EV};
 pub use scf::{
     downsample_array_to_wave_grid, pw_coords_to_fft_indices, run_scf, run_scf_with_energy,
-    BuildVEffWithEnergy, CheckOutcome, Converged, DensityUpdated, Initialized, Mixed,
-    MixingPhaseKind, ScfIteration, ScfPhase, VEffBuilt, WavefunctionsUpdated,
+    run_scf_with_energy_gated, BuildVEffWithEnergy, CheckOutcome, Converged, DensityUpdated,
+    Initialized, Mixed, MixingPhaseKind, ScfDivergenceGate, ScfIteration, ScfPhase, VEffBuilt,
+    WavefunctionsUpdated,
 };
 pub use mixing::{DensityHistory, Kerker, MixingOff, MixingPhase, Pulay};

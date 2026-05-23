@@ -267,6 +267,16 @@ impl<S: SpinPolicy, Phase: ScfPhase, M: MixingPhase> ScfIteration<S, Phase, M> {
             _phase: PhantomData,
         }
     }
+
+    /// Access the computed density (for testing).
+    pub fn density(&self) -> &Density {
+        &self.density
+    }
+
+    /// Access the cell geometry (for testing).
+    pub fn cell(&self) -> &CellGeometry {
+        &self.cell
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -473,7 +483,7 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
             #[allow(unused_variables)]
             let total_e_raw_conv = rho_sum / n_grid;
             #[allow(unused_variables)]
-            let total_e_phys_conv = rho_sum * self.cell.volume / n_grid;
+            let total_e_phys_conv = rho_sum / n_grid;  // FIXED: density already in CASTEP raw units (ρ×Ω)
             let psi_data = &self.psi.data;
             #[allow(unused_variables)]
             let (mut psi_abs_min, mut psi_abs_max) = (f64::INFINITY, 0.0f64);
@@ -517,7 +527,18 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
 
         // Clone eigenvalues before moving self
         let eig_clone = self.eigenvalues.clone();
-        let eig = if eig_clone.is_empty() { None } else { Some(eig_clone.as_slice()) };
+        // CHEMRUST_FORCE_NO_EIGS=1 forces the iter-1-like filter path at every
+        // iteration by ignoring any prior eigenvalues. Diagnostic flag for the
+        // iter-2-divergence debug session — confirms whether the per-band
+        // eigenvalue branches in chebyshev.rs:1582-1660 contain the bug.
+        let force_no_eigs = std::env::var("CHEMRUST_FORCE_NO_EIGS")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        let eig = if eig_clone.is_empty() || force_no_eigs {
+            None
+        } else {
+            Some(eig_clone.as_slice())
+        };
 
         // Upload PW-to-FFT index map to GPU
         let fft_idx_dev: CudaSlice<i32> = stream
@@ -708,7 +729,7 @@ impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated, MixingOff> {
             #[allow(unused_variables)]
             let total_e_raw_conv = rho_sum / n_grid;
             #[allow(unused_variables)]
-            let total_e_phys_conv = rho_sum * self.cell.volume / n_grid;
+            let total_e_phys_conv = rho_sum / n_grid;  // FIXED: density already in CASTEP raw units (ρ×Ω)
             #[allow(unused_variables)]
             let occ_sum: f64 = occupations.0.iter().sum();
             #[allow(unused_variables)]
@@ -1204,6 +1225,63 @@ pub fn run_scf_with_energy(
     ndeg: usize,
     tol: f64,
 ) -> Result<FinalResult, Error> {
+    run_scf_with_energy_gated(state, ndeg, tol, None)
+}
+
+/// Divergence-detection gate for SCF runs.
+///
+/// Per-iteration sanity checks: when an SCF iteration produces a state outside
+/// any of these physical bounds, the run panics with a structured message
+/// rather than continuing to spin through wasted iterations. Used by tests
+/// (and optionally by callers who want defensive runtime checks). Production
+/// `run_scf_with_energy` does not apply a gate.
+#[derive(Clone, Debug)]
+pub struct ScfDivergenceGate {
+    /// Maximum permitted RR last-band eigenvalue (Ha). Cu111+CO converged
+    /// last band ≈ 0.13 Ha; anything above this threshold suggests the
+    /// Chebyshev filter window has bootstrapped wrong from a prior bad iter.
+    pub max_last_band_ha: f64,
+    /// Minimum permitted RR band-0 eigenvalue (Ha). For Cu111+CO this sits
+    /// around −1.05 Ha; anything below this is filter-amplified bare V_loc
+    /// and indicates the cascade has begun.
+    pub min_band0_ha: f64,
+    /// Maximum allowed V_eff range (Ha) as a multiple of the iter-1 baseline.
+    /// Cu111+CO iter-1 = 8.69 Ha; default 5.0× catches the §11 cascade
+    /// (iter-2 = 20.26 Ha already, iter-3 = 30+ Ha) early.
+    pub max_veff_range_factor: f64,
+    /// Iteration ceiling. Even a converging SCF from a fixture-converged
+    /// starting state should finish well under this many iterations.
+    pub max_iter: u64,
+    /// Permitted relative drift in total electron count (fraction). Density
+    /// integral should match N_electrons within this tolerance; large drift
+    /// indicates the augmentation density or mixing has gone wrong.
+    pub electron_count_tolerance: f64,
+}
+
+impl Default for ScfDivergenceGate {
+    fn default() -> Self {
+        Self {
+            max_last_band_ha: 5.0,
+            min_band0_ha: -30.0,
+            max_veff_range_factor: 5.0,
+            max_iter: 60,
+            electron_count_tolerance: 0.05,
+        }
+    }
+}
+
+/// Like `run_scf_with_energy` but with optional divergence gating.
+///
+/// When `gate = Some(...)`, the loop inspects per-iteration state after the
+/// SCF check completes. Any out-of-bounds value triggers a panic with a
+/// structured message identifying which gate fired, the offending value,
+/// the iteration index, and a brief reference to the expected range.
+pub fn run_scf_with_energy_gated(
+    state: ScfIteration<NonSpin, Initialized, MixingOff>,
+    ndeg: usize,
+    tol: f64,
+    gate: Option<ScfDivergenceGate>,
+) -> Result<FinalResult, Error> {
     use std::time::Instant;
 
     let mut state = state;
@@ -1211,10 +1289,30 @@ pub fn run_scf_with_energy(
     let mut iter_count: u64 = 0;
     let mut prev_energy: Option<f64> = None;
     let mut header_printed = false;
+    let mut iter1_veff_range: Option<f64> = None;
+    let mut iter1_n_electrons: Option<f64> = None;
     loop {
         state = {
             let v_eff = state.build_v_eff_with_energy()?;
+
+            // Sample V_eff range BEFORE moving v_eff into diagonalize, so we
+            // can use it for the gate at end-of-iteration.
+            let veff_range_now = if gate.is_some() {
+                v_eff.v_eff().as_ref().map(|veff| {
+                    let arr = veff.as_real_grid().as_real_array();
+                    let mn = arr.iter().cloned().fold(f64::INFINITY, f64::min);
+                    let mx = arr.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                    mx - mn
+                })
+            } else {
+                None
+            };
+
             let wfn = v_eff.diagonalize(ndeg, None)?;
+
+            // Snapshot eigenvalues for the gate before they move on.
+            let band0_now = wfn.eigenvalues().first().copied();
+            let last_band_now = wfn.eigenvalues().last().copied();
 
             // Dispatch mixing phase at runtime
             let mixed = match wfn.next_mixing {
@@ -1264,6 +1362,75 @@ pub fn run_scf_with_energy(
                             elapsed,
                         );
                         prev_energy = Some(e_total);
+                    }
+
+                    // ---- Divergence gate ----
+                    if let Some(g) = gate.as_ref() {
+                        // Iter ceiling
+                        if iter_count > g.max_iter {
+                            panic!(
+                                "[SCF gate] iteration ceiling exceeded: iter {} > max {} \
+                                 (likely diverging — examine prior iterations' eigenvalues and V_eff range)",
+                                iter_count, g.max_iter,
+                            );
+                        }
+                        // Last band: catch filter-window cascade early
+                        if let Some(lb) = last_band_now
+                            && lb > g.max_last_band_ha
+                        {
+                            panic!(
+                                "[SCF gate] iter {}: last band = {:.4} Ha exceeds gate {:.2} Ha\n  \
+                                 reference (Cu111+CO converged): last band ≈ 0.13 Ha\n  \
+                                 likely cause: filter window bootstrap from a prior iter's RR output \
+                                 (see notes/open-followups.md §11)",
+                                iter_count, lb, g.max_last_band_ha,
+                            );
+                        }
+                        // Band-0: catch bare-V_loc amplification
+                        if let Some(b0) = band0_now
+                            && b0 < g.min_band0_ha
+                        {
+                            panic!(
+                                "[SCF gate] iter {}: band-0 = {:.4} Ha below gate {:.2} Ha\n  \
+                                 reference (Cu111+CO converged): band-0 ≈ -1.05 Ha\n  \
+                                 likely cause: filter amplifying bare V_loc wells in absence of \
+                                 V_H/V_xc smoothing (see notes/open-followups.md §11 cascade)",
+                                iter_count, b0, g.min_band0_ha,
+                            );
+                        }
+                        // V_eff range: relative to iter-1 baseline
+                        if let Some(rng) = veff_range_now {
+                            if iter1_veff_range.is_none() {
+                                iter1_veff_range = Some(rng);
+                            }
+                            let baseline = iter1_veff_range.unwrap_or(rng);
+                            let factor = rng / baseline;
+                            if factor > g.max_veff_range_factor {
+                                panic!(
+                                    "[SCF gate] iter {}: V_eff range {:.4} Ha is {:.2}× iter-1 baseline ({:.4} Ha), exceeds gate {:.2}×\n  \
+                                     reference (Cu111+CO converged): V_eff range ≈ 8.69 Ha\n  \
+                                     likely cause: density degraded into bare V_loc wells",
+                                    iter_count, rng, factor, baseline, g.max_veff_range_factor,
+                                );
+                            }
+                        }
+                        // Total electron count from the new (post-mix) density.
+                        let rho_arr = next.density.as_wave_array();
+                        let cell_volume = next.cell.volume;
+                        let n_grid = rho_arr.len() as f64;
+                        let n_electrons_now = rho_arr.iter().sum::<f64>() * cell_volume / n_grid;
+                        if iter1_n_electrons.is_none() {
+                            iter1_n_electrons = Some(n_electrons_now);
+                        }
+                        let baseline_ne = iter1_n_electrons.unwrap_or(n_electrons_now);
+                        let drift = (n_electrons_now - baseline_ne).abs() / baseline_ne.abs().max(1.0);
+                        if drift > g.electron_count_tolerance {
+                            panic!(
+                                "[SCF gate] iter {}: electron count {:.4} drifted {:.2}% from iter-1 baseline {:.4}, exceeds gate {:.2}%\n  \
+                                 likely cause: augmentation density or mixing broken",
+                                iter_count, n_electrons_now, drift * 100.0, baseline_ne, g.electron_count_tolerance * 100.0,
+                            );
+                        }
                     }
 
                     let mut s: ScfIteration<_, Initialized, MixingOff> = next;
@@ -1378,6 +1545,23 @@ impl<S: SpinPolicy, M: MixingPhase> ScfIteration<S, VEffBuilt, M> {
     pub fn psi_data(&self) -> &[Complex64] {
         &self.psi.data
     }
+    /// Mutable access to ψ coefficient slice (debug/testing only).
+    /// Use to inject controlled pollution before running diagonalize.
+    #[doc(hidden)]
+    pub fn psi_data_mut(&mut self) -> &mut [Complex64] {
+        &mut self.psi.data
+    }
+    /// Set eigenvalues (debug/testing only). Used to mimic the iter-2 filter
+    /// code path which receives eigenvalues from a prior diagonalization.
+    #[doc(hidden)]
+    pub fn set_eigenvalues(&mut self, eigs: Vec<f64>) {
+        self.eigenvalues = eigs;
+    }
+    /// Access (n_bands, n_pw) shape (debug/testing only).
+    #[doc(hidden)]
+    pub fn psi_shape(&self) -> (usize, usize) {
+        (self.psi.n_bands, self.psi.n_pw)
+    }
 }
 
 impl<S: SpinPolicy, M: MixingPhase> ScfIteration<S, WavefunctionsUpdated, M> {
@@ -1388,10 +1572,6 @@ impl<S: SpinPolicy, M: MixingPhase> ScfIteration<S, WavefunctionsUpdated, M> {
 }
 
 impl<S: SpinPolicy, M: MixingPhase> ScfIteration<S, DensityUpdated<M>, MixingOff> {
-    /// Access the computed density (for testing).
-    pub fn density(&self) -> &Density {
-        &self.density
-    }
     /// Access ρ_aug on the fine grid (debug/testing only).
     #[doc(hidden)]
     pub fn density_aug_fine(&self) -> Option<&chemrust_hamiltonian_core::fft::RealGrid<f64>> {

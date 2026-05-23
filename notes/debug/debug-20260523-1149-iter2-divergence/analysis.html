@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>h_eig vs prior eigenvalues — iter-2 divergence analysis</title>
+<style>
+body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; max-width: 850px; margin: 2em auto; padding: 0 1em; color: #1a1a1a; line-height: 1.55; }
+h1 { border-bottom: 2px solid #1a1a1a; padding-bottom: 0.3em; }
+h2 { color: #444; margin-top: 2em; border-left: 4px solid #4a90e2; padding-left: 0.6em; }
+h3 { color: #666; }
+code, pre { font-family: "JetBrains Mono", "Fira Code", Consolas, monospace; }
+code { background: #f3f3f3; padding: 1px 5px; border-radius: 3px; font-size: 0.95em; }
+pre { background: #1e1e1e; color: #f0f0f0; padding: 1em; border-radius: 6px; overflow-x: auto; }
+pre code { background: none; padding: 0; }
+table { border-collapse: collapse; margin: 1em 0; width: 100%; }
+th, td { border: 1px solid #ccc; padding: 0.5em 0.8em; text-align: left; }
+th { background: #efefef; }
+.callout { background: #fff8e1; border-left: 4px solid #f5a623; padding: 0.8em 1em; margin: 1em 0; border-radius: 0 4px 4px 0; }
+.callout-bug { background: #ffebee; border-left: 4px solid #d0021b; padding: 0.8em 1em; margin: 1em 0; border-radius: 0 4px 4px 0; }
+.callout-fix { background: #e8f5e9; border-left: 4px solid #2e7d32; padding: 0.8em 1em; margin: 1em 0; border-radius: 0 4px 4px 0; }
+.eq { background: #f8f8fc; padding: 0.6em 1em; border-left: 3px solid #888; margin: 0.5em 0; font-family: "JetBrains Mono", Consolas, monospace; }
+.subtle { color: #666; font-size: 0.93em; }
+.h-clean { color: #2e7d32; font-weight: bold; }
+.h-bug { color: #d0021b; font-weight: bold; }
+hr { border: none; border-top: 1px solid #ddd; margin: 2.5em 0; }
+</style>
+</head>
+<body>
+
+<h1>h_eig vs prior eigenvalues — what Mode B is getting wrong</h1>
+<p class="subtle">Session: <code>debug-20260523-1149-iter2-divergence</code><br>
+Goal: explain the technical distinction between <code>h_eig</code> (what production currently uses) and the prior-iteration generalized eigenvalues (what Das Algorithm 3 specifies), and why this matters at iter-2.</p>
+
+<h2>1. The two quantities, defined</h2>
+
+<h3>1a. <code>h_eig</code> — per-band Rayleigh quotient on bare H</h3>
+
+<p>Computed fresh inside the filter, once per call, at <code>chebyshev.rs:1509-1538</code>:</p>
+
+<div class="eq">h_eig[b] = ⟨ψ<sub>b</sub> | H | ψ<sub>b</sub>⟩</div>
+
+<p>This is a property of the <em>current input ψ</em> (the wavefunction passed into the filter). It depends on whatever <code>ψ</code> looks like right now, including any pollution or residual mixing of eigenvectors.</p>
+
+<p>If <code>ψ<sub>b</sub></code> is an exact eigenvector of bare H with eigenvalue λ<sub>b</sub>, then <code>h_eig[b] = λ<sub>b</sub></code>. If <code>ψ<sub>b</sub></code> is a mixture of eigenvectors, <code>h_eig[b]</code> is a weighted average of their eigenvalues (the Rayleigh quotient identity).</p>
+
+<h3>1b. Prior generalized eigenvalues — <code>eigenvalues[]</code> from RR</h3>
+
+<p>Passed into the filter via the <code>eigenvalues: Option&lt;&amp;[f64]&gt;</code> argument. Originates from the prior iteration's Rayleigh-Ritz step (<code>scf.rs:553</code>), where ZHEGVD solved the <em>generalized</em> eigenproblem:</p>
+
+<div class="eq">H<sub>sub</sub> · X = λ<sub>gen</sub> · S<sub>sub</sub> · X</div>
+
+<p>These λ<sub>gen</sub> are eigenvalues of the operator <code>S<sup>−1</sup>·H</code> projected onto the iter-1 subspace. They are <em>frozen at the moment the prior iteration finished</em>, independent of the current ψ being filtered.</p>
+
+<h2>2. When the two agree, and when they disagree</h2>
+
+<table>
+<tr><th>Scenario</th><th><code>h_eig</code></th><th><code>eigenvalues</code> (prior gen. eig)</th><th>Agreement</th></tr>
+<tr><td>Iter-1, ψ = CASTEP fixture (converged)</td><td>≈ λ<sub>b</sub> (CASTEP eigenvalue)</td><td>not yet computed (None)</td><td>N/A — only h_eig available</td></tr>
+<tr><td>Iter-2, ψ = iter-1's RR output, no pollution</td><td>≈ λ<sub>gen,b</sub> (because ψ is S-orthonormal generalized eigenvector)</td><td>= λ<sub>gen,b</sub> exactly (from iter-1 RR)</td><td>Agree to numerical noise</td></tr>
+<tr><td>Iter-2, ψ = iter-1's RR output BUT V_eff differs slightly</td><td>= ⟨ψ<sub>old</sub>|H<sub>new</sub>|ψ<sub>old</sub>⟩ — a Rayleigh quotient of the new H on the old ψ</td><td>= old generalized eigenvalues from iter-1 RR</td><td><strong>Disagree</strong> by O(δV<sub>eff</sub>)</td></tr>
+<tr><td>Pollution test, ψ has α·band-1 mixed into band-0</td><td>= (1−α²)·λ<sub>0</sub> + α²·λ<sub>1</sub> for band-0 (averaged)</td><td>= λ<sub>0</sub> (clean, unaware of pollution)</td><td><strong>Disagree</strong> by O(α²)</td></tr>
+</table>
+
+<h2>3. What Das Algorithm 3 actually says</h2>
+
+<p>From <code>reference_paper/extracted/das-2025-rchfsi/main.tex</code> lines 595-606, the INPUTS to Algorithm 3 explicitly include:</p>
+
+<div class="eq">"current eigenvalue estimates Λ<sup>(i)</sup> = diag(ε₁<sup>(i)</sup>, …, εₙ<sup>(i)</sup>)"</div>
+
+<p>The superscript <code>(i)</code> denotes the prior <em>outer iteration</em>. Concretely Λ<sup>(i)</sup> are the eigenvalues from the previous Rayleigh-Ritz solve — i.e. <code>eigenvalues[]</code> passed into our filter, not <code>h_eig</code>.</p>
+
+<p>Algorithm 3 then uses Λ<sup>(i)</sup> in two places:</p>
+
+<div class="eq">Line 597: Y ← A·X<sup>(i)</sup> − B·X<sup>(i)</sup>·Λ<sup>(i)</sup> &nbsp;&nbsp;(<em>residual definition</em>)</div>
+<div class="eq">Line 598: Λ_Y ← (σ₁/e)·(Λ<sup>(i)</sup> − c·I) &nbsp;&nbsp;(<em>initial Λ_Y</em>)</div>
+<div class="eq">Line 599: Λ_X ← (2σ₂/e)·Λ_Y·Λ<sup>(i)</sup> − (2σ₂/e)·c·Λ_Y − σ·σ₂·Λ_X &nbsp;&nbsp;(<em>recurrence Λ_X update</em>)</div>
+
+<p>All three uses of Λ<sup>(i)</sup> reference the same quantity — the prior iteration's eigenvalues.</p>
+
+<h2>4. What Mode B actually does (the bug)</h2>
+
+<p>Lines <code>chebyshev.rs:1578-1581</code> set the source for Λ<sup>(i)</sup>:</p>
+
+<pre><code>let lam_source: &amp;[f64] = match filter_mode {
+    FilterMode::SinvHFullDas =&gt; eigenvalues.unwrap_or(&amp;h_eig),
+    _ =&gt; &amp;h_eig,           // &lt;-- Mode B always uses h_eig, ignoring eigenvalues
+};</code></pre>
+
+<p>Mode B (production default) hits the catch-all arm and ALWAYS uses <code>h_eig</code> — even when <code>eigenvalues</code> contains the correct prior iteration data.</p>
+
+<p>Mode C (SinvHFullDas) does the right thing: uses <code>eigenvalues</code> when available, falls back to <code>h_eig</code> only when none provided.</p>
+
+<div class="callout-bug">
+<strong>The bug:</strong> Mode B uses Rayleigh quotients of bare H on the <em>current input ψ</em> as a proxy for prior-iteration generalized eigenvalues. These quantities only agree when ψ is exactly an eigenvector of S<sup>−1</sup>·H. Once ψ drifts (iter-2 V_eff change, pollution, or any other perturbation), <code>h_eig</code> and the true Λ<sup>(i)</sup> diverge, and Mode B's recurrence is fed wrong shift values.
+</div>
+
+<h2>5. The numerical evidence (this session)</h2>
+
+<h3>5a. Bisecting probe results</h3>
+
+<table>
+<tr><th>Trial</th><th><code>eigenvalues</code></th><th>b_low</th><th>Δ_band0 (Ha)</th><th>Δ_last (Ha)</th></tr>
+<tr><td>0 (iter-1 path)</td><td>None</td><td>0.0890</td><td class="h-clean">0.000160</td><td class="h-clean">0.000701</td></tr>
+<tr><td>1 (eigs=Some, b_low same as iter-1)</td><td>Some, last = max_veff</td><td>0.0890</td><td class="h-bug">0.009980</td><td class="h-bug">0.013181</td></tr>
+<tr><td>2 (eigs=Some, b_low = clean_last)</td><td>Some, last = 0.131</td><td>0.1311</td><td class="h-bug">0.009922</td><td class="h-clean">0.000540</td></tr>
+<tr><td>3 (eigs=Some, b_low = 5.0)</td><td>Some, last = 5.0</td><td>5.0000</td><td>0.005997</td><td>0.249951</td></tr>
+</table>
+
+<p>Comparing Trial 0 vs Trial 1: holding <code>b_low</code> identical and toggling <code>eigenvalues</code> from <code>None</code> to <code>Some(...)</code> degrades denoising by <strong>62×</strong>. This isolates the bug to branches activated by <code>eigenvalues.is_some()</code> — the per-band Λ_Y init at <code>chebyshev.rs:1582-1587</code> and per-band Λ_X update at <code>chebyshev.rs:1652-1660</code>.</p>
+
+<p>Both of those branches use <code>lam_source</code>, which for Mode B is hard-wired to <code>&amp;h_eig</code> at line 1580. So the per-band shifts being applied use Rayleigh quotients of the polluted ψ rather than the prior iteration's true generalized eigenvalues.</p>
+
+<h3>5b. Why iter-1 succeeded despite this bug</h3>
+
+<p>Iter-1 has <code>eigenvalues = None</code> (no prior RR yet). The branches at <code>chebyshev.rs:1582-1587</code> and <code>1652-1660</code> take the simpler path (uniform scalar shift, no per-band <code>coeff·ly·l</code> term). The bug is gated behind <code>is_some()</code>, so iter-1 doesn't trigger it.</p>
+
+<h3>5c. Why production iter-2 cascade</h3>
+
+<p>At production iter-2:</p>
+<ol>
+<li>ψ = iter-1's RR output, S-orthonormal generalized eigenvector basis</li>
+<li>V_eff slightly different from iter-1's because ρ changed</li>
+<li>So <code>h_eig[b] = ⟨ψ<sub>b</sub>|H<sub>new</sub>|ψ<sub>b</sub>⟩ ≠ λ<sub>gen,b</sub></code> (the iter-1 RR eigenvalue)</li>
+<li>Mode B feeds h_eig as Λ<sup>(i)</sup> into the recurrence (line 1580)</li>
+<li>Per-band shifts at line 1583 and 1654 use slightly-wrong Λ<sup>(i)</sup></li>
+<li>Recurrence amplifies the wrong eigencomponents over 8 steps</li>
+<li>Last band drifts from 0.13 Ha to 1.95 Ha</li>
+<li>Iter-3 uses 1.95 Ha as b_low, filter window collapses, cascade explodes</li>
+</ol>
+
+<h2>6. Proposed fix</h2>
+
+<div class="callout-fix">
+<strong>Change line 1580 of <code>chebyshev.rs</code>:</strong>
+<pre><code>let lam_source: &amp;[f64] = match filter_mode {
+    FilterMode::SinvHFullDas =&gt; eigenvalues.unwrap_or(&amp;h_eig),
+-   _ =&gt; &amp;h_eig,
++   _ =&gt; eigenvalues.unwrap_or(&amp;h_eig),
+};</code></pre>
+<p>With this change, Mode B falls back to <code>h_eig</code> only when no prior eigenvalues exist (iter-1 path), and uses the passed-in <code>eigenvalues</code> for iter-2+.</p>
+</div>
+
+<h2>7. Risk: will this break iter-1 SC-4-tight?</h2>
+
+<p>§10's filter-mode sweep showed Mode B winning iter-1 SC-4-tight with all 10 bands within 0.05 Ha, while Mode C lost by 10× (band-0 |ΔC| ≈ 0.13 Ha).</p>
+
+<p>Crucially, at iter-1 the proposed fix changes nothing: <code>eigenvalues</code> is None on the iter-1 call, so <code>eigenvalues.unwrap_or(&amp;h_eig) = &amp;h_eig</code>. Mode B's behavior at iter-1 is unchanged.</p>
+
+<p>The fix only changes behavior when <code>eigenvalues.is_some()</code> — i.e. iter-2 and beyond. So iter-1 SC-4-tight should remain green.</p>
+
+<p>Mode C lost iter-1 not because of the lam_source choice (Mode C also gets None at iter-1 → falls back to h_eig identically to Mode B). Mode C's loss came from the extra <code>apply_s_inverse</code> in Step 4 reconstruction (<code>chebyshev.rs:1693</code>) plus possibly other Mode-C-specific differences. The proposed fix doesn't touch that line.</p>
+
+<h2>8. Verification plan</h2>
+
+<p>Before changing production code:</p>
+<ol>
+<li>Add a test flag that toggles the <code>lam_source</code> choice independently of <code>filter_mode</code>. Re-run the bisecting probe with the flag forcing <code>lam_source = eigenvalues</code> for Mode B.</li>
+<li>If Δ_band0 drops back to ~0.00016 Ha (Trial 0 value), the hypothesis is confirmed and the fix should be applied to production.</li>
+<li>If Δ_band0 stays elevated, the bug is elsewhere in branches 2+3 (perhaps a sign error in the formula at line 1583 or 1654 itself, not just the source).</li>
+</ol>
+
+</body>
+</html>
