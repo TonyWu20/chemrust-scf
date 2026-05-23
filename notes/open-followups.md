@@ -572,3 +572,96 @@ inexact-inverse tolerance irrelevant — standard ChFSI with exact S⁻¹ is
 algebraically correct. The R-ChFSI implementation remains as a potential
 future simplification (per Das `main.tex:612`, R-ChFSI ≡ ChFSI when ζ = 0)
 but is no longer required for SCF correctness.
+
+## 11. SCF diverges at iter-2 despite correct iter-1 eigenvalues
+
+**Symptom (2026-05-23):** After fixing the three compounding bugs in commit
+`8607def` (GPU D-screening revert, b_low bootstrap, Mode B filter), iter-1
+passes SC-4-tight (all 10 bands within 0.05 Ha of CASTEP). But iter-2 diverges:
+
+| Metric | Iter-1 | Iter-2 | Iter-3 | Reference |
+|--------|--------|--------|--------|-----------|
+| Band-0 eigenvalue | −1.046 Ha | −0.864 Ha | −12.68 Ha | −1.055 Ha |
+| Last band | 0.130 Ha | 1.952 Ha | 0.286 Ha | 0.115 Ha |
+| V_eff range | 8.69 Ha | 20.26 Ha | 30.36 Ha | 8.69 Ha |
+| Cu D_screened amax | 2–6 Ha | 8–31 Ha | 75–315 Ha | 2–6 Ha |
+
+Log: `/tmp/scf-diag-global-woodbury-0523-1021.log`
+
+**What is known:**
+
+1. **Iter-1 density is correct in total.** `rho_sum=2.42e7` (soft) +
+   `aug_sum=5.71e7` ≈ `8.13e7` = fixture value. The density going into
+   iter-2 V_eff assembly is physically correct.
+
+2. **Iter-2 V_eff range = 20.26 Ha** (vs iter-1 8.69 Ha). This is a 2.3×
+   increase, not the 4–5× explosion seen before the §8 fix. The density
+   is not the primary cause — the V_eff is moderately wrong, not catastrophically.
+
+3. **Iter-2 RR produces `last band = 1.95 Ha`** (vs 0.13 Ha at iter-1).
+   The subspace has drifted upward by ~1.8 Ha in one step. This means the
+   Chebyshev filter at iter-2 is not keeping the subspace near the converged
+   eigenvectors — it's amplifying higher-energy states.
+
+4. **Iter-2 b_low = eig[last] = 0.130 Ha** (correct per Alg 4.1 §7.2).
+   The filter window `[0.130, 20.80]` Ha should damp everything above 0.130 Ha.
+   But the iter-2 RR last band is 1.95 Ha — well above b_low. This means
+   the filter is not damping the high-energy components effectively in 8 steps.
+
+5. **Iter-2 D_screened amax = 8–31 Ha** (vs 2–6 Ha at iter-1). This is
+   elevated but not catastrophic. The D_screened explosion at iter-3 (75–315 Ha)
+   is a consequence of the wrong iter-2 wavefunctions producing wrong density,
+   not a primary cause.
+
+**Hypothesis:** The Chebyshev filter degree (ndeg=8) is insufficient to
+separate the wanted subspace (below 0.13 Ha) from the unwanted spectrum
+(above 0.13 Ha) when starting from a non-converged wavefunction. At iter-1
+we start from the CASTEP converged wavefunction, so the filter only needs
+to refine a nearly-correct subspace. At iter-2 we start from the iter-1
+RR output, which has drifted — the filter needs to do more work.
+
+The filter polynomial `T_8(x)` with window `[0.13, 20.80]` Ha has a
+contrast ratio of `T_8(20.80/10.47) / T_8(0.13/10.47)` ≈ `T_8(1.99) /
+T_8(0.012)`. `T_8(1.99) ≈ 2^7 × 1.99^8 ≈ 3.2e4` and `T_8(0.012) ≈ 1`.
+So the filter should amplify the wanted subspace by ~32,000× relative to
+the unwanted. That should be more than enough for 8 steps.
+
+**Alternative hypothesis:** The iter-2 wavefunction after RR rotation is
+not S-orthonormal. The Gram-Schmidt step uses S-inner product, but the
+RR rotation `ψ_new = ψ_row · X` does not re-orthonormalize. If the
+eigenvectors X from ZHEGVD are not exactly S-orthonormal (due to numerical
+precision in S_sub assembly), the iter-2 starting wavefunction has
+non-trivial S-overlap, which corrupts the residual `Y = H·X − S·X·Λ` in
+Step 1 of R-ChFSI.
+
+**Diagnostic plan:**
+
+1. **Check S-orthonormality of iter-1 RR output.** After `diagonalize()`,
+   compute `S_sub = ψ_new† · S · ψ_new` and check `‖S_sub − I‖_∞`. If
+   this is > 1e-6, the RR output is not S-orthonormal and the iter-2
+   filter starts from a corrupted subspace.
+
+2. **Check iter-2 residual norm at k=1.** The R-ChFSI Step 1 residual
+   `Y = H·X − S·X·Λ` should be small if X is close to the eigenvectors.
+   If `‖Y‖` is large at iter-2 (much larger than at iter-1), the starting
+   wavefunction has drifted significantly.
+
+3. **Try ndeg=16 or ndeg=32 at iter-2.** If the filter degree is the
+   bottleneck, increasing it should stabilize iter-2. This is a quick
+   diagnostic, not a production fix.
+
+4. **Check whether iter-2 V_eff range of 20.26 Ha is causing the problem.**
+   The D_screened at iter-2 is 8–31 Ha (vs 2–6 Ha at iter-1). This is
+   elevated but not catastrophic. The question is whether this elevation
+   is enough to corrupt the iter-2 Hamiltonian sufficiently to cause the
+   iter-3 explosion.
+
+**Entry point for next session:**
+- Read `notes/debug/debug-20260523-0916-iter1-filter-operator-mismatch/RESOLUTION.md`
+  for context on what was fixed.
+- Run `fixed_point_matches_castep_energy` with `--nocapture` and check
+  iter-2 `[NewDensity] rho_sum` and `[RR] eigenvalues: last=` to confirm
+  the pattern above.
+- The discriminator for this issue is iter-2 `last band < 0.5 Ha` (vs
+  current 1.95 Ha). If the last band stays near 0.13 Ha after iter-2,
+  the SCF has a chance of converging.
