@@ -145,6 +145,8 @@ fn detect_degenerate_blocks(eigenvalues: &[f64], eps_degen: f64) -> Vec<(usize, 
 /// - `psi_row`: filtered wavefunctions in RowDistributed layout (n_pw x n_bands)
 /// - `hpsi_row`: H|psi> in RowDistributed layout (n_pw x n_bands)
 /// - `vnl_data`: precomputed V_NL data (beta_g, D, Q matrices per ion)
+/// - `prev_psi_dev`: (optional) previous iteration's ψ for Procrustes pinning
+/// - `pin_cfg`: (optional) Procrustes pin configuration
 ///
 /// The overlap matrix S_sub includes the USPP augmentation:
 ///   S_sub = psi^dag·psi  +  Σ_ion C_proj^dag · q · C_proj
@@ -166,6 +168,8 @@ pub(crate) fn rayleigh_ritz(
     blas: &BlasHandle,
     stream: &Arc<CudaStream>,
     ctx: &Arc<CudaContext>,
+    prev_psi_dev: Option<&CudaSlice<CudaComplex>>,
+    pin_cfg: Option<&RrPinConfig>,
 ) -> RayleighRitzResult {
     let n = n_bands as i32;
     let k = n_pw as i32;
@@ -444,6 +448,8 @@ pub fn rayleigh_ritz_with_matrices(
     blas: &BlasHandle,
     stream: &Arc<CudaStream>,
     ctx: &Arc<CudaContext>,
+    prev_psi_dev: Option<&CudaSlice<CudaComplex>>,
+    pin_cfg: Option<&RrPinConfig>,
 ) -> Result<
     (
         Gpu<WavefunctionSet<ColumnDistributed>>,

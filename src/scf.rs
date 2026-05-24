@@ -550,6 +550,10 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
         // H2D psi
         let psi_gpu = Gpu::from_host_with(&self.psi, &stream, &mut pcie)?;
 
+        // Save the input ψ for Procrustes pinning (prev_psi_dev)
+        // This is the basis we hand to Chebyshev before filter/GS produce ψ_after_GS.
+        let prev_psi_dev = psi_gpu.as_device_slice();
+
         // V_NL precomputation (CPU, uses chemrust-hamiltonian, one-time cost)
         // Pass the downsampled V_eff for D-matrix screening (D = D0 + ∫ Q·V_eff).
         let v_eff_for_d = chemrust_hamiltonian_core::EffectivePotential::from_inner(
@@ -594,6 +598,8 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
             n_bands, n_pw, &kernels,
             &mut pcie,
             &solver, &blas, &stream, &ctx,
+            Some(prev_psi_dev),
+            None,  // pin_cfg: will be set in Step 5 when pin code is implemented
         )?;
 
         stream.synchronize()?;
@@ -715,6 +721,8 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
             n_bands, n_pw, &kernels,
             &mut pcie,
             &solver, &blas, &stream, &ctx,
+            None,  // prev_psi_dev: not used in test-only variant
+            None,  // pin_cfg: not used in test-only variant
         )?;
 
         Ok((eigenvalues_cpu.into_inner(), h_sub_cpu.into_inner(), s_sub_cpu.into_inner(), x_cpu.into_inner()))
