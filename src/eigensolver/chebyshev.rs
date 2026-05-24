@@ -578,7 +578,7 @@ unsafe fn lanczos_upper_bound(
 /// Computed directly from the fractional G-vectors (from `pw_coords`) rather than
 /// from the full grid `g2()`, because the kernel `init_kinetic` indexes by
 /// plane-wave index (0..n_pw), not by grid position.
-fn compute_kinetic_energies(
+pub(crate) fn compute_kinetic_energies(
     pw_coords: &[[i32; 3]],
     recip_lattice: &chemrust_hamiltonian_core::RecipLattice,
 ) -> KineticEnergies {
@@ -704,7 +704,7 @@ unsafe fn apply_v_loc_hamiltonian(
 /// Apply the full Hamiltonian H|psi>. Includes T + V_loc (FFT-based)
 /// and V_NL (non-local pseudopotential via cuBLAS gemm).
 #[allow(clippy::too_many_arguments)]
-unsafe fn apply_full_hamiltonian(
+pub(crate) unsafe fn apply_full_hamiltonian(
     psi_dev: &CudaSlice<CudaComplex>,
     v_eff_dev: &CudaSlice<f64>,
     kinetic_dev: &CudaSlice<f64>,
