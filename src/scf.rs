@@ -767,6 +767,56 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
             &vnl_data, &fft_idx_dev, &kernels, &blas, &stream,
         )
     }
+
+    /// Compute `S · ψ_input` for an arbitrary host-side ψ block using the
+    /// Vnl projectors + Q matrices that this VEffBuilt state would use in a
+    /// real diagonalize call. Used by tests that need true USPP S-inner
+    /// products (e.g., `⟨ψ_a | S | ψ_b⟩` with normalisation `⟨ψ|S|ψ⟩ = 1`).
+    ///
+    /// `psi_input` must be column-major `[band * n_pw + g]`; output is the
+    /// same layout. `n_pw` is read from `self.psi.n_pw`.
+    #[doc(hidden)]
+    pub fn apply_s_for_test(
+        &self,
+        psi_input: &[Complex64],
+        n_bands: usize,
+    ) -> Result<Vec<Complex64>, Error> {
+        let n_pw = self.psi.n_pw;
+        assert_eq!(
+            psi_input.len(), n_bands * n_pw,
+            "apply_s_for_test: psi_input shape mismatch"
+        );
+
+        let ctx = Arc::new(CudaContext::new(0)?);
+        let stream = ctx.default_stream();
+        let blas = BlasHandle::new(stream.clone())?;
+        let solver = SolverHandle::new(stream.clone())?;
+
+        let v_eff_ref = self.v_eff.as_ref().expect("VEffBuilt phase guarantees v_eff is Some");
+        let v_eff_spin = S::v_eff_for_spin(v_eff_ref, 0);
+        let v_eff_arr = v_eff_spin.as_real_grid().as_real_array();
+
+        let mut pcie = PcieAccount::default();
+        let v_eff_wave = downsample_array_to_wave_grid(v_eff_arr, &self.fine_grid, &self.wave_grid)?;
+        let v_eff_for_d = chemrust_hamiltonian_core::EffectivePotential::from_inner(
+            chemrust_hamiltonian_core::fft::RealGrid::from_inner(v_eff_wave.as_fine_array().clone()),
+        );
+
+        let psi_for_betapsi = self.psi.data.clone();
+        let n_bands_state = self.psi.n_bands;
+
+        let vnl_data = VnlBatchData::precompute(
+            &self.pw_coords, &self.pots, &self.cell,
+            &self.wave_grid, &self.k_point,
+            &psi_for_betapsi, n_bands_state, n_pw, None,
+            Some(&v_eff_for_d),
+            &stream, &mut pcie, &blas, &solver,
+        )?;
+
+        crate::eigensolver::chebyshev::apply_s_for_test(
+            psi_input, n_bands, n_pw, &vnl_data, &blas, &stream,
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------

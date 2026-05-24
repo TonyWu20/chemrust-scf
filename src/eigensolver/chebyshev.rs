@@ -1749,22 +1749,23 @@ pub(crate) fn chebyshev_filter(
                     gs_s_col_ptr as *const _, 1,
                     &mut norm_sq_s as *mut _ as *mut _,
                 ).result().map_err(Error::Blas)?;
-                // Divide by (Ω/N_grid) to convert integral → grid-sum normalization
-                let volume_factor = _cell.volume / n_pw as f64;
-                norm_sq_s.x /= volume_factor;
-                norm_sq_s.y /= volume_factor;
+                // Grid-sum convention (consistent with CASTEP `.check`, RR
+                // S_sub gemm, and density.rs): cublasZdotc returns the raw
+                // grid-sum ⟨ψ|S|ψ⟩, which equals 1.0 for an S-orthonormal
+                // wavefunction. No (Ω/N) division — that previously turned
+                // the dimensionless grid-sum target into the integral target,
+                // breaking convention symmetry with downstream RR + density.
                 if b == 0 && _pass == 0 {
                     eprintln!(
-                        "[GramSchmidt] band-0 pass-0: raw norm²_S = {:.6e}, volume_factor = {:.6e}, scaled norm²_S = {:.6e}",
-                        norm_sq_s.x * volume_factor, volume_factor, norm_sq_s.x
+                        "[GramSchmidt] band-0 pass-0: norm²_S = {:.6e} (grid-sum convention; ≈1.0 for S-orthonormal input)",
+                        norm_sq_s.x
                     );
                 }
                 // Subtract projections onto all previous S-orthonormal columns
                 for j in 0..b {
                     let col_j = (psi_ptr as *mut CudaComplex).add(j * n_pw);
-                    // dot = ⟨col_j, col_b⟩_S = ⟨col_j, S·col_b⟩
-                    // cublasZdotc computes grid sum; divide by (Ω/N_grid) to match
-                    // the grid-sum normalization target.
+                    // dot = ⟨col_j, col_b⟩_S = ⟨col_j, S·col_b⟩ in grid-sum
+                    // convention (matches RR S_sub gemm and density.rs).
                     let mut dot = CudaComplex { x: 0.0, y: 0.0 };
                     cudarc::cublas::sys::cublasZdotc_v2(
                         blas.raw_handle(), n_pw_i32,
@@ -1772,8 +1773,6 @@ pub(crate) fn chebyshev_filter(
                         gs_s_col_ptr as *const _, 1,
                         &mut dot as *mut _ as *mut _,
                     ).result().map_err(Error::Blas)?;
-                    dot.x /= _cell.volume / n_pw as f64;
-                    dot.y /= _cell.volume / n_pw as f64;
                     // col_b -= dot * col_j
                     let neg_dot = CudaComplex { x: -dot.x, y: -dot.y };
                     cudarc::cublas::sys::cublasZaxpy_v2(
@@ -1953,4 +1952,51 @@ pub struct HComponentsForTest {
     pub hpsi_full: Vec<num_complex::Complex64>,
     pub n_bands: usize,
     pub n_pw: usize,
+}
+
+// ---------------------------------------------------------------------------
+// S·ψ host-side helper for tests.
+//
+// Wraps the (crate-private) `apply_s_times` so external tests can compute
+// the USPP overlap matrix `⟨ψ_a | S | ψ_b⟩ = ψ_a^H · (S·ψ_b)` correctly.
+// L2 dot products are unreliable for low-PW-norm Cu 3d bands (‖ψ‖² ≈ 0.14
+// means the L2 self-overlap ceiling is ≈ 0.02 — physically unreachable
+// for any "> 0.5" similarity gate).
+// ---------------------------------------------------------------------------
+
+#[doc(hidden)]
+pub fn apply_s_for_test(
+    psi_host: &[num_complex::Complex64],
+    n_bands: usize,
+    n_pw: usize,
+    vnl_data: &VnlBatchData,
+    blas: &BlasHandle,
+    stream: &Arc<CudaStream>,
+) -> Result<Vec<num_complex::Complex64>, Error> {
+    let n_elem = n_bands * n_pw;
+    let psi_cuda: Vec<CudaComplex> = psi_host
+        .iter()
+        .map(|&c| CudaComplex { x: c.re, y: c.im })
+        .collect();
+    let psi_dev: CudaSlice<CudaComplex> = stream.clone_htod(&psi_cuda).map_err(Error::Cuda)?;
+    let mut spsi_dev: CudaSlice<CudaComplex> = stream.alloc_zeros(n_elem).map_err(Error::Cuda)?;
+    stream.memcpy_dtod(&psi_dev, &mut spsi_dev).map_err(Error::Cuda)?;
+
+    unsafe {
+        apply_s_times(
+            &psi_dev,
+            &mut spsi_dev,
+            vnl_data,
+            n_bands as i32,
+            n_pw as i32,
+            blas,
+            stream,
+        )?;
+    }
+    stream.synchronize()?;
+    let spsi_raw = stream.clone_dtoh(&spsi_dev).map_err(Error::Cuda)?;
+    Ok(spsi_raw
+        .into_iter()
+        .map(|c| num_complex::Complex64::new(c.x, c.y))
+        .collect())
 }

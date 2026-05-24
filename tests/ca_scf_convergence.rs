@@ -3161,3 +3161,413 @@ fn scf_converges_to_castep_energy_at_castep_tolerance() {
         diff_ev, fixtures::cu111_co::CASTEP_TOLERANCE_EV,
     );
 }
+
+// ---------------------------------------------------------------------------
+// §14 F3d discriminators — added 2026-05-24, debug-20260524-f3d-narrow-pinning.
+// Two tight tests that MUST fail red on the current `feat/phase-global-woodbury`
+// HEAD and MUST turn green after F3d-narrow polar pinning lands. Both are
+// `#[ignore]` + feature `scf_diag` to match the convention; both anchor against
+// EXTERNAL fixture values (CASTEP `.bands` and `.check`), not derived numbers.
+// ---------------------------------------------------------------------------
+
+/// **T-cascade-tight** — converts `cascade_iter3_diagnostic` into a hard
+/// assertion: iter-3 band-0 must be within 0.1 Ha of CASTEP's reference value.
+///
+/// EXTERNAL anchor (A1): `Cu111_CO.bands` line 12 → −1.05502287 Ha.
+/// Pre-fix value (current HEAD): iter-3 band-0 ≈ −11.94 Ha.
+/// Discriminator ratio: |−11.94 − (−1.055)| / 0.1 ≈ 109× — strongly binary.
+#[test]
+#[ignore = "requires GPU and CASTEP fixture data"]
+#[cfg(feature = "scf_diag")]
+fn cascade_iter3_diagnostic_tight() {
+    if !gpu_available() {
+        eprintln!("SKIP: no GPU available");
+        return;
+    }
+    init_tracing();
+
+    let fx = fixtures::cu111_co::fixture();
+
+    // Iter-1
+    let state = fixtures::cu111_co::build_scf_state(fx);
+    let iter1_state = state.build_v_eff_with_energy().expect("iter-1 build_v_eff");
+    let iter1_diag = iter1_state.diagonalize(8, None).expect("iter-1 diagonalize");
+    let eigs_1 = iter1_diag.eigenvalues().to_vec();
+    let iter1_dens = iter1_diag.construct_density_off().expect("iter-1 construct_density");
+    let iter2_state = match iter1_dens.mix().check(1e-8).expect("iter-1 check") {
+        chemrust_scf::CheckOutcome::Converged(_) => panic!("iter-1 converged early"),
+        chemrust_scf::CheckOutcome::NotConverged { state, .. } => state,
+    };
+
+    // Iter-2
+    let iter2_veff = iter2_state.build_v_eff_with_energy().expect("iter-2 build_v_eff");
+    let iter2_diag = iter2_veff.diagonalize(8, None).expect("iter-2 diagonalize");
+    let eigs_2 = iter2_diag.eigenvalues().to_vec();
+    let iter2_dens = iter2_diag.construct_density_off().expect("iter-2 construct_density");
+    let iter3_state = match iter2_dens.mix().check(1e-8).expect("iter-2 check") {
+        chemrust_scf::CheckOutcome::Converged(_) => panic!("iter-2 converged early"),
+        chemrust_scf::CheckOutcome::NotConverged { state, .. } => state,
+    };
+
+    // Iter-3
+    let iter3_veff = iter3_state.build_v_eff_with_energy().expect("iter-3 build_v_eff");
+    let iter3_diag = iter3_veff.diagonalize(8, None).expect("iter-3 diagonalize");
+    let eigs_3 = iter3_diag.eigenvalues().to_vec();
+
+    let iter3_band0 = eigs_3[0];
+    let castep_band0 = -1.05502287f64;
+    let drift = (iter3_band0 - castep_band0).abs();
+
+    eprintln!(
+        "[T-cascade-tight] iter-1 band-0 = {:.6} Ha, iter-2 = {:.6} Ha, iter-3 = {:.6} Ha",
+        eigs_1[0], eigs_2[0], iter3_band0,
+    );
+    eprintln!(
+        "[T-cascade-tight] CASTEP band-0 = {:.8} Ha (Cu111_CO.bands:12), drift = {:.4e} Ha (gate 0.1 Ha)",
+        castep_band0, drift,
+    );
+
+    assert!(
+        drift < 0.1,
+        "T-cascade-tight FAIL: iter-3 band-0 = {:.4} Ha drifts {:.4} Ha from CASTEP \
+         {:.4} Ha (gate 0.1 Ha). Pre-fix value ~ -11.94 Ha; F3d-narrow polar pin \
+         expected to bring drift below 0.1 Ha.",
+        iter3_band0, drift, castep_band0,
+    );
+}
+
+/// **T-overlap-iter2** — runs 2 SCF iterations from CASTEP state and asserts
+/// average per-band S-inner-product overlap with CASTEP `.check` ψ exceeds 0.5.
+///
+/// EXTERNAL anchor (A9): `Cu111_CO.check` (USPP S-orthonormal: ⟨ψ|S|ψ⟩ = 1).
+/// Pre-fix value (current HEAD): avg L2 overlap ~ 0.11 — but L2 is the wrong
+/// metric for low-PW-norm USPP wavefunctions. We route through `apply_s_for_test`
+/// to compute true `|⟨ψ_iter2 | S | ψ_castep⟩|²`, which has a ceiling of 1.0
+/// for identical wavefunctions and remains a valid comparison.
+///
+/// The test depends on the existence of a `pub apply_s_for_test` method on
+/// `ScfIteration<S, VEffBuilt, M>` (added 2026-05-24 in src/scf.rs:~770).
+#[test]
+#[ignore = "requires GPU and CASTEP fixture data"]
+#[cfg(feature = "scf_diag")]
+fn overlap_iter2_against_castep() {
+    if !gpu_available() {
+        eprintln!("SKIP: no GPU available");
+        return;
+    }
+    init_tracing();
+
+    use num_complex::Complex64;
+
+    let fx = fixtures::cu111_co::fixture();
+    let wfc = fx.check.wavefunction.as_ref().expect(".check wavefunction");
+    let kpt_block = &wfc.kpt_data[0];
+    let n_bands_total = kpt_block.bands.len();
+    let n_pw = kpt_block.nplw;
+    let castep_psi: Vec<Complex64> = kpt_block.bands.concat();
+
+    // Iter-1 → iter-2
+    let state = fixtures::cu111_co::build_scf_state(fx);
+    let iter1_veff = state.build_v_eff_with_energy().expect("iter-1 build_v_eff");
+    let iter1_diag = iter1_veff.diagonalize(8, None).expect("iter-1 diagonalize");
+    let iter1_dens = iter1_diag.construct_density_off().expect("iter-1 construct_density");
+    let iter2_state = match iter1_dens.mix().check(1e-8).expect("iter-1 check") {
+        chemrust_scf::CheckOutcome::Converged(_) => panic!("iter-1 converged early"),
+        chemrust_scf::CheckOutcome::NotConverged { state, .. } => state,
+    };
+    let iter2_veff = iter2_state.build_v_eff_with_energy().expect("iter-2 build_v_eff");
+
+    // Compute S · ψ_castep using iter-2's vnl_data (same V_eff would project
+    // identically; we just need the projector + Q-matrix machinery).
+    let s_castep = iter2_veff
+        .apply_s_for_test(&castep_psi, n_bands_total)
+        .expect("apply_s_for_test on castep_psi");
+
+    // Now diagonalize iter-2 and pull ψ_iter2.
+    let iter2_diag = iter2_veff.diagonalize(8, None).expect("iter-2 diagonalize");
+    let psi_iter2 = iter2_diag.psi_data().to_vec();
+
+    // Per-band overlap: |⟨ψ_iter2_b | S | ψ_castep_b⟩|² for first 20 bands.
+    let n_check = 20usize.min(n_bands_total);
+    let mut overlaps = Vec::with_capacity(n_check);
+    for b in 0..n_check {
+        let ours = &psi_iter2[b * n_pw..(b + 1) * n_pw];
+        let scas = &s_castep[b * n_pw..(b + 1) * n_pw];
+        let dot: Complex64 = ours
+            .iter()
+            .zip(scas.iter())
+            .map(|(a, b)| a.conj() * b)
+            .sum();
+        overlaps.push(dot.norm_sqr());
+    }
+    let avg_overlap = overlaps.iter().sum::<f64>() / n_check as f64;
+    let min_overlap = overlaps.iter().cloned().fold(f64::INFINITY, f64::min);
+
+    eprintln!(
+        "[T-overlap-iter2] per-band |⟨ψ_iter2|S|ψ_castep⟩|² (first {} bands):",
+        n_check,
+    );
+    for b in 0..n_check {
+        eprintln!("  band {:3}: {:.6}", b, overlaps[b]);
+    }
+    eprintln!(
+        "[T-overlap-iter2] avg = {:.4}, min = {:.4} (gate avg > 0.5)",
+        avg_overlap, min_overlap,
+    );
+
+    assert!(
+        avg_overlap > 0.5,
+        "T-overlap-iter2 FAIL: avg S-overlap = {:.4} ≤ 0.5 across first {} bands. \
+         Pre-fix L2 overlap was ~0.11 (and L2 is bounded by ‖ψ‖⁴ for low-PW-norm \
+         USPP bands); S-inner overlap is unbounded above by that artefact and \
+         should reach near 1.0 once F3d-narrow polar pinning lands.",
+        avg_overlap, n_check,
+    );
+}
+
+/// **Diagnostic self-test for the S-overlap helper** — verifies the diagnostic
+/// itself before its output is trusted as a green/red signal for
+/// `overlap_iter2_against_castep`. Three cases (all from `Cu111_CO.check`):
+///
+/// 1. CASTEP ψ vs CASTEP ψ → `|⟨ψ_b|S|ψ_b⟩|²` ≈ 1.0 per band (S-orthonormality).
+/// 2. CASTEP ψ band-0 vs CASTEP ψ band-1 → ≈ 0 (S-orthogonal eigenstates).
+/// 3. CASTEP ψ with columns 2 and 3 swapped vs CASTEP ψ → bands 2 and 3 detect
+///    the swap (low self-overlap, high cross-overlap).
+///
+/// Required by `/debug-outcomes` Step 5: a diagnostic must be self-tested
+/// against ≥10 sample points through 2 structurally independent paths before
+/// its output is trusted.
+#[test]
+#[ignore = "requires GPU and CASTEP fixture data"]
+#[cfg(feature = "scf_diag")]
+fn overlap_helper_self_test() {
+    if !gpu_available() {
+        eprintln!("SKIP: no GPU available");
+        return;
+    }
+    init_tracing();
+
+    use num_complex::Complex64;
+
+    let fx = fixtures::cu111_co::fixture();
+    let wfc = fx.check.wavefunction.as_ref().expect(".check wavefunction");
+    let kpt_block = &wfc.kpt_data[0];
+    let n_bands_total = kpt_block.bands.len();
+    let n_pw = kpt_block.nplw;
+    let castep_psi: Vec<Complex64> = kpt_block.bands.concat();
+
+    // Need a VEffBuilt state to call apply_s_for_test. Iter-1 V_eff is fine
+    // — apply_s_times only consumes vnl_data (β, Q), not V_eff content.
+    let state = fixtures::cu111_co::build_scf_state(fx);
+    let veff = state.build_v_eff_with_energy().expect("build_v_eff");
+
+    let s_castep = veff
+        .apply_s_for_test(&castep_psi, n_bands_total)
+        .expect("apply_s_for_test on castep_psi");
+
+    let dot_sq = |a: &[Complex64], b: &[Complex64]| -> f64 {
+        let z: Complex64 = a.iter().zip(b.iter()).map(|(x, y)| x.conj() * y).sum();
+        z.norm_sqr()
+    };
+
+    // === Case 1: self-overlap = 1 per band ===
+    eprintln!("[Self-test C1] CASTEP ψ_b · S · ψ_b should ≈ 1.0 (USPP S-norm)");
+    let n_check = 20usize.min(n_bands_total);
+    let mut self_min = f64::INFINITY;
+    let mut self_max = 0.0f64;
+    for b in 0..n_check {
+        let psi_b = &castep_psi[b * n_pw..(b + 1) * n_pw];
+        let spsi_b = &s_castep[b * n_pw..(b + 1) * n_pw];
+        let v = dot_sq(psi_b, spsi_b);
+        eprintln!("  band {:3}: |⟨ψ|S|ψ⟩|² = {:.8}", b, v);
+        self_min = self_min.min(v);
+        self_max = self_max.max(v);
+    }
+    assert!(
+        self_min > 0.99 && self_max < 1.01,
+        "Self-test C1 FAIL: ⟨ψ|S|ψ⟩ deviates from 1 (min={:.6}, max={:.6}). \
+         Either apply_s_for_test is broken or .check ψ is not S-orthonormal.",
+        self_min, self_max,
+    );
+    eprintln!("[Self-test C1] PASS: self-overlap min={:.6} max={:.6}", self_min, self_max);
+
+    // === Case 2: distinct-band cross-overlap = 0 ===
+    eprintln!("[Self-test C2] CASTEP ψ_0 · S · ψ_1 should ≈ 0 (S-orthogonal)");
+    let psi0 = &castep_psi[0..n_pw];
+    let spsi1 = &s_castep[n_pw..2 * n_pw];
+    let cross_01 = dot_sq(psi0, spsi1);
+    eprintln!("  |⟨ψ_0|S|ψ_1⟩|² = {:.2e}", cross_01);
+    assert!(
+        cross_01 < 1e-6,
+        "Self-test C2 FAIL: distinct-band cross-overlap {:.2e} too large \
+         (expected ≪ 1e-6 from CASTEP S-orthonormalization).",
+        cross_01,
+    );
+    eprintln!("[Self-test C2] PASS: cross-overlap {:.2e} < 1e-6", cross_01);
+
+    // === Case 3: column-swap ψ → bands 2,3 self-overlap drops ===
+    // Build a permuted ψ where columns 2 and 3 are swapped.
+    eprintln!("[Self-test C3] Column-swap detection (ψ' has cols 2,3 swapped)");
+    let mut psi_swapped = castep_psi.clone();
+    {
+        let (left, right) = psi_swapped.split_at_mut(3 * n_pw);
+        // left[2*n_pw..3*n_pw] is original col 2; right[..n_pw] is original col 3.
+        let col2 = &mut left[2 * n_pw..3 * n_pw];
+        let col3 = &mut right[..n_pw];
+        for i in 0..n_pw {
+            std::mem::swap(&mut col2[i], &mut col3[i]);
+        }
+    }
+    // Compute |⟨ψ_swapped_2 | S | ψ_castep_2⟩|² and …_3.
+    // S·ψ_castep is unchanged (we keep s_castep). ψ_swapped col 2 is castep col 3.
+    let swap_self_2 = dot_sq(
+        &psi_swapped[2 * n_pw..3 * n_pw],
+        &s_castep[2 * n_pw..3 * n_pw],
+    );
+    let swap_self_3 = dot_sq(
+        &psi_swapped[3 * n_pw..4 * n_pw],
+        &s_castep[3 * n_pw..4 * n_pw],
+    );
+    let swap_cross_23 = dot_sq(
+        &psi_swapped[2 * n_pw..3 * n_pw],
+        &s_castep[3 * n_pw..4 * n_pw],
+    );
+    eprintln!("  |⟨ψ'_2|S|ψ_2⟩|² = {:.4} (expect ≈ 0)", swap_self_2);
+    eprintln!("  |⟨ψ'_3|S|ψ_3⟩|² = {:.4} (expect ≈ 0)", swap_self_3);
+    eprintln!("  |⟨ψ'_2|S|ψ_3⟩|² = {:.4} (expect ≈ 1)", swap_cross_23);
+    assert!(
+        swap_self_2 < 0.05 && swap_self_3 < 0.05,
+        "Self-test C3 FAIL: column-swap not detected — diagonal overlaps still \
+         high (col2={:.4}, col3={:.4}).",
+        swap_self_2, swap_self_3,
+    );
+    assert!(
+        swap_cross_23 > 0.95,
+        "Self-test C3 FAIL: column-swap not detected — cross overlap col2-col3 \
+         only {:.4} (expected > 0.95 since ψ'_2 = ψ_3).",
+        swap_cross_23,
+    );
+    eprintln!("[Self-test C3] PASS: swap correctly detected");
+    eprintln!("[Self-test] All 3 cases PASS — overlap helper is trustworthy");
+}
+
+/// **Subspace projector diagnostic** — discriminates pure unitary rotation
+/// within a band block from genuine subspace loss.
+///
+/// For two bases that span the same k-dim subspace, the projection matrix
+/// `P[a,b] = ⟨our_a | S | castep_b⟩` has unitary singular values, so
+/// `‖P‖_F² = Σ |P[a,b]|² = k`. If our bases don't span the same subspace,
+/// `‖P‖_F² < k`.
+///
+/// Reports:
+///   - `band-0` (singleton): expect ≈ 1.0
+///   - `Cu-3d cluster` (bands 1-13): expect 13.0 if pure rotation,
+///     < 13.0 if span has changed
+///   - `0..30` (full check window): expect 30.0 if pure rotation
+///   - `0..40`: same with margin
+///
+/// This is the §14 rotation-vs-span-loss discriminator. If the cluster sums
+/// near k for each block, §14 polar-pinning addresses the problem. If sums
+/// drop materially, the eigensolver is moving the entire subspace span.
+#[test]
+#[ignore = "requires GPU and CASTEP fixture data"]
+#[cfg(feature = "scf_diag")]
+fn subspace_projector_iter1_vs_castep() {
+    if !gpu_available() {
+        eprintln!("SKIP: no GPU available");
+        return;
+    }
+    init_tracing();
+
+    use num_complex::Complex64;
+
+    let fx = fixtures::cu111_co::fixture();
+    let wfc = fx.check.wavefunction.as_ref().expect(".check wavefunction");
+    let kpt_block = &wfc.kpt_data[0];
+    let n_bands_total = kpt_block.bands.len();
+    let n_pw = kpt_block.nplw;
+    let castep_psi: Vec<Complex64> = kpt_block.bands.concat();
+
+    // iter-1 only — compare iter-1 OUTPUT ψ vs CASTEP ψ. iter-2 V_eff is
+    // already polluted by iter-1's incorrect ψ → iter-2's eigenproblem is a
+    // different operator, so iter-2 vs CASTEP wouldn't isolate the rotation.
+    let state = fixtures::cu111_co::build_scf_state(fx);
+    let iter1_veff = state.build_v_eff_with_energy().expect("iter-1 build_v_eff");
+
+    let s_castep = iter1_veff
+        .apply_s_for_test(&castep_psi, n_bands_total)
+        .expect("apply_s_for_test on castep_psi");
+
+    let iter1_diag = iter1_veff.diagonalize(8, None).expect("iter-1 diagonalize");
+    let psi_iter1_out = iter1_diag.psi_data().to_vec();
+
+    // Window of bands to examine
+    let nb = 40usize.min(n_bands_total);
+
+    // Full overlap matrix M[a,b] = |⟨our_a | S · castep_b⟩|²
+    let mut m = vec![0f64; nb * nb];
+    for a in 0..nb {
+        let ours = &psi_iter1_out[a * n_pw..(a + 1) * n_pw];
+        for b in 0..nb {
+            let scas = &s_castep[b * n_pw..(b + 1) * n_pw];
+            let dot: Complex64 = ours
+                .iter()
+                .zip(scas.iter())
+                .map(|(x, y)| x.conj() * y)
+                .sum();
+            m[a * nb + b] = dot.norm_sqr();
+        }
+    }
+
+    let block_sum = |i0: usize, i1: usize| -> f64 {
+        let mut s = 0.0;
+        for a in i0..i1 {
+            for b in i0..i1 {
+                s += m[a * nb + b];
+            }
+        }
+        s
+    };
+
+    let s_band0   = block_sum(0,  1);   // expect ≈ 1.0
+    let s_cu3d    = block_sum(1, 14);   // expect ≈ 13.0 if pure rotation
+    let s_0_to_30 = block_sum(0, 30);   // expect ≈ 30.0
+    let s_0_to_40 = block_sum(0, 40);   // expect ≈ 40.0
+
+    eprintln!("[Subspace] block sums of |⟨our|S|castep⟩|² (Frobenius²) — equal block size = pure rotation");
+    eprintln!("[Subspace] band-0 (k=1):   {:8.4}   expect ≈ 1.0", s_band0);
+    eprintln!("[Subspace] Cu-3d 1..14 (k=13): {:8.4}   expect ≈ 13.0", s_cu3d);
+    eprintln!("[Subspace] 0..30 (k=30):       {:8.4}   expect ≈ 30.0", s_0_to_30);
+    eprintln!("[Subspace] 0..40 (k=40):       {:8.4}   expect ≈ 40.0", s_0_to_40);
+
+    // Also report per-band row sums Σ_b |M[a,b]|² and per-row max
+    eprintln!("[Subspace] per-row max + arg-max (where in CASTEP's basis does our band sit):");
+    for a in 0..(20usize.min(nb)) {
+        let mut best_b = 0usize;
+        let mut best_v = 0f64;
+        let mut row_sum = 0f64;
+        for b in 0..nb {
+            let v = m[a * nb + b];
+            row_sum += v;
+            if v > best_v {
+                best_v = v;
+                best_b = b;
+            }
+        }
+        eprintln!(
+            "  our_a={:3}: row_sum={:.4} max={:.4} at castep_b={:3}",
+            a, row_sum, best_v, best_b
+        );
+    }
+
+    // Soft thresholds — informational asserts. Pure rotation: ratio ≈ 1.
+    // Genuine subspace loss: ratio << 1.
+    let ratio_3d = s_cu3d / 13.0;
+    let ratio_30 = s_0_to_30 / 30.0;
+    let ratio_40 = s_0_to_40 / 40.0;
+    eprintln!("[Subspace] ratios: 3d={:.3}  0..30={:.3}  0..40={:.3}  (1.0 = pure rotation)",
+        ratio_3d, ratio_30, ratio_40);
+
+    // Diagnostic only — keep going whatever the values are.
+    eprintln!("[Subspace] diagnostic complete; no hard assert");
+}
