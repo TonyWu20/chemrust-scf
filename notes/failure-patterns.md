@@ -240,3 +240,29 @@ cutoffs are inadequate.
 **Diagnostic**: CASTEP iprint=3 energy component breakdown (hartree, xc, ewald)
 exposed which component was wrong. Head-to-head component comparison in eV
 showed E_H, E_xc, and rho_vxc matching exactly — only Ewald differed.
+
+## 2026-05-24: postrr-cascade-amplification (Procrustes pin against ψ_prev)
+**Root cause**: The PostRr pin (SVD-polar of M = ψ_prev^H · S · ψ_after_GS · X,
+applied as R = U·V^H on X columns within near-degenerate blocks) fixes iter-1
+in-block gauge rotation almost completely (1e-6 outliers → 0.94 floor), but
+**amplifies** cascade across SCF iterations: iter-3 band-0 drift grew from
+−11.94 Ha (PinMode::Off baseline) to −14.91 Ha under PostRr+eps_degen=0.05
+(both vs CASTEP A1 = −1.055 Ha). Hypothesis: pin against the previous
+iteration's ψ creates self-reinforcing feedback through V_eff — iter-t pin
+aligns to iter-(t−1) which was itself pinned, so error compounds rather than
+re-anchoring to ground truth.
+**Resolution**: `notes/debug/debug-20260524-postrr-cascade-amplification/RESOLUTION.md`
+**Implementation**: `src/eigensolver/rayleigh_ritz.rs` (PinMode enum, postrr
+path, typed faer SVD); `src/scf.rs` (`RrPinConfig::from_env()` plumbing, PCI-E
+budget extensions). Default `PinMode::Off` — PostRr is opt-in via
+`CHEMRUST_PIN_MODE=postrr`. PreRr declared but unimplemented.
+**Pattern**: relative-target-procrustes-feedback — using a moving reference
+(ψ_prev) for Procrustes alignment is unstable when the reference itself is
+the previous iteration's output of the same algorithm. The chain `ψ_t aligns
+to ψ_{t−1}, ψ_{t−1} aligns to ψ_{t−2}, ...` drifts cumulatively rather than
+converging to a fixed anchor. Candidate fix: pin against an **absolute**
+reference (e.g., the initial guess or iter-1 RR output frozen for the SCF run).
+**Sibling failure**: iter-1 `> 0.999` gate is unreachable due to Chebyshev
+filter pollution from bands outside the 40-band window (proposal §1.3
+documented this as ~6–11% span pollution). Tighter `b_low` (proposal §5
+follow-up) is needed before any pin variant can hit the strict gate.
