@@ -9,11 +9,13 @@ use cudarc::driver::{CudaContext, CudaSlice};
 use ndarray::{Array3, ShapeBuilder};
 use num_complex::Complex64;
 
-use crate::device::blas::BlasHandle;
+use crate::device::blas::{op, BlasHandle, ZgemmConfig};
+use crate::device::fft::BatchedFftPlan3d;
 use crate::device::solver::SolverHandle;
 use crate::device::pcie::PcieAccount;
 use crate::device::{CudaComplex, Gpu};
-use crate::eigensolver::chebyshev::{FilterMode, chebyshev_filter, CudaKernelSet};
+use crate::eigensolver::chebyshev::{compute_kinetic_energies, FilterMode, chebyshev_filter, CudaKernelSet};
+use crate::eigensolver::davidson_minimal::{davidson_minimal_single_sweep, DavidsonResult};
 use crate::eigensolver::rayleigh_ritz::rayleigh_ritz;
 #[cfg(any(test, feature = "scf_diag"))]
 use crate::eigensolver::rayleigh_ritz::rayleigh_ritz_with_matrices;
@@ -581,6 +583,106 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
             .clone_htod(&self.pw_fft_indices)
             .map_err(Error::Cuda)?;
         pcie.h2d_bytes += self.pw_fft_indices.len() * std::mem::size_of::<i32>();
+
+        // ---- Eigensolver dispatch: CHEMRUST_EIGENSOLVER env var ----
+        let eigensolver_method = std::env::var("CHEMRUST_EIGENSOLVER")
+            .unwrap_or_else(|_| "chebyshev".to_string());
+
+        if eigensolver_method == "davidson" {
+            // ndeg ignored — davidson_minimal is single-sweep (Phase 0 scratch test).
+            let [ngz, ngy, ngx] = self.wave_grid.grid();
+            let grid_size_usize = ngx * ngy * ngz;
+            let inv_ntotal = 1.0 / (grid_size_usize as f64);
+
+            // Precompute kinetic energies (same CPU computation chebyshev_filter does internally)
+            let kinetic_cpu = compute_kinetic_energies(
+                &self.pw_coords,
+                self.wave_grid.recip_lattice(),
+            );
+            let kinetic_dev: CudaSlice<f64> = stream
+                .clone_htod(&kinetic_cpu.0)
+                .map_err(Error::Cuda)?;
+            pcie.h2d_bytes += kinetic_cpu.0.len() * std::mem::size_of::<f64>();
+
+            // FFT plan (batched C2C) — same as chebyshev_filter creates
+            let fft_plan = BatchedFftPlan3d::plan_batched_c2c(
+                ngx as i32, ngy as i32, ngz as i32, n_bands as i32,
+                stream.clone(),
+            ).map_err(Error::Fft)?;
+
+            let lock_tol = std::env::var("CHEMRUST_DAVIDSON_LOCK_TOL")
+                .unwrap_or_else(|_| "1e-6".to_string())
+                .parse::<f64>()
+                .unwrap_or(1e-6);
+
+            let psi_in = psi_gpu.as_device_slice();
+            let v_eff_slice = v_eff_gpu.as_device_slice();
+
+            let result: DavidsonResult = unsafe {
+                davidson_minimal_single_sweep(
+                    psi_in,
+                    v_eff_slice,
+                    &kinetic_dev,
+                    &fft_idx_dev,
+                    &vnl_data,
+                    n_pw,
+                    n_bands,
+                    grid_size_usize,
+                    inv_ntotal,
+                    &fft_plan,
+                    lock_tol,
+                    &blas,
+                    &solver,
+                    &kernels,
+                    &stream,
+                    &ctx,
+                )?
+            };
+
+            // Wrap psi_out CudaSlice into Gpu<WavefunctionSet<ColumnDistributed>>
+            let psi_new_gpu: Gpu<WavefunctionSet<ColumnDistributed>> = Gpu {
+                slice: result.psi_out,
+                shape: vec![n_bands, n_pw],
+                ctx: (*ctx).clone(),
+                _marker: PhantomData,
+            };
+            let eigenvalues_cpu = Cpu::new(result.eigenvalues);
+
+            // Recompute beta_psi_gpu: C_proj = beta_g^H · psi_out for each ion
+            let mut beta_psi_gpu: Vec<CudaSlice<CudaComplex>> = Vec::new();
+            for entry in &vnl_data.entries {
+                let ne = entry.n_expanded as usize;
+                let mut c_proj: CudaSlice<CudaComplex> = stream
+                    .alloc_zeros(ne * n_bands)
+                    .map_err(Error::Cuda)?;
+                unsafe {
+                    blas.gemm_c64(ZgemmConfig {
+                        transa: op::C,
+                        transb: op::N,
+                        m: ne as i32,
+                        n: n_bands as i32,
+                        k: n_pw as i32,
+                        alpha: CudaComplex { x: 1.0, y: 0.0 },
+                        lda: n_pw as i32,
+                        ldb: n_pw as i32,
+                        beta: CudaComplex { x: 0.0, y: 0.0 },
+                        ldc: ne as i32,
+                    }, &entry.beta_g, psi_new_gpu.as_device_slice(), &mut c_proj)?;
+                }
+                beta_psi_gpu.push(c_proj);
+            }
+
+            stream.synchronize()?;
+            let Cpu(psi_new) = psi_new_gpu.sync_to_host_with(&stream, &mut pcie)?;
+            let eigenvalues = eigenvalues_cpu.into_inner();
+
+            let mut next: ScfIteration<S, WavefunctionsUpdated, MixingOff> = self.into_phase();
+            next.psi = psi_new;
+            next.eigenvalues = eigenvalues;
+            next.beta_psi_per_ion = Some(beta_psi_gpu);
+            return Ok(next);
+        }
+        // ---- End davidson dispatch ----
 
         // Chebyshev filter (pipeline: T+V_loc via FFT, V_NL via gemm)
         let (psi_filtered_row, hpsi_row) = chebyshev_filter(
