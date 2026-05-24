@@ -505,10 +505,12 @@ pub(crate) fn rayleigh_ritz(
                     let k_block = (hi - lo) as usize;
 
                     // Extract M_block = M[lo..hi, lo..hi]
+                    // m_host is col-major (n_bands × n_bands): element [row, col] at m_host[col * n_bands + row]
+                    // m_block will be col-major (k_block × k_block): element [row, col] at m_block[col * k_block + row]
                     let mut m_block = vec![CudaComplex { x: 0.0, y: 0.0 }; k_block * k_block];
-                    for i in 0..k_block {
-                        for j in 0..k_block {
-                            m_block[i * k_block + j] = m_host[(lo + i) * n_bands + (lo + j)];
+                    for col in 0..k_block {
+                        for row in 0..k_block {
+                            m_block[col * k_block + row] = m_host[(lo + col) * n_bands + (lo + row)];
                         }
                     }
 
@@ -521,18 +523,76 @@ pub(crate) fn rayleigh_ritz(
 
                     // CPU SVD via faer
                     use faer::prelude::*;
-                    let m_faer = Mat::<Complex64>::from_fn(k_block, k_block, |i, j| m_block_c64[i * k_block + j]);
+                    // faer Mat is col-major: from_fn(rows, cols, |row, col| ...) with col-major storage
+                    let m_faer = Mat::<Complex64>::from_fn(k_block, k_block, |row, col| m_block_c64[col * k_block + row]);
 
-                    if let Ok(_svd) = m_faer.svd() {
-                        // SVD succeeded - we have the polar unitary factor R = U · V^H
-                        // For now, we log that a degenerate block was detected.
-                        // The actual rotation application is deferred.
-                        #[cfg(feature = "scf_diag")]
-                        eprintln!("[PostRr] detected degenerate block [{}, {}), k={}", lo, hi, k_block);
-                    } else {
-                        #[cfg(feature = "scf_diag")]
-                        eprintln!("[PostRr] SVD failed for block [{}, {})", lo, hi);
+                    let svd = match m_faer.svd() {
+                        Ok(s) => s,
+                        Err(_) => {
+                            #[cfg(feature = "scf_diag")]
+                            eprintln!("[PostRr] SVD failed for block [{}, {})", lo, hi);
+                            continue;
+                        }
+                    };
+
+                    // faer 0.24 Svd API: U() is left singulars, V() is right singulars (NOT V^H).
+                    // Procrustes-optimal R = U · V^H, where V^H = V().adjoint().
+                    let u_mat = svd.U();   // Mat<Complex64> (k × k)
+                    let v_mat = svd.V();   // Mat<Complex64> (k × k)
+
+                    // R = U · V^H — k×k unitary by construction
+                    let r_mat = u_mat * v_mat.adjoint();
+
+                    // Sanity: ‖R^H · R − I‖_F < 1e-10
+                    {
+                        let rh_r = r_mat.adjoint() * &r_mat;
+                        let mut frob_err = 0.0_f64;
+                        for i in 0..k_block {
+                            for j in 0..k_block {
+                                let target = if i == j { Complex64::new(1.0, 0.0) } else { Complex64::ZERO };
+                                let d = rh_r[(i, j)] - target;
+                                frob_err += d.norm_sqr();
+                            }
+                        }
+                        if frob_err.sqrt() > 1e-10 {
+                            #[cfg(feature = "scf_diag")]
+                            eprintln!("[PostRr] R not unitary for block [{}, {}): ‖R^H·R - I‖_F = {:.3e} — skipping", lo, hi, frob_err.sqrt());
+                            continue;
+                        }
                     }
+
+                    // Apply X[:, lo..hi] ← X[:, lo..hi] · R^H on x_host (col-major, n_bands × n_bands).
+                    // Source slab: rows 0..n_bands, cols lo..hi (k_block columns).
+                    // Output:     rows 0..n_bands, cols lo..hi (overwrite same block).
+                    //
+                    // Right-multiply by R^H (k×k):  X_new[r, lo+c] = Σ_p X_old[r, lo+p] · conj(R[c, p])
+                    // i.e. for each output col c, sum over input cols p with weight conj(R[c, p]).
+                    {
+                        let mut new_block = vec![CudaComplex { x: 0.0, y: 0.0 }; n_bands * k_block];
+                        for c in 0..k_block {
+                            for r in 0..n_bands {
+                                let mut acc = Complex64::ZERO;
+                                for p in 0..k_block {
+                                    let x_rp = {
+                                        let cu = x_host[(lo + p) * n_bands + r]; // col-major: col=(lo+p), row=r
+                                        Complex64::new(cu.x, cu.y)
+                                    };
+                                    let r_cp_conj = r_mat[(c, p)].conj();
+                                    acc += x_rp * r_cp_conj;
+                                }
+                                new_block[c * n_bands + r] = CudaComplex { x: acc.re, y: acc.im };
+                            }
+                        }
+                        // Write back into x_host columns lo..hi
+                        for c in 0..k_block {
+                            for r in 0..n_bands {
+                                x_host[(lo + c) * n_bands + r] = new_block[c * n_bands + r];
+                            }
+                        }
+                    }
+
+                    #[cfg(feature = "scf_diag")]
+                    eprintln!("[PostRr] pinned block [{}, {}), k={}", lo, hi, k_block);
                 }
 
                 // H2D the (potentially modified) X back to GPU
