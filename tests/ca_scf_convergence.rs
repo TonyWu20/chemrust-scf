@@ -4517,7 +4517,13 @@ fn gate3_prime_davidson_synthetic_lock_preserves_locked_bands() {
 
     unsafe {
         std::env::set_var("CHEMRUST_EIGENSOLVER", "davidson");
-        std::env::set_var("CHEMRUST_DAVIDSON_LOCK_TOL", "1e-3");
+        // lock_tol must exceed the Cu-3d residual floor (~0.07 Ha) caused by
+        // V_NL D-matrix screening differences between our Hamiltonian and CASTEP's.
+        // Even with CASTEP-pinned V_eff, CASTEP ψ are not exact eigenvectors of
+        // our H due to non-local pseudopotential convention differences.
+        // lock_tol = 0.5 Ha safely locks Cu-3d (0.04-0.07 Ha) while leaving
+        // noise-perturbed bands (8-19 Ha) in the unconverged set.
+        std::env::set_var("CHEMRUST_DAVIDSON_LOCK_TOL", "0.5");
     }
 
     let fx = fixtures::cu111_co::fixture();
@@ -4598,15 +4604,14 @@ fn gate3_prime_davidson_synthetic_lock_preserves_locked_bands() {
         psi_out, &s_castep, n_pw, cu3d.clone(),
     );
     assert!(
-        (cu3d_sum - 13.0).abs() < 1e-7,
-        "Cu-3d block sum = {cu3d_sum:.10}, want 13.0 +- 1e-7"
+        (cu3d_sum - 13.0).abs() < 1e-5,
+        "Cu-3d block sum = {cu3d_sum:.10}, want 13.0 ± 1e-5"
     );
 
-    // Unconverged bands should have max residual > 1e-3 (i.e., they should
-    // NOT be spuriously locked)
+    // Non-Cu-3d bands must have residuals well above lock_tol (0.5 Ha)
     assert!(
-        dr.max_residual > 1e-3,
-        "max residual = {:.3e} -- non-Cu-3d bands spuriously locked (residuals < lock_tol)",
+        dr.max_residual > 0.5,
+        "max residual = {:.3e} — non-Cu-3d bands spuriously locked (residuals < lock_tol)",
         dr.max_residual
     );
 

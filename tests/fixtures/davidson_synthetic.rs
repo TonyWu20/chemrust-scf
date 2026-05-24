@@ -76,8 +76,8 @@ pub fn construct_synthetic_locked_input(
         }
         let offset = b * n_pw;
         for g in 0..n_pw {
-            let re: f64 = rng.random_range(-1.0..1.0);
-            let im: f64 = rng.random_range(-1.0..1.0);
+            let re: f64 = rng.gen_range(-1.0..1.0);
+            let im: f64 = rng.gen_range(-1.0..1.0);
             psi_perturbed[offset + g] = Complex64::new(
                 psi_perturbed[offset + g].re + epsilon * re,
                 psi_perturbed[offset + g].im + epsilon * im,
