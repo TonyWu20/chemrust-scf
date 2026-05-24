@@ -5,6 +5,14 @@
 the empirical state, what was tried, and what the next attempt must do
 differently.
 
+**Implementation plan:** A detailed, A/B-augmented implementation plan
+lives at `notes/proposals/14-eigensolver-rotation-fix-plan.md`. That
+plan supersedes §3–§4 of this document by introducing a `PinMode` enum
+and implementing **both** `PreRr` (proposal §3.1) and `PostRr` (recommended
+based on strict-degeneracy theory) so the cascade test can falsify between
+them. Read this proposal for the empirical motivation and constraints; read
+the plan for the executable design.
+
 **Cross-reference:** `notes/open-followups.md` §14 (one-line index entry).
 This document is the dedicated unit; load it instead of the index when
 working on this issue.

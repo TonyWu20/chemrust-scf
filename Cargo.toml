@@ -14,6 +14,7 @@ libm = "0.2"
 cudarc = { version = "0.19.7", features = ["cuda-12090", "cublas", "cufft", "cusolver", "nvrtc"] }
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 rand = "0.8"
+faer = "0.24"
 
 [features]
 scf_diag = []

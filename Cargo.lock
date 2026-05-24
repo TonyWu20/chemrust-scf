@@ -131,6 +131,7 @@ dependencies = [
  "bon",
  "chemrust-hamiltonian-core",
  "cudarc",
+ "faer",
  "libm",
  "ndarray",
  "num-complex",

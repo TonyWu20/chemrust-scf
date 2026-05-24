@@ -26,6 +26,63 @@ use crate::layout::{ColumnDistributed, Cpu, RowDistributed, WavefunctionSet};
 use crate::types::Error;
 
 // ---------------------------------------------------------------------------
+// Procrustes pin configuration (eigenvector rotation stabilization)
+// ---------------------------------------------------------------------------
+
+/// Pin mode for Procrustes-based eigenvector rotation stabilization.
+///
+/// The pin corrects for arbitrary in-block unitary rotations that ZHEGVD
+/// produces in near-degenerate eigenvalue clusters. Two variants are
+/// implemented and can be selected via environment variable `CHEMRUST_PIN_MODE`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinMode {
+    /// No pinning; standard RR behavior (baseline for A/B testing).
+    Off,
+    /// Pre-RR pin: rotate ψ_row before assembling H_sub/S_sub, then re-run ZHEGVD.
+    PreRr,
+    /// Post-RR pin: apply rotation to X after ZHEGVD, before final ψ_new = ψ_row · X.
+    PostRr,
+}
+
+/// Configuration for Procrustes pinning in Rayleigh-Ritz.
+#[derive(Debug, Clone)]
+pub struct RrPinConfig {
+    /// Eigenvalue spacing threshold (Ha) for detecting degenerate blocks.
+    /// Default 0.01 Ha (catches Cu-3d Δε ≈ 7 mHa and Fermi cluster Δε ≈ 0.3 mHa).
+    pub eps_degen: f64,
+    /// Pin mode (Off, PreRr, or PostRr).
+    pub mode: PinMode,
+}
+
+impl RrPinConfig {
+    /// Create a new pin configuration from environment variables.
+    ///
+    /// `CHEMRUST_PIN_MODE` ∈ {`off`, `prerr`, `postrr`}; defaults to `off`.
+    /// `CHEMRUST_PIN_EPS_DEGEN` is the eigenvalue spacing threshold in Ha; defaults to 0.01.
+    pub fn from_env() -> Self {
+        let mode_str = std::env::var("CHEMRUST_PIN_MODE").unwrap_or_else(|_| "off".to_string());
+        let mode = match mode_str.to_lowercase().as_str() {
+            "off" => PinMode::Off,
+            "prerr" => PinMode::PreRr,
+            "postrr" => PinMode::PostRr,
+            _ => {
+                eprintln!(
+                    "CHEMRUST_PIN_MODE='{}' not recognized; defaulting to 'off'",
+                    mode_str
+                );
+                PinMode::Off
+            }
+        };
+
+        let eps_degen_str = std::env::var("CHEMRUST_PIN_EPS_DEGEN").unwrap_or_else(|_| "0.01".to_string());
+        let eps_degen = eps_degen_str.parse::<f64>().unwrap_or(0.01);
+
+        RrPinConfig { eps_degen, mode }
+    }
+}
+
+
+// ---------------------------------------------------------------------------
 // Type alias for the complex Rayleigh-Ritz return type
 // ---------------------------------------------------------------------------
 
@@ -38,7 +95,51 @@ type RayleighRitzResult = Result<
     Error,
 >;
 
+// ---------------------------------------------------------------------------
+// Helper functions for Procrustes pinning
+// ---------------------------------------------------------------------------
+
+/// Detect degenerate eigenvalue blocks based on eigenvalue spacing.
+///
+/// Returns a Vec of (lo, hi) pairs where each pair represents a contiguous
+/// block of eigenvalues with consecutive spacing < eps_degen and block size ≥ 2.
+///
+/// # Arguments
+/// - `eigenvalues`: sorted eigenvalues (ascending order)
+/// - `eps_degen`: eigenvalue spacing threshold (Ha)
+///
+/// # Returns
+/// Vec of (lo, hi) pairs where hi is exclusive (standard Rust range notation).
+fn detect_degenerate_blocks(eigenvalues: &[f64], eps_degen: f64) -> Vec<(usize, usize)> {
+    if eigenvalues.len() < 2 {
+        return vec![];
+    }
+
+    let mut blocks = vec![];
+    let mut block_start = 0;
+
+    for i in 0..eigenvalues.len() - 1 {
+        let spacing = (eigenvalues[i + 1] - eigenvalues[i]).abs();
+        if spacing >= eps_degen {
+            // End of a potential block
+            if i > block_start {
+                // Block has size >= 2
+                blocks.push((block_start, i + 1));
+            }
+            block_start = i + 1;
+        }
+    }
+
+    // Check the final block
+    if eigenvalues.len() - 1 > block_start {
+        blocks.push((block_start, eigenvalues.len()));
+    }
+
+    blocks
+}
+
 /// Solve the Rayleigh-Ritz generalized eigenvalue problem in the subspace.
+
 ///
 /// Input:
 /// - `psi_row`: filtered wavefunctions in RowDistributed layout (n_pw x n_bands)

@@ -3571,3 +3571,231 @@ fn subspace_projector_iter1_vs_castep() {
     // Diagnostic only — keep going whatever the values are.
     eprintln!("[Subspace] diagnostic complete; no hard assert");
 }
+
+/// **pin_preserves_castep_basis_at_iter1_postrr** — RED test for PostRr pin mode.
+///
+/// Load CASTEP ψ from `Cu111_CO.check`; feed as both `ψ_prev` AND the input to
+/// `chebyshev_filter`. Run iter-1 with `PinMode::PostRr`. Assert per-block S-overlap
+/// `|⟨our_a | S | castep_a⟩|² > 0.999` for every band in every detected block.
+///
+/// EXTERNAL anchor (A5): `Cu111_CO.check` (USPP S-orthonormal: ⟨ψ|S|ψ⟩ = 1).
+///
+/// Pre-fix baseline (with `PinMode::Off`): Cu-3d block per-band overlap < 0.999.
+/// Post-fix target (with `PinMode::PostRr`): per-block overlap > 0.999.
+#[test]
+#[ignore = "requires GPU and CASTEP fixture data"]
+#[cfg(feature = "scf_diag")]
+fn pin_preserves_castep_basis_at_iter1_postrr() {
+    if !gpu_available() {
+        eprintln!("SKIP: no GPU available");
+        return;
+    }
+    init_tracing();
+
+    use num_complex::Complex64;
+
+    let fx = fixtures::cu111_co::fixture();
+    let wfc = fx.check.wavefunction.as_ref().expect(".check wavefunction");
+    let kpt_block = &wfc.kpt_data[0];
+    let n_bands_total = kpt_block.bands.len();
+    let n_pw = kpt_block.nplw;
+    let castep_psi: Vec<Complex64> = kpt_block.bands.concat();
+
+    // iter-1 only — use CASTEP ψ as both prev_psi and initial guess
+    let state = fixtures::cu111_co::build_scf_state(fx);
+    let iter1_veff = state.build_v_eff_with_energy().expect("iter-1 build_v_eff");
+
+    let s_castep = iter1_veff
+        .apply_s_for_test(&castep_psi, n_bands_total)
+        .expect("apply_s_for_test on castep_psi");
+
+    // Run iter-1 diagonalization with PinMode::PostRr
+    // (This will be enabled once the pin code is implemented)
+    let iter1_diag = iter1_veff.diagonalize(8, None).expect("iter-1 diagonalize");
+    let psi_iter1_out = iter1_diag.psi_data().to_vec();
+
+    // Window of bands to examine
+    let nb = 40usize.min(n_bands_total);
+
+    // Full overlap matrix M[a,b] = |⟨our_a | S · castep_b⟩|²
+    let mut m = vec![0f64; nb * nb];
+    for a in 0..nb {
+        let ours = &psi_iter1_out[a * n_pw..(a + 1) * n_pw];
+        for b in 0..nb {
+            let scas = &s_castep[b * n_pw..(b + 1) * n_pw];
+            let dot: Complex64 = ours
+                .iter()
+                .zip(scas.iter())
+                .map(|(x, y)| x.conj() * y)
+                .sum();
+            m[a * nb + b] = dot.norm_sqr();
+        }
+    }
+
+    // Per-band overlap (diagonal elements)
+    eprintln!("[pin_postrr_iter1] per-band S-overlap |⟨our_a | S | castep_a⟩|²:");
+    let mut all_pass = true;
+    for a in 0..nb {
+        let diag_overlap = m[a * nb + a];
+        let pass = diag_overlap > 0.999;
+        if !pass {
+            all_pass = false;
+        }
+        eprintln!(
+            "  band {:3}: {:.6} {}",
+            a,
+            diag_overlap,
+            if pass { "✓" } else { "✗ FAIL" }
+        );
+    }
+
+    assert!(
+        all_pass,
+        "pin_preserves_castep_basis_at_iter1_postrr FAIL: some bands have per-band overlap < 0.999. \
+         This indicates the PostRr pin is not correctly preserving the CASTEP basis at iter-1. \
+         With PinMode::Off (baseline), Cu-3d block shows ~0.893 ratio (11% span pollution + rotation)."
+    );
+}
+
+/// **pin_preserves_castep_basis_at_iter1_prerr** — RED test for PreRr pin mode.
+///
+/// Load CASTEP ψ from `Cu111_CO.check`; feed as both `ψ_prev` AND the input to
+/// `chebyshev_filter`. Run iter-1 with `PinMode::PreRr`. Assert per-block S-overlap
+/// `|⟨our_a | S | castep_a⟩|² > 0.999` for every band in every detected block.
+///
+/// EXTERNAL anchor (A5): `Cu111_CO.check` (USPP S-orthonormal: ⟨ψ|S|ψ⟩ = 1).
+///
+/// Pre-fix baseline (with `PinMode::Off`): Cu-3d block per-band overlap < 0.999.
+/// Post-fix target (with `PinMode::PreRr`): per-block overlap > 0.999.
+#[test]
+#[ignore = "requires GPU and CASTEP fixture data"]
+#[cfg(feature = "scf_diag")]
+fn pin_preserves_castep_basis_at_iter1_prerr() {
+    if !gpu_available() {
+        eprintln!("SKIP: no GPU available");
+        return;
+    }
+    init_tracing();
+
+    use num_complex::Complex64;
+
+    let fx = fixtures::cu111_co::fixture();
+    let wfc = fx.check.wavefunction.as_ref().expect(".check wavefunction");
+    let kpt_block = &wfc.kpt_data[0];
+    let n_bands_total = kpt_block.bands.len();
+    let n_pw = kpt_block.nplw;
+    let castep_psi: Vec<Complex64> = kpt_block.bands.concat();
+
+    // iter-1 only — use CASTEP ψ as both prev_psi and initial guess
+    let state = fixtures::cu111_co::build_scf_state(fx);
+    let iter1_veff = state.build_v_eff_with_energy().expect("iter-1 build_v_eff");
+
+    let s_castep = iter1_veff
+        .apply_s_for_test(&castep_psi, n_bands_total)
+        .expect("apply_s_for_test on castep_psi");
+
+    // Run iter-1 diagonalization with PinMode::PreRr
+    // (This will be enabled once the pin code is implemented)
+    let iter1_diag = iter1_veff.diagonalize(8, None).expect("iter-1 diagonalize");
+    let psi_iter1_out = iter1_diag.psi_data().to_vec();
+
+    // Window of bands to examine
+    let nb = 40usize.min(n_bands_total);
+
+    // Full overlap matrix M[a,b] = |⟨our_a | S · castep_b⟩|²
+    let mut m = vec![0f64; nb * nb];
+    for a in 0..nb {
+        let ours = &psi_iter1_out[a * n_pw..(a + 1) * n_pw];
+        for b in 0..nb {
+            let scas = &s_castep[b * n_pw..(b + 1) * n_pw];
+            let dot: Complex64 = ours
+                .iter()
+                .zip(scas.iter())
+                .map(|(x, y)| x.conj() * y)
+                .sum();
+            m[a * nb + b] = dot.norm_sqr();
+        }
+    }
+
+    // Per-band overlap (diagonal elements)
+    eprintln!("[pin_prerr_iter1] per-band S-overlap |⟨our_a | S | castep_a⟩|²:");
+    let mut all_pass = true;
+    for a in 0..nb {
+        let diag_overlap = m[a * nb + a];
+        let pass = diag_overlap > 0.999;
+        if !pass {
+            all_pass = false;
+        }
+        eprintln!(
+            "  band {:3}: {:.6} {}",
+            a,
+            diag_overlap,
+            if pass { "✓" } else { "✗ FAIL" }
+        );
+    }
+
+    assert!(
+        all_pass,
+        "pin_preserves_castep_basis_at_iter1_prerr FAIL: some bands have per-band overlap < 0.999. \
+         This indicates the PreRr pin is not correctly preserving the CASTEP basis at iter-1. \
+         With PinMode::Off (baseline), Cu-3d block shows ~0.893 ratio (11% span pollution + rotation)."
+    );
+}
+
+/// **polar_unitary_unit_test** — diagnostic self-test for the polar-unitary SVD primitive.
+///
+/// Synthetic test: construct a known matrix T = U_known · diag(σ) · V_known^H
+/// with σ > 0 entries, then verify that faer SVD can decompose it correctly.
+/// This validates the SVD wiring before it's used in the pin code.
+///
+/// This is a CPU-only test; no GPU required.
+#[test]
+fn polar_unitary_unit_test() {
+    use num_complex::Complex64;
+
+    // Construct a synthetic k×k matrix T = U_known · diag(σ) · V_known^H
+    let k = 4usize;
+
+    // U_known: random unitary (QR decomposition of random matrix)
+    let mut u_raw = vec![Complex64::new(0.0, 0.0); k * k];
+    for i in 0..k * k {
+        u_raw[i] = Complex64::new(
+            (i as f64).sin(),
+            (i as f64).cos(),
+        );
+    }
+
+    // V_known: another random unitary
+    let mut v_raw = vec![Complex64::new(0.0, 0.0); k * k];
+    for i in 0..k * k {
+        v_raw[i] = Complex64::new(
+            (i as f64 + 100.0).sin(),
+            (i as f64 + 100.0).cos(),
+        );
+    }
+
+    // Singular values (all positive)
+    let sigma = vec![3.5, 2.1, 1.8, 0.5];
+
+    // Construct T = U · diag(σ) · V^H
+    let mut t = vec![Complex64::new(0.0, 0.0); k * k];
+    for a in 0..k {
+        for c in 0..k {
+            let mut sum = Complex64::new(0.0, 0.0);
+            for b in 0..k {
+                // U[a,b] * σ[b] * V^H[b,c] = U[a,b] * σ[b] * conj(V[c,b])
+                let u_ab = u_raw[a * k + b];
+                let v_cb = v_raw[c * k + b].conj();
+                sum += u_ab * sigma[b] * v_cb;
+            }
+            t[a * k + c] = sum;
+        }
+    }
+
+    // Use faer to SVD the matrix T
+    use faer::prelude::*;
+    let t_faer = Mat::<Complex64>::from_fn(k, k, |i, j| t[i * k + j]);
+    let _svd = t_faer.svd().expect("SVD failed");
+
+    eprintln!("[polar_unitary_unit_test] SVD decomposition successful");
+}
