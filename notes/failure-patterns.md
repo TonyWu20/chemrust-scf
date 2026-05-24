@@ -266,3 +266,45 @@ reference (e.g., the initial guess or iter-1 RR output frozen for the SCF run).
 filter pollution from bands outside the 40-band window (proposal §1.3
 documented this as ~6–11% span pollution). Tighter `b_low` (proposal §5
 follow-up) is needed before any pin variant can hit the strict gate.
+
+## 2026-05-24: blow-tightening-falsified (proposal §5 lever exhausted)
+
+**Symptom investigated**: "tighten `b_low` (proposal §5) to reduce filter pollution" — the postrr-cascade-amplification post-mortem (line 145-148) recommended this as the binding constraint on the iter-1 ceiling (PostRr floor 0.945, ceiling 0.977 vs gate 0.999). The proposal §14 §1.4 attributed ~6–11% Cu-3d span pollution to filter window choice.
+
+**Pad-sweep result (definitive)**:
+
+| pad above max_h_eig (Ha) | b_low (Ha) | Cu-3d/13 ratio |
+|---|---|---|
+| -0.05 | 0.0708 | 0.893 |
+| (max_veff baseline) | 0.0894 | 0.893 |
+| 0.0 | 0.1208 | 0.891 |
+| +0.5 | 0.6208 | 0.797 |
+
+Tightening b_low across the relevant range produces NO improvement; lifting it well above the tracked subspace makes things WORSE. The proposal §14 §1.4 attribution is **falsified**.
+
+**Phantom check (decisive)**: `diagnostic_selftest_castep_self_overlap_block_sums` measures `Σ_{a,b∈1..14} |⟨ψ_castep_a | S | ψ_castep_b⟩|² = 13.0000` exactly — CASTEP ψ produces the perfect block sum against itself. So the 0.893 IS real pipeline loss; it's NOT a CASTEP stored-precision floor.
+
+**Pattern**: `wrong-mechanism-attribution`. Two independent investigation paths (the parent §14 proposal team and this debug session) both fingered b_low as the lever for the same symptom, citing the same theoretical justification. Both were wrong. The 10.7% Cu-3d block sum loss is a numerical-precision floor in the filter→GS→RR pipeline at f64, NOT a filter-window-discrimination issue. The ~120 untracked-physical bands inside the damp window claim is doubly false: (a) `b_low = max_veff = 0.089` Ha sits ABOVE all 160 tracked bands → no discrimination occurs at all, ALL bands are amplified uniformly; (b) sweeping b_low to actually discriminate (0.1208 Ha — at the highest tracked band) gives the SAME ratio. The mechanism is upstream of where everyone was looking.
+
+**Architectural finding (load-bearing)**: `scf.rs:577` and `scf.rs:716` deliberately hardcode `eig: Option<&[f64]> = None;` per the §10 Global Woodbury fix's intent (per-band eigenvalue machinery is provably redundant when ζ ≈ 0; eigenvalue-source dependency introduces stale-label noise). This means the proposal-text claim "iter-2+ b_low = eig[last] puts ~120 untracked bands inside the damped window" is RUBBISH at the architectural level — that branch is dead code.
+
+**Reclassified prior claims**:
+- "Current `b_low = max_veff + 2.0`" (proposal §5, line 267) → **STALE** — actual value since 2026-05-23 is `max_veff` (no +2.0).
+- "Iter-3 b_low = 1.95 Ha would cause cascade" → **REFUTED** — production iter-3 b_low = 0.0894 Ha (same as iter-1, eig is always None).
+- "Tightening b_low at iter-2+ should reduce ~3% iter-1 residual" → **REFUTED** by sweep.
+
+**Concrete next directions** (in order of cost-to-test):
+
+1. **Pivot to absolute-target Procrustes (P1)** — pin against iter-1 RR output frozen for the SCF run. Whole-40-band-window granularity (not per-cluster). Reuses PostRr `PinMode` infrastructure. Medium effort. The cluster-boundary rotation that the per-band S-norm test localized is at band 14/15 within the OCCUPIED 1..93 manifold (CASTEP `perc_extra_bands=72` → 93 occupied + 67 buffer = 160), not at the buffer edge — so buffer enlargement does NOT help.
+2. **Davidson eigensolver (P2)** — never builds H_sub; sidesteps cluster mixing. Heavy refactor. Reserve for if P1 insufficient.
+3. **Band-by-band CG (P3)** — replaces eigensolver entirely with CASTEP's algorithm. Heaviest. Last resort.
+
+**Do NOT pursue further**:
+- Filter window tuning (this session falsified it).
+- Per-cluster Procrustes pinning (cluster-boundary rotation is a 40-band-window problem).
+- Buffer enlargement (CASTEP convention `perc_extra_bands=72` pins 160 tracked bands; ours matches).
+- Augmentation-convention or S-application audit (S-norms confirmed = 1.0000).
+- f64-precision blame (other DFT codes work fine at f64; per-band S-norm test confirms no precision floor).
+
+**Resolution**: `notes/debug/debug-20260524-blow-tightening/RESOLUTION.md`
+

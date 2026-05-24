@@ -3799,3 +3799,466 @@ fn polar_unitary_unit_test() {
 
     eprintln!("[polar_unitary_unit_test] SVD decomposition successful");
 }
+
+/// **diagnostic_selftest_apply_s_for_test_on_castep_psi** — Step 5 self-test
+/// for the `subspace_projector_iter1_vs_castep` diagnostic.
+///
+/// EXTERNAL anchor (A5): CASTEP ψ from `Cu111_CO.check` is S-orthonormal under
+/// USPP S, i.e. `⟨ψ_a | S | ψ_b⟩ = δ_ab`. Therefore the diagonal of the matrix
+/// `M[a,b] = ⟨ψ_a | S | ψ_b⟩` should be 1.0 ± numerical noise; off-diagonals
+/// should be ≤ 1e-3 (not exactly 0 because CASTEP's checkpoint is stored with
+/// finite precision).
+///
+/// This test isolates the diagnostic's S-application path (apply_s_for_test
+/// → apply_s_times → host dot-product). If the diagonal diverges from 1.0 or
+/// the off-diagonals are large, every block-sum number that
+/// `subspace_projector_iter1_vs_castep` reports is suspect — and any b_low
+/// tightening conclusion drawn from those numbers is unreliable.
+///
+/// Independent verification: this test does NOT use any of the diagonalize
+/// path that `subspace_projector_iter1_vs_castep` exercises. It just wraps
+/// `apply_s_for_test` directly on CASTEP ψ → ⟨castep_a|S|castep_b⟩.
+#[test]
+#[ignore = "requires GPU and CASTEP fixture data"]
+#[cfg(feature = "scf_diag")]
+fn diagnostic_selftest_apply_s_for_test_on_castep_psi() {
+    if !gpu_available() {
+        eprintln!("SKIP: no GPU available");
+        return;
+    }
+    init_tracing();
+
+    use num_complex::Complex64;
+
+    let fx = fixtures::cu111_co::fixture();
+    let wfc = fx.check.wavefunction.as_ref().expect(".check wavefunction");
+    let kpt_block = &wfc.kpt_data[0];
+    let n_bands_total = kpt_block.bands.len();
+    let n_pw = kpt_block.nplw;
+    let castep_psi: Vec<Complex64> = kpt_block.bands.concat();
+
+    let state = fixtures::cu111_co::build_scf_state(fx);
+    let veff_state = state.build_v_eff_with_energy().expect("build_v_eff");
+
+    let s_castep = veff_state
+        .apply_s_for_test(&castep_psi, n_bands_total)
+        .expect("apply_s_for_test on castep_psi");
+
+    // Sample the first 12 bands (covers band-0, Cu-3d cluster 1..14, and a
+    // couple beyond) — well above the 10-sample minimum required by Step 5.
+    let n_samples = 12usize.min(n_bands_total);
+
+    let mut max_diag_err = 0.0f64;
+    let mut max_off_diag = 0.0f64;
+    let mut diag_off_count = 0usize;
+
+    eprintln!("[diag-selftest] M[a,b] = |⟨castep_a | S | castep_b⟩|² (CASTEP ψ S-orthonormal → I)");
+    eprintln!("[diag-selftest] (a, b)  M[a,b]");
+    for a in 0..n_samples {
+        let psi_a = &castep_psi[a * n_pw..(a + 1) * n_pw];
+        for b in 0..n_samples {
+            let s_psi_b = &s_castep[b * n_pw..(b + 1) * n_pw];
+            let dot: Complex64 = psi_a
+                .iter()
+                .zip(s_psi_b.iter())
+                .map(|(x, y)| x.conj() * y)
+                .sum();
+            let m = dot.norm_sqr();
+            if a == b {
+                let err = (m - 1.0).abs();
+                eprintln!("[diag-selftest] ({:2},{:2})  {:.6}  (diagonal — expect ≈ 1.0; err {:.2e})", a, b, m, err);
+                max_diag_err = max_diag_err.max(err);
+                if err > 1e-3 {
+                    diag_off_count += 1;
+                }
+            } else {
+                if m > 1e-4 {
+                    eprintln!("[diag-selftest] ({:2},{:2})  {:.6}  (off-diagonal — should be ≈ 0)", a, b, m);
+                }
+                max_off_diag = max_off_diag.max(m);
+            }
+        }
+    }
+
+    eprintln!(
+        "[diag-selftest] summary: max_diag_err = {:.2e}; max_off_diag = {:.6}; diag_off_count = {}",
+        max_diag_err, max_off_diag, diag_off_count
+    );
+
+    // EXTERNAL anchor: CASTEP ψ is S-orthonormal. Diagonals must be 1.0 ± 1e-3.
+    // Off-diagonals must be ≤ 1e-3 (the .check stores ψ with finite precision,
+    // and floating-point S-application has rounding error; 1e-3 is the
+    // empirical noise floor seen in test_2_s_sub at the converged state).
+    assert!(
+        max_diag_err < 1e-3,
+        "Diagonal of ⟨castep|S|castep⟩ deviates from 1.0 by {:.2e} (gate < 1e-3) — \
+         the diagnostic's S-application is bugged; do NOT trust subspace_projector_iter1_vs_castep until fixed",
+        max_diag_err
+    );
+    assert!(
+        max_off_diag < 1e-3,
+        "Off-diagonal of ⟨castep|S|castep⟩ reaches {:.6} (gate < 1e-3) — \
+         CASTEP ψ is supposed to be S-orthonormal; the diagnostic's S-application is bugged",
+        max_off_diag
+    );
+
+    eprintln!("[diag-selftest] PASS — diagnostic's S-application is trustworthy");
+}
+
+/// **diagnostic_selftest_castep_self_overlap_block_sums** — Phantom-check
+/// for the `subspace_projector_iter1_vs_castep` 0.893 Cu-3d baseline.
+///
+/// Hypothesis: the 0.893 ratio (block sum 11.6041 vs 13.0 expected) is NOT
+/// caused by our pipeline's filter pollution — it's the inherent block sum
+/// that CASTEP's stored ψ produces against itself due to finite stored
+/// precision in the `.check` file.
+///
+/// Test: compute Σ_{a,b∈1..14} |⟨ψ_castep_a | S | ψ_castep_b⟩|² with NO
+/// filter, NO RR, NO Gram-Schmidt — just the S-application and the dot
+/// products. EXTERNAL anchor (A5): for S-orthonormal ψ, the diagonal is 1
+/// and off-diagonals are 0, so the block sum should be exactly 13.0.
+///
+/// - If result is ~13.0: 0.893 IS our pipeline's loss; the proposal §14
+///   §1.4 attribution remains a candidate (just not the b_low lever).
+/// - If result is ~11.6 (matches the projector test): 0.893 is a CASTEP
+///   stored-precision floor; the entire §14 §1.4 mechanism is phantom.
+#[test]
+#[ignore = "requires GPU and CASTEP fixture data"]
+#[cfg(feature = "scf_diag")]
+fn diagnostic_selftest_castep_self_overlap_block_sums() {
+    if !gpu_available() {
+        eprintln!("SKIP: no GPU available");
+        return;
+    }
+    init_tracing();
+
+    use num_complex::Complex64;
+
+    let fx = fixtures::cu111_co::fixture();
+    let wfc = fx.check.wavefunction.as_ref().expect(".check wavefunction");
+    let kpt_block = &wfc.kpt_data[0];
+    let n_bands_total = kpt_block.bands.len();
+    let n_pw = kpt_block.nplw;
+    let castep_psi: Vec<Complex64> = kpt_block.bands.concat();
+
+    let state = fixtures::cu111_co::build_scf_state(fx);
+    let veff_state = state.build_v_eff_with_energy().expect("build_v_eff");
+
+    let s_castep = veff_state
+        .apply_s_for_test(&castep_psi, n_bands_total)
+        .expect("apply_s_for_test on castep_psi");
+
+    let nb = 40usize.min(n_bands_total);
+
+    // Compute M[a,b] = |⟨castep_a | S | castep_b⟩|² (full 40×40)
+    let mut m = vec![0f64; nb * nb];
+    for a in 0..nb {
+        let psi_a = &castep_psi[a * n_pw..(a + 1) * n_pw];
+        for b in 0..nb {
+            let s_psi_b = &s_castep[b * n_pw..(b + 1) * n_pw];
+            let dot: Complex64 = psi_a
+                .iter()
+                .zip(s_psi_b.iter())
+                .map(|(x, y)| x.conj() * y)
+                .sum();
+            m[a * nb + b] = dot.norm_sqr();
+        }
+    }
+
+    let block_sum = |i0: usize, i1: usize| -> f64 {
+        let mut s = 0.0;
+        for a in i0..i1 {
+            for b in i0..i1 {
+                s += m[a * nb + b];
+            }
+        }
+        s
+    };
+
+    let s_band0 = block_sum(0, 1);
+    let s_cu3d = block_sum(1, 14);
+    let s_0_30 = block_sum(0, 30);
+    let s_0_40 = block_sum(0, 40);
+
+    eprintln!("[castep-self] CASTEP-vs-CASTEP block sums (S-orthonormal → block size = k)");
+    eprintln!("[castep-self] band-0 (k=1):     {:8.4}   expect ≈ 1.0  ratio = {:.4}", s_band0, s_band0);
+    eprintln!("[castep-self] Cu-3d 1..14 (k=13):  {:8.4}   expect ≈ 13.0  ratio = {:.4}", s_cu3d, s_cu3d / 13.0);
+    eprintln!("[castep-self] 0..30 (k=30):        {:8.4}   expect ≈ 30.0  ratio = {:.4}", s_0_30, s_0_30 / 30.0);
+    eprintln!("[castep-self] 0..40 (k=40):        {:8.4}   expect ≈ 40.0  ratio = {:.4}", s_0_40, s_0_40 / 40.0);
+
+    // Reference: subspace_projector_iter1_vs_castep reports
+    //   Cu-3d = 11.6041 (ratio 0.893)
+    //   0..40 = 37.5412 (ratio 0.939)
+    //
+    // If THIS test (CASTEP vs itself) reports the same numbers, the 0.893 is
+    // a CASTEP stored-precision floor and the proposal §14 §1.4 attribution
+    // is phantom.
+    eprintln!("[castep-self] PHANTOM CHECK: subspace_projector reports Cu-3d = 11.6041 (ratio 0.893)");
+    eprintln!("[castep-self] If THIS test also reports ratio < 0.999 → 0.893 is a CASTEP precision artifact, NOT pollution from our pipeline");
+}
+
+/// **diagnostic_per_band_s_norm_of_our_output** — Localise the 0.893 Cu-3d loss.
+///
+/// After confirming (in `diagnostic_selftest_castep_self_overlap_block_sums`)
+/// that the 0.893 ratio is REAL pipeline loss (CASTEP-vs-CASTEP gives 13.0000
+/// exactly), and confirming (in `b_low_sweep_subspace_projector` /
+/// pad sweep documented in notes) that tightening b_low does NOT lift the
+/// ratio, this test asks: what does `‖our_output_ψ_a‖²_S` look like per band?
+///
+/// EXTERNAL anchor (A5): for USPP S-orthonormal ψ, every band's S-norm = 1.0
+/// exactly. Our output ψ comes from `diagonalize(ndeg=8)` and SHOULD satisfy
+/// this — Rayleigh-Ritz constructs eigenvectors satisfying ⟨X|S_sub|X⟩ = I,
+/// and Gram-Schmidt re-normalizes against S.
+///
+/// Three discriminator outcomes:
+/// 1. All `‖ψ_a‖²_S ≈ 1.0` → loss is OFF-DIAGONAL (rotation/permutation within
+///    or across blocks). Look at the Cu-3d-vs-the-rest cross-block overlap.
+/// 2. Cu-3d bands `‖ψ_a‖²_S ≈ 0.89` uniformly, others ≈ 1.0 → uniform
+///    multiplicative offset specific to Cu 3d. Caused by Q-matrix indexing,
+///    β-projector normalization/phase, or augmentation-density assembly
+///    bug. Other DFT codes (CASTEP, VASP) don't have this because they
+///    wrote the convention; we ported it.
+/// 3. Per-band `‖ψ_a‖²_S` varies randomly → finite-precision / catastrophic
+///    cancellation in Gram-Schmidt (low PW norm + nearly-S-parallel bands).
+#[test]
+#[ignore = "requires GPU and CASTEP fixture data"]
+#[cfg(feature = "scf_diag")]
+fn diagnostic_per_band_s_norm_of_our_output() {
+    if !gpu_available() {
+        eprintln!("SKIP: no GPU available");
+        return;
+    }
+    init_tracing();
+
+    use num_complex::Complex64;
+
+    let fx = fixtures::cu111_co::fixture();
+    let wfc = fx.check.wavefunction.as_ref().expect(".check wavefunction");
+    let kpt_block = &wfc.kpt_data[0];
+    let n_bands_total = kpt_block.bands.len();
+    let n_pw = kpt_block.nplw;
+
+    // Run iter-1 diagonalize starting from CASTEP ψ (loaded by fixture builder).
+    let state = fixtures::cu111_co::build_scf_state(fx);
+    let veff_state = state.build_v_eff_with_energy().expect("build_v_eff");
+
+    let iter1_diag = veff_state.diagonalize(8, None).expect("iter-1 diagonalize");
+    let our_psi = iter1_diag.psi_data().to_vec();
+
+    // Rebuild a VEffBuilt state from the same fixture so we have apply_s_for_test
+    // available (diagonalize consumes the state, so we need a fresh one with the
+    // same V_NL machinery).
+    let state2 = fixtures::cu111_co::build_scf_state(fx);
+    let veff_state2 = state2.build_v_eff_with_energy().expect("rebuild build_v_eff");
+
+    let s_our = veff_state2
+        .apply_s_for_test(&our_psi, n_bands_total)
+        .expect("apply_s_for_test on our_psi");
+
+    // Per-band S-norm: ‖ψ_a‖²_S = ⟨ψ_a | S | ψ_a⟩
+    let n_report = 40usize.min(n_bands_total);
+    eprintln!("[per-band-S-norm] band  ‖ψ_a‖²_S  (expect 1.0)  delta");
+    let mut s_norms = Vec::with_capacity(n_report);
+    for a in 0..n_report {
+        let psi_a = &our_psi[a * n_pw..(a + 1) * n_pw];
+        let s_psi_a = &s_our[a * n_pw..(a + 1) * n_pw];
+        let dot: Complex64 = psi_a
+            .iter()
+            .zip(s_psi_a.iter())
+            .map(|(x, y)| x.conj() * y)
+            .sum();
+        // ‖ψ_a‖²_S = Re ⟨ψ_a | S | ψ_a⟩ — should be real-positive (S is Hermitian PSD)
+        let s_norm = dot.re;
+        let delta = s_norm - 1.0;
+        s_norms.push(s_norm);
+        let marker = if delta.abs() > 0.01 { " <-- OUTLIER" } else { "" };
+        eprintln!("[per-band-S-norm] {:3}    {:.6}      {:+.6}{}", a, s_norm, delta, marker);
+    }
+
+    // Summary
+    let band0 = s_norms[0];
+    let cu3d_mean = s_norms[1..14].iter().sum::<f64>() / 13.0;
+    let cu3d_min = s_norms[1..14].iter().cloned().fold(f64::INFINITY, f64::min);
+    let cu3d_max = s_norms[1..14].iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let outside_3d_mean = (s_norms[14..n_report].iter().sum::<f64>())
+        / (n_report - 14) as f64;
+
+    eprintln!("[per-band-S-norm] summary:");
+    eprintln!("[per-band-S-norm]   band-0          = {:.6}", band0);
+    eprintln!("[per-band-S-norm]   Cu-3d 1..14 mean = {:.6}  (min {:.6} max {:.6})", cu3d_mean, cu3d_min, cu3d_max);
+    eprintln!("[per-band-S-norm]   14..{} mean      = {:.6}", n_report, outside_3d_mean);
+
+    // Discrimination logic
+    eprintln!("[per-band-S-norm] DISCRIMINATOR:");
+    if cu3d_mean < 0.95 && (cu3d_max - cu3d_min).abs() < 0.02 {
+        eprintln!("[per-band-S-norm]   → Cu-3d UNIFORM offset (~0.89). Cause: Q-matrix / β-projector normalization / augmentation-density convention bug specific to Cu 3d.");
+    } else if cu3d_max - cu3d_min > 0.05 {
+        eprintln!("[per-band-S-norm]   → Cu-3d S-norms VARY widely. Cause: Gram-Schmidt catastrophic cancellation under nearly-S-parallel bands.");
+    } else if (cu3d_mean - 1.0).abs() < 0.01 {
+        eprintln!("[per-band-S-norm]   → Cu-3d S-norms ≈ 1.0. The 0.893 projector loss is OFF-DIAGONAL: rotation/permutation between Cu-3d bands and bands outside the cluster.");
+    } else {
+        eprintln!("[per-band-S-norm]   → mixed pattern; investigate further");
+    }
+}
+
+/// **b_low_sweep_subspace_projector** — Step 7.1 sweep harness.
+///
+/// Runs `subspace_projector_iter1_vs_castep` block-sum measurement against
+/// CASTEP ψ for several candidate `b_low` source values. The eigenvalues
+/// are set via `state.set_eigenvalues(...)` BEFORE diagonalize, which routes
+/// through the iter-2+ branch at `chebyshev.rs:1411` (`b_low = eig[last]`).
+/// By overriding only `eig[last]` (keeping all other eigenvalues at the
+/// converged-baseline values), we isolate the b_low effect.
+///
+/// EXTERNAL anchors: A2 (ε_F = −0.122443 Ha), A3 (smearing = 0.1 eV =
+/// 3.6749e-3 Ha), A5 (CASTEP ψ from `Cu111_CO.check`).
+///
+/// Candidates swept (matching CRITERIA.md primary candidate list):
+/// - `max_veff` (0.089 Ha) — iter-1 fallback; preserves iter-1's tighter window
+/// - `clean_last` (0.131 Ha) — current iter-2 default from converged baseline
+/// - `eF + 3·smearing` (-0.111 Ha) — Fermi-aware tight
+/// - `eF + 10·smearing` (-0.086 Ha) — loose but Fermi-anchored
+/// - `eig[40]` — the band at the tracking-window edge
+///
+/// Output: a table of (candidate, b_low value, block sums, ratios) printed
+/// to stderr. Use offline to pick the winning candidate for Step 7.2.
+#[test]
+#[ignore = "requires GPU and CASTEP fixture data"]
+#[cfg(feature = "scf_diag")]
+fn b_low_sweep_subspace_projector() {
+    if !gpu_available() {
+        eprintln!("SKIP: no GPU available");
+        return;
+    }
+    init_tracing();
+
+    use chemrust_scf::density::test_api::FilterMode;
+    use num_complex::Complex64;
+
+    let fx = fixtures::cu111_co::fixture();
+    let wfc = fx.check.wavefunction.as_ref().expect(".check wavefunction");
+    let kpt_block = &wfc.kpt_data[0];
+    let n_bands_total = kpt_block.bands.len();
+    let n_pw = kpt_block.nplw;
+    let castep_psi: Vec<Complex64> = kpt_block.bands.concat();
+
+    // First, get the clean baseline eigenvalues from a ndeg=0 (filter-bypassed)
+    // run. This gives us a fully-populated eig[] vector to override.
+    let clean_eigs: Vec<f64> = {
+        let state = fixtures::cu111_co::build_scf_state(fx);
+        state
+            .build_v_eff()
+            .expect("build_v_eff")
+            .diagonalize_with_mode(0, None, FilterMode::SinvHKeepHEig)
+            .expect("ndeg=0")
+            .eigenvalues()
+            .to_vec()
+    };
+    let clean_last = *clean_eigs.last().unwrap();
+    let clean_eig40 = clean_eigs.get(40).copied().unwrap_or(clean_last);
+
+    // EXTERNAL anchor constants
+    let max_veff = 0.089_f64;          // chebyshev.rs:1401 inline comment
+    let e_fermi = -0.122_443_f64;       // A2: Cu111_CO.bands:5
+    let smearing = 3.6749e-3_f64;       // A3: 0.1 eV in Ha
+
+    let candidates: Vec<(&str, f64)> = vec![
+        ("iter-1 None (baseline)", f64::NAN), // sentinel: pass None, no override
+        ("max_veff",               max_veff),
+        ("clean_last",             clean_last),
+        ("eF + 3w",                e_fermi + 3.0 * smearing),
+        ("eF + 10w",               e_fermi + 10.0 * smearing),
+        ("eig[40]",                clean_eig40),
+        ("HIGH stress (5.0 Ha)",   5.0),
+    ];
+
+    eprintln!(
+        "[b_low-sweep] clean baseline: eig[0] = {:.4}, eig[40] = {:.4}, eig[last] = {:.4}",
+        clean_eigs[0], clean_eig40, clean_last
+    );
+    eprintln!(
+        "[b_low-sweep] {:<28}  {:>10}  {:>8}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}",
+        "candidate", "b_low(Ha)", "k=1", "Cu-3d/13", "0..30/30", "0..40/40", "off-block", "iter1band0"
+    );
+
+    let nb = 40usize.min(n_bands_total);
+
+    for (label, b_low_override) in &candidates {
+        let state = fixtures::cu111_co::build_scf_state(fx);
+        let mut veff_state = state.build_v_eff_with_energy().expect("build_v_eff_with_energy");
+
+        // Inject the override BEFORE diagonalize. NaN means "leave as None"
+        // (iter-1 path).
+        if !b_low_override.is_nan() {
+            let mut eigs = clean_eigs.clone();
+            *eigs.last_mut().unwrap() = *b_low_override;
+            veff_state.set_eigenvalues(eigs);
+        }
+
+        // Apply S to CASTEP ψ first — needs to happen on the same state's
+        // VnlBatchData so the S-operator matches the diagonalize call's S.
+        let s_castep = veff_state
+            .apply_s_for_test(&castep_psi, n_bands_total)
+            .expect("apply_s_for_test on castep_psi");
+
+        let diag = veff_state
+            .diagonalize_with_mode(8, None, FilterMode::SinvHKeepHEig)
+            .expect("diagonalize_with_mode ndeg=8");
+        let psi_out = diag.psi_data().to_vec();
+        let band0_out = diag.eigenvalues()[0];
+
+        // Build M[a,b] = |⟨our_a | S | castep_b⟩|² for a, b in 0..nb
+        let mut m = vec![0f64; nb * nb];
+        for a in 0..nb {
+            let ours = &psi_out[a * n_pw..(a + 1) * n_pw];
+            for b in 0..nb {
+                let scas = &s_castep[b * n_pw..(b + 1) * n_pw];
+                let dot: Complex64 = ours
+                    .iter()
+                    .zip(scas.iter())
+                    .map(|(x, y)| x.conj() * y)
+                    .sum();
+                m[a * nb + b] = dot.norm_sqr();
+            }
+        }
+
+        let block_sum = |i0: usize, i1: usize| -> f64 {
+            let mut s = 0.0;
+            for a in i0..i1 {
+                for b in i0..i1 {
+                    s += m[a * nb + b];
+                }
+            }
+            s
+        };
+
+        // Off-block leakage: sum |M[a,b]|² for a in 1..14, b in 0..nb but b not in 1..14.
+        let mut off_block = 0.0;
+        for a in 1..14 {
+            for b in 0..nb {
+                if !(1..14).contains(&b) {
+                    off_block += m[a * nb + b];
+                }
+            }
+        }
+
+        let s_band0 = block_sum(0, 1);
+        let s_cu3d = block_sum(1, 14);
+        let s_0_30 = block_sum(0, 30);
+        let s_0_40 = block_sum(0, 40);
+
+        let bl_str = if b_low_override.is_nan() {
+            String::from("(None)")
+        } else {
+            format!("{:>10.4}", b_low_override)
+        };
+
+        eprintln!(
+            "[b_low-sweep] {:<28}  {:>10}  {:>8.4}  {:>10.4}  {:>10.4}  {:>10.4}  {:>10.4}  {:>10.6}",
+            label, bl_str, s_band0, s_cu3d / 13.0, s_0_30 / 30.0, s_0_40 / 40.0, off_block, band0_out
+        );
+    }
+
+    eprintln!("[b_low-sweep] Targets: Cu-3d/13 ≥ 0.94 (gate), 0..40/40 increase, off-block decrease");
+    eprintln!("[b_low-sweep] Diagnostic sweep complete; no hard assert");
+}
