@@ -4382,7 +4382,7 @@ fn b_low_sweep_subspace_projector() {
 /// Phase 0 Gate 3: does per-band locking preserve the Cu-3d block at 13.0
 /// where Chebyshev-RR's ZHEGVD-rotation forces it to 11.6?
 ///
-/// CHEMRUST_EIGENSOLVER=davidson dispatches to davidson_minimal::single_sweep.
+/// CHEMRUST_EIGENSOLVER=davidson dispatches to davidson::single_sweep.
 /// V_eff is OUR V_eff, not CASTEP-pinned: pinning V_eff trivializes the test
 /// (all residuals = 0 → no ZHEGVD).
 ///
@@ -4390,7 +4390,7 @@ fn b_low_sweep_subspace_projector() {
 #[test]
 #[ignore = "requires GPU and CASTEP fixture data"]
 #[cfg(feature = "scf_diag")]
-fn gate3_davidson_minimal_locking_preserves_cu3d_block() {
+fn gate3_davidson_locking_preserves_cu3d_block() {
     if !gpu_available() {
         eprintln!("SKIP: no GPU available");
         return;
