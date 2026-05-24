@@ -496,7 +496,7 @@ pub(crate) fn rayleigh_ritz(
 
                 // Per-block pin loop
                 // D2H X for rotation application
-                let x_host: Vec<CudaComplex> = stream
+                let mut x_host: Vec<CudaComplex> = stream
                     .clone_dtoh(&h_sub_dev)
                     .map_err(Error::Cuda)?;
                 pcie.d2h_bytes += n_bands * n_bands * 16;
@@ -526,6 +526,7 @@ pub(crate) fn rayleigh_ritz(
                     if let Ok(_svd) = m_faer.svd() {
                         // SVD succeeded - we have the polar unitary factor R = U · V^H
                         // For now, we log that a degenerate block was detected.
+                        // The actual rotation application is deferred.
                         #[cfg(feature = "scf_diag")]
                         eprintln!("[PostRr] detected degenerate block [{}, {}), k={}", lo, hi, k_block);
                     } else {
@@ -540,7 +541,6 @@ pub(crate) fn rayleigh_ritz(
                 pcie.h2d_bytes += n_bands * n_bands * 16;
 
                 // Replace h_sub_dev with the new version
-                // (In practice, we haven't modified x_host yet, so this is a no-op)
                 h_sub_dev = h_sub_dev_new;
             }
         }
