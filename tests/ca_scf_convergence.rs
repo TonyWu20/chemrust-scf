@@ -4464,17 +4464,11 @@ fn gate3_davidson_locking_preserves_cu3d_block() {
         "Cu-3d block sum {s_cu3d} outside valid range [0, 14]"
     );
 
-    // Read Davidson diagnostics
-    let diag_snapshot = chemrust_scf::DAVIDSON_LAST_DIAG
-        .lock()
-        .unwrap()
-        .clone();
-
-    let (n_locked, max_residual) = if let Some(ref d) = diag_snapshot {
-        (d.n_locked, d.max_residual)
-    } else {
-        (0usize, f64::NAN)
-    };
+    // Read Davidson diagnostics from the result (not the global static)
+    let (n_locked, max_residual) = diag
+        .davidson_diagnostics()
+        .map(|d| (d.n_locked, d.max_residual_sinv))
+        .unwrap_or((0usize, f64::NAN));
 
     let decision = if s_cu3d >= 12.999 {
         "PASS — locking sufficient. Proceed Phase 1A (Davidson v1)."
@@ -4610,9 +4604,9 @@ fn gate3_prime_davidson_synthetic_lock_preserves_locked_bands() {
 
     // Non-Cu-3d bands must have residuals well above lock_tol (0.5 Ha)
     assert!(
-        dr.max_residual > 0.5,
+        dr.max_residual_sinv > 0.5,
         "max residual = {:.3e} — non-Cu-3d bands spuriously locked (residuals < lock_tol)",
-        dr.max_residual
+        dr.max_residual_sinv
     );
 
     println!("[Gate 3'] PASS -- locking preserves Cu-3d block bitwise");
@@ -4621,7 +4615,7 @@ fn gate3_prime_davidson_synthetic_lock_preserves_locked_bands() {
     println!("[Gate 3'] Cu-3d block sum = {cu3d_sum:.10} (target 13.0)");
     println!(
         "[Gate 3'] max residual on unconverged = {:.3e} Ha",
-        dr.max_residual
+        dr.max_residual_sinv
     );
     println!("[Gate 3'] lock_tol = {:.3e}", dr.lock_tol);
     println!("[Gate 3'] perturbation epsilon = {epsilon}");
@@ -4665,10 +4659,10 @@ fn gate3_prime_prime_davidson_stops_cascade_through_scf3() {
     let iter1_diag = iter1_state.diagonalize(0, None).expect("iter-1 diagonalize");
     if let Some(dr) = iter1_diag.davidson_diagnostics() {
         iter_locks.push(dr.n_locked);
-        iter_max_res.push(dr.max_residual);
+        iter_max_res.push(dr.max_residual_sinv);
         eprintln!(
             "[Gate 3''] iter 1: n_locked = {} / 160, max_res = {:.3e} Ha, lock_tol = {:.3e}",
-            dr.n_locked, dr.max_residual, dr.lock_tol,
+            dr.n_locked, dr.max_residual_sinv, dr.lock_tol,
         );
     }
     let eigs_1 = iter1_diag.eigenvalues().to_vec();
@@ -4683,10 +4677,10 @@ fn gate3_prime_prime_davidson_stops_cascade_through_scf3() {
     let iter2_diag = iter2_veff.diagonalize(0, None).expect("iter-2 diagonalize");
     if let Some(dr) = iter2_diag.davidson_diagnostics() {
         iter_locks.push(dr.n_locked);
-        iter_max_res.push(dr.max_residual);
+        iter_max_res.push(dr.max_residual_sinv);
         eprintln!(
             "[Gate 3''] iter 2: n_locked = {} / 160, max_res = {:.3e} Ha",
-            dr.n_locked, dr.max_residual,
+            dr.n_locked, dr.max_residual_sinv,
         );
     }
     let eigs_2 = iter2_diag.eigenvalues().to_vec();
@@ -4701,10 +4695,10 @@ fn gate3_prime_prime_davidson_stops_cascade_through_scf3() {
     let iter3_diag = iter3_veff.diagonalize(0, None).expect("iter-3 diagonalize");
     if let Some(dr) = iter3_diag.davidson_diagnostics() {
         iter_locks.push(dr.n_locked);
-        iter_max_res.push(dr.max_residual);
+        iter_max_res.push(dr.max_residual_sinv);
         eprintln!(
             "[Gate 3''] iter 3: n_locked = {} / 160, max_res = {:.3e} Ha",
-            dr.n_locked, dr.max_residual,
+            dr.n_locked, dr.max_residual_sinv,
         );
     }
     let eigs_3 = iter3_diag.eigenvalues().to_vec();
@@ -4741,5 +4735,82 @@ fn gate3_prime_prime_davidson_stops_cascade_through_scf3() {
     unsafe {
         std::env::remove_var("CHEMRUST_EIGENSOLVER");
         std::env::remove_var("CHEMRUST_DAVIDSON_LOCK_TOL");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// F6: Perturbation recovery SCF with Davidson eigensolver
+// ---------------------------------------------------------------------------
+//
+// Primary acceptance gate for Phase 1A. Run the full SCF from a perturbed
+// density using CHEMRUST_EIGENSOLVER=davidson. The SCF must converge to
+// within CASTEP_TOLERANCE_EV (1e-5 eV) of the reference total energy.
+//
+// See notes/failure-patterns.md § tolerance-conflation for why the legacy
+// TOLERANCE_EV (2e-4 eV) is inappropriate — this test uses the actual
+// CASTEP convergence tolerance.
+
+#[test]
+#[ignore = "requires GPU and CASTEP fixture data, long-running (~30 min)"]
+fn test_scf_converges_with_davidson() {
+    if !gpu_available() {
+        eprintln!("SKIP: no GPU available");
+        return;
+    }
+    init_tracing();
+
+    // Set env vars for Davidson eigensolver
+    unsafe {
+        std::env::set_var("CHEMRUST_EIGENSOLVER", "davidson");
+    }
+
+    let fx = fixtures::cu111_co::fixture();
+    let mut state = fixtures::cu111_co::build_scf_state(fx);
+
+    // Apply 5% multiplicative noise (same as the Chebyshev perturbation test)
+    let mut rng = rand::thread_rng();
+    let mut noisy_arr = state.density_mut().as_wave_array().clone().into_owned();
+    let total: f64 = noisy_arr.iter().sum();
+
+    for v in noisy_arr.iter_mut() {
+        *v *= 1.0 + 0.05 * (rng.r#gen::<f64>() * 2.0 - 1.0);
+    }
+    let new_total: f64 = noisy_arr.iter().sum();
+    let scale = total / new_total;
+    for v in noisy_arr.iter_mut() {
+        *v *= scale;
+    }
+
+    *state.density_mut() =
+        chemrust_scf::Density::from_inner(chemrust_scf::WaveGridArray::from_inner(noisy_arr));
+
+    let result = chemrust_scf::run_scf_with_energy_gated(
+        state,
+        8,
+        1e-8,
+        Some(chemrust_scf::ScfDivergenceGate::default()),
+    )
+    .expect("SCF with Davidson converged after perturbation");
+
+    let computed_ev = result.total_energy * chemrust_scf::HARTREE_TO_EV;
+    let diff_ev = (computed_ev - fixtures::cu111_co::REFERENCE_ENERGY_EV).abs();
+
+    println!("=== F6: Davidson SCF convergence ===");
+    println!("Total energy:            {:.8} eV", computed_ev);
+    println!("Reference energy:        {:.8} eV", fixtures::cu111_co::REFERENCE_ENERGY_EV);
+    println!("Absolute difference:     {:.8} eV", diff_ev);
+    println!("CASTEP tolerance:        {:.8} eV", fixtures::cu111_co::CASTEP_TOLERANCE_EV);
+
+    assert!(
+        diff_ev < fixtures::cu111_co::CASTEP_TOLERANCE_EV,
+        "Davidson SCF total energy differs by {:.8} eV from CASTEP reference, exceeds {:.8} eV",
+        diff_ev,
+        fixtures::cu111_co::CASTEP_TOLERANCE_EV,
+    );
+
+    println!("[F6 PASS] Davidson SCF converged to {:.2e} eV — Phase 1A acceptance gate passed", diff_ev);
+
+    unsafe {
+        std::env::remove_var("CHEMRUST_EIGENSOLVER");
     }
 }

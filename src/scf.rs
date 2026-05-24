@@ -812,6 +812,7 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
     /// Returns: `(eigenvalues, H_sub_cpu, S_sub_cpu, X_cpu)` — all col-major (n_bands × n_bands).
     #[cfg(any(test, feature = "scf_diag"))]
     #[doc(hidden)]
+    #[allow(clippy::type_complexity)]
     pub fn diagonalize_with_rr_matrices(
         self,
         ndeg: usize,
@@ -1920,6 +1921,58 @@ impl<S: SpinPolicy, M: MixingPhase> ScfIteration<S, WavefunctionsUpdated, M> {
     #[doc(hidden)]
     pub fn davidson_diagnostics(&self) -> Option<&DavidsonDiagnostic> {
         self.last_davidson_diagnostics.as_ref()
+    }
+
+    /// Number of locked bands after a Davidson solve.
+    #[cfg(any(test, feature = "scf_diag"))]
+    pub fn davidson_n_locked(&self) -> Option<usize> {
+        self.last_davidson_diagnostics.as_ref().map(|d| d.n_locked)
+    }
+
+    /// Number of unconverged bands after a Davidson solve.
+    #[cfg(any(test, feature = "scf_diag"))]
+    pub fn davidson_n_unconverged(&self) -> Option<usize> {
+        self.last_davidson_diagnostics
+            .as_ref()
+            .map(|d| d.n_unconverged)
+    }
+
+    /// Number of Davidson outer iterations completed.
+    #[cfg(any(test, feature = "scf_diag"))]
+    pub fn davidson_n_outer_iters(&self) -> Option<usize> {
+        self.last_davidson_diagnostics
+            .as_ref()
+            .map(|d| d.n_davidson_iters)
+    }
+
+    /// Maximum S⁻¹-weighted residual norm after a Davidson solve.
+    #[cfg(any(test, feature = "scf_diag"))]
+    pub fn davidson_max_residual_sinv(&self) -> Option<f64> {
+        self.last_davidson_diagnostics
+            .as_ref()
+            .map(|d| d.max_residual_sinv)
+    }
+
+    /// Per-band S⁻¹-weighted residual norms after a Davidson solve.
+    #[cfg(any(test, feature = "scf_diag"))]
+    pub fn davidson_residual_norms_sinv(&self) -> Option<Vec<f64>> {
+        self.last_davidson_diagnostics
+            .as_ref()
+            .map(|d| d.residual_norms_sinv.clone())
+    }
+
+    /// Davidson eigenvalue deltas from the most recent solve.
+    #[cfg(any(test, feature = "scf_diag"))]
+    pub fn davidson_eigenvalue_deltas(&self) -> Option<Vec<f64>> {
+        self.last_davidson_diagnostics
+            .as_ref()
+            .map(|d| d.eigenvalue_deltas.clone())
+    }
+
+    /// Number of subspace restarts during the most recent Davidson solve.
+    #[cfg(any(test, feature = "scf_diag"))]
+    pub fn davidson_n_restarts(&self) -> Option<usize> {
+        self.last_davidson_diagnostics.as_ref().map(|d| d.n_restarts)
     }
 }
 

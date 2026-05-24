@@ -1215,3 +1215,84 @@ unsafe fn solve_block_zhegvd(
 
     Ok(())
 }
+
+// ======================================================================
+// CPU unit tests (no GPU required)
+// ======================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::lock_tol_for_iter;
+
+    #[test]
+    fn lock_tol_for_iter_baseline() {
+        // iter 1: lock_tol = 0.5 (initial_tol)
+        let tol_1 = lock_tol_for_iter(1, 1e-6);
+        assert!(
+            (tol_1 - 0.5).abs() < 1e-15,
+            "iter 1 lock_tol = {tol_1}, expected 0.5"
+        );
+
+        // iter 2: lock_tol = 0.5 (unchanged)
+        let tol_2 = lock_tol_for_iter(2, 1e-6);
+        assert!(
+            (tol_2 - 0.5).abs() < 1e-15,
+            "iter 2 lock_tol = {tol_2}, expected 0.5"
+        );
+
+        // iter 3: lock_tol = target + (0.5 - target) * 0.5^1
+        let expected_3 = 1e-6 + (0.5 - 1e-6) * 0.5_f64.powi(1);
+        let tol_3 = lock_tol_for_iter(3, 1e-6);
+        assert!(
+            (tol_3 - expected_3).abs() < 1e-15,
+            "iter 3 lock_tol = {tol_3}, expected {expected_3}"
+        );
+
+        // iter 4: lock_tol = target + (0.5 - target) * 0.5^2
+        let expected_4 = 1e-6 + (0.5 - 1e-6) * 0.5_f64.powi(2);
+        let tol_4 = lock_tol_for_iter(4, 1e-6);
+        assert!(
+            (tol_4 - expected_4).abs() < 1e-15,
+            "iter 4 lock_tol = {tol_4}, expected {expected_4}"
+        );
+
+        // iter 10: should still be between target_tol and initial_tol
+        let tol_10 = lock_tol_for_iter(10, 1e-6);
+        assert!(
+            tol_10 > 1e-6 - 1e-15,
+            "iter 10 lock_tol = {tol_10} fell below target 1e-6"
+        );
+        assert!(
+            tol_10 < 0.5,
+            "iter 10 lock_tol = {tol_10} exceeded initial_tol 0.5"
+        );
+
+        // Edge: scf_iter = 0 (should behave like iter-1)
+        let tol_0 = lock_tol_for_iter(0, 1e-6);
+        assert!(
+            (tol_0 - 0.5).abs() < 1e-15,
+            "iter 0 lock_tol = {tol_0}, expected 0.5"
+        );
+    }
+
+    #[test]
+    fn lock_tol_for_iter_convergence_asymptotic() {
+        // For large iter, lock_tol should approach target
+        let tol = lock_tol_for_iter(100, 1e-6);
+        let diff = (tol - 1e-6).abs();
+        assert!(
+            diff < 1e-10,
+            "iter 100 lock_tol = {tol} is {diff} from target 1e-6, should be very close"
+        );
+    }
+
+    #[test]
+    fn lock_tol_for_iter_zero_target_tol() {
+        // target_tol = 0.0: lock_tol should approach 0
+        let tol = lock_tol_for_iter(100, 0.0);
+        assert!(
+            tol < 1e-10,
+            "iter 100 with target 0.0: lock_tol = {tol}, expected near 0"
+        );
+    }
+}

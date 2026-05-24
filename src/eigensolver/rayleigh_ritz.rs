@@ -692,7 +692,7 @@ pub(crate) fn rayleigh_ritz(
 /// Return tuple: (psi_new, eigenvalues, beta_psi_per_ion, H_sub, S_sub, X)
 /// All matrices are col-major (n_bands × n_bands) on the host.
 #[cfg(any(test, feature = "scf_diag"))]
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub fn rayleigh_ritz_with_matrices(
     psi_row: &Gpu<WavefunctionSet<RowDistributed>>,
     hpsi_row: &Gpu<WavefunctionSet<RowDistributed>>,
@@ -705,8 +705,8 @@ pub fn rayleigh_ritz_with_matrices(
     blas: &BlasHandle,
     stream: &Arc<CudaStream>,
     ctx: &Arc<CudaContext>,
-    prev_psi_dev: Option<&CudaSlice<CudaComplex>>,
-    pin_cfg: Option<&RrPinConfig>,
+    _prev_psi_dev: Option<&CudaSlice<CudaComplex>>,
+    _pin_cfg: Option<&RrPinConfig>,
 ) -> Result<
     (
         Gpu<WavefunctionSet<ColumnDistributed>>,
