@@ -4631,3 +4631,115 @@ fn gate3_prime_davidson_synthetic_lock_preserves_locked_bands() {
         std::env::remove_var("CHEMRUST_DAVIDSON_LOCK_TOL");
     }
 }
+
+#[test]
+#[ignore = "requires GPU and CASTEP fixture data"]
+#[cfg(feature = "scf_diag")]
+fn gate3_prime_prime_davidson_stops_cascade_through_scf3() {
+    // Phase 0 Gate 3'' — does Davidson's locking arrest the iter-3 cascade
+    // that defeats Chebyshev-RR? Sufficient condition for Davidson v1 (Phase 1A).
+    // See notes/plans/phase-eigensolver-migration/TASKS.md Group C2.
+
+    if !gpu_available() {
+        eprintln!("SKIP: no GPU available");
+        return;
+    }
+    init_tracing();
+
+    unsafe {
+        std::env::set_var("CHEMRUST_EIGENSOLVER", "davidson");
+        // Calibrated above the V_NL noise floor (~0.1 Ha with our iter-1 V_eff)
+        // discovered in Gate 3' (see GATE3_TWEAKS_REPORT.md Tweak 2).
+        // Override via CHEMRUST_DAVIDSON_LOCK_TOL for sweeps.
+        std::env::set_var("CHEMRUST_DAVIDSON_LOCK_TOL", "0.5");
+    }
+
+    let fx = fixtures::cu111_co::fixture();
+    let mut iter_locks: Vec<usize> = Vec::new();
+    let mut iter_max_res: Vec<f64> = Vec::new();
+    let mut iter3_band0_ha = f64::NAN;
+
+    // Iter-1
+    let state = fixtures::cu111_co::build_scf_state(fx);
+    let iter1_state = state.build_v_eff_with_energy().expect("iter-1 build_v_eff");
+    let iter1_diag = iter1_state.diagonalize(0, None).expect("iter-1 diagonalize");
+    if let Some(dr) = iter1_diag.davidson_diagnostics() {
+        iter_locks.push(dr.n_locked);
+        iter_max_res.push(dr.max_residual);
+        eprintln!(
+            "[Gate 3''] iter 1: n_locked = {} / 160, max_res = {:.3e} Ha, lock_tol = {:.3e}",
+            dr.n_locked, dr.max_residual, dr.lock_tol,
+        );
+    }
+    let eigs_1 = iter1_diag.eigenvalues().to_vec();
+    let iter1_dens = iter1_diag.construct_density_off().expect("iter-1 construct_density");
+    let iter2_state = match iter1_dens.mix().check(1e-8).expect("iter-1 check") {
+        chemrust_scf::CheckOutcome::Converged(_) => panic!("iter-1 converged early"),
+        chemrust_scf::CheckOutcome::NotConverged { state, .. } => state,
+    };
+
+    // Iter-2
+    let iter2_veff = iter2_state.build_v_eff_with_energy().expect("iter-2 build_v_eff");
+    let iter2_diag = iter2_veff.diagonalize(0, None).expect("iter-2 diagonalize");
+    if let Some(dr) = iter2_diag.davidson_diagnostics() {
+        iter_locks.push(dr.n_locked);
+        iter_max_res.push(dr.max_residual);
+        eprintln!(
+            "[Gate 3''] iter 2: n_locked = {} / 160, max_res = {:.3e} Ha",
+            dr.n_locked, dr.max_residual,
+        );
+    }
+    let eigs_2 = iter2_diag.eigenvalues().to_vec();
+    let iter2_dens = iter2_diag.construct_density_off().expect("iter-2 construct_density");
+    let iter3_state = match iter2_dens.mix().check(1e-8).expect("iter-2 check") {
+        chemrust_scf::CheckOutcome::Converged(_) => panic!("iter-2 converged early"),
+        chemrust_scf::CheckOutcome::NotConverged { state, .. } => state,
+    };
+
+    // Iter-3
+    let iter3_veff = iter3_state.build_v_eff_with_energy().expect("iter-3 build_v_eff");
+    let iter3_diag = iter3_veff.diagonalize(0, None).expect("iter-3 diagonalize");
+    if let Some(dr) = iter3_diag.davidson_diagnostics() {
+        iter_locks.push(dr.n_locked);
+        iter_max_res.push(dr.max_residual);
+        eprintln!(
+            "[Gate 3''] iter 3: n_locked = {} / 160, max_res = {:.3e} Ha",
+            dr.n_locked, dr.max_residual,
+        );
+    }
+    let eigs_3 = iter3_diag.eigenvalues().to_vec();
+    iter3_band0_ha = eigs_3[0];
+
+    let castep_band0 = -1.05502287_f64;
+    let drift = (iter3_band0_ha - castep_band0).abs();
+    let chebyshev_baseline_drift = 10.9_f64; // iter-3 = -11.94 Ha
+
+    let decision = if drift < 0.5 {
+        "PASS — cascade arrested. Phase 1A Davidson v1 unblocked."
+    } else if drift < 2.0 {
+        "PARTIAL — cascade reduced but not eliminated. Phase 1A scope must include preconditioner."
+    } else if drift < chebyshev_baseline_drift * 0.5 {
+        "WEAK — cascade reduced < 50%. Davidson alone insufficient; consider CG."
+    } else {
+        "FAIL — cascade unaffected. Davidson does NOT fix the cascade. Fall back to Phase 1B (block CG)."
+    };
+
+    eprintln!(
+        "[Gate 3''] eigenvalues: iter-1 band-0={:.6}, iter-2 band-0={:.6}, iter-3 band-0={:.6} Ha",
+        eigs_1[0], eigs_2[0], iter3_band0_ha,
+    );
+    println!("[Gate 3''] iter-3 band-0 = {iter3_band0_ha:.6} Ha");
+    println!("[Gate 3''] CASTEP band-0  = {castep_band0:.6} Ha");
+    println!("[Gate 3''] drift          = {drift:.6} Ha");
+    println!("[Gate 3''] Chebyshev-RR baseline drift: {chebyshev_baseline_drift:.6} Ha");
+    println!("[Gate 3''] Locks per iter: {iter_locks:?}");
+    println!("[Gate 3''] Max residual per iter: {iter_max_res:?}");
+    println!("[Gate 3''] Decision: {decision}");
+
+    assert!(iter3_band0_ha.is_finite(), "iter-3 band-0 not finite");
+
+    unsafe {
+        std::env::remove_var("CHEMRUST_EIGENSOLVER");
+        std::env::remove_var("CHEMRUST_DAVIDSON_LOCK_TOL");
+    }
+}
