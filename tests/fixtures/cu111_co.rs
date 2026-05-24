@@ -367,15 +367,9 @@ pub fn build_state_with_castep_veff(
         .build_v_eff_with_energy()
         .expect("build_v_eff_with_energy failed");
 
-    // Get CASTEP's V_eff from the pot_fmt fixture
+    // CASTEP V_eff from pot_fmt: already chemrust_hamiltonian_core::EffectivePotential,
+    // which is exactly NonSpin::VEff — the type set_v_eff expects.
     let castep_veff = castep_veff_as_effective(fx);
-
-    // Convert chemrust_hamiltonian_core::EffectivePotential → chemrust_scf::EffectivePotential
-    // Both wrap the same underlying Array3<f64> (fine grid).
-    let arr = castep_veff.as_real_grid().as_real_array().clone();
-    let fine = FineGridArray::from_inner(arr);
-    let veff_crate = ScfEffectivePotential::from_inner(fine);
-
-    state.set_v_eff(veff_crate);
+    state.set_v_eff(castep_veff);
     state
 }

@@ -8,14 +8,11 @@
 // All tests require GPU and CASTEP fixture data — marked `#[ignore]`.
 // Run with: cargo test --release --test davidson_minimal_validation -- --ignored
 
-use num_complex::Complex64;
-
 mod fixtures;
 
 #[cfg(feature = "scf_diag")]
 mod tests {
-    use chemrust_scf::*;
-    use num_complex::Complex64;
+    use super::fixtures;
 
     /// Self-consistency test: with CASTEP's V_eff pinned, the Davidson
     /// single-sweep should preserve the CASTEP-converged ψ band-by-band
