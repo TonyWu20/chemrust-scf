@@ -370,7 +370,11 @@ impl BuildVEffWithEnergy for NonSpin {
         let v_h = poisson::solve_poisson(&CoreDensity::from_inner(rho_total_fine.clone()), fine_grid)?;
         let v_xc = xc::compute_pbe_xc(density_total.as_real_grid().as_real_array(), fine_grid, cell.volume)?;
         let n_grid = density_total.as_real_grid().as_real_array().len() as f64;
-        let d_v = cell.volume / n_grid;
+        // ρ is in CASTEP raw units (ρ_phys × Ω), so the discrete integral
+        // ∫ρ V d³r = Σ (ρ_phys[i] × Ω) × V[i] × (1/N) = Σ ρ_grid[i] × V[i] × (1/N).
+        // The correct weight is 1/N, NOT Ω/N (which would overcount by Ω).
+        // CASTEP xc_gga (xc.f90:1056) uses the same /N_grid normalization.
+        let d_v = 1.0 / n_grid;
         let e_hartree_raw: f64 = rho_total_fine.as_real_array().iter()
             .zip(v_h.as_real_grid().as_real_array().iter())
             .map(|(&rv, &vh)| rv * vh * d_v)
@@ -1687,6 +1691,44 @@ impl<S: SpinPolicy, M: MixingPhase> ScfIteration<S, DensityUpdated<M>, MixingOff
     }
 }
 
+// --- Energy-component accessors (debug/diagnostics) ---
+impl<S: SpinPolicy, State: ScfPhase, M: MixingPhase> ScfIteration<S, State, M> {
+    /// Read E_xc from the most recent V_eff assembly (diagnostic only).
+    #[doc(hidden)]
+    pub fn e_xc_value(&self) -> Option<f64> { self.e_xc }
+
+    /// Read E_H from the most recent V_eff assembly (diagnostic only).
+    #[doc(hidden)]
+    pub fn e_hartree_value(&self) -> Option<f64> { self.e_hartree }
+
+    /// Read ∫ρV_xc from the most recent V_eff assembly (diagnostic only).
+    #[doc(hidden)]
+    pub fn rho_vxc_value(&self) -> Option<f64> { self.rho_vxc }
+
+    /// Read the Ewald energy (diagnostic only).
+    #[doc(hidden)]
+    pub fn ewald_value(&self) -> f64 { self.ewald }
+
+    /// Access cell geometry (diagnostic only).
+    #[doc(hidden)]
+    pub fn cell_geometry(&self) -> &CellGeometry { &self.cell }
+
+    /// Access pseudopotentials (diagnostic only).
+    #[doc(hidden)]
+    pub fn pseudopotentials(&self) -> &PseudopotentialSet { &self.pots }
+
+    /// Access smearing parameters (diagnostic only).
+    #[doc(hidden)]
+    pub fn smearing_params(&self) -> &SmearingParams { &self.smearing }
+
+}
+
+impl<S: SpinPolicy, M: MixingPhase> ScfIteration<S, Mixed, M> {
+    /// Access eigenvalues from the most recent diagonalization (diagnostic only).
+    #[doc(hidden)]
+    pub fn eigenvalues(&self) -> &[f64] { &self.eigenvalues }
+}
+
 impl<S: SpinPolicy> ScfIteration<S, Initialized, MixingOff> {
     /// Mutable access to density (for perturbation testing).
     pub fn density_mut(&mut self) -> &mut Density {
@@ -1962,5 +2004,70 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Verify that the discrete energy integral convention is correct:
+    /// ρ is in CASTEP raw units (ρ_phys × Ω), so the integral weight for
+    /// Σ ρ_grid[i] × V[i] must be 1/N_grid, NOT Ω/N_grid.
+    ///
+    /// Reference: CASTEP xc_gga (xc.f90:1056) uses /total_fine_grid_points,
+    /// and hartree_energy is computed in reciprocal space with an explicit
+    /// 1/Ω factor. When computing the same integral in real space:
+    ///   ∫ρV d³r ≈ Σ ρ_phys[i] × V[i] × (Ω/N) = Σ (ρ_grid[i]/Ω) × V[i] × (Ω/N)
+    ///          = Σ ρ_grid[i] × V[i] × (1/N)
+    /// So the weight is 1/N, not Ω/N (which would overcount by Ω = volume).
+    #[test]
+    fn test_energy_integral_convention() {
+        // Synthetic uniform density in CASTEP ρ×Ω convention.
+        // For uniform ρ_phys = Q_total/Ω, each grid point stores ρ_grid = Q_total
+        // (since ρ_grid = ρ_phys × Ω = Q_total).
+        // We use a simple cubic cell at volume 125.0 Bohr³, 4×4×4 grid.
+        let volume = 125.0_f64;
+        let n_grid = 64.0_f64; // 4×4×4
+        let q_total = 186.0_f64; // Cu111+CO valence electrons
+        let rho_grid = q_total; // ρ_phys × Ω = Q_total for uniform density
+
+        // Assume V_H = 1.0 Ha everywhere (uniform potential for a uniform density)
+        let v_h = 1.0_f64;
+
+        // Physical expectation: ∫ ρ_phys V_H d³r = Q_total * ⟨V_H⟩
+        // For uniform density and uniform V_H: ∫ = (Q_total/Ω) × V_H × Ω = Q_total × V_H
+        let expected = q_total * v_h; // 186 Ha × 1.0 = 186 Ha
+
+        // Compute e_hartree_raw with d_v = 1/N (correct convention)
+        let d_v_correct = 1.0 / n_grid;
+        // Σ ρ_grid × V_H × d_v = N_grid × (Q_total × 1.0) × (1/N_grid) = Q_total ✓
+        let e_hartree_raw_correct = rho_grid * v_h * d_v_correct * n_grid;
+
+        // Compute e_hartree_raw with d_v = Ω/N (old buggy convention)
+        let d_v_buggy = volume / n_grid;
+        // Σ ρ_grid × V_H × d_v = N_grid × Q_total × (Ω/N_grid) = Q_total × Ω
+        let e_hartree_raw_buggy = rho_grid * v_h * d_v_buggy * n_grid;
+
+        assert!(
+            (e_hartree_raw_correct - expected).abs() < 1e-12,
+            "Correct formula gives {e_hartree_raw_correct}, expected {expected}"
+        );
+        assert!(
+            (e_hartree_raw_buggy / expected - volume).abs() < 1e-12,
+            "Buggy formula is off by Ω = {volume}: ratio = {}",
+            e_hartree_raw_buggy / expected
+        );
+
+        // Same test for the rho_vxc integral (same pattern, different potential)
+        let v_xc = -0.5_f64; // synthetic V_xc
+        let expected_rho_vxc = q_total * v_xc; // ∫ ρ_phys × V_xc = Q_total × V_xc = -93 Ha
+        let rho_vxc_correct = rho_grid * v_xc * d_v_correct * n_grid;
+        let rho_vxc_buggy = rho_grid * v_xc * d_v_buggy * n_grid;
+
+        assert!(
+            (rho_vxc_correct - expected_rho_vxc).abs() < 1e-12,
+            "Correct rho_vxc gives {rho_vxc_correct}, expected {expected_rho_vxc}"
+        );
+        assert!(
+            (rho_vxc_buggy / expected_rho_vxc - volume).abs() < 1e-12,
+            "Buggy rho_vxc is off by Ω = {volume}: ratio = {}",
+            rho_vxc_buggy / expected_rho_vxc
+        );
     }
 }

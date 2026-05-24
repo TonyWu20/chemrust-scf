@@ -3011,6 +3011,45 @@ fn iter1_drift_from_castep_state_is_bounded() {
     let dens = diag.construct_density_off().expect("iter-1 construct_density");
     let mixed = dens.mix();
 
+    // --- Energy component breakdown (before check() consumes them) ---
+    let eigs = mixed.eigenvalues();
+    let n_electrons: f64 = mixed.cell_geometry().species_iter()
+        .map(|info| {
+            mixed.pseudopotentials().get(info.symbol)
+                .and_then(|p| p.ionic_charge())
+                .unwrap_or(0.0)
+                * info.num_ions as f64
+        })
+        .sum();
+    let (occ, chem) = chemrust_scf::density::compute_occupations(
+        eigs, mixed.smearing_params(), n_electrons,
+    ).expect("compute_occupations");
+    let e_band: f64 = eigs.iter().zip(occ.0.iter()).map(|(&e, &f)| f * e).sum();
+
+    let e_xc = mixed.e_xc_value().unwrap_or(f64::NAN);
+    let e_hartree = mixed.e_hartree_value().unwrap_or(f64::NAN);
+    let rho_vxc = mixed.rho_vxc_value().unwrap_or(f64::NAN);
+    let ewald = mixed.ewald_value();
+
+    eprintln!("[Q1:diag] n_electrons = {}", n_electrons);
+    eprintln!("[Q1:diag] smearing width = {:.8} Ha ({:.6} eV)",
+        mixed.smearing_params().width,
+        mixed.smearing_params().width * chemrust_scf::HARTREE_TO_EV);
+    eprintln!("[Q1:diag] fermi level = {:.8} Ha", chem.0);
+    eprintln!("[Q1:diag] n_bands = {}, occ sum = {:.6}",
+        eigs.len(), occ.0.iter().sum::<f64>());
+    eprintln!("[Q1:diag] band-0 eigenvalue = {:.6} Ha, band-last = {:.6} Ha",
+        eigs[0], eigs[eigs.len()-1]);
+    eprintln!("[Q1:components] e_band     = {:.8} Ha", e_band);
+    eprintln!("[Q1:components] e_hartree  = {:.8} Ha", e_hartree);
+    eprintln!("[Q1:components] e_xc       = {:.8} Ha", e_xc);
+    eprintln!("[Q1:components] rho_vxc    = {:.8} Ha", rho_vxc);
+    eprintln!("[Q1:components] ewald      = {:.8} Ha", ewald);
+    let e_total_fwd = e_band - e_hartree + e_xc - rho_vxc + ewald;
+    eprintln!("[Q1:components] E_total    = {:.8} Ha (from components)", e_total_fwd);
+    eprintln!("[Q1:components] reference  = {:.8} Ha", fixtures::cu111_co::REFERENCE_ENERGY_EV / chemrust_scf::HARTREE_TO_EV);
+    eprintln!("[Q1:components] component drift = {:.4e} Ha", (e_total_fwd - fixtures::cu111_co::REFERENCE_ENERGY_EV / chemrust_scf::HARTREE_TO_EV).abs());
+
     // check() converts Mixed → CheckOutcome. NotConverged carries the post-iter-1
     // state in Initialized phase, with total_energy populated.
     let post_iter1 = match mixed.check(1e-8).expect("iter-1 check") {

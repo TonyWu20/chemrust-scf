@@ -27,12 +27,13 @@ pub const HARTREE_TO_EV: f64 = 27.211384;
 
 /// Compute the Ewald energy (ion-ion electrostatic) in Hartree.
 ///
-/// Standard Ewald summation formula:
+/// Standard Ewald summation formula with uniform neutralising background:
 ///
 /// ```text
 /// E_ewald = 1/2 Σ_{R} Σ_{I,J} Z_I Z_J erfc(α|r_IJ - R|) / |r_IJ - R|
 ///         + 2π/V Σ_{G≠0} |S(G)|² exp(-G²/4α²) / G²
 ///         - α/√π Σ_I Z_I²
+///         - π/(2α²V) × (Σ_I Z_I)²      ← background self-energy (G=0)
 /// ```
 ///
 /// Where:
@@ -42,6 +43,11 @@ pub const HARTREE_TO_EV: f64 = 27.211384;
 /// - V = cell volume
 /// - R = lattice translation vectors (real-space, nearest-neighbour shells)
 /// - G = reciprocal lattice vectors (up to ~7α).
+///
+/// The last term (G=0 background correction) is required because the
+/// reciprocal-space sum explicitly excludes G=0.  CASTEP applies the same
+/// correction (ewald.f90:585-587); without it the periodic Ewald sum of a
+/// charged unit cell would diverge.
 pub fn ewald_energy(cell: &CellGeometry, pots: &PseudopotentialSet) -> f64 {
     let volume = cell.volume;
     let alpha = (std::f64::consts::PI / volume).powf(1.0 / 3.0);
@@ -58,26 +64,53 @@ pub fn ewald_energy(cell: &CellGeometry, pots: &PseudopotentialSet) -> f64 {
         })
         .collect();
 
+    // Total charge Q = Σ Z_I (used for the G=0 background correction).
+    let q_total: f64 = ionic_charges.iter().sum();
+    #[cfg(feature = "scf_diag")]
+    eprintln!("[Ewald] q_total={} alpha={:.6} volume={:.2} alpha2V_ovpi={:.6} bg_term_ha={:.4}",
+        q_total, alpha, volume,
+        0.5 * std::f64::consts::PI / (alpha * alpha * volume),
+        -0.5 * std::f64::consts::PI * q_total * q_total / (alpha * alpha * volume));
+
     // Self-energy: -α/√π · Σ_I Z_I²
     let self_energy = {
         let sum_z2: f64 = ionic_charges.iter().map(|z| z * z).sum();
         -alpha / std::f64::consts::PI.sqrt() * sum_z2
     };
 
-    // Real-space sum (nearest-image shells).
-    let real_cutoff = 8.0; // Bohr — erfc(α·8) decays rapidly.
+    // G=0 background correction: -π·Q²/(2·α²·V)
+    // Removes the self-interaction of the uniform neutralising background
+    // that is implicitly excluded when G=0 is skipped in the recip sum.
+    let background_correction =
+        -0.5_f64 * std::f64::consts::PI * q_total * q_total / (alpha * alpha * volume);
+
+    // Real-space sum: compute cutoff to guarantee erfc(α×cutoff) < 5e-15.
+    // For α = (π/Ω)^(1/3) ≈ 0.052 this gives cutoff ≈ 106 Bohr, which
+    // requires about 11×7×7 = 539 image cells — still tractable.
+    let erfc_precision = 5e-15_f64;
+    // erfc(x) < ε for x > sqrt(-ln(ε·√π)) roughly, but a safe bound is:
+    // erfc(x) ≈ exp(-x²) / (x·√π) for large x.  Solve exp(-x²) = ε·√π·x.
+    // For ε = 5e-15, x ≈ 5.5 gives erfc(5.5) = 5.4e-15.
+    let erf_inv = 5.5_f64;
+    let real_cutoff = erf_inv / alpha;
     let real_energy = ewald_real_space(cell, &ionic_charges, alpha, real_cutoff);
 
-    // Reciprocal-space sum (G-vectors up to ~7α).
-    let recip_energy = ewald_reciprocal_space(cell, &ionic_charges, alpha);
+    // Reciprocal-space sum (G-vectors up to |G|_max).
+    // The Gaussian weight exp(-G²/4α²) must be < ε for convergence.
+    // |G|_max = 2α · sqrt(-ln(ε))  →  for ε = 5e-15, sqrt(-ln(ε)) ≈ 5.74.
+    let recip_g_max = 2.0 * alpha * (-erfc_precision.ln()).sqrt();
+    let recip_energy = ewald_reciprocal_space(cell, &ionic_charges, alpha, recip_g_max);
 
-    real_energy + recip_energy + self_energy
+    real_energy + recip_energy + self_energy + background_correction
 }
 
-/// Real-space Ewald sum over nearest-image pairs.
+/// Real-space Ewald sum over image-cell pairs.
 ///
 /// Iterates over all ion pairs (I,J) and lattice translation vectors R within
 /// `cutoff` Bohr.  The factor ½ is applied at the end.
+///
+/// `cutoff` must be large enough that `erfc(α·cutoff)` is negligible (typically
+/// < 1e-14) for the Ewald sum to converge to machine precision.
 fn ewald_real_space(
     cell: &CellGeometry,
     charges: &[f64],
@@ -152,21 +185,19 @@ fn ewald_real_space(
 
 /// Reciprocal-space Ewald sum.
 ///
-/// Iterates over integer G-vector triplets `(h,k,l)` up to `g_max ≈ 7α`
+/// Iterates over integer G-vector triplets `(h,k,l)` up to `g_max`
 /// and accumulates `|S(G)|² exp(-G²/4α²) / G²`.
 fn ewald_reciprocal_space(
     cell: &CellGeometry,
     charges: &[f64],
     alpha: f64,
+    g_max: f64,
 ) -> f64 {
     let volume = cell.volume;
     let recip = cell.recip_lattice.as_array();
     let b1 = recip[0];
     let b2 = recip[1];
     let b3 = recip[2];
-
-    // Cutoff for reciprocal-space sum.
-    let g_max = 7.0 * alpha;
 
     // Bounding box for (h,k,l) from the reciprocal-space norms.
     let b_norm = |b: &[f64; 3]| (b[0] * b[0] + b[1] * b[1] + b[2] * b[2]).sqrt();

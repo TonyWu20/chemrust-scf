@@ -203,3 +203,40 @@ chemrust-scf eigensolver rotation in degenerate manifolds, full stop.
 **Resolution**: `notes/debug/debug-20260524-tprime-d-injection/RESOLUTION.md`.
 chemrust-hamiltonian issue #9 left open as tracking artifact (per user
 direction) but flagged as not-blocking for Q2.
+
+## 2026-05-24: energy-integral-d_v-unit-bug (Issue 15)
+**Root cause**: Energy integrals `e_hartree` and `rho_vxc` used `d_v = Ω/N` as the
+discrete sum weight, but ρ is stored in CASTEP raw units (ρ_phys × Ω). The correct
+weight is `1/N` — using `Ω/N` overcounts by a factor of Ω (~22,310 Bohr³), producing
+an iter-1 total energy of −32M Ha instead of −886 Ha.
+**Fix**: `src/scf.rs:373` — `let d_v = 1.0 / n_grid` (was `cell.volume / n_grid`).
+**Pattern**: density-unit-convention-mismatch — a ρ×Ω density used with a dV = Ω/N
+weight gives Ω²/N per grid point instead of the correct Ω/N, introducing one extra
+power of Ω into the integral.
+**Diagnostic**: Q1 (`iter1_drift_from_castep_state_is_bounded`) catches the energy
+drift at a 20 mHa gate — a 7-order-of-magnitude discriminator ratio (3.2407e7 Ha
+drift vs 0.02 Ha gate).
+**Prior root-cause dead ends (§13, T-prime)**: The energy bug (this issue) has
+been present since the code's inception. Many prior debugging sessions attributed
+SCF divergence to eigensolver rotation, D-screening, or augmentation density —
+and those *are* real follow-on effects — but the first symptom (wrong iter-1
+energy from the fixture-converged state) was always this bug. It was missed
+because no test checked iter-1 total energy against CASTEP at any precision
+until Q1 was written.
+
+## 2026-05-24: ewald-cutoff-and-background (co-discovered with Issue 15)
+**Root cause**: Two compounding bugs:
+1. Real-space Ewald cutoff was hardcoded at 8 Bohr, but for α = (π/Ω)^(1/3) ≈ 0.052,
+   `erfc(0.052 × 8) = 0.556`, truncating ~56% of the long-range real-space sum.
+2. The G=0 background correction `−π·Q²/(2α²V)` was absent (CASTEP ewald.f90:585-587).
+**Fix**: `src/energy.rs` — adaptive cutoff computed from precision `5.5/α` (≈ 106 Bohr
+for Cu111+CO); added `background_correction` term matching CASTEP formula.
+**Pattern**: ewald-truncation-error — a real-space cutoff that doesn't account for
+the slow decay of `erfc(α·r)` at small α truncates the long-range Coulomb sum,
+producing an error proportional to the missing tail. Combined with the missing
+G=0 term, the total Ewald was off by 346 Ha (1193 vs 847 Ha). α-invariance of
+the Ewald total is a useful cross-check: if changing α changes the total, the
+cutoffs are inadequate.
+**Diagnostic**: CASTEP iprint=3 energy component breakdown (hartree, xc, ewald)
+exposed which component was wrong. Head-to-head component comparison in eV
+showed E_H, E_xc, and rho_vxc matching exactly — only Ewald differed.

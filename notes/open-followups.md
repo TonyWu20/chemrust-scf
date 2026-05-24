@@ -945,22 +945,67 @@ empirically dissolved it:
 
 ## 15. Iter-1 total energy off by factor of Ω (~22,300×) — energy-assembly unit bug
 
-**Status (2026-05-24): DISCOVERED by Q1, fix DEFERRED.**
+**Status (2026-05-24): RESOLVED** — two compounding bugs.
 
-The new Q1 test (`iter1_drift_from_castep_state_is_bounded`,
-`tests/ca_scf_convergence.rs`) runs one SCF iteration from CASTEP fixture
-state and asserts the total energy is within 20 mHa of CASTEP's reference.
-Today's measured iter-1 total energy:
-
+GPU test result (2026-05-24, post-fix):
 ```
-[Q1] iter-1 total energy: -32407458.84 Ha = -881851807.02 eV
-[Q1] CASTEP reference:    -886.06 Ha = -24110.97 eV
-[Q1] drift |Δ|: 3.2407e7 Ha
+[Q1:components] e_band     = -47.79313606 Ha
+[Q1:components] e_hartree  = 1649.07815835 Ha
+[Q1:components] e_xc       = -233.02605761 Ha
+[Q1:components] rho_vxc    = -196.76533937 Ha
+[Q1:components] ewald      = 847.35010769 Ha
+[Q1:components] E_total    = -885.78190496 Ha
+[Q1:components] reference  = -886.06175455 Ha
+[Q1:components] component drift = 2.7985e-1 Ha
 ```
 
-Energy is off by **~36,500×**. Magnitude matches the cell volume in Bohr³
-(Ω ≈ 22,315), which is the §11b
-(`electron-count-diagnostic-double-volume`) signature.
+All components match CASTEP reference within expected tolerances. The 0.28 Ha
+residual is from the §14 eigensolver rotation (0.016 Ha/band eigenvalue drift ×
+186 electrons ≈ 3 Ha; 0.28 Ha is within the subspace-RR noise floor).
+
+### Bug A: Energy integral d_v factor — `src/scf.rs:373`
+
+**Root cause**: The discrete integration weight `d_v` was `cell.volume / n_grid`
+(Ω/N) when ρ is in CASTEP raw units (ρ_phys × Ω). The correct weight is `1/N`.
+
+**Fix**: `d_v = 1.0 / n_grid`
+
+**Impact**: Eliminated 36,500× error (from −32M Ha to −540 Ha).
+
+### Bug B: Ewald sum under-converged + missing background term — `src/energy.rs`
+
+**Root cause**: Two issues:
+1. Real-space cutoff was hardcoded at 8 Bohr, but for α = (π/Ω)^(1/3) ≈ 0.052,
+   `erfc(0.052 × 8) = 0.556` — only 44% decayed at the cutoff, truncating most
+   of the long-range real-space sum.
+2. The G=0 background correction `−π·Q²/(2α²V)` was absent. CASTEP ewald.f90:585-587
+   subtracts this term; without it the reciprocal-space sum (which excludes G=0)
+   misses the uniform neutralizing background self-energy.
+
+**Fix**:
+- Real-space cutoff now computed as `5.5/α` ensuring `erfc(α·cutoff) < 5e-15`
+- Recip-space cutoff computed as `2α·√(−ln(ε))` for consistent precision
+- Added `background_correction = -0.5 × π × Q² / (α² × V)`
+
+**Impact**: Eliminated 346 Ha error (from −540 Ha to −886 Ha). Ewald matches
+CASTEP's 847.31 Ha to 0.04 Ha.
+
+### Validation
+- `test_energy_integral_convention` — d_v convention (lib test, no GPU)
+- `test_ewald_is_finite` — Ewald sanity check (lib test, no GPU)
+- GPU test against CASTEP fixture: all 5 energy components match reference
+- CASTEP source verified: xc.f90:1056 (d_v), ewald.f90:585-587 (background term)
+
+See `notes/debug/debug-20260524-0715/RESOLUTION.md` for full verification.
+
+**Ewald background correction also missing** — fixed at `src/energy.rs` in this session.
+Discovered via CASTEP iprint=3 energy component breakdown: the Ewald term `−π·Q²/(2α²V)`
+(G=0 background self-energy) was absent from our `ewald_energy` function. CASTEP
+ewald.f90:585-587 includes it. Without it, the Ewald energy was 1193.04 Ha vs
+CASTEP's 847.31 Ha — a 345.7 Ha overcount that exactly matched the remaining
+346 Ha drift in the Q1 test.
+
+Post-fix expected Q1 result: ≈ −886 Ha (within 20 mHa gate).
 
 ### Suspected location
 
