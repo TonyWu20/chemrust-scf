@@ -94,6 +94,26 @@ pub static DAVIDSON_LAST_DIAG: std::sync::Mutex<Option<DavidsonDiagnostic>> =
     std::sync::Mutex::new(None);
 
 // ---------------------------------------------------------------------------
+// Lock tolerance ratchet schedule
+// ---------------------------------------------------------------------------
+
+/// Compute Davidson lock tolerance for a given SCF iteration.
+///
+/// Starts at 0.5 Ha (proven by Phase 0 — all 160 bands lock at iter-1),
+/// tightens geometrically toward target_tol.
+pub(crate) fn lock_tol_for_iter(scf_iter: usize, target_tol: f64) -> f64 {
+    let initial_tol: f64 = 0.5;
+    let decay: f64 = 0.5;
+    if scf_iter <= 2 {
+        initial_tol // iter-1 and iter-2: loose lock catches ~all bands
+    } else {
+        let gap = initial_tol - target_tol;
+        let tol = target_tol + gap * decay.powi(scf_iter as i32 - 2);
+        tol.max(target_tol)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Main driver
 // ---------------------------------------------------------------------------
 

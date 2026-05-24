@@ -15,9 +15,10 @@ use crate::device::solver::SolverHandle;
 use crate::device::pcie::PcieAccount;
 use crate::device::{CudaComplex, Gpu};
 use crate::eigensolver::chebyshev::{compute_kinetic_energies, FilterMode, chebyshev_filter, CudaKernelSet};
-use crate::eigensolver::davidson_minimal::{davidson_minimal_single_sweep, DavidsonResult};
+use crate::eigensolver::davidson::{davidson_v1, DavidsonConfig, lock_tol_for_iter};
 #[cfg(any(test, feature = "scf_diag"))]
-use crate::eigensolver::davidson_minimal::{DavidsonDiagnostic, DAVIDSON_LAST_DIAG};
+use crate::eigensolver::davidson::{DavidsonDiagnostic, DAVIDSON_LAST_DIAG};
+use crate::eigensolver::preconditioner::TpaPreconditioner;
 use crate::eigensolver::rayleigh_ritz::rayleigh_ritz;
 #[cfg(any(test, feature = "scf_diag"))]
 use crate::eigensolver::rayleigh_ritz::rayleigh_ritz_with_matrices;
@@ -168,6 +169,9 @@ pub struct ScfIteration<
     #[cfg(any(test, feature = "scf_diag"))]
     pub(crate) last_davidson_diagnostics: Option<DavidsonDiagnostic>,
 
+    /// Current SCF iteration number (1-indexed). Updated by run_scf before diagonalize.
+    pub(crate) scf_iter: usize,
+
     _phase: PhantomData<State>,
 }
 
@@ -238,6 +242,7 @@ impl<S: SpinPolicy> ScfIteration<S, Initialized, MixingOff> {
             density_aug_fine: None,
             #[cfg(any(test, feature = "scf_diag"))]
             last_davidson_diagnostics: None,
+            scf_iter: 0,
             _phase: PhantomData,
         }
     }
@@ -279,6 +284,7 @@ impl<S: SpinPolicy, Phase: ScfPhase, M: MixingPhase> ScfIteration<S, Phase, M> {
             density_aug_fine: self.density_aug_fine,
             #[cfg(any(test, feature = "scf_diag"))]
             last_davidson_diagnostics: self.last_davidson_diagnostics,
+            scf_iter: self.scf_iter,
             _phase: PhantomData,
         }
     }
@@ -600,7 +606,6 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
             .unwrap_or_else(|_| "chebyshev".to_string());
 
         if eigensolver_method == "davidson" {
-            // ndeg ignored — davidson_minimal is single-sweep (Phase 0 scratch test).
             let [ngz, ngy, ngx] = self.wave_grid.grid();
             let grid_size_usize = ngx * ngy * ngz;
             let inv_ntotal = 1.0 / (grid_size_usize as f64);
@@ -621,16 +626,32 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
                 stream.clone(),
             ).map_err(Error::Fft)?;
 
+            // Lock tolerance from env-var override or ratchet schedule
             let lock_tol = std::env::var("CHEMRUST_DAVIDSON_LOCK_TOL")
-                .unwrap_or_else(|_| "1e-6".to_string())
-                .parse::<f64>()
-                .unwrap_or(1e-6);
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or_else(|| lock_tol_for_iter(self.scf_iter, 1e-6));
 
             let psi_in = psi_gpu.as_device_slice();
             let v_eff_slice = v_eff_gpu.as_device_slice();
 
-            let result: DavidsonResult = unsafe {
-                davidson_minimal_single_sweep(
+            // Davidson configuration with TPA preconditioner
+            let davidson_cfg = DavidsonConfig {
+                max_outer_iter: 30,
+                block_eps_degen: 0.01,
+                max_subspace_dim_factor: 3.0,
+                preconditioner: TpaPreconditioner::new(&ctx, 1e-12)?,
+            };
+
+            // Previous eigenvalues as initial guess for per-band delta check
+            let prev_lambdas = if self.eigenvalues.is_empty() {
+                None
+            } else {
+                Some(self.eigenvalues.as_slice())
+            };
+
+            let result = unsafe {
+                davidson_v1(
                     psi_in,
                     v_eff_slice,
                     &kinetic_dev,
@@ -647,6 +668,8 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
                     &kernels,
                     &stream,
                     &ctx,
+                    &davidson_cfg,
+                    prev_lambdas,
                 )?
             };
 
@@ -1173,6 +1196,7 @@ impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated, MixingOff> {
             density_aug_fine,
             #[cfg(any(test, feature = "scf_diag"))]
             last_davidson_diagnostics: None,
+            scf_iter: self.scf_iter,
             _phase: PhantomData,
         })
     }
@@ -1213,6 +1237,7 @@ impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated, MixingOff> {
             density_aug_fine,
             #[cfg(any(test, feature = "scf_diag"))]
             last_davidson_diagnostics: None,
+            scf_iter: self.scf_iter,
             _phase: PhantomData,
         })
     }
@@ -1260,6 +1285,7 @@ impl<S: SpinPolicy> ScfIteration<S, DensityUpdated<MixingOff>, MixingOff> {
             density_aug_fine: self.density_aug_fine,
             #[cfg(any(test, feature = "scf_diag"))]
             last_davidson_diagnostics: self.last_davidson_diagnostics,
+            scf_iter: self.scf_iter,
             _phase: PhantomData,
         }
     }
@@ -1298,6 +1324,7 @@ impl<S: SpinPolicy> ScfIteration<S, DensityUpdated<Kerker>, Kerker> {
             density_aug_fine: self.density_aug_fine,
             #[cfg(any(test, feature = "scf_diag"))]
             last_davidson_diagnostics: self.last_davidson_diagnostics,
+            scf_iter: self.scf_iter,
             _phase: PhantomData,
         }
     }
@@ -1336,6 +1363,7 @@ impl<S: SpinPolicy> ScfIteration<S, DensityUpdated<Pulay>, Pulay> {
             density_aug_fine: self.density_aug_fine,
             #[cfg(any(test, feature = "scf_diag"))]
             last_davidson_diagnostics: self.last_davidson_diagnostics,
+            scf_iter: self.scf_iter,
             _phase: PhantomData,
         }
     }
@@ -1499,6 +1527,7 @@ pub fn run_scf<S: SpinPolicy + BuildVEff>(
 ) -> Result<FinalResult, Error> {
     let mut state = state;
     loop {
+        state.scf_iter += 1;
         state = {
             let v_eff = state.build_v_eff()?;
             let wfn = v_eff.diagonalize(ndeg, None)?;
@@ -1599,6 +1628,7 @@ pub fn run_scf_with_energy_gated(
     let mut iter1_veff_range: Option<f64> = None;
     let mut iter1_n_electrons: Option<f64> = None;
     loop {
+        state.scf_iter += 1;
         state = {
             let v_eff = state.build_v_eff_with_energy()?;
 
@@ -2044,6 +2074,7 @@ mod tests {
             q_sf_cache: None,
             density_aug_fine: None,
             last_davidson_diagnostics: None,
+            scf_iter: 0,
             _phase: PhantomData,
         };
 
@@ -2098,6 +2129,7 @@ mod tests {
             q_sf_cache: None,
             density_aug_fine: None,
             last_davidson_diagnostics: None,
+            scf_iter: 0,
             _phase: PhantomData,
         }
     }
