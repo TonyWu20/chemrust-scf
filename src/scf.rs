@@ -16,6 +16,8 @@ use crate::device::pcie::PcieAccount;
 use crate::device::{CudaComplex, Gpu};
 use crate::eigensolver::chebyshev::{compute_kinetic_energies, FilterMode, chebyshev_filter, CudaKernelSet};
 use crate::eigensolver::davidson_minimal::{davidson_minimal_single_sweep, DavidsonResult};
+#[cfg(any(test, feature = "scf_diag"))]
+use crate::eigensolver::davidson_minimal::{DavidsonDiagnostic, DAVIDSON_LAST_DIAG};
 use crate::eigensolver::rayleigh_ritz::rayleigh_ritz;
 #[cfg(any(test, feature = "scf_diag"))]
 use crate::eigensolver::rayleigh_ritz::rayleigh_ritz_with_matrices;
@@ -161,6 +163,11 @@ pub struct ScfIteration<
     /// density before V_H/V_xc evaluation.
     pub(crate) density_aug_fine: Option<chemrust_hamiltonian_core::fft::RealGrid<f64>>,
 
+    /// Diagnostics from the most recent Davidson eigensolve (Phase 0 Gate 3 tests).
+    /// `None` when Chebyshev-RR was used or no diagonalize has run yet.
+    #[cfg(any(test, feature = "scf_diag"))]
+    pub(crate) last_davidson_diagnostics: Option<DavidsonDiagnostic>,
+
     _phase: PhantomData<State>,
 }
 
@@ -229,6 +236,8 @@ impl<S: SpinPolicy> ScfIteration<S, Initialized, MixingOff> {
             beta_psi_per_ion: None,
             q_sf_cache: None,
             density_aug_fine: None,
+            #[cfg(any(test, feature = "scf_diag"))]
+            last_davidson_diagnostics: None,
             _phase: PhantomData,
         }
     }
@@ -268,6 +277,8 @@ impl<S: SpinPolicy, Phase: ScfPhase, M: MixingPhase> ScfIteration<S, Phase, M> {
             beta_psi_per_ion: self.beta_psi_per_ion,
             q_sf_cache: self.q_sf_cache,
             density_aug_fine: self.density_aug_fine,
+            #[cfg(any(test, feature = "scf_diag"))]
+            last_davidson_diagnostics: self.last_davidson_diagnostics,
             _phase: PhantomData,
         }
     }
@@ -680,6 +691,13 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
             next.psi = psi_new;
             next.eigenvalues = eigenvalues;
             next.beta_psi_per_ion = Some(beta_psi_gpu);
+
+            // Stash Davidson diagnostics for post-diagonalize inspection
+            #[cfg(any(test, feature = "scf_diag"))]
+            {
+                next.last_davidson_diagnostics = DAVIDSON_LAST_DIAG.lock().unwrap().clone();
+            }
+
             return Ok(next);
         }
         // ---- End davidson dispatch ----
@@ -1153,6 +1171,8 @@ impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated, MixingOff> {
             beta_psi_per_ion: self.beta_psi_per_ion,
             q_sf_cache: self.q_sf_cache,
             density_aug_fine,
+            #[cfg(any(test, feature = "scf_diag"))]
+            last_davidson_diagnostics: None,
             _phase: PhantomData,
         })
     }
@@ -1191,6 +1211,8 @@ impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated, MixingOff> {
             beta_psi_per_ion: self.beta_psi_per_ion,
             q_sf_cache: self.q_sf_cache,
             density_aug_fine,
+            #[cfg(any(test, feature = "scf_diag"))]
+            last_davidson_diagnostics: None,
             _phase: PhantomData,
         })
     }
@@ -1236,6 +1258,8 @@ impl<S: SpinPolicy> ScfIteration<S, DensityUpdated<MixingOff>, MixingOff> {
             beta_psi_per_ion: self.beta_psi_per_ion,
             q_sf_cache: self.q_sf_cache,
             density_aug_fine: self.density_aug_fine,
+            #[cfg(any(test, feature = "scf_diag"))]
+            last_davidson_diagnostics: self.last_davidson_diagnostics,
             _phase: PhantomData,
         }
     }
@@ -1272,6 +1296,8 @@ impl<S: SpinPolicy> ScfIteration<S, DensityUpdated<Kerker>, Kerker> {
             beta_psi_per_ion: self.beta_psi_per_ion,
             q_sf_cache: self.q_sf_cache,
             density_aug_fine: self.density_aug_fine,
+            #[cfg(any(test, feature = "scf_diag"))]
+            last_davidson_diagnostics: self.last_davidson_diagnostics,
             _phase: PhantomData,
         }
     }
@@ -1308,6 +1334,8 @@ impl<S: SpinPolicy> ScfIteration<S, DensityUpdated<Pulay>, Pulay> {
             beta_psi_per_ion: self.beta_psi_per_ion,
             q_sf_cache: self.q_sf_cache,
             density_aug_fine: self.density_aug_fine,
+            #[cfg(any(test, feature = "scf_diag"))]
+            last_davidson_diagnostics: self.last_davidson_diagnostics,
             _phase: PhantomData,
         }
     }
@@ -1854,6 +1882,15 @@ impl<S: SpinPolicy, M: MixingPhase> ScfIteration<S, WavefunctionsUpdated, M> {
     pub fn psi_data(&self) -> &[Complex64] {
         &self.psi.data
     }
+
+    /// Davidson diagnostics from the most recent diagonalize call.
+    /// Returns `Some` when Davidson was dispatched (CHEMRUST_EIGENSOLVER=davidson);
+    /// `None` when Chebyshev-RR was used.
+    #[cfg(any(test, feature = "scf_diag"))]
+    #[doc(hidden)]
+    pub fn davidson_diagnostics(&self) -> Option<&DavidsonDiagnostic> {
+        self.last_davidson_diagnostics.as_ref()
+    }
 }
 
 impl<S: SpinPolicy, M: MixingPhase> ScfIteration<S, DensityUpdated<M>, MixingOff> {
@@ -2006,6 +2043,7 @@ mod tests {
             beta_psi_per_ion: None,
             q_sf_cache: None,
             density_aug_fine: None,
+            last_davidson_diagnostics: None,
             _phase: PhantomData,
         };
 
@@ -2059,6 +2097,7 @@ mod tests {
             beta_psi_per_ion: None,
             q_sf_cache: None,
             density_aug_fine: None,
+            last_davidson_diagnostics: None,
             _phase: PhantomData,
         }
     }

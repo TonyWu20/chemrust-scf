@@ -49,8 +49,12 @@ pub struct DavidsonResult {
 pub struct DavidsonDiagnostic {
     pub n_locked: usize,
     pub n_unconverged: usize,
+    pub locked_indices: Vec<usize>,
+    pub unconv_indices: Vec<usize>,
+    pub residual_norms: Vec<f64>,
     pub max_residual: f64,
     pub mean_residual: f64,
+    pub lock_tol: f64,
 }
 
 /// Most recent Davidson diagnostic, accessible via re-export for tests.
@@ -254,6 +258,12 @@ pub(crate) unsafe fn davidson_minimal_single_sweep(
     }
     let n_locked = locked.iter().filter(|&&l| l).count();
     let k = unconv_idx.len();
+    let locked_indices: Vec<usize> = locked
+        .iter()
+        .enumerate()
+        .filter(|&(_, &l)| l)
+        .map(|(i, _)| i)
+        .collect();
 
     // ------------------------------------------------------------------
     // Step 8: Early return if all bands are locked
@@ -276,8 +286,12 @@ pub(crate) unsafe fn davidson_minimal_single_sweep(
         *DAVIDSON_LAST_DIAG.lock().unwrap() = Some(DavidsonDiagnostic {
             n_locked,
             n_unconverged: k,
+            locked_indices: locked_indices.clone(),
+            unconv_indices: unconv_idx.clone(),
+            residual_norms: residual_norms.clone(),
             max_residual: max_res,
             mean_residual: mean_res,
+            lock_tol,
         });
 
         return Ok(DavidsonResult {
@@ -637,8 +651,12 @@ pub(crate) unsafe fn davidson_minimal_single_sweep(
     *DAVIDSON_LAST_DIAG.lock().unwrap() = Some(DavidsonDiagnostic {
         n_locked,
         n_unconverged: k,
+        locked_indices: locked_indices.clone(),
+        unconv_indices: unconv_idx.clone(),
+        residual_norms: residual_norms.clone(),
         max_residual: max_res,
         mean_residual: mean_res,
+        lock_tol,
     });
 
     Ok(DavidsonResult {
