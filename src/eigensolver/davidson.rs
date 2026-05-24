@@ -171,6 +171,37 @@ pub(crate) unsafe fn davidson_v1(
     let max_subspace = (cfg.max_subspace_dim_factor * n_bands as f64).ceil() as usize;
 
     // ------------------------------------------------------------------
+    // Helper: grow subspace buffers when capacity is exhausted
+    // ------------------------------------------------------------------
+    /// Reallocate subspace and sspace buffers with `new_cap` columns,
+    /// preserving existing data. Returns the new capacity on success.
+    unsafe fn ensure_subspace_cap(
+        subspace_dev: &mut CudaSlice<CudaComplex>,
+        sspace_dev: &mut CudaSlice<CudaComplex>,
+        current_dim: usize,
+        new_cap: usize,
+        n_pw: usize,
+        stream: &Arc<CudaStream>,
+    ) -> Result<usize, Error> {
+        let mut new_sub =
+            stream.alloc_zeros(n_pw * new_cap).map_err(Error::Cuda)?;
+        let mut new_sspace =
+            stream.alloc_zeros(n_pw * new_cap).map_err(Error::Cuda)?;
+        // Copy existing data (first `current_dim` columns)
+        if current_dim > 0 {
+            stream
+                .memcpy_dtod(subspace_dev, &mut new_sub)
+                .map_err(Error::Cuda)?;
+            stream
+                .memcpy_dtod(sspace_dev, &mut new_sspace)
+                .map_err(Error::Cuda)?;
+        }
+        *subspace_dev = new_sub;
+        *sspace_dev = new_sspace;
+        Ok(new_cap)
+    }
+
+    // ------------------------------------------------------------------
     // Persistent buffer allocation (reused across outer iterations)
     // ------------------------------------------------------------------
     let mut psi_dev: CudaSlice<CudaComplex> =
@@ -201,11 +232,15 @@ pub(crate) unsafe fn davidson_v1(
     let mut s_temp_dev: CudaSlice<CudaComplex> =
         stream.alloc_zeros(n_pw).map_err(Error::Cuda)?;
 
-    // Subspace buffers: n_pw × max_subspace, column-major
+    // Subspace buffers: start at n_bands columns, grow dynamically.
+    // This avoids pre-allocating for the worst-case max_subspace (3× n_bands),
+    // which would waste ~4 GB on large systems before any search directions
+    // are accumulated.
+    let mut subspace_cap: usize = n_bands;
     let mut subspace_dev: CudaSlice<CudaComplex> =
-        stream.alloc_zeros(n_pw * max_subspace).map_err(Error::Cuda)?;
+        stream.alloc_zeros(n_pw * subspace_cap).map_err(Error::Cuda)?;
     let mut sspace_dev: CudaSlice<CudaComplex> =
-        stream.alloc_zeros(n_pw * max_subspace).map_err(Error::Cuda)?;
+        stream.alloc_zeros(n_pw * subspace_cap).map_err(Error::Cuda)?;
 
     // ------------------------------------------------------------------
     // Initialise subspace with psi_init
@@ -804,6 +839,22 @@ pub(crate) unsafe fn davidson_v1(
         // ==============================================================
         // No restart: compute corrections and expand subspace
         // ==============================================================
+
+        // Grow subspace buffers if needed for the new directions
+        let needed_cap = subspace_dim + n_new_directions;
+        if needed_cap > subspace_cap {
+            let new_cap = (needed_cap * 2).min(max_subspace);
+            subspace_cap = unsafe {
+                ensure_subspace_cap(
+                    &mut subspace_dev,
+                    &mut sspace_dev,
+                    subspace_dim,
+                    new_cap,
+                    n_pw,
+                    stream,
+                )?
+            };
+        }
 
         // ---- Step 10: Preconditioned correction t_b = P⁻¹·r_b ----
         for &b in &unconv_idx {
