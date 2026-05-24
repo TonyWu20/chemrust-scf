@@ -1,4 +1,6 @@
 pub(crate) mod chebyshev;
+pub(crate) mod hamiltonian;
+pub(crate) mod kernels;
 pub(crate) mod d_screening;
 pub(crate) mod davidson_minimal;
 pub mod rayleigh_ritz;

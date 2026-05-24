@@ -208,3 +208,106 @@ look up the verdict in the §3 table, and write the revised
 
 This file is then superseded by the revised `GATE3_RESULT.md` and may
 be retained as forensic context or deleted at the user's discretion.
+
+---
+
+## 7. Post-C2 retrospective (appended 2026-05-24)
+
+> **STATUS: SUPERSEDED** (2026-05-24, commit `4e6ad91`).
+> Forensic record only. The operational Phase 1 decision lives in
+> `GATE3_RESULT.md`. Sections §1–§6 are preserved verbatim as the
+> pre-C2 snapshot; this section appends the outcome and reconciles
+> the two pre-registered decision matrices that disagreed on what
+> the measured drift means.
+
+### 7.1. C2 measured outcome
+
+| Metric | Value | Source |
+|---|---|---|
+| iter-1 band-0 | −1.041322 Ha | `GATE3_RESULT.md:38` |
+| iter-2 band-0 | −1.033873 Ha | `GATE3_RESULT.md:39` |
+| iter-3 band-0 | **−0.995789 Ha** | `GATE3_RESULT.md:40` |
+| CASTEP band-0 reference | −1.05502287 Ha | test fixture |
+| **iter-3 drift** | **59.234 mHa** | `GATE3_RESULT.md:42` |
+| Locks per iter | [160, 160, 151] / 160 | `GATE3_RESULT.md:43` |
+| Max residual per iter | [0.101, 0.122, 0.670] Ha | `GATE3_RESULT.md:44` |
+| Chebyshev-RR baseline drift (iter-3) | 10.9 Ha | `GATE3_RESULT.md:42` |
+| Reduction vs Chebyshev-RR | **185×** | `GATE3_RESULT.md:47` |
+
+### 7.2. Verdict under each pre-registered matrix
+
+The 59 mHa drift was evaluated against two pre-registered matrices.
+Both were committed before C2 ran:
+
+| Matrix source | Buckets | Verdict for 59 mHa |
+|---|---|---|
+| `TASKS.md:1032-1043` mirrored in the test code at `tests/ca_scf_convergence.rs:4717-4725` | < 0.5 Ha / 0.5–2.0 Ha / 2.0–5.45 Ha / ≥ 5.45 Ha | **PASS** (headroom 8.5×) |
+| This file's §3 (lines 110-124) | ≤ 50 mHa / (50, 100] mHa / (100, 197] mHa / > 197 mHa | **PASS-WITH-CAVEAT** (50 < 59 ≤ 100) |
+
+`GATE3_RESULT.md` cites only the TASKS.md/test matrix. That choice
+is legitimate — the test code is the artefact that ran, and its
+threshold ladder is the one bound to the executed measurement — but
+it is not the whole story. Under §3 of this file the same number
+lands in the PASS-WITH-CAVEAT bucket. Both are pre-registered; both
+clear the cascade-arrested bar; the operational decision (Davidson v1,
+Phase 1A) is unchanged.
+
+### 7.3. What §3's PASS-WITH-CAVEAT actually obligates
+
+Per §3 line 121, a result in (50, 100] mHa means: *"Locking helps
+significantly. Phase 1A's outer-iteration tightening should close
+the gap. Document the iter-1/2/3 n_locked and max_res trajectory."*
+
+The trajectory documentation requirement is now satisfied by §7.1
+above and by `GATE3_RESULT.md`. The "outer-iteration tightening
+closes the gap" obligation maps directly onto §4 item 1 of this file
+(lock_tol ratchet schedule), which is already on the Phase 1A
+backlog. No new obligation is added; the §3 caveat is operationally
+discharged by Phase 1A's existing scope.
+
+### 7.4. Process gap, not a result correction
+
+Two pre-registered matrices for the same gate is the process gap.
+Both are coherent in isolation; neither is wrong. They were written
+on different dates against different framings (TASKS.md anchored on
+"is the cascade arrested at all?"; §3 anchored on "is locking as good
+as the T3 V_eff-injection floor of 9.8 mHa?") and never reconciled
+into a single binding artefact before C2 ran.
+
+The pragmatic resolution: the test code is the binding artefact (it
+is the one that runs and produces the number), and any tighter
+narrative target written in an assessment note must be either lifted
+into TASKS.md (so it also binds the test) or flagged at the point of
+writing as a non-binding aspiration. §3 did neither, so its tighter
+thresholds operate only as discipline — they tell us 59 mHa is
+*close to* the floor, not at it.
+
+### 7.5. Lesson for future gates
+
+A single canonical matrix per gate is the only one that binds. The
+canonical matrix must be:
+
+1. **In TASKS.md, not in a sibling assessment note.** TASKS.md is the
+   document the implementer reads when writing the test.
+2. **Mirrored bit-for-bit in the test's decision branches.** If the
+   thresholds in `tests/*.rs` and TASKS.md drift apart, the test
+   wins by default (it is what runs); the documentation is silently
+   stale.
+3. **Reconciled with any narrative targets in assessment notes
+   *before* the gate runs.** If an assessment note proposes tighter
+   thresholds (as §3 did here), either lift them into TASKS.md and
+   the test, or label them at the top of the relevant section as
+   "narrative target only — not a gate criterion."
+
+For Phase 1A and subsequent phases: when a `make-judgement` or
+`drive-outcomes` produces a pre-C2-style assessment with quantitative
+thresholds, the next action must be either merge-into-TASKS.md or
+explicit-narrative-label, before any test is run. Not after.
+
+### 7.6. Cross-references
+
+- Outcome: `GATE3_RESULT.md` (this same directory)
+- Test: `tests/ca_scf_convergence.rs:4638-4745` (in particular the
+  decision branches at lines 4717-4725)
+- Original pre-registration of the TASKS matrix: `TASKS.md:1032-1043`
+- Phase 1A entry point: `PHASE_PLAN.md` section "Phase 1A — Davidson v1"

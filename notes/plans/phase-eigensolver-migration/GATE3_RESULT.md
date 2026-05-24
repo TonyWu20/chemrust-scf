@@ -68,6 +68,13 @@ SCF iterations, preventing the remaining 0.059 Ha from cascading. Phase 1A's
 preconditioner + outer iteration should close this gap entirely by tightening
 residuals below a production lock_tol of 1e-6.
 
+> **Matrix-reconciliation note.** Under the tighter pre-registered
+> matrix in `DAVIDSON_ASSESSMENT_PRE_C2.md` §3 (PASS ≤ 50 mHa,
+> PASS-WITH-CAVEAT 50–100 mHa), 59 mHa lands in PASS-WITH-CAVEAT;
+> the operational decision (Davidson v1, Phase 1A) is unchanged
+> because both matrices were pre-registered and both clear the
+> cascade-arrested bar. See PRE_C2 §7 for the reconciliation.
+
 ## Next-phase anchor
 
 `/drive-outcomes notes/plans/phase-eigensolver-migration/PHASE_PLAN.md`
