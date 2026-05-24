@@ -620,11 +620,17 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
         // Assert: hot path should only have setup H2D + final D2H.
         // Any additional transfer (e.g. D2H inside the Chebyshev loop) is a bug.
         // beta_psi is now GPU-resident, so it's excluded from D2H accounting.
+        // PostRr pin path adds 2 × n_bands² × 16 D2Hs (M and X) for the per-block SVD.
+        let pin_d2h_bytes = if pin_cfg.mode == crate::eigensolver::rayleigh_ritz::PinMode::PostRr {
+            2 * n_bands * n_bands * 16
+        } else {
+            0
+        };
         assert_eq!(
             pcie.d2h_bytes,
-            psi_bytes + eig_bytes,
-            "D2H: expected psi({psi_bytes}) + eigenvalues({eig_bytes}) = {}",
-            psi_bytes + eig_bytes,
+            psi_bytes + eig_bytes + pin_d2h_bytes,
+            "D2H: expected psi({psi_bytes}) + eigenvalues({eig_bytes}) + pin({pin_d2h_bytes}) = {}",
+            psi_bytes + eig_bytes + pin_d2h_bytes,
         );
 
         let [ngz, ngy, ngx] = self.wave_grid.grid();
@@ -637,10 +643,16 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
             .sum();
         let b_concat_bytes = n_pw * vnl_data.n_total_expanded as usize * 16;
         let lu_m_bytes = vnl_data.n_total_expanded as usize * vnl_data.n_total_expanded as usize * 16;
+        // PostRr pin path adds 1 × n_bands² × 16 H2D for the rotated X writeback.
+        let pin_h2d_bytes = if pin_cfg.mode == crate::eigensolver::rayleigh_ritz::PinMode::PostRr {
+            n_bands * n_bands * 16
+        } else {
+            0
+        };
         assert_eq!(
             pcie.h2d_bytes,
             psi_bytes + veff_bytes + fft_idx_bytes + kinetic_bytes + vnl_bytes
-                + b_concat_bytes + lu_m_bytes,
+                + b_concat_bytes + lu_m_bytes + pin_h2d_bytes,
             "H2D tracking check failed",
         );
 

@@ -48,7 +48,11 @@ pub enum PinMode {
 #[derive(Debug, Clone)]
 pub struct RrPinConfig {
     /// Eigenvalue spacing threshold (Ha) for detecting degenerate blocks.
-    /// Default 0.01 Ha (catches Cu-3d Δε ≈ 7 mHa and Fermi cluster Δε ≈ 0.3 mHa).
+    /// Default 0.05 Ha (catches Cu-3d Δε ≈ 7 mHa and Fermi cluster Δε ≈ 0.3 mHa,
+    /// and is loose enough to merge fragmented near-degenerate clusters whose
+    /// boundaries jitter under Chebyshev filter pollution — empirically validated
+    /// against `pin_preserves_castep_basis_at_iter1_postrr` where 0.01 Ha
+    /// produced 1e-6 outliers from over-fragmentation).
     pub eps_degen: f64,
     /// Pin mode (Off, PreRr, or PostRr).
     pub mode: PinMode,
@@ -58,7 +62,7 @@ impl RrPinConfig {
     /// Create a new pin configuration from environment variables.
     ///
     /// `CHEMRUST_PIN_MODE` ∈ {`off`, `prerr`, `postrr`}; defaults to `off`.
-    /// `CHEMRUST_PIN_EPS_DEGEN` is the eigenvalue spacing threshold in Ha; defaults to 0.01.
+    /// `CHEMRUST_PIN_EPS_DEGEN` is the eigenvalue spacing threshold in Ha; defaults to 0.05.
     pub fn from_env() -> Self {
         let mode_str = std::env::var("CHEMRUST_PIN_MODE").unwrap_or_else(|_| "off".to_string());
         let mode = match mode_str.to_lowercase().as_str() {
@@ -74,8 +78,8 @@ impl RrPinConfig {
             }
         };
 
-        let eps_degen_str = std::env::var("CHEMRUST_PIN_EPS_DEGEN").unwrap_or_else(|_| "0.01".to_string());
-        let eps_degen = eps_degen_str.parse::<f64>().unwrap_or(0.01);
+        let eps_degen_str = std::env::var("CHEMRUST_PIN_EPS_DEGEN").unwrap_or_else(|_| "0.05".to_string());
+        let eps_degen = eps_degen_str.parse::<f64>().unwrap_or(0.05);
 
         RrPinConfig { eps_degen, mode }
     }
