@@ -4378,3 +4378,123 @@ fn b_low_sweep_subspace_projector() {
     eprintln!("[b_low-sweep] Targets: Cu-3d/13 ≥ 0.94 (gate), 0..40/40 increase, off-block decrease");
     eprintln!("[b_low-sweep] Diagnostic sweep complete; no hard assert");
 }
+
+/// Phase 0 Gate 3: does per-band locking preserve the Cu-3d block at 13.0
+/// where Chebyshev-RR's ZHEGVD-rotation forces it to 11.6?
+///
+/// CHEMRUST_EIGENSOLVER=davidson dispatches to davidson_minimal::single_sweep.
+/// V_eff is OUR V_eff, not CASTEP-pinned: pinning V_eff trivializes the test
+/// (all residuals = 0 → no ZHEGVD).
+///
+/// Mirror of `subspace_projector_iter1_vs_castep` for block-sum computation.
+#[test]
+#[ignore = "requires GPU and CASTEP fixture data"]
+#[cfg(feature = "scf_diag")]
+fn gate3_davidson_minimal_locking_preserves_cu3d_block() {
+    if !gpu_available() {
+        eprintln!("SKIP: no GPU available");
+        return;
+    }
+    init_tracing();
+
+    // Set env var for dispatch
+    unsafe {
+        std::env::set_var("CHEMRUST_EIGENSOLVER", "davidson");
+    }
+
+    use num_complex::Complex64;
+
+    let fx = fixtures::cu111_co::fixture();
+    let wfc = fx.check.wavefunction.as_ref().expect(".check wavefunction");
+    let kpt_block = &wfc.kpt_data[0];
+    let n_bands_total = kpt_block.bands.len();
+    let n_pw = kpt_block.nplw;
+    let castep_psi: Vec<Complex64> = kpt_block.bands.concat();
+
+    // Build state with OUR V_eff (not CASTEP-pinned) — this is the discriminator
+    let state = fixtures::cu111_co::build_scf_state(fx);
+    let veff_state = state.build_v_eff_with_energy().expect("build_v_eff");
+
+    let s_castep = veff_state
+        .apply_s_for_test(&castep_psi, n_bands_total)
+        .expect("apply_s_for_test on castep_psi");
+
+    // ndeg=0 is ignored by davidson branch (single-sweep)
+    let diag = veff_state.diagonalize(0, None).expect("davidson diagonalize");
+    let psi_out = diag.psi_data().to_vec();
+
+    // Window of bands to examine
+    let nb = 40usize.min(n_bands_total);
+
+    // Full overlap matrix M[a,b] = |⟨our_a|S|castep_b⟩|²
+    let mut m = vec![0f64; nb * nb];
+    for a in 0..nb {
+        let ours = &psi_out[a * n_pw..(a + 1) * n_pw];
+        for b in 0..nb {
+            let scas = &s_castep[b * n_pw..(b + 1) * n_pw];
+            let dot: Complex64 = ours
+                .iter()
+                .zip(scas.iter())
+                .map(|(x, y)| x.conj() * y)
+                .sum();
+            m[a * nb + b] = dot.norm_sqr();
+        }
+    }
+
+    let block_sum = |i0: usize, i1: usize| -> f64 {
+        let mut s = 0.0;
+        for a in i0..i1 {
+            for b in i0..i1 {
+                s += m[a * nb + b];
+            }
+        }
+        s
+    };
+
+    let s_band0 = block_sum(0, 1);
+    let s_cu3d = block_sum(1, 14); // 13 bands, Cu-3d cluster
+    let s_30 = block_sum(0, 30);
+    let s_40 = block_sum(0, 40);
+
+    let ratio = s_cu3d / 13.0;
+
+    // The only hard assertion: sanity check that s_cu3d is finite and in range
+    assert!(
+        s_cu3d.is_finite() && (0.0..=14.0).contains(&s_cu3d),
+        "Cu-3d block sum {s_cu3d} outside valid range [0, 14]"
+    );
+
+    // Read Davidson diagnostics
+    let diag_snapshot = chemrust_scf::DAVIDSON_LAST_DIAG
+        .lock()
+        .unwrap()
+        .clone();
+
+    let (n_locked, max_residual) = if let Some(ref d) = diag_snapshot {
+        (d.n_locked, d.max_residual)
+    } else {
+        (0usize, f64::NAN)
+    };
+
+    let decision = if s_cu3d >= 12.999 {
+        "PASS — locking sufficient. Proceed Phase 1A (Davidson v1)."
+    } else if s_cu3d <= 11.700 {
+        "FAIL — locking insufficient. Fall back Phase 1B (block CG)."
+    } else {
+        "MIXED — locking helps but incomplete. Lean Davidson; re-evaluate Phase 2."
+    };
+
+    println!("[Gate 3] Cu-3d block sum (bands 1..14 vs CASTEP): {s_cu3d:.6}");
+    println!("[Gate 3] Self-overlap reference (CASTEP vs CASTEP): 13.000000");
+    println!("[Gate 3] Chebyshev-RR baseline (recorded): 11.610000 (ratio 0.893)");
+    println!("[Gate 3] Davidson ratio: {ratio:.6}");
+    println!("[Gate 3] Sibling block sums: band0={s_band0:.6}, 0..30={s_30:.6}, 0..40={s_40:.6}");
+    println!("[Gate 3] Locked bands: {n_locked} / {n_bands_total}");
+    println!("[Gate 3] Max residual: {max_residual:.3e}");
+    println!("[Gate 3] Decision: {decision}");
+
+    // Cleanup env var
+    unsafe {
+        std::env::remove_var("CHEMRUST_EIGENSOLVER");
+    }
+}
