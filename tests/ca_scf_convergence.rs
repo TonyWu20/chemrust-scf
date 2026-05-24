@@ -4101,6 +4101,122 @@ fn diagnostic_per_band_s_norm_of_our_output() {
     }
 }
 
+/// **cascade_with_castep_anchored_postrr_pin** — Upper-bound test of whether
+/// any Procrustes-style pin can stop the iter-3 cascade.
+///
+/// Production absolute-target Procrustes would pin against the FROZEN iter-1
+/// RR output (a self-derived reference). But iter-1's output is itself
+/// 11%-rotated from CASTEP (per `subspace_projector_iter1_vs_castep`'s 0.893
+/// Cu-3d ratio). So pinning against iter-1's output freezes in that
+/// rotation, and the question is whether the cascade is driven by:
+///   (a) inter-iteration rotation drift (which a stable reference fixes), or
+///   (b) the iter-1 rotation itself causing wrong density → wrong V_eff →
+///       cascade (which no reference can fix without using CASTEP ψ as the
+///       reference).
+///
+/// This test is the UPPER BOUND: inject CASTEP ψ as the input to every
+/// iteration via `psi_data_mut`, so PostRr's `prev_psi_dev` = CASTEP ψ at
+/// every call. The pin then aligns each iteration's output to CASTEP's
+/// basis — the strongest possible Procrustes target.
+///
+/// EXTERNAL anchor (A1): `Cu111_CO.bands:12` → band-0 = −1.05502287 Ha.
+///
+/// Discriminator:
+///   - iter-3 band-0 within 0.1 Ha of A1 → cascade IS rotation-driven, and a
+///     real-world (iter-1-anchored) absolute-target pin has a chance.
+///   - iter-3 band-0 still diverges → cascade is NOT rotation-driven at all;
+///     it's V_eff drift or density mixing. Any pin is doomed.
+///
+/// Caveat: this MIXES the V_eff/density evolution (still computed from our
+/// own ψ via construct_density) with the absolute pin reference. The iter-2
+/// density is built from CASTEP-anchored iter-1 output, not from our
+/// unpinned iter-1 output. Even so, the test cleanly probes: does pinning
+/// EVER work?
+#[test]
+#[ignore = "requires GPU and CASTEP fixture data"]
+#[cfg(feature = "scf_diag")]
+fn cascade_with_castep_anchored_postrr_pin() {
+    if !gpu_available() {
+        eprintln!("SKIP: no GPU available");
+        return;
+    }
+    init_tracing();
+
+    use num_complex::Complex64;
+
+    // Set PostRr pin mode via env var (RrPinConfig::from_env reads this).
+    unsafe { std::env::set_var("CHEMRUST_PIN_MODE", "postrr"); }
+
+    let fx = fixtures::cu111_co::fixture();
+    let wfc = fx.check.wavefunction.as_ref().expect(".check wavefunction");
+    let kpt_block = &wfc.kpt_data[0];
+    let castep_psi: Vec<Complex64> = kpt_block.bands.concat();
+
+    eprintln!("[castep-anchor] PinMode=PostRr, eps_degen default, ψ_prev=CASTEP ψ at every iteration");
+
+    // ---- Iter-1 ----
+    let state = fixtures::cu111_co::build_scf_state(fx);
+    let mut iter1_veff = state.build_v_eff_with_energy().expect("iter-1 build_v_eff");
+    // Inject CASTEP ψ as the input (overwriting fixture's initial guess if needed)
+    iter1_veff.psi_data_mut().copy_from_slice(&castep_psi);
+    let iter1_diag = iter1_veff.diagonalize(8, None).expect("iter-1 diagonalize");
+    let eigs_1 = iter1_diag.eigenvalues().to_vec();
+    eprintln!("[castep-anchor] iter-1 band-0 = {:.6} Ha (anchored to CASTEP)", eigs_1[0]);
+
+    let iter1_dens = iter1_diag.construct_density_off().expect("iter-1 construct_density");
+    let iter2_state = match iter1_dens.mix().check(1e-8).expect("iter-1 check") {
+        chemrust_scf::CheckOutcome::Converged(_) => panic!("iter-1 converged early"),
+        chemrust_scf::CheckOutcome::NotConverged { state, .. } => state,
+    };
+
+    // ---- Iter-2 ----
+    let mut iter2_veff = iter2_state.build_v_eff_with_energy().expect("iter-2 build_v_eff");
+    iter2_veff.psi_data_mut().copy_from_slice(&castep_psi);  // RE-INJECT CASTEP ψ as ref
+    let iter2_diag = iter2_veff.diagonalize(8, None).expect("iter-2 diagonalize");
+    let eigs_2 = iter2_diag.eigenvalues().to_vec();
+    eprintln!("[castep-anchor] iter-2 band-0 = {:.6} Ha", eigs_2[0]);
+
+    let iter2_dens = iter2_diag.construct_density_off().expect("iter-2 construct_density");
+    let iter3_state = match iter2_dens.mix().check(1e-8).expect("iter-2 check") {
+        chemrust_scf::CheckOutcome::Converged(_) => panic!("iter-2 converged early"),
+        chemrust_scf::CheckOutcome::NotConverged { state, .. } => state,
+    };
+
+    // ---- Iter-3 ----
+    let mut iter3_veff = iter3_state.build_v_eff_with_energy().expect("iter-3 build_v_eff");
+    iter3_veff.psi_data_mut().copy_from_slice(&castep_psi);  // RE-INJECT CASTEP ψ as ref
+    let iter3_diag = iter3_veff.diagonalize(8, None).expect("iter-3 diagonalize");
+    let eigs_3 = iter3_diag.eigenvalues().to_vec();
+
+    let iter3_band0 = eigs_3[0];
+    let castep_band0 = -1.05502287_f64;
+    let drift = (iter3_band0 - castep_band0).abs();
+
+    eprintln!(
+        "[castep-anchor] iter-1 = {:.6}, iter-2 = {:.6}, iter-3 = {:.6}",
+        eigs_1[0], eigs_2[0], iter3_band0
+    );
+    eprintln!(
+        "[castep-anchor] CASTEP band-0 = {:.8} Ha; iter-3 drift = {:.4e} Ha (gate 0.1)",
+        castep_band0, drift
+    );
+    eprintln!(
+        "[castep-anchor] Baseline (PinMode::Off, no inject): iter-3 = −11.94 Ha, drift = 10.9 Ha"
+    );
+    eprintln!(
+        "[castep-anchor] PostRr+relative (postrr-cascade-amplification): iter-3 = −14.91 Ha, drift = 13.86 Ha"
+    );
+    if drift < 0.1 {
+        eprintln!("[castep-anchor] PASS — cascade IS rotation-driven; absolute-target Procrustes has a chance");
+    } else if drift < 1.0 {
+        eprintln!("[castep-anchor] PARTIAL — significant lift vs baseline, but cascade is also V_eff/density-driven");
+    } else {
+        eprintln!("[castep-anchor] FAIL — even CASTEP-anchored pin cannot stop cascade; root cause is upstream of ψ rotation");
+    }
+
+    // Diagnostic only — no hard assert, this is an upper-bound probe
+}
+
 /// **b_low_sweep_subspace_projector** — Step 7.1 sweep harness.
 ///
 /// Runs `subspace_projector_iter1_vs_castep` block-sum measurement against
