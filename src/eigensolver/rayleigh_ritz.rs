@@ -494,39 +494,35 @@ pub(crate) fn rayleigh_ritz(
                     .map_err(Error::Cuda)?;
                 pcie.d2h_bytes += n_bands * n_bands * 16;
 
-                // Per-block pin loop
-                // D2H X for rotation application
-                let mut x_host: Vec<CudaComplex> = stream
+                // Per-block pin loop with typed faer Mat API
+                use faer::Mat;
+                use num_complex::Complex64;
+
+                // One typed conversion from the col-major device snapshot.
+                // faer's Mat<T> is column-major by default — matches CUDA's layout.
+                let m_full: Mat<Complex64> = Mat::from_fn(n_bands, n_bands, |r, c| {
+                    let cu = m_host[c * n_bands + r];
+                    Complex64::new(cu.x, cu.y)
+                });
+
+                // D2H X once, wrap as a typed col-major Mat.
+                let x_host: Vec<CudaComplex> = stream
                     .clone_dtoh(&h_sub_dev)
                     .map_err(Error::Cuda)?;
                 pcie.d2h_bytes += n_bands * n_bands * 16;
 
-                for (lo, hi) in blocks {
-                    let k_block = (hi - lo) as usize;
+                let mut x_full: Mat<Complex64> = Mat::from_fn(n_bands, n_bands, |r, c| {
+                    let cu = x_host[c * n_bands + r];
+                    Complex64::new(cu.x, cu.y)
+                });
 
-                    // Extract M_block = M[lo..hi, lo..hi]
-                    // m_host is col-major (n_bands × n_bands): element [row, col] at m_host[col * n_bands + row]
-                    // m_block will be col-major (k_block × k_block): element [row, col] at m_block[col * k_block + row]
-                    let mut m_block = vec![CudaComplex { x: 0.0, y: 0.0 }; k_block * k_block];
-                    for col in 0..k_block {
-                        for row in 0..k_block {
-                            m_block[col * k_block + row] = m_host[(lo + col) * n_bands + (lo + row)];
-                        }
-                    }
+                for &(lo, hi) in &blocks {
+                    let k_block = hi - lo;
 
-                    // Convert to num_complex::Complex64 for faer SVD
-                    use num_complex::Complex64;
-                    let m_block_c64: Vec<Complex64> = m_block
-                        .iter()
-                        .map(|c| Complex64::new(c.x, c.y))
-                        .collect();
+                    // Typed block extraction. submatrix(start_row, start_col, nrows, ncols) → MatRef.
+                    let m_block = m_full.submatrix(lo, lo, k_block, k_block).to_owned();
 
-                    // CPU SVD via faer
-                    use faer::prelude::*;
-                    // faer Mat is col-major: from_fn(rows, cols, |row, col| ...) with col-major storage
-                    let m_faer = Mat::<Complex64>::from_fn(k_block, k_block, |row, col| m_block_c64[col * k_block + row]);
-
-                    let svd = match m_faer.svd() {
+                    let svd = match m_block.svd() {
                         Ok(s) => s,
                         Err(_) => {
                             #[cfg(feature = "scf_diag")]
@@ -535,59 +531,39 @@ pub(crate) fn rayleigh_ritz(
                         }
                     };
 
-                    // faer 0.24 Svd API: U() is left singulars, V() is right singulars (NOT V^H).
-                    // Procrustes-optimal R = U · V^H, where V^H = V().adjoint().
-                    let u_mat = svd.U();   // Mat<Complex64> (k × k)
-                    let v_mat = svd.V();   // Mat<Complex64> (k × k)
-
-                    // R = U · V^H — k×k unitary by construction
-                    let r_mat = u_mat * v_mat.adjoint();
+                    let u = svd.U();           // Mat<Complex64> (k × k)
+                    let v = svd.V();           // Mat<Complex64> (k × k)  — NOT V^H
+                    let r: Mat<Complex64> = u * v.adjoint();   // Procrustes-optimal unitary R = U · V^H
 
                     // Sanity: ‖R^H · R − I‖_F < 1e-10
                     {
-                        let rh_r = r_mat.adjoint() * &r_mat;
-                        let mut frob_err = 0.0_f64;
+                        let rh_r: Mat<Complex64> = r.adjoint() * &r;
+                        let mut frob_err_sq = 0.0_f64;
                         for i in 0..k_block {
                             for j in 0..k_block {
                                 let target = if i == j { Complex64::new(1.0, 0.0) } else { Complex64::ZERO };
-                                let d = rh_r[(i, j)] - target;
-                                frob_err += d.norm_sqr();
+                                frob_err_sq += (rh_r[(i, j)] - target).norm_sqr();
                             }
                         }
-                        if frob_err.sqrt() > 1e-10 {
+                        if frob_err_sq.sqrt() > 1e-10 {
                             #[cfg(feature = "scf_diag")]
-                            eprintln!("[PostRr] R not unitary for block [{}, {}): ‖R^H·R - I‖_F = {:.3e} — skipping", lo, hi, frob_err.sqrt());
+                            eprintln!(
+                                "[PostRr] R not unitary for block [{}, {}): ‖R^H·R − I‖_F = {:.3e} — skipping",
+                                lo, hi, frob_err_sq.sqrt()
+                            );
                             continue;
                         }
                     }
 
-                    // Apply X[:, lo..hi] ← X[:, lo..hi] · R^H on x_host (col-major, n_bands × n_bands).
-                    // Source slab: rows 0..n_bands, cols lo..hi (k_block columns).
-                    // Output:     rows 0..n_bands, cols lo..hi (overwrite same block).
-                    //
-                    // Right-multiply by R^H (k×k):  X_new[r, lo+c] = Σ_p X_old[r, lo+p] · conj(R[c, p])
-                    // i.e. for each output col c, sum over input cols p with weight conj(R[c, p]).
-                    {
-                        let mut new_block = vec![CudaComplex { x: 0.0, y: 0.0 }; n_bands * k_block];
-                        for c in 0..k_block {
-                            for r in 0..n_bands {
-                                let mut acc = Complex64::ZERO;
-                                for p in 0..k_block {
-                                    let x_rp = {
-                                        let cu = x_host[(lo + p) * n_bands + r]; // col-major: col=(lo+p), row=r
-                                        Complex64::new(cu.x, cu.y)
-                                    };
-                                    let r_cp_conj = r_mat[(c, p)].conj();
-                                    acc += x_rp * r_cp_conj;
-                                }
-                                new_block[c * n_bands + r] = CudaComplex { x: acc.re, y: acc.im };
-                            }
-                        }
-                        // Write back into x_host columns lo..hi
-                        for c in 0..k_block {
-                            for r in 0..n_bands {
-                                x_host[(lo + c) * n_bands + r] = new_block[c * n_bands + r];
-                            }
+                    // Apply X[:, lo..hi] ← X[:, lo..hi] · R^H using typed mat-mul.
+                    let x_slab = x_full.submatrix(0, lo, n_bands, k_block).to_owned();
+                    let x_slab_new: Mat<Complex64> = x_slab * r.adjoint();
+
+                    // Copy the rotated slab back into x_full's column band.
+                    // faer offers no `assign_to_submatrix`, so we walk the typed Mat directly.
+                    for c in 0..k_block {
+                        for row in 0..n_bands {
+                            x_full[(row, lo + c)] = x_slab_new[(row, c)];
                         }
                     }
 
@@ -595,12 +571,16 @@ pub(crate) fn rayleigh_ritz(
                     eprintln!("[PostRr] pinned block [{}, {}), k={}", lo, hi, k_block);
                 }
 
-                // H2D the (potentially modified) X back to GPU
-                let h_sub_dev_new: CudaSlice<CudaComplex> =
-                    stream.clone_htod(&x_host).map_err(Error::Cuda)?;
+                // Single typed conversion back to flat Vec<CudaComplex> for H2D.
+                let mut x_host_out: Vec<CudaComplex> = Vec::with_capacity(n_bands * n_bands);
+                for c in 0..n_bands {
+                    for r in 0..n_bands {
+                        let z = x_full[(r, c)];
+                        x_host_out.push(CudaComplex { x: z.re, y: z.im });
+                    }
+                }
+                let h_sub_dev_new = stream.clone_htod(&x_host_out).map_err(Error::Cuda)?;
                 pcie.h2d_bytes += n_bands * n_bands * 16;
-
-                // Replace h_sub_dev with the new version
                 h_sub_dev = h_sub_dev_new;
             }
         }
