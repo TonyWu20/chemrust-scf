@@ -593,13 +593,14 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
         )?;
 
         // Rayleigh-Ritz
+        let pin_cfg = crate::eigensolver::rayleigh_ritz::RrPinConfig::from_env();
         let (psi_new_gpu, eigenvalues_cpu, beta_psi_gpu) = rayleigh_ritz(
             &psi_filtered_row, &hpsi_row, &vnl_data,
             n_bands, n_pw, &kernels,
             &mut pcie,
             &solver, &blas, &stream, &ctx,
             Some(prev_psi_dev),
-            None,  // pin_cfg: will be set in Step 5 when pin code is implemented
+            Some(&pin_cfg),
         )?;
 
         stream.synchronize()?;
