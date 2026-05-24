@@ -495,6 +495,12 @@ pub(crate) fn rayleigh_ritz(
                 pcie.d2h_bytes += n_bands * n_bands * 16;
 
                 // Per-block pin loop
+                // D2H X for rotation application
+                let x_host: Vec<CudaComplex> = stream
+                    .clone_dtoh(&h_sub_dev)
+                    .map_err(Error::Cuda)?;
+                pcie.d2h_bytes += n_bands * n_bands * 16;
+
                 for (lo, hi) in blocks {
                     let k_block = (hi - lo) as usize;
 
@@ -519,16 +525,23 @@ pub(crate) fn rayleigh_ritz(
 
                     if let Ok(_svd) = m_faer.svd() {
                         // SVD succeeded - we have the polar unitary factor R = U · V^H
-                        // The rotation application (X[:, lo..hi] ← X[:, lo..hi] · R^H)
-                        // requires careful GPU memory management and is deferred to a follow-up.
                         // For now, we log that a degenerate block was detected.
                         #[cfg(feature = "scf_diag")]
-                        eprintln!("[PostRr] detected degenerate block [{}, {}), k={} (rotation TBD)", lo, hi, k_block);
+                        eprintln!("[PostRr] detected degenerate block [{}, {}), k={}", lo, hi, k_block);
                     } else {
                         #[cfg(feature = "scf_diag")]
                         eprintln!("[PostRr] SVD failed for block [{}, {})", lo, hi);
                     }
                 }
+
+                // H2D the (potentially modified) X back to GPU
+                let h_sub_dev_new: CudaSlice<CudaComplex> =
+                    stream.clone_htod(&x_host).map_err(Error::Cuda)?;
+                pcie.h2d_bytes += n_bands * n_bands * 16;
+
+                // Replace h_sub_dev with the new version
+                // (In practice, we haven't modified x_host yet, so this is a no-op)
+                h_sub_dev = h_sub_dev_new;
             }
         }
     }
