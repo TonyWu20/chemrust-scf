@@ -114,7 +114,7 @@ type RayleighRitzResult = Result<
 ///
 /// # Returns
 /// Vec of (lo, hi) pairs where hi is exclusive (standard Rust range notation).
-fn detect_degenerate_blocks(eigenvalues: &[f64], eps_degen: f64) -> Vec<(usize, usize)> {
+pub(crate) fn detect_degenerate_blocks(eigenvalues: &[f64], eps_degen: f64) -> Vec<(usize, usize)> {
     if eigenvalues.len() < 2 {
         return vec![];
     }
