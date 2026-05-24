@@ -4498,3 +4498,131 @@ fn gate3_davidson_minimal_locking_preserves_cu3d_block() {
         std::env::remove_var("CHEMRUST_EIGENSOLVER");
     }
 }
+
+#[test]
+#[ignore = "requires GPU and CASTEP fixture data"]
+#[cfg(feature = "scf_diag")]
+fn gate3_prime_davidson_synthetic_lock_preserves_locked_bands() {
+    // Phase 0 Gate 3' -- synthetic-lock identity preservation.
+    // Forces Cu-3d into the locked set by construction; asserts bitwise preservation.
+    // See notes/plans/phase-eigensolver-migration/TASKS.md Group C1.
+
+    if !gpu_available() {
+        eprintln!("SKIP: no GPU available");
+        return;
+    }
+    init_tracing();
+
+    use num_complex::Complex64;
+
+    unsafe {
+        std::env::set_var("CHEMRUST_EIGENSOLVER", "davidson");
+        std::env::set_var("CHEMRUST_DAVIDSON_LOCK_TOL", "1e-3");
+    }
+
+    let fx = fixtures::cu111_co::fixture();
+    let psi_castep = fixtures::cu111_co::castep_psi_first_kpoint(fx);
+    let n_pw = fixtures::cu111_co::n_pw_first_kpoint(fx);
+    let n_bands: usize = 160;
+
+    let cu3d = 1..14usize;
+    let epsilon: f64 = std::env::var("CHEMRUST_GATE3_PERTURB_EPS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.01);
+
+    // Build tmp state with CASTEP V_eff for S-inner products during construction
+    let tmp_state = fixtures::cu111_co::build_state_with_castep_veff(fx);
+
+    // Construct psi_perturbed: Cu-3d bands bitwise == psi_castep, rest have noise
+    let psi_perturbed = fixtures::davidson_synthetic::construct_synthetic_locked_input(
+        &psi_castep,
+        n_pw,
+        n_bands,
+        cu3d.clone(),
+        epsilon,
+        42, // seed
+        &tmp_state,
+    );
+
+    // Sanity: Cu-3d bands bitwise unchanged in input
+    for b in cu3d.clone() {
+        let band_in = &psi_perturbed[b * n_pw..(b + 1) * n_pw];
+        let band_ref = &psi_castep[b * n_pw..(b + 1) * n_pw];
+        for g in 0..n_pw {
+            assert_eq!(
+                band_in[g], band_ref[g],
+                "construct_synthetic_locked_input modified Cu-3d band {b} at G={g}"
+            );
+        }
+    }
+
+    // Build state with CASTEP V_eff + perturbed psi, run Davidson
+    let veff_state = fixtures::cu111_co::build_state_with_castep_veff_and_psi(
+        fx, &psi_perturbed,
+    );
+    let diag = veff_state.diagonalize(0, None).expect("davidson diag");
+    let dr = diag.davidson_diagnostics().expect("davidson diagnostics set");
+    let psi_out = diag.psi_data();
+
+    // Assertions
+    assert_eq!(
+        dr.n_locked, 13,
+        "expected 13 locked bands (Cu-3d cluster), got {}",
+        dr.n_locked
+    );
+    let expected_locked: Vec<usize> = cu3d.clone().collect();
+    assert_eq!(
+        dr.locked_indices, expected_locked,
+        "locked set should be exactly Cu-3d bands 1..14"
+    );
+
+    // Bitwise identity: locked bands must be byte-for-byte identical to input
+    for &b in &expected_locked {
+        let band_in = &psi_perturbed[b * n_pw..(b + 1) * n_pw];
+        let band_out = &psi_out[b * n_pw..(b + 1) * n_pw];
+        for g in 0..n_pw {
+            assert_eq!(
+                band_out[g], band_in[g],
+                "band {b} G {g}: locked band rotated. in={:?} out={:?}",
+                band_in[g], band_out[g]
+            );
+        }
+    }
+
+    // Cu-3d block sum vs CASTEP: should be 13.0 +- 1e-7
+    let s_castep = tmp_state
+        .apply_s_for_test(&psi_castep, n_bands)
+        .expect("apply_s_for_test");
+    let cu3d_sum = fixtures::davidson_synthetic::compute_s_block_sum(
+        psi_out, &s_castep, n_pw, cu3d.clone(),
+    );
+    assert!(
+        (cu3d_sum - 13.0).abs() < 1e-7,
+        "Cu-3d block sum = {cu3d_sum:.10}, want 13.0 +- 1e-7"
+    );
+
+    // Unconverged bands should have max residual > 1e-3 (i.e., they should
+    // NOT be spuriously locked)
+    assert!(
+        dr.max_residual > 1e-3,
+        "max residual = {:.3e} -- non-Cu-3d bands spuriously locked (residuals < lock_tol)",
+        dr.max_residual
+    );
+
+    println!("[Gate 3'] PASS -- locking preserves Cu-3d block bitwise");
+    println!("[Gate 3'] n_locked = {} / 160", dr.n_locked);
+    println!("[Gate 3'] locked_indices = {:?}", dr.locked_indices);
+    println!("[Gate 3'] Cu-3d block sum = {cu3d_sum:.10} (target 13.0)");
+    println!(
+        "[Gate 3'] max residual on unconverged = {:.3e} Ha",
+        dr.max_residual
+    );
+    println!("[Gate 3'] lock_tol = {:.3e}", dr.lock_tol);
+    println!("[Gate 3'] perturbation epsilon = {epsilon}");
+
+    unsafe {
+        std::env::remove_var("CHEMRUST_EIGENSOLVER");
+        std::env::remove_var("CHEMRUST_DAVIDSON_LOCK_TOL");
+    }
+}

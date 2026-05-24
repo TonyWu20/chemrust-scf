@@ -10,6 +10,7 @@ use chemrust_scf::{
     FineGridArray, KPoint, MixingOff, ScfIteration, SmearingParams, SmearingScheme, VEffBuilt,
     WaveGridArray, WavefunctionSet, pw_coords_to_fft_indices,
 };
+use num_complex::Complex64;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -371,5 +372,18 @@ pub fn build_state_with_castep_veff(
     // which is exactly NonSpin::VEff — the type set_v_eff expects.
     let castep_veff = castep_veff_as_effective(fx);
     state.set_v_eff(castep_veff);
+    state
+}
+
+/// Build an SCF state with CASTEP V_eff pinned AND custom psi injected.
+///
+/// Calls `build_state_with_castep_veff`, then overwrites the internal
+/// wavefunction with the provided `psi_in`.
+pub fn build_state_with_castep_veff_and_psi(
+    fx: &Cu111CoFixture,
+    psi_in: &[Complex64],
+) -> ScfIteration<NonSpin, VEffBuilt, MixingOff> {
+    let mut state = build_state_with_castep_veff(fx);
+    state.psi_data_mut().copy_from_slice(psi_in);
     state
 }
