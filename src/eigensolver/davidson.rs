@@ -102,13 +102,17 @@ pub static DAVIDSON_LAST_DIAG: std::sync::Mutex<Option<DavidsonDiagnostic>> =
 /// Starts at 0.5 Ha (proven by Phase 0 — all 160 bands lock at iter-1),
 /// tightens geometrically toward target_tol.
 pub(crate) fn lock_tol_for_iter(scf_iter: usize, target_tol: f64) -> f64 {
-    let initial_tol: f64 = 0.5;
+    // iter 1: loose enough to lock the trivially-converged bands but tight
+    // enough to force ZHEGVD on bands whose residual exceeds ~0.01 Ha.
+    // This prevents the vacuous all-lock problem where eigenvectors stay
+    // frozen and eigenvalues drift unchecked across SCF iterations.
+    let tol_at_iter1: f64 = 0.01;
     let decay: f64 = 0.5;
-    if scf_iter <= 2 {
-        initial_tol // iter-1 and iter-2: loose lock catches ~all bands
+    if scf_iter <= 1 {
+        tol_at_iter1
     } else {
-        let gap = initial_tol - target_tol;
-        let tol = target_tol + gap * decay.powi(scf_iter as i32 - 2);
+        let gap = tol_at_iter1 - target_tol;
+        let tol = target_tol + gap * decay.powi(scf_iter as i32 - 1);
         tol.max(target_tol)
     }
 }
@@ -1277,34 +1281,27 @@ mod tests {
 
     #[test]
     fn lock_tol_for_iter_baseline() {
-        // iter 1: lock_tol = 0.5 (initial_tol)
+        // iter 1: lock_tol = 0.01 (initial_tol)
         let tol_1 = lock_tol_for_iter(1, 1e-6);
         assert!(
-            (tol_1 - 0.5).abs() < 1e-15,
-            "iter 1 lock_tol = {tol_1}, expected 0.5"
+            (tol_1 - 0.01).abs() < 1e-15,
+            "iter 1 lock_tol = {tol_1}, expected 0.01"
         );
 
-        // iter 2: lock_tol = 0.5 (unchanged)
+        // iter 2: lock_tol = target + (0.01 - target) * 0.5^1
+        let expected_2 = 1e-6 + (0.01 - 1e-6) * 0.5_f64.powi(1);
         let tol_2 = lock_tol_for_iter(2, 1e-6);
         assert!(
-            (tol_2 - 0.5).abs() < 1e-15,
-            "iter 2 lock_tol = {tol_2}, expected 0.5"
+            (tol_2 - expected_2).abs() < 1e-15,
+            "iter 2 lock_tol = {tol_2}, expected {expected_2}"
         );
 
-        // iter 3: lock_tol = target + (0.5 - target) * 0.5^1
-        let expected_3 = 1e-6 + (0.5 - 1e-6) * 0.5_f64.powi(1);
+        // iter 3: lock_tol = target + (0.01 - target) * 0.5^2
+        let expected_3 = 1e-6 + (0.01 - 1e-6) * 0.5_f64.powi(2);
         let tol_3 = lock_tol_for_iter(3, 1e-6);
         assert!(
             (tol_3 - expected_3).abs() < 1e-15,
             "iter 3 lock_tol = {tol_3}, expected {expected_3}"
-        );
-
-        // iter 4: lock_tol = target + (0.5 - target) * 0.5^2
-        let expected_4 = 1e-6 + (0.5 - 1e-6) * 0.5_f64.powi(2);
-        let tol_4 = lock_tol_for_iter(4, 1e-6);
-        assert!(
-            (tol_4 - expected_4).abs() < 1e-15,
-            "iter 4 lock_tol = {tol_4}, expected {expected_4}"
         );
 
         // iter 10: should still be between target_tol and initial_tol
@@ -1321,8 +1318,8 @@ mod tests {
         // Edge: scf_iter = 0 (should behave like iter-1)
         let tol_0 = lock_tol_for_iter(0, 1e-6);
         assert!(
-            (tol_0 - 0.5).abs() < 1e-15,
-            "iter 0 lock_tol = {tol_0}, expected 0.5"
+            (tol_0 - 0.01).abs() < 1e-15,
+            "iter 0 lock_tol = {tol_0}, expected 0.01"
         );
     }
 
