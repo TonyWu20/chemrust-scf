@@ -3,10 +3,11 @@ use std::sync::OnceLock;
 
 use chemrust_hamiltonian_core::{
     CastepBin, CastepBinFile, CheckFile, EffectivePotential, ElectronDensity, GVectorGrid,
-    PseudopotentialSet, formatted,
+    NonSpin, PseudopotentialSet, formatted,
 };
 use chemrust_scf::{
-    ColumnDistributed, Density, KPoint, ScfIteration, SmearingParams, SmearingScheme,
+    ColumnDistributed, Density, EffectivePotential as ScfEffectivePotential,
+    FineGridArray, KPoint, MixingOff, ScfIteration, SmearingParams, SmearingScheme, VEffBuilt,
     WaveGridArray, WavefunctionSet, pw_coords_to_fft_indices,
 };
 
@@ -330,4 +331,51 @@ pub fn d_screened_by_global_ion(
 pub fn castep_veff_as_effective(fx: &Cu111CoFixture) -> EffectivePotential {
     use chemrust_hamiltonian_core::fft::RealGrid;
     EffectivePotential::from_inner(RealGrid::from_inner(fx.pot_fmt.clone()))
+}
+
+/// Extract the converged wavefunction (first k-point) from the .check fixture
+/// as a flat `Vec<Complex64>` in column-major (n_bands × n_pw) layout.
+pub fn castep_psi_first_kpoint(fx: &Cu111CoFixture) -> Vec<num_complex::Complex64> {
+    fx.check
+        .wavefunction
+        .as_ref()
+        .expect(".check must have wavefunction")
+        .kpt_data[0]
+        .bands
+        .concat()
+}
+
+/// Number of plane-waves at the first k-point in the .check fixture.
+pub fn n_pw_first_kpoint(fx: &Cu111CoFixture) -> usize {
+    fx.check
+        .wavefunction
+        .as_ref()
+        .expect(".check must have wavefunction")
+        .kpt_data[0]
+        .nplw
+}
+
+/// Build an SCF state with CASTEP's V_eff pinned in place.
+///
+/// Constructs a VEffBuilt state via `build_scf_state` + `build_v_eff_with_energy`,
+/// then replaces the assembled V_eff with the CASTEP reference from `.pot_fmt`.
+/// The returned state has `MixingOff` — suitable for a single-shot diagonalize.
+pub fn build_state_with_castep_veff(
+    fx: &Cu111CoFixture,
+) -> ScfIteration<NonSpin, VEffBuilt, MixingOff> {
+    let mut state = build_scf_state(fx)
+        .build_v_eff_with_energy()
+        .expect("build_v_eff_with_energy failed");
+
+    // Get CASTEP's V_eff from the pot_fmt fixture
+    let castep_veff = castep_veff_as_effective(fx);
+
+    // Convert chemrust_hamiltonian_core::EffectivePotential → chemrust_scf::EffectivePotential
+    // Both wrap the same underlying Array3<f64> (fine grid).
+    let arr = castep_veff.as_real_grid().as_real_array().clone();
+    let fine = FineGridArray::from_inner(arr);
+    let veff_crate = ScfEffectivePotential::from_inner(fine);
+
+    state.set_v_eff(veff_crate);
+    state
 }

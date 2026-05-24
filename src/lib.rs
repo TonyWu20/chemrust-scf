@@ -6,6 +6,9 @@ pub mod density;
 pub mod device;
 pub(crate) mod eigensolver;
 
+#[doc(hidden)]
+pub use eigensolver::davidson_minimal::{DAVIDSON_LAST_DIAG, DavidsonDiagnostic};
+
 pub use types::{
     Density, DensityUpsampled, EffectivePotential, Error, FinalResult, FineGridArray, KineticEnergies, KPoint,
     SmearingParams, SmearingScheme, WaveGridArray,

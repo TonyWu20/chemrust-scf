@@ -143,7 +143,6 @@ fn detect_degenerate_blocks(eigenvalues: &[f64], eps_degen: f64) -> Vec<(usize, 
 }
 
 /// Solve the Rayleigh-Ritz generalized eigenvalue problem in the subspace.
-
 ///
 /// Input:
 /// - `psi_row`: filtered wavefunctions in RowDistributed layout (n_pw x n_bands)
@@ -343,8 +342,8 @@ pub(crate) fn rayleigh_ritz(
     // ---- Step 3c: Procrustes pin (PostRr variant) ----
     // Apply pin AFTER ZHEGVD, on the eigenvector matrix X (in h_sub_dev).
     // This corrects for arbitrary in-block unitary rotations in near-degenerate clusters.
-    if let (Some(prev_psi), Some(cfg)) = (prev_psi_dev, pin_cfg) {
-        if cfg.mode == PinMode::PostRr {
+    if let (Some(prev_psi), Some(cfg)) = (prev_psi_dev, pin_cfg)
+        && cfg.mode == PinMode::PostRr {
             // Detect degenerate blocks
             let blocks = detect_degenerate_blocks(&eigenvalues_host, cfg.eps_degen);
 
@@ -587,7 +586,6 @@ pub(crate) fn rayleigh_ritz(
                 pcie.h2d_bytes += n_bands * n_bands * 16;
                 h_sub_dev = h_sub_dev_new;
             }
-        }
     }
 
 
