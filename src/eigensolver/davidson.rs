@@ -29,7 +29,7 @@
 use std::sync::Arc;
 
 use cudarc::cublas::sys::{
-    cublasDznrm2_v2, cublasZaxpy_v2, cublasZcopy_v2, cublasZdscal_v2, cublasZdotc_v2,
+    cublasZaxpy_v2, cublasZcopy_v2, cublasZdotc_v2,
 };
 use cudarc::cusolver::sys::{cublasFillMode_t, cusolverEigMode_t};
 use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
@@ -522,31 +522,12 @@ pub(crate) unsafe fn davidson_v1(
                 .map_err(Error::Blas)?;
             }
 
-            // Normalize
-            let (unconv_ptr, _) = psi_unconv_new.device_ptr(stream);
-            let unrot_col_norm =
-                (unconv_ptr as *const CudaComplex).add(u * n_pw);
-            let mut norm: f64 = 0.0;
-            cublasDznrm2_v2(
-                handle, n_pw_i32,
-                unrot_col_norm as *const _, 1,
-                &mut norm as *mut _,
-            )
-            .result()
-            .map_err(Error::Blas)?;
-            if norm > 1e-30 {
-                let inv_norm = 1.0 / norm;
-                let (unrot_mut, _) = psi_unconv_new.device_ptr_mut(stream);
-                let unrot_mut_col =
-                    (unrot_mut as *mut CudaComplex).add(u * n_pw);
-                cublasZdscal_v2(
-                    handle, n_pw_i32,
-                    &inv_norm as *const _,
-                    unrot_mut_col as *mut _, 1,
-                )
-                .result()
-                .map_err(Error::Blas)?;
-            }
+            // The rotated column is already S-normalised from ZHEGVD
+            // (X^H·S_sub·X = I, preserved by ψ_u·X rotation). S-orth
+            // against locked bands perturbs the norm only slightly.
+            // Do NOT re-normalise with L2 (cublasDznrm2) — L2-normalising
+            // inflates identity norms from ~0.37 to ~1.0 per band and
+            // destabilises the soft density, triggering an SCF cascade.
         }
 
         core::mem::drop(s_psi_in);
