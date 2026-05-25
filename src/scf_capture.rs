@@ -175,6 +175,7 @@ pub fn capture_as_castep_bin<S: SpinPolicy>(
         total_energy,
         eigenvalues,
         density,
+        parameters_raw: None,
         fine_grid: Some(fine_grid_dims),
         wavefunction: Some(wavefunction),
         forces: None,

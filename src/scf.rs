@@ -1823,60 +1823,40 @@ pub fn run_scf_with_energy_gated(
                                     * info.num_ions as f64
                             })
                             .sum();
-                        if let Some(castep_bin) =
+                        if let Some(mut castep_bin) =
                             crate::scf_capture::capture_as_castep_bin(&next, n_electrons)
                         {
-                            let out_path = std::env::var("CHEMRUST_CHECK_DUMP")
-                                .unwrap_or_else(|_| "chemrust_iter2.check".to_string());
-                            // CASTEP requires the PARAMETERS section to be written by
-                            // CASTEP itself (full parameters_dump). We extract it from
-                            // a reference .check file specified via CHEMRUST_REF_CHECK.
-                            let ref_path = std::env::var("CHEMRUST_REF_CHECK").unwrap_or_else(|_| {
-                                tracing::warn!(
-                                    "[scf capture] CHEMRUST_REF_CHECK not set, \
-                                     .check file will not be CASTEP-compatible"
-                                );
-                                String::new()
-                            });
-                            if let Ok(mut file) = std::fs::File::create(&out_path) {
-                                // 1. Write reference parameters section verbatim
-                                if !ref_path.is_empty() {
-                                    match chemrust_hamiltonian_core::extract_params_from(&ref_path) {
-                                        Ok(params) => {
-                                            use std::io::Write;
-                                            if let Err(e) = file.write_all(&params) {
-                                                tracing::warn!(
-                                                    "[scf capture] failed to write params: {e}"
-                                                );
-                                            }
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!(
-                                                "[scf capture] failed to extract params from {}: {e}",
-                                                ref_path,
-                                            );
-                                        }
+                            // Inject parameters_raw from the reference .check file
+                            // (CASTEP requires the full parameters_dump block).
+                            let ref_path = std::env::var("CHEMRUST_REF_CHECK");
+                            if let Ok(path) = ref_path {
+                                if let Ok(ref_file) = std::fs::File::open(&path) {
+                                    use std::io::BufReader;
+                                    if let Ok(ref_bin) = chemrust_hamiltonian_core::CheckFile::read(
+                                        BufReader::new(ref_file),
+                                    ) {
+                                        castep_bin.parameters_raw = ref_bin.parameters_raw;
                                     }
                                 }
-                                // 2. Write variable sections (CELL through END)
-                                if let Err(e) =
-                                    chemrust_hamiltonian_core::write_check_after_params(
-                                        &castep_bin, &mut file,
-                                    )
-                                {
-                                    tracing::warn!(
+                            }
+                            let out_path = std::env::var("CHEMRUST_CHECK_DUMP")
+                                .unwrap_or_else(|_| "chemrust_iter2.check".to_string());
+                            if let Ok(mut file) = std::fs::File::create(&out_path) {
+                                match chemrust_hamiltonian_core::CheckFile::write(
+                                    &castep_bin, &mut file,
+                                ) {
+                                    Ok(()) => {
+                                        tracing::info!(
+                                            "[scf capture] iter-2 state written to {out_path}"
+                                        );
+                                        panic!(
+                                            "SCF_DISCRIMINATOR_STOP: iter-2 .check at {out_path}; \
+                                             run CASTEP continuation from this checkpoint"
+                                        );
+                                    }
+                                    Err(e) => tracing::warn!(
                                         "[scf capture] failed to write .check: {e}"
-                                    );
-                                } else {
-                                    tracing::info!(
-                                        "[scf capture] iter-2 state written to {}",
-                                        out_path,
-                                    );
-                                    // Stop SCF after iter-2 — .check file ready for CASTEP.
-                                    panic!(
-                                        "SCF_DISCRIMINATOR_STOP: iter-2 .check at {out_path}; \
-                                         run CASTEP continuation from this checkpoint"
-                                    );
+                                    ),
                                 }
                             } else {
                                 tracing::warn!(
