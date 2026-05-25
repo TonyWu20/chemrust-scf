@@ -167,7 +167,6 @@ pub struct ScfIteration<
     /// `None` when Chebyshev-RR was used or no diagonalize has run yet.
     #[cfg(any(test, feature = "scf_diag"))]
     pub(crate) last_davidson_diagnostics: Option<DavidsonDiagnostic>,
-
     /// Current SCF iteration number (1-indexed). Updated by run_scf before diagonalize.
     pub(crate) scf_iter: usize,
 
@@ -1592,6 +1591,12 @@ pub struct ScfDivergenceGate {
     /// from 0.37 → 0.80) indicates the augmentation density is not being
     /// constructed or mixing is corrupting the soft/aug split.
     pub soft_fraction_tolerance: f64,
+    /// Raw PARAMETERS section from the reference .check file, for the iter-2
+    /// CASTEP continuation discriminator. Set by the test from `fx.check`;
+    /// the capture point injects this into the emitted .check to satisfy
+    /// CASTEP's `parameters_restore` without re-reading the fixture.
+    #[cfg(any(test, feature = "scf_diag"))]
+    pub parameters_raw: Option<Vec<u8>>,
 }
 
 impl Default for ScfDivergenceGate {
@@ -1603,6 +1608,8 @@ impl Default for ScfDivergenceGate {
             max_iter: 60,
             electron_count_tolerance: 0.05,
             soft_fraction_tolerance: 0.20,
+            #[cfg(any(test, feature = "scf_diag"))]
+            parameters_raw: None,
         }
     }
 }
@@ -1826,21 +1833,12 @@ pub fn run_scf_with_energy_gated(
                         if let Some(mut castep_bin) =
                             crate::scf_capture::capture_as_castep_bin(&next, n_electrons)
                         {
-                            // Inject parameters_raw from the reference .check file
-                            // (CASTEP requires the full parameters_dump block).
-                            // Path follows tests/fixtures/cu111_co.rs convention.
-                            let fixture_dir = std::env::var("CASTEP_FIXTURE_DIR")
-                                .unwrap_or_else(|_| {
-                                    "/export/public_castep_jobs/tony/Cu111_CO_Single_Point_0522_F8"
-                                        .to_string()
-                                });
-                            let ref_path = format!("{fixture_dir}/Cu111_CO.check");
-                            if let Ok(ref_file) = std::fs::File::open(&ref_path) {
-                                use std::io::BufReader;
-                                if let Ok(ref_bin) = chemrust_hamiltonian_core::CheckFile::read(
-                                    BufReader::new(ref_file),
-                                ) {
-                                    castep_bin.parameters_raw = ref_bin.parameters_raw;
+                            // Inject parameters_raw from the gate (set by test
+                            // from fx.check — no re-read of the fixture file).
+                            if let Some(ref gate) = gate {
+                                #[cfg(any(test, feature = "scf_diag"))]
+                                if let Some(ref raw) = gate.parameters_raw {
+                                    castep_bin.parameters_raw = Some(raw.clone());
                                 }
                             }
                             let out_path = std::env::var("CHEMRUST_CHECK_DUMP")
