@@ -1828,15 +1828,19 @@ pub fn run_scf_with_energy_gated(
                         {
                             // Inject parameters_raw from the reference .check file
                             // (CASTEP requires the full parameters_dump block).
-                            let ref_path = std::env::var("CHEMRUST_REF_CHECK");
-                            if let Ok(path) = ref_path {
-                                if let Ok(ref_file) = std::fs::File::open(&path) {
-                                    use std::io::BufReader;
-                                    if let Ok(ref_bin) = chemrust_hamiltonian_core::CheckFile::read(
-                                        BufReader::new(ref_file),
-                                    ) {
-                                        castep_bin.parameters_raw = ref_bin.parameters_raw;
-                                    }
+                            // Path follows tests/fixtures/cu111_co.rs convention.
+                            let fixture_dir = std::env::var("CASTEP_FIXTURE_DIR")
+                                .unwrap_or_else(|_| {
+                                    "/export/public_castep_jobs/tony/Cu111_CO_Single_Point_0522_F8"
+                                        .to_string()
+                                });
+                            let ref_path = format!("{fixture_dir}/Cu111_CO.check");
+                            if let Ok(ref_file) = std::fs::File::open(&ref_path) {
+                                use std::io::BufReader;
+                                if let Ok(ref_bin) = chemrust_hamiltonian_core::CheckFile::read(
+                                    BufReader::new(ref_file),
+                                ) {
+                                    castep_bin.parameters_raw = ref_bin.parameters_raw;
                                 }
                             }
                             let out_path = std::env::var("CHEMRUST_CHECK_DUMP")
