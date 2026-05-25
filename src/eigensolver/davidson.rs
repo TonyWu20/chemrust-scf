@@ -529,20 +529,17 @@ pub(crate) unsafe fn davidson_v1(
         }
 
         // ---------------------------------------------------------------
-        // Step 8: Block-partition unconverged eigenvalues
+        // Step 8: Gather unconverged bands
         // ---------------------------------------------------------------
-        let unconv_eigenvalues: Vec<f64> =
-            unconv_idx.iter().map(|&b| eigenvalues[b]).collect();
-        let blocks = detect_degenerate_blocks(&unconv_eigenvalues, cfg.block_eps_degen);
-        let n_blocks = if blocks.is_empty() {
-            // Treat all unconverged as one block
-            1
-        } else {
-            blocks.len()
-        };
-
-        // Pre-allocate per-block temporaries reused in the block loop
+        // NOTE: detect_degenerate_blocks is called for diagnostic purposes
+        // only; we always solve a single unified k×k ZHEGVD. Per-block
+        // partitioning causes cross-block eigenvalue ordering to be lost,
+        // producing |Δλ| > 1 Ha and preventing convergence.
         let k = n_unconv;
+        let _blocks = detect_degenerate_blocks(
+            &unconv_idx.iter().map(|&b| eigenvalues[b]).collect::<Vec<_>>(),
+            cfg.block_eps_degen,
+        );
 
         // Gather unconverged columns (ψ and Hψ) into contiguous buffers
         let mut psi_unconv_dev: CudaSlice<CudaComplex> =
@@ -581,142 +578,31 @@ pub(crate) unsafe fn davidson_v1(
             }
         }
 
-        // Scatter ZHEGVD eigenvalues back into the main array (per block)
+        // ---------------------------------------------------------------
+        // Step 9: Unified subspace ZHEGVD (single k×k problem)
+        // ---------------------------------------------------------------
+        // Always solve one k×k eigenproblem — never partition into
+        // separate degenerate blocks. Per-block ZHEGVD produces
+        // eigenvalues sorted within each block, losing the global
+        // band-to-eigenvalue correspondence and causing |Δλ| > 1 Ha.
         let mut eigenvalues_k: Vec<f64> = vec![0.0; k];
-
-        // ---------------------------------------------------------------
-        // Step 9: Per-block ZHEGVD
-        // ---------------------------------------------------------------
-        if n_blocks <= 1 {
-            // Single block: full k×k problem
-            let mut psi_unconv_new: CudaSlice<CudaComplex> =
-                stream.alloc_zeros(n_pw * k).map_err(Error::Cuda)?;
-            solve_block_zhegvd(
-                &psi_unconv_dev,
-                &hpsi_unconv_dev,
-                vnl_data,
-                k,
-                n_pw,
-                blas,
-                solver,
-                stream,
-                &mut eigenvalues_k,
-                &mut eig_dev,
-                &mut info_dev,
-                &mut psi_unconv_new,
-            )?;
-            psi_unconv_dev = psi_unconv_new;
-        } else {
-            // Multiple blocks: solve each independently.
-            // `detect_degenerate_blocks` only returns blocks of size ≥ 2;
-            // isolated single bands are not included in any block.
-            // We must preserve those columns verbatim — otherwise they
-            // become zeros and corrupt the psi for the next outer iteration.
-            let mut psi_rotated: CudaSlice<CudaComplex> =
-                stream.alloc_zeros(n_pw * k).map_err(Error::Cuda)?;
-            stream
-                .memcpy_dtod(&psi_unconv_dev, &mut psi_rotated)
-                .map_err(Error::Cuda)?;
-
-            for &(block_lo, block_hi) in blocks.iter() {
-                let bk = block_hi - block_lo;
-                if bk < 1 {
-                    continue;
-                }
-
-                // Extract block columns from psi_unconv_dev and hpsi_unconv_dev
-                let mut psi_block: CudaSlice<CudaComplex> =
-                    stream.alloc_zeros(n_pw * bk).map_err(Error::Cuda)?;
-                let mut hpsi_block: CudaSlice<CudaComplex> =
-                    stream.alloc_zeros(n_pw * bk).map_err(Error::Cuda)?;
-
-                {
-                    let (psi_unconv_ptr, _) = psi_unconv_dev.device_ptr(stream);
-                    let (hpsi_unconv_ptr, _) = hpsi_unconv_dev.device_ptr(stream);
-                    let (psi_block_mut, _) = psi_block.device_ptr_mut(stream);
-                    let (hpsi_block_mut, _) = hpsi_block.device_ptr_mut(stream);
-
-                    for i in 0..bk {
-                        let src_col = (psi_unconv_ptr as *const CudaComplex)
-                            .add((block_lo + i) * n_pw);
-                        let hsrc_col = (hpsi_unconv_ptr as *const CudaComplex)
-                            .add((block_lo + i) * n_pw);
-                        let dst = (psi_block_mut as *mut CudaComplex).add(i * n_pw);
-                        let hdst = (hpsi_block_mut as *mut CudaComplex).add(i * n_pw);
-
-                        cublasZcopy_v2(
-                            handle,
-                            n_pw_i32,
-                            src_col as *const _,
-                            1,
-                            dst as *mut _,
-                            1,
-                        )
-                        .result()
-                        .map_err(Error::Blas)?;
-
-                        cublasZcopy_v2(
-                            handle,
-                            n_pw_i32,
-                            hsrc_col as *const _,
-                            1,
-                            hdst as *mut _,
-                            1,
-                        )
-                        .result()
-                        .map_err(Error::Blas)?;
-                    }
-                }
-
-                // Solve block — use separate result buffer
-                let mut block_result: CudaSlice<CudaComplex> =
-                    stream.alloc_zeros(n_pw * bk).map_err(Error::Cuda)?;
-                let mut block_eig = vec![0.0_f64; bk];
-                solve_block_zhegvd(
-                    &psi_block,
-                    &hpsi_block,
-                    vnl_data,
-                    bk,
-                    n_pw,
-                    blas,
-                    solver,
-                    stream,
-                    &mut block_eig,
-                    &mut eig_dev,
-                    &mut info_dev,
-                    &mut block_result,
-                )?;
-
-                // Copy block eigenvalues back
-                for (i, &val) in block_eig.iter().enumerate() {
-                    eigenvalues_k[block_lo + i] = val;
-                }
-
-                // Copy rotated block back to psi_rotated
-                {
-                    let (psi_rot_mut, _) = psi_rotated.device_ptr_mut(stream);
-                    let (block_result_ptr, _) = block_result.device_ptr(stream);
-                    for i in 0..bk {
-                        let src = (block_result_ptr as *const CudaComplex).add(i * n_pw);
-                        let dst = (psi_rot_mut as *mut CudaComplex)
-                            .add((block_lo + i) * n_pw);
-                        cublasZcopy_v2(
-                            handle,
-                            n_pw_i32,
-                            src as *const _,
-                            1,
-                            dst as *mut _,
-                            1,
-                        )
-                        .result()
-                        .map_err(Error::Blas)?;
-                    }
-                }
-            }
-
-            // Replace psi_unconv_dev with the rotated result
-            psi_unconv_dev = psi_rotated;
-        }
+        let mut psi_unconv_new: CudaSlice<CudaComplex> =
+            stream.alloc_zeros(n_pw * k).map_err(Error::Cuda)?;
+        solve_block_zhegvd(
+            &psi_unconv_dev,
+            &hpsi_unconv_dev,
+            vnl_data,
+            k,
+            n_pw,
+            blas,
+            solver,
+            stream,
+            &mut eigenvalues_k,
+            &mut eig_dev,
+            &mut info_dev,
+            &mut psi_unconv_new,
+        )?;
+        psi_unconv_dev = psi_unconv_new;
 
         // Update eigenvalues for unconverged bands
         for (pos, &b) in unconv_idx.iter().enumerate() {
