@@ -18,7 +18,6 @@ use crate::eigensolver::chebyshev::{compute_kinetic_energies, FilterMode, chebys
 use crate::eigensolver::davidson::{davidson_v1, DavidsonConfig, lock_tol_for_iter};
 #[cfg(any(test, feature = "scf_diag"))]
 use crate::eigensolver::davidson::{DavidsonDiagnostic, DAVIDSON_LAST_DIAG};
-use crate::eigensolver::preconditioner::TpaPreconditioner;
 use crate::eigensolver::rayleigh_ritz::rayleigh_ritz;
 #[cfg(any(test, feature = "scf_diag"))]
 use crate::eigensolver::rayleigh_ritz::rayleigh_ritz_with_matrices;
@@ -603,7 +602,7 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
 
         // ---- Eigensolver dispatch: CHEMRUST_EIGENSOLVER env var ----
         let eigensolver_method = std::env::var("CHEMRUST_EIGENSOLVER")
-            .unwrap_or_else(|_| "chebyshev".to_string());
+            .unwrap_or_else(|_| "davidson".to_string());
 
         if eigensolver_method == "davidson" {
             let [ngz, ngy, ngx] = self.wave_grid.grid();
@@ -635,19 +634,10 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
             let psi_in = psi_gpu.as_device_slice();
             let v_eff_slice = v_eff_gpu.as_device_slice();
 
-            // Davidson configuration with TPA preconditioner
+            // Davidson configuration
             let davidson_cfg = DavidsonConfig {
                 max_outer_iter: 30,
                 block_eps_degen: 0.01,
-                max_subspace_dim_factor: 3.0,
-                preconditioner: TpaPreconditioner::new(&ctx, 1e-12)?,
-            };
-
-            // Previous eigenvalues as initial guess for per-band delta check
-            let prev_lambdas = if self.eigenvalues.is_empty() {
-                None
-            } else {
-                Some(self.eigenvalues.as_slice())
             };
 
             let result = unsafe {
@@ -669,7 +659,6 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
                     &stream,
                     &ctx,
                     &davidson_cfg,
-                    prev_lambdas,
                 )?
             };
 
@@ -1937,14 +1926,6 @@ impl<S: SpinPolicy, M: MixingPhase> ScfIteration<S, WavefunctionsUpdated, M> {
             .map(|d| d.n_unconverged)
     }
 
-    /// Number of Davidson outer iterations completed.
-    #[cfg(any(test, feature = "scf_diag"))]
-    pub fn davidson_n_outer_iters(&self) -> Option<usize> {
-        self.last_davidson_diagnostics
-            .as_ref()
-            .map(|d| d.n_davidson_iters)
-    }
-
     /// Maximum S⁻¹-weighted residual norm after a Davidson solve.
     #[cfg(any(test, feature = "scf_diag"))]
     pub fn davidson_max_residual_sinv(&self) -> Option<f64> {
@@ -1969,11 +1950,6 @@ impl<S: SpinPolicy, M: MixingPhase> ScfIteration<S, WavefunctionsUpdated, M> {
             .map(|d| d.eigenvalue_deltas.clone())
     }
 
-    /// Number of subspace restarts during the most recent Davidson solve.
-    #[cfg(any(test, feature = "scf_diag"))]
-    pub fn davidson_n_restarts(&self) -> Option<usize> {
-        self.last_davidson_diagnostics.as_ref().map(|d| d.n_restarts)
-    }
 }
 
 impl<S: SpinPolicy, M: MixingPhase> ScfIteration<S, DensityUpdated<M>, MixingOff> {
