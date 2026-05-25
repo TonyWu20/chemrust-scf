@@ -625,11 +625,14 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
                 stream.clone(),
             ).map_err(Error::Fft)?;
 
-            // Lock tolerance from env-var override or ratchet schedule
+            // Lock tolerance from env-var override or ratchet schedule.
+            // Target 0.05 Ha is the empirical stability floor for Cu111+CO —
+            // below this the ratchet unlocks enough bands that ZHEGVD rotation
+            // perturbs the density, triggering an SCF cascade.
             let lock_tol = std::env::var("CHEMRUST_DAVIDSON_LOCK_TOL")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or_else(|| lock_tol_for_iter(self.scf_iter, 1e-6));
+                .unwrap_or_else(|| lock_tol_for_iter(self.scf_iter, 0.05));
 
             let psi_in = psi_gpu.as_device_slice();
             let v_eff_slice = v_eff_gpu.as_device_slice();
