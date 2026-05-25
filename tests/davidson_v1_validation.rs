@@ -358,7 +358,7 @@ fn test_davidson_v1_max_residual_monotonic() {
             "Davidson produced 0 locked and 0 unconverged — impossible state"
         );
 
-        eprintln!("[F5 PASS] max_residual_sinv = {max_res:.6e} (finite), n_iters = {n_iters}");
+        eprintln!("[F5 PASS] max_residual_sinv = {max_res:.6e} (finite), n_locked = {n_locked}");
     } else {
         panic!("Davidson diagnostics not available — CHEMRUST_EIGENSOLVER=davidson may not be set");
     }
