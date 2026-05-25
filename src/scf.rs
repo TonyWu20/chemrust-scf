@@ -1839,7 +1839,18 @@ pub fn run_scf_with_energy_gated(
                                         "[scf capture] iter-2 state written to {}",
                                         path,
                                     );
+                                    // Stop SCF after iter-2 — .check file ready for CASTEP.
+                                    panic!(
+                                        "SCF_DISCRIMINATOR_STOP: iter-2 .check at {path}; \
+                                         run CASTEP continuation from this checkpoint"
+                                    );
                                 }
+                            } else {
+                                tracing::warn!(
+                                    "[scf capture] cannot create {}: {}",
+                                    path,
+                                    std::io::Error::last_os_error(),
+                                );
                             }
                         }
                     }
