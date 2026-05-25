@@ -101,12 +101,14 @@ pub static DAVIDSON_LAST_DIAG: std::sync::Mutex<Option<DavidsonDiagnostic>> =
 
 /// Compute Davidson lock tolerance for a given SCF iteration.
 ///
-/// Starts at 0.01 Ha and tightens geometrically toward `target_tol`.
-/// 0.01 is chosen empirically — 0.5 Ha vacuously locks all bands
-/// (see postmortem, Bug 1), while < 0.001 risks the solver failing
-/// to lock any band at early SCF iterations.
+/// Starts at 0.2 Ha — loose enough to lock most bands at iter-1
+/// (max observed S⁻¹ residual ≈ 0.104 Ha for continuation ψ with our V_eff),
+/// tightens geometrically toward `target_tol`.
+///
+/// S⁻¹-weighted norms are ~100× larger than plain L2 norms for the Cu111+CO
+/// system. Phase 0's 0.5 Ha (calibrated for L2) maps to ~0.2 Ha for S⁻¹.
 pub(crate) fn lock_tol_for_iter(scf_iter: usize, target_tol: f64) -> f64 {
-    let initial: f64 = 0.01;
+    let initial: f64 = 0.2;
     let decay: f64 = 0.5;
     if scf_iter <= 1 {
         initial
@@ -820,23 +822,23 @@ mod tests {
 
     #[test]
     fn lock_tol_for_iter_baseline() {
-        // iter 1: lock_tol = 0.01 (initial)
+        // iter 1: lock_tol = 0.2 (initial)
         let tol_1 = lock_tol_for_iter(1, 1e-6);
         assert!(
-            (tol_1 - 0.01).abs() < 1e-15,
-            "iter 1 lock_tol = {tol_1}, expected 0.01"
+            (tol_1 - 0.2).abs() < 1e-15,
+            "iter 1 lock_tol = {tol_1}, expected 0.2"
         );
 
-        // iter 2: lock_tol = target + (0.01 - target) * 0.5^1
-        let expected_2 = 1e-6 + (0.01 - 1e-6) * 0.5_f64.powi(1);
+        // iter 2: lock_tol = target + (0.2 - target) * 0.5^1
+        let expected_2 = 1e-6 + (0.2 - 1e-6) * 0.5_f64.powi(1);
         let tol_2 = lock_tol_for_iter(2, 1e-6);
         assert!(
             (tol_2 - expected_2).abs() < 1e-15,
             "iter 2 lock_tol = {tol_2}, expected {expected_2}"
         );
 
-        // iter 3: lock_tol = target + (0.01 - target) * 0.5^2
-        let expected_3 = 1e-6 + (0.01 - 1e-6) * 0.5_f64.powi(2);
+        // iter 3: lock_tol = target + (0.2 - target) * 0.5^2
+        let expected_3 = 1e-6 + (0.2 - 1e-6) * 0.5_f64.powi(2);
         let tol_3 = lock_tol_for_iter(3, 1e-6);
         assert!(
             (tol_3 - expected_3).abs() < 1e-15,
@@ -853,8 +855,8 @@ mod tests {
         // Edge: scf_iter = 0 (should behave like iter-1)
         let tol_0 = lock_tol_for_iter(0, 1e-6);
         assert!(
-            (tol_0 - 0.01).abs() < 1e-15,
-            "iter 0 lock_tol = {tol_0}, expected 0.01"
+            (tol_0 - 0.2).abs() < 1e-15,
+            "iter 0 lock_tol = {tol_0}, expected 0.2"
         );
     }
 
