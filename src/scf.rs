@@ -1826,29 +1826,62 @@ pub fn run_scf_with_energy_gated(
                         if let Some(castep_bin) =
                             crate::scf_capture::capture_as_castep_bin(&next, n_electrons)
                         {
-                            use chemrust_hamiltonian_core::CheckFile;
-                            let path = std::env::var("CHEMRUST_CHECK_DUMP")
+                            let out_path = std::env::var("CHEMRUST_CHECK_DUMP")
                                 .unwrap_or_else(|_| "chemrust_iter2.check".to_string());
-                            if let Ok(mut file) = std::fs::File::create(&path) {
-                                if let Err(e) = CheckFile::write(&castep_bin, &mut file) {
+                            // CASTEP requires the PARAMETERS section to be written by
+                            // CASTEP itself (full parameters_dump). We extract it from
+                            // a reference .check file specified via CHEMRUST_REF_CHECK.
+                            let ref_path = std::env::var("CHEMRUST_REF_CHECK").unwrap_or_else(|_| {
+                                tracing::warn!(
+                                    "[scf capture] CHEMRUST_REF_CHECK not set, \
+                                     .check file will not be CASTEP-compatible"
+                                );
+                                String::new()
+                            });
+                            if let Ok(mut file) = std::fs::File::create(&out_path) {
+                                // 1. Write reference parameters section verbatim
+                                if !ref_path.is_empty() {
+                                    match chemrust_hamiltonian_core::extract_params_from(&ref_path) {
+                                        Ok(params) => {
+                                            use std::io::Write;
+                                            if let Err(e) = file.write_all(&params) {
+                                                tracing::warn!(
+                                                    "[scf capture] failed to write params: {e}"
+                                                );
+                                            }
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                "[scf capture] failed to extract params from {}: {e}",
+                                                ref_path,
+                                            );
+                                        }
+                                    }
+                                }
+                                // 2. Write variable sections (CELL through END)
+                                if let Err(e) =
+                                    chemrust_hamiltonian_core::write_check_after_params(
+                                        &castep_bin, &mut file,
+                                    )
+                                {
                                     tracing::warn!(
                                         "[scf capture] failed to write .check: {e}"
                                     );
                                 } else {
                                     tracing::info!(
                                         "[scf capture] iter-2 state written to {}",
-                                        path,
+                                        out_path,
                                     );
                                     // Stop SCF after iter-2 — .check file ready for CASTEP.
                                     panic!(
-                                        "SCF_DISCRIMINATOR_STOP: iter-2 .check at {path}; \
+                                        "SCF_DISCRIMINATOR_STOP: iter-2 .check at {out_path}; \
                                          run CASTEP continuation from this checkpoint"
                                     );
                                 }
                             } else {
                                 tracing::warn!(
                                     "[scf capture] cannot create {}: {}",
-                                    path,
+                                    out_path,
                                     std::io::Error::last_os_error(),
                                 );
                             }
