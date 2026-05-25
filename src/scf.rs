@@ -1578,10 +1578,17 @@ pub struct ScfDivergenceGate {
     /// Iteration ceiling. Even a converging SCF from a fixture-converged
     /// starting state should finish well under this many iterations.
     pub max_iter: u64,
-    /// Permitted relative drift in total electron count (fraction). Density
-    /// integral should match N_electrons within this tolerance; large drift
-    /// indicates the augmentation density or mixing has gone wrong.
+    /// Permitted relative drift in TOTAL electron count (soft + augmented,
+    /// fraction). Compares soft density on wave grid plus augmentation
+    /// density on fine grid against iter-1 baseline. CASTEP reference:
+    /// total ≈ 186 e⁻, soft ≈ 36.8% (Cu111+CO, RHO_SOFT_SUM ≈ 3.0e7,
+    /// RHO_AUG_SUM ≈ 5.1e7).
     pub electron_count_tolerance: f64,
+    /// Permitted drift in the soft-electron fraction (soft/total) relative
+    /// to the iter-1 baseline. A catastrophic flip in this ratio (e.g.
+    /// from 0.37 → 0.80) indicates the augmentation density is not being
+    /// constructed or mixing is corrupting the soft/aug split.
+    pub soft_fraction_tolerance: f64,
 }
 
 impl Default for ScfDivergenceGate {
@@ -1592,6 +1599,7 @@ impl Default for ScfDivergenceGate {
             max_veff_range_factor: 5.0,
             max_iter: 60,
             electron_count_tolerance: 0.05,
+            soft_fraction_tolerance: 0.20,
         }
     }
 }
@@ -1617,6 +1625,7 @@ pub fn run_scf_with_energy_gated(
     let mut header_printed = false;
     let mut iter1_veff_range: Option<f64> = None;
     let mut iter1_n_electrons: Option<f64> = None;
+    let mut iter1_soft_fraction: Option<f64> = None;
     loop {
         state.scf_iter += 1;
         state = {
@@ -1741,22 +1750,58 @@ pub fn run_scf_with_energy_gated(
                                 );
                             }
                         }
-                        // Total electron count from the new (post-mix) density.
-                        // Density is stored in CASTEP raw units (ρ×Ω), so the correct
-                        // formula is sum/N, not sum*Ω/N (which would apply Ω twice).
+                        // Total electron count = soft (wave grid) + augmented (fine grid).
+                        // CASTEP raw units (ρ×Ω): electrons = sum/N for each grid.
                         let rho_arr = next.density.as_wave_array();
-                        let n_grid = rho_arr.len() as f64;
-                        let n_electrons_now = rho_arr.iter().sum::<f64>() / n_grid;
+                        let soft_sum: f64 = rho_arr.iter().sum();
+                        let n_soft = rho_arr.len() as f64;
+                        let soft_e = soft_sum / n_soft;
+                        let aug_e = next
+                            .density_aug_fine
+                            .as_ref()
+                            .map(|aug| {
+                                let aug_arr = aug.as_real_array();
+                                let aug_sum: f64 = aug_arr.iter().sum();
+                                aug_sum / aug_arr.len() as f64
+                            })
+                            .unwrap_or(0.0);
+                        let total_e_now = soft_e + aug_e;
+                        let soft_fraction_now = if total_e_now > 0.0 {
+                            soft_e / total_e_now
+                        } else {
+                            0.0
+                        };
+
                         if iter1_n_electrons.is_none() {
-                            iter1_n_electrons = Some(n_electrons_now);
+                            iter1_n_electrons = Some(total_e_now);
+                            iter1_soft_fraction = Some(soft_fraction_now);
                         }
-                        let baseline_ne = iter1_n_electrons.unwrap_or(n_electrons_now);
-                        let drift = (n_electrons_now - baseline_ne).abs() / baseline_ne.abs().max(1.0);
-                        if drift > g.electron_count_tolerance {
+                        let baseline_total = iter1_n_electrons.unwrap_or(total_e_now);
+                        let baseline_soft_frac = iter1_soft_fraction.unwrap_or(soft_fraction_now);
+
+                        // Gate 1: total electron count drift
+                        let total_drift =
+                            (total_e_now - baseline_total).abs() / baseline_total.abs().max(1.0);
+                        if total_drift > g.electron_count_tolerance {
                             panic!(
-                                "[SCF gate] iter {}: electron count {:.4} drifted {:.2}% from iter-1 baseline {:.4}, exceeds gate {:.2}%\n  \
+                                "[SCF gate] iter {}: total electron count {:.4} (soft={:.4} aug={:.4}) drifted {:.2}% from iter-1 baseline {:.4}, exceeds gate {:.2}%\n  \
                                  likely cause: augmentation density or mixing broken",
-                                iter_count, n_electrons_now, drift * 100.0, baseline_ne, g.electron_count_tolerance * 100.0,
+                                iter_count, total_e_now, soft_e, aug_e,
+                                total_drift * 100.0, baseline_total,
+                                g.electron_count_tolerance * 100.0,
+                            );
+                        }
+
+                        // Gate 2: soft/augmented fraction must not flip catastrophically
+                        let frac_drift =
+                            (soft_fraction_now - baseline_soft_frac).abs();
+                        if frac_drift > g.soft_fraction_tolerance {
+                            panic!(
+                                "[SCF gate] iter {}: soft fraction {:.4} drifted Δ={:.4} from iter-1 baseline {:.4}, exceeds gate {:.4}\n  \
+                                 CASTEP reference soft fraction ≈ 0.368 (RHO_SOFT ~3.0e7 / total ~8.1e7)\n  \
+                                 likely cause: augmentation density not constructed or mixing corrupting soft/aug split",
+                                iter_count, soft_fraction_now, frac_drift, baseline_soft_frac,
+                                g.soft_fraction_tolerance,
                             );
                         }
                     }
