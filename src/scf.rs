@@ -1809,6 +1809,41 @@ pub fn run_scf_with_energy_gated(
                         }
                     }
 
+                    // --- iter-2 capture: write .check for CASTEP continuation discriminator ---
+                    #[cfg(any(test, feature = "scf_diag"))]
+                    if iter_count == 2 {
+                        let n_electrons: f64 = next
+                            .cell
+                            .species_iter()
+                            .map(|info| {
+                                next.pots
+                                    .get(info.symbol)
+                                    .and_then(|p| p.ionic_charge())
+                                    .unwrap_or(0.0)
+                                    * info.num_ions as f64
+                            })
+                            .sum();
+                        if let Some(castep_bin) =
+                            crate::scf_capture::capture_as_castep_bin(&next, n_electrons)
+                        {
+                            use chemrust_hamiltonian_core::CheckFile;
+                            let path = std::env::var("CHEMRUST_CHECK_DUMP")
+                                .unwrap_or_else(|_| "chemrust_iter2.check".to_string());
+                            if let Ok(mut file) = std::fs::File::create(&path) {
+                                if let Err(e) = CheckFile::write(&castep_bin, &mut file) {
+                                    tracing::warn!(
+                                        "[scf capture] failed to write .check: {e}"
+                                    );
+                                } else {
+                                    tracing::info!(
+                                        "[scf capture] iter-2 state written to {}",
+                                        path,
+                                    );
+                                }
+                            }
+                        }
+                    }
+
                     let mut s: ScfIteration<_, Initialized, MixingOff> = next;
                     s.next_mixing = next_mixing;
                     s
