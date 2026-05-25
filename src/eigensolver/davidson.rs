@@ -607,9 +607,16 @@ pub(crate) unsafe fn davidson_v1(
             )?;
             psi_unconv_dev = psi_unconv_new;
         } else {
-            // Multiple blocks: solve each independently
+            // Multiple blocks: solve each independently.
+            // `detect_degenerate_blocks` only returns blocks of size ≥ 2;
+            // isolated single bands are not included in any block.
+            // We must preserve those columns verbatim — otherwise they
+            // become zeros and corrupt the psi for the next outer iteration.
             let mut psi_rotated: CudaSlice<CudaComplex> =
                 stream.alloc_zeros(n_pw * k).map_err(Error::Cuda)?;
+            stream
+                .memcpy_dtod(&psi_unconv_dev, &mut psi_rotated)
+                .map_err(Error::Cuda)?;
 
             for &(block_lo, block_hi) in blocks.iter() {
                 let bk = block_hi - block_lo;
