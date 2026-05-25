@@ -4806,3 +4806,156 @@ fn test_scf_converges_with_davidson() {
         std::env::remove_var("CHEMRUST_EIGENSOLVER");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Step 1 discriminator: does Chebyshev-RR also cascade at iter-3?
+// ---------------------------------------------------------------------------
+// If Chebyshev also cascades → bug is in SCF feedback loop (V_eff/D_screened/mixing).
+// If Chebyshev converges clean → bug is Davidson-specific.
+//
+// See plan: ~/programming/chemrust-scf/../just-now-i-dazzling-quilt.md Step 1.
+
+#[test]
+#[ignore = "requires GPU and CASTEP fixture data"]
+#[cfg(feature = "scf_diag")]
+fn step1_chebyshev_iter3_cascade_discriminator() {
+    if !gpu_available() {
+        eprintln!("SKIP: no GPU available");
+        return;
+    }
+    init_tracing();
+
+    unsafe {
+        std::env::set_var("CHEMRUST_EIGENSOLVER", "chebyshev");
+    }
+
+    let fx = fixtures::cu111_co::fixture();
+    let castep_band0 = -1.05502287_f64;
+
+    // Iter-1
+    let state = fixtures::cu111_co::build_scf_state(fx);
+    let iter1_state = state.build_v_eff_with_energy().expect("iter-1 build_v_eff");
+    let veff1_range = iter1_state.v_eff().as_ref().map(|veff| {
+        let arr = veff.as_real_grid().as_real_array();
+        let mn = arr.iter().cloned().fold(f64::INFINITY, f64::min);
+        let mx = arr.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        mx - mn
+    });
+    let iter1_diag = iter1_state.diagonalize(0, None).expect("iter-1 diagonalize");
+    let eigs_1 = iter1_diag.eigenvalues().to_vec();
+    let iter1_dens = iter1_diag.construct_density_off().expect("iter-1 construct_density");
+    let iter2_state = match iter1_dens.mix().check(1e-8).expect("iter-1 check") {
+        chemrust_scf::CheckOutcome::Converged(_) => panic!("iter-1 converged early"),
+        chemrust_scf::CheckOutcome::NotConverged { state, .. } => state,
+    };
+
+    // Iter-2
+    let iter2_veff = iter2_state.build_v_eff_with_energy().expect("iter-2 build_v_eff");
+    let veff2_range = iter2_veff.v_eff().as_ref().map(|veff| {
+        let arr = veff.as_real_grid().as_real_array();
+        let mn = arr.iter().cloned().fold(f64::INFINITY, f64::min);
+        let mx = arr.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        mx - mn
+    });
+    let iter2_diag = iter2_veff.diagonalize(0, None).expect("iter-2 diagonalize");
+    let eigs_2 = iter2_diag.eigenvalues().to_vec();
+    let iter2_dens = iter2_diag.construct_density_off().expect("iter-2 construct_density");
+    let iter3_state = match iter2_dens.mix().check(1e-8).expect("iter-2 check") {
+        chemrust_scf::CheckOutcome::Converged(_) => panic!("iter-2 converged early"),
+        chemrust_scf::CheckOutcome::NotConverged { state, .. } => state,
+    };
+
+    // Iter-3
+    let iter3_veff = iter3_state.build_v_eff_with_energy().expect("iter-3 build_v_eff");
+    let veff3_range = iter3_veff.v_eff().as_ref().map(|veff| {
+        let arr = veff.as_real_grid().as_real_array();
+        let mn = arr.iter().cloned().fold(f64::INFINITY, f64::min);
+        let mx = arr.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        mx - mn
+    });
+    let iter3_diag = iter3_veff.diagonalize(0, None).expect("iter-3 diagonalize");
+    let eigs_3 = iter3_diag.eigenvalues().to_vec();
+
+    let iter3_band0_ha = eigs_3[0];
+    let iter3_drift = (iter3_band0_ha - castep_band0).abs();
+
+    // Print diagnostics
+    println!("=== Step 1: Chebyshev iter-3 cascade discriminator ===");
+    println!("V_eff range iter-1: {:?} Ha", veff1_range);
+    println!("V_eff range iter-2: {:?} Ha", veff2_range);
+    println!("V_eff range iter-3: {:?} Ha", veff3_range);
+    println!("Energy iter-1:      (available after check)");
+    println!("Energy iter-2:      (available after check)");
+    println!("Energy iter-3:      (available after check)");
+    println!("Band-0 iter-1:      {:.6} Ha", eigs_1[0]);
+    println!("Band-0 iter-2:      {:.6} Ha", eigs_2[0]);
+    println!("Band-0 iter-3:      {:.6} Ha", iter3_band0_ha);
+    println!("CASTEP band-0:      {:.6} Ha", castep_band0);
+    println!("Iter-3 drift:       {:.6} Ha", iter3_drift);
+
+    // Discriminator logic (mirrors plan Step 1 expected outcomes)
+    let veff3 = veff3_range.unwrap_or(0.0);
+    let cascades = veff3 > 20.0 || iter3_drift > 1.0;
+
+    if cascades {
+        println!(
+            "RESULT: Chebyshev ALSO cascades at iter-3 (V_eff range={:.2} Ha, drift={:.4} Ha).\n\
+             → Bug is in SCF feedback loop (V_eff/D_screened/mixing), NOT eigensolver-specific.\n\
+             → [[chebyshev_rr_architecturally_unsuitable]] is FALSIFIED.\n\
+             → Proceed to Step 2 (V_eff isolation)."
+        , veff3, iter3_drift);
+    } else {
+        println!(
+            "RESULT: Chebyshev does NOT cascade at iter-3 (V_eff range={:.2} Ha, drift={:.4} Ha).\n\
+             → Bug is Davidson-specific.\n\
+             → [[chebyshev_rr_architecturally_unsuitable]] stands.\n\
+             → Proceed to Davidson-specific diagnosis."
+        , veff3, iter3_drift);
+    }
+
+    assert!(iter3_band0_ha.is_finite(), "iter-3 band-0 not finite");
+
+    unsafe {
+        std::env::remove_var("CHEMRUST_EIGENSOLVER");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Iter-2 .check discriminator — write chemrust iter-2 state as CASTEP .check
+// ---------------------------------------------------------------------------
+// Run with:
+//   CHEMRUST_CHECK_DUMP=/tmp/chemrust_iter2.check cargo test --release
+//     test_iter2_check_discriminator -- --ignored --nocapture
+// Then copy the .check to a CASTEP job dir and run with `continuation`.
+#[test]
+#[ignore = "requires GPU + CASTEP fixture"]
+fn test_iter2_check_discriminator() {
+    if !gpu_available() {
+        eprintln!("SKIP: no GPU available");
+        return;
+    }
+    init_tracing();
+
+    unsafe {
+        std::env::set_var("CHEMRUST_EIGENSOLVER", "davidson");
+    }
+
+    let fx = fixtures::cu111_co::fixture();
+    let state = fixtures::cu111_co::build_scf_state(fx);
+
+    let gate = chemrust_scf::ScfDivergenceGate {
+        parameters_raw: fx.check.parameters_raw.clone(),
+        ..Default::default()
+    };
+
+    let _result = chemrust_scf::run_scf_with_energy_gated(
+        state,
+        8,
+        1e-8,
+        Some(gate),
+    );
+
+    // Should not reach here — capture panics at iter-2.
+    panic!("SCF did not stop at iter-2");
+}
+
