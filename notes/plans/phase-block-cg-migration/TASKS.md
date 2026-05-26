@@ -350,7 +350,7 @@ Gate 2: Convergence from Pseudoatomic Guess
 
 **Counter-example**: If convergence takes > 50 steps, the preconditioner is ineffective or the line search is suboptimal.
 
-**Test fixture scope**: Cu111_CO V_eff + pseudoatomic guess
+**Test fixture scope**: Cu111_CO V_eff + random initialization (CASTEP method='R')
 
 **Verification granularity**: Per-iteration residual norm + final eigenvalue comparison
 
@@ -418,13 +418,20 @@ This is P⁻¹ = T⁻¹ + T⁻¹·β·R·β†·T⁻¹ where R = (−Q⁻¹ − 
 
 ### Exploration 5: Initial Guess Strategy
 
-**Initial assumption**: Gate 2 uses "random ψ".
+**Initial assumption**: Gate 2 uses "random ψ" but unclear what that means.
 
-**User clarification**: "chemrust-hamiltonian ports the pseudoatomic SCF of CASTEP in its Hubbard U module. That should be also how CASTEP generates initial guess too?"
+**User challenge**: "This is not physical. How can you expect you can converge without generating guesses for C and O atom too?"
 
-**Finding**: chemrust-hamiltonian's `atomic_solver` module provides pseudoatomic SCF. This is more realistic than random coefficients and matches CASTEP's actual initialization.
+**Source audit** (CASTEP `wave.f90:1900-1949`):
+CASTEP's `wave_initialise` with method='R' generates random complex coefficients:
+- Uniform distribution: ψ[g] = (rn1 - 0.5) + i·(rn2 - 0.5) where rn1, rn2 ~ U(0,1)
+- Only for plane waves with E_k < 3.307 Ha (90 eV cutoff, hardcoded line 1737)
+- Higher energy plane waves are zeroed
+- Then S-normalized
 
-**Implication**: Gate 2 will use pseudoatomic guess from `atomic_solver::solve_pseudoatomic_scf()`, not random coefficients. This is a more realistic test of CG convergence.
+**Finding**: CASTEP does NOT use LCAO/pseudoatomic superposition for initial guess in the standard path. It uses simple random initialization with a kinetic energy cutoff.
+
+**Implication**: Gate 2 will use CASTEP's random initialization (method='R'), not pseudoatomic SCF. This is the actual CASTEP algorithm.
 
 ## Risk Assessment
 
