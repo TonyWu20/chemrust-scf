@@ -1301,6 +1301,7 @@ pub fn chebyshev_filter_for_test(
     max_veff: f64,
     ndeg: usize,
     eigenvalues: Option<&[f64]>,
+    filter_mode: FilterMode,
     blas: &BlasHandle,
     solver: &SolverHandle,
     stream: &Arc<CudaStream>,
@@ -1368,7 +1369,7 @@ pub fn chebyshev_filter_for_test(
         solver,
         stream,
         ctx,
-        FilterMode::BareH, // Standard mode for diagnostic
+        filter_mode,
     )?;
 
     // Download filtered ψ̂ from GPU (RowDistributed layout)

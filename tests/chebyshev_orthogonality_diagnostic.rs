@@ -156,10 +156,9 @@ fn off_diagonal_stats(m: &Array2<Complex64>) -> (f64, f64, f64) {
     (max, median, mean)
 }
 
-#[test]
-#[ignore = "requires GPU and CASTEP fixture data"]
-fn diagnostic_1_orthogonality_after_chebyshev_filter() {
-    use chemrust_scf::{chebyshev_filter_for_test, BlasHandle, SolverHandle, VnlBatchData};
+/// Helper function to run orthogonality diagnostic with a specific filter mode
+fn run_orthogonality_diagnostic(filter_mode: chemrust_scf::FilterMode, mode_name: &str) {
+    use chemrust_scf::{BlasHandle, SolverHandle, VnlBatchData};
     use cudarc::driver::CudaContext;
     use std::sync::Arc;
     use chemrust_hamiltonian_core::GVectorGrid;
@@ -169,7 +168,7 @@ fn diagnostic_1_orthogonality_after_chebyshev_filter() {
         return;
     }
 
-    println!("\n=== Diagnostic 1: Orthogonality After Chebyshev Filtering ===\n");
+    println!("\n=== Diagnostic 1: Orthogonality After Chebyshev Filtering ({}) ===\n", mode_name);
 
     let fx = fixtures::cu111_co::fixture();
 
@@ -263,8 +262,8 @@ fn diagnostic_1_orthogonality_after_chebyshev_filter() {
 
     // Run Chebyshev filter (ndeg=8, no prior eigenvalues)
     let ndeg = 8;
-    println!("Running Chebyshev filter with ndeg = {}...", ndeg);
-    let psi_filtered = chebyshev_filter_for_test(
+    println!("Running Chebyshev filter with ndeg = {}, mode = {}...", ndeg, mode_name);
+    let psi_filtered = chemrust_scf::chebyshev_filter_for_test(
         &psi_input,
         &v_eff_flat,
         n_bands,
@@ -278,6 +277,7 @@ fn diagnostic_1_orthogonality_after_chebyshev_filter() {
         max_veff,
         ndeg,
         None, // No prior eigenvalues (first call)
+        filter_mode,
         &blas,
         &solver,
         &stream,
@@ -350,6 +350,29 @@ fn diagnostic_1_orthogonality_after_chebyshev_filter() {
         println!("DIAGNOSTIC RESULT: Orthogonality is completely broken (κ₂ = infinity)");
         println!("                   → Abandon iterative Chebyshev, use band-by-band CG");
     }
+}
+
+#[test]
+#[ignore = "requires GPU and CASTEP fixture data"]
+fn diagnostic_1_orthogonality_after_chebyshev_filter() {
+    // Original test: BareH mode (physically incorrect for USPP, but baseline)
+    run_orthogonality_diagnostic(chemrust_scf::FilterMode::BareH, "BareH");
+}
+
+#[test]
+#[ignore = "requires GPU and CASTEP fixture data"]
+fn diagnostic_1b_orthogonality_sinvh_keep_h_eig() {
+    // CRITICAL: Test the production filter mode (SinvHKeepHEig)
+    // This is the mode actually used in the SCF loop for USPP systems.
+    // If κ₂ > 10¹⁰ here, the entire PARSEC Algorithm 4 approach may not work.
+    run_orthogonality_diagnostic(chemrust_scf::FilterMode::SinvHKeepHEig, "SinvHKeepHEig");
+}
+
+#[test]
+#[ignore = "requires GPU and CASTEP fixture data"]
+fn diagnostic_1c_orthogonality_sinvh_full_das() {
+    // Optional: Test the full Das Algorithm 3 mode
+    run_orthogonality_diagnostic(chemrust_scf::FilterMode::SinvHFullDas, "SinvHFullDas");
 }
 
 #[test]
