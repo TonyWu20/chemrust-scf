@@ -175,7 +175,10 @@ pub fn capture_as_castep_bin<S: SpinPolicy>(
         total_energy,
         eigenvalues,
         density,
-        parameters_raw: None,
+        parameters_raw: vec![],
+        cell_raw: vec![],
+        orig_cell_raw: vec![],
+        kpoint_weights: vec![1.0], // Single Gamma-point with weight 1.0
         fine_grid: Some(fine_grid_dims),
         wavefunction: Some(wavefunction),
         forces: None,

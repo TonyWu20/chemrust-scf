@@ -1,0 +1,527 @@
+\section{Introduction}
+\label{sec-1}
+
+\begin{comment}
+\textit{
+\begin{itemize}
+    \item STATEMENT: Initial paragraph stating the problem that the paper addresses and its proposed solution including its novelty and its applications. {\bf DONE}
+    \item SOTA: Give a concise description of the state of the art of Chebyshev accelerated subspace iteration with many references to scientific papers, HPC optimizations, applications to domain software and stand alone libraries. {\bf DONE}
+    \item SUBSECTION: brief description of the general subspace iteration + Chebyshev filtering and RR-projection. Introduce the ChASE library specialized algorithm, its optimizations (polynomial degree, spectral bounds), its emphasis on HPC and parallelism. {\bf DONE} 
+    \item SUBSECTION: Focus on QR-factorization. Enlist the many algorithms for factorizing tall and skinny matrices. Describe the stability and the performance aspects of each of them. Emphasize the issues that accompany the CholeskiQR and how they have been addressed in the last 10 years. Describe how the Chebyshev filtering may make the use of CholeskiQR unfeasible if not appropriately controlled. State in details the goal of the paper and the results that achieves. State how such results can be used to switch from different QR-algorithms including the various flavors of CholeskiQR and how the switching mechanism can be used to enhance performance in ChASE. {\bf DONE}
+    \item Describe the structure of the manuscript and its original contributions. {\bf DONE}
+\end{itemize}
+}
+\end{comment}
+
+Subspace iteration with Chebyshev acceleration is among the earliest and most influential iterative techniques developed for computing a selected portion of the spectrum of symmetric (Hermitian) algebraic eigenvalue problems, and it remains a cornerstone of modern large-scale eigensolvers. A trial subspace is first enhanced through a polynomial filtering step that amplifies the components associated with the desired eigenvalues, after which the resulting vectors are orthonormalized and used to construct a reduced eigenvalue problem via a Rayleigh–Ritz projection. This reduced problem is then solved using standard dense diagonalization techniques (e.g., divide-and-conquer algorithm), and the resulting approximate eigenpairs are projected back to the original space and tested for convergence. 
+
+From a computational standpoint, this workflow is dominated by two key computations: the filtering step, which can be efficiently expressed as repeated matrix–matrix multiplications (GEMM) and therefore maps well to modern hardware, and the orthonormalization step, which is typically performed using the Householder QR algorithm and constitutes the second most expensive operation. Unlike the filter, Householder QR relies heavily on lower-level BLAS routines and is less amenable to efficient high-performance implementations. A natural alternative is the CholeskyQR algorithm, which is rich in BLAS-3 operations and can be implemented in a manner similar to the Chebyshev filter. However, CholeskyQR is notoriously sensitive to the condition number of the matrix of vectors to be orthonormalized, a difficulty exacerbated by the fact that polynomial filtering tends to produce highly correlated subspaces. Recent variants such as CholeskyQR2 \cite{fukaya2014choleskyqr2} and shifted 
+CholeskyQR2 \cite{fukaya2020shifted} offer promising alternatives, provided reliable information about the condition number of the subspace is made available. In this work, we present a detailed numerical analysis of the conditioning of the filtered subspace under an exhaustive range of scenarios and show how this information can be exploited to safely modify the 
+orthonormalization step within subspace iteration. We implement the resulting strategy in 
+the ChASE eigensolver library and demonstrate that it delivers both numerical robustness and significant performance gains on modern architectures.
+
+
+\subsection{Filtered subspace iteration: its inception and modern revival}
+One of the the first explicit mention in the scientific literature of
+subspace iteration applied to the solution of the symmetric algebraic
+eigenvalue problems is by L.~Bauer in
+1957~\cite{Bauer:1957hv}. Following this work, as famously mentioned
+by Parlett~\cite{Parlett:1998tv}, eigensolvers based on subspace
+iteration [ ... where developed in the 1960s and 1970s when the
+Lanczos algorithm was under the cloud]. What shaped subspace
+iteration in its modern form is the fundamental work of Rutishauser in
+a number of papers spanning from 1969 to
+1971~\cite{Rutishauser:1969ub, Rutishauser:1971wc,
+  Rutishauser:1970wc}. The first paper of this
+series~\cite{Rutishauser:1969ub} builds on Bauer's Simultaneous
+Iteration method and introduce many of the key ideas included in
+modern implementations of eigensolvers based on subspace
+iteration. Soon after is groundbreaking work, Rutishauser published
+two similar papers with additional details of the algorithm (named {\it
+  ritzit}) which are at the base of its robustness and
+efficacy~\cite{Rutishauser:1970wc, Rutishauser:1971wc}.
+
+Soon after Rutishauser's first publication, several authors
+contributed to improve his initial algorithm. For instance, the Ritz
+iteration, which projects the eigenproblem onto the search space using
+a Jacobi step, was upgraded by Stewart to a Rayleigh-Ritz step so as
+to avoid to deal with non-positive definite
+matrices~\cite{Stewart:1969cq}. Stewart rigorously
+demonstrated the enhanced convergence of the eigenpairs when
+orthogonal iteration (subspace + orthonormalization) is used in
+conjunction with Rayleigh-Ritz. Concurrently to these development a
+version of subspace iteration was developed by civil engineers
+proposing an algorithm very similar to Rutishauser's, but their
+exposition is less clear-cut and uses a language and formalism
+somewhat different from conventional numerical
+analysts~\cite{Clint:1970wz}. The interested reader can find a clear
+review of the improved {\it ritzit} algorithm in Parlett
+book~\cite{Parlett:1998tv}.
+
+Alongside these developments, several authors generalized subspace
+iteration to non-Hermitian and unsymmetric eigenproblems
+(see~\cite{Stewart:1976vaa} for an example). In the intervening years
+up to the last decade, the development of iterative eigensolvers for
+the Hermitian eigenvalue problem took a different direction due to the
+resurgence of the Lanczos algorithm and its
+variations~\cite{Cullum:1974fe, Parlett:1979vf, Cullum:1985wj,
+  Wu:2000vq, Davidson:1975wf, Crouzeix:1994wh, Ruhe:1984ep,
+  Stewart:2002tw}. Subspace iteration eigensolvers saw a revival in
+popularity starting in the middle of the 2000s with application to
+electronic structure theory, first in the context of sparse
+eigenproblems~\cite{Zhou:2006ek, Zhou:2014fe}, and later also for
+sequences of dense eigenproblems~\cite{Berljafa:2014jv, Levitt:2015wc}.
+This coming back is due in part to the emerging need of solving for
+just the full subspace without resolving the single
+eigenpairs~\cite{Zhou:2006ek} and in part to the ability of the
+eigensolver to receive as input approximate eigenvectors, and in doing
+so, decrease considerably its time-to-convergence~\cite{DiNapoli:2012uy}.
+
+The last decade has witnessed an increased use of filtered subspace iteration in new advanced methods of electronic structure computations. A Chebyshev filtered subspace iteration has been used to power a discontinuous Galerkin approach to solve the Kohn-Sham equation using a adaptive local basis set \cite{Banerjee2016, Banerjee2018}. Similarly, an early version of the ChASE library \cite{Winkelmann2019chase} was integrated to solve Excitonic Hamiltonian emerging from the Tamm-Dancoff approximation (TDA) of the Bethe-Salpeter equation \cite{zhang2021solving}. It has been also shown that Chebyshev Filtered subspace returns high-performance gains on many cores \cite{Kreutzer2018}. More recently, our team has endevoured in a substantial effort to develop the ChASE library into a full-fledged accelerated and distributed parallel library \cite{Wu2022chase,Wu2023chase} with further extensions to pseudo-Hermitian eigenproblems \cite{dinapoli2026chase} arising from Bethe-Salpeter equation beyond TDA.      
+
+
+%\subsection{Quotient iteration and  Raleigh-Ritz (R-R) projection.}
+%\label{sec-2-1}
+% {\it In this section we need to mention convergence theorems
+%   only. There is no need mention backward stability. Sensitivity of
+%   the solution to starting vectors can be just mentioned as an element
+%   of stability already suggested by Rutishauser. No theorems needed
+%   for that.
+% }
+
+
+\begin{comment}
+For sake of simplicity, and only in this section, we make the two
+following additional hypothesis: first we assume that $A$ is positive
+definite ($\lambda_1 > 0$), second we seek the highest $k$ eigenpairs
+corresponding to $(\lambda_{n-k},x_{n-k}),\ldots,(\lambda_n,x_n)$.
+Algorithm~\ref{alg:SubIt} illustrate the traditional structure of the
+Quotient Iteration algorithm including a Rayleigh-Ritz step. This is
+by no means the most general subspace iteration algorithm but it is
+complex enough to aid in analyzing its conventional convergence
+properties.
+
+\newlength{\dlen} \settowidth{\dlen}{{\sc Check for convergence}} 
+\newlength{\ylen} \settowidth{\ylen}{Y}
+\begin{algorithm}[h!t]
+  \caption{Quotient Iteration + Rayleigh-Ritz}
+  \label{alg:SubIt}
+  \begin{algorithmic}[1]
+  \Require Matrix $A$, % vector matrix 
+  % $ \subit{V}{0} \equiv \left[
+  %   v^{(0)}_1, \ldots, v^{(0)}_{k} \right]$
+  \Ensure $k$ extremal eigenpairs $\left(\Lambda,Y\right)$ with
+  $\Lambda = \diag (\lambda_n, \ldots,\lambda_{n-k})$ and $Y = \left[
+    y_n, \ldots, y_{n-k}\right]$.
+  \item[]
+  \State Set the size of search space $\ell > k$ 
+  \State $\subit V{0} \gets {\rm randn}(n,\ell)$
+  \While{size$(Y) < k$}
+  \State Compute, $\subit V{i}= A \subit V{i-1}.$ \label{lst:line:subsp} 
+  \Comment{\parbox{\dlen}{\sc Subspace Projection}}
+  \State Orthonormalize $\subit V{i} = \subit Q{i} \subit{R}{i}.$ \label{lst:line:QR}
+  \Comment{\parbox{\dlen}{\sc QR algorithm}} 
+  \State Compute Rayleigh quotient $\tilde{A} = \her{\subit Q{i}} A\
+  \subit Q{i}.$ \label{lst:line:rrst} 
+  \Comment{\parbox{\dlen}{{\sc Rayleigh-Ritz} (Start)}}
+  \State Solve the reduced problem $\tilde{A} =\subit W{i}
+  \subit{\tilde{\Lambda}}{i} \her{\subit W{i}}$.
+  \State Compute $\subit V{i} \gets \subit Q{i} \subit W{i}.$ \label{lst:line:rren}
+  \Comment{\parbox{\dlen}{{\sc Rayleigh-Ritz} (End)}}
+    \If{${\rm Res}(\subit{V_{:,a}}{i},\tilde{\lambda}_a)<\textsc{tol}$}
+    \label{lst:line:resid} 
+    \Comment{\parbox{\dlen}{{\sc Check for convergence}}}
+    \State $\parbox{\ylen}{$\Lambda$}= \big[\Lambda\;\tilde{\lambda}_a\big]$
+    and $\parbox{\ylen}{Y}= \big[Y\;\subit{V_{:,a}}{i}\big]$ 
+    \EndIf
+  % \State Compute residuals ${\rm Res}(\subit{V_{:,j}}{i},\tilde{\lambda}_j)<\textsc{tol}$
+  \EndWhile
+\end{algorithmic}
+\end{algorithm}
+
+The simplest version of subspace iteration is realized by removing
+from Algorithm~\ref{alg:SubIt} all the lines between
+Line~\ref{lst:line:subsp} and~\ref{lst:line:resid}. Notice that we are
+already considering a search space which is larger than the sought
+after subspace. Such a choice increases the convergence ratio at the
+cost of extra computations. The resulting subspace converges linearly
+to the desired eigenspace under the mild assumption that the matrix
+$\her{X} \subit V{0}$ is indeed an $\ell\times \ell$ invertible
+matrix. Let us define with
+$\subit \Scal{i} = \Rcal\left(\subit V{i}\right)$ the subspace spanned
+by the column of $\subit V{i}$ and with $\Theta^{(i)}$ the largest
+canonical angle between $\subit \Scal{i}$ and $\Rcal (X_1)$ with
+$X_1 = [x_n, \ldots , x_{n-\ell}]$. Then $\exists\ \varepsilon_i > 0$
+such that
+% In particular, for any
+% $\varepsilon > 0$ one can define $\Theta^{(i)}$ as the largest canonical
+% angle between $\Rcal (A \subit V{i-1})$ and $\Rcal (X_1)$ with
+% $X_1 = [x_n, \ldots , x_{n-k}]$, such that
+\[
+\Theta^{(i)} = \odg{\left[ \frac{\lambda_{n-\ell-1}}{\lambda_{n-k}} +
+    \varepsilon_i \right]^i}
+\]
+holds (see~\cite{Stewart:2001id} pp.389-90) with $\lim_{i
+  \longrightarrow \infty} \varepsilon_i = 0$. This relation
+illustrates the convergence of whole subspace and as such it does not give any
+indication on how well each single eigenvector $x_a$ can be
+approximated by $\subit \Scal{i}$. A refined version of the
+convergence bound for a single vector is given by
+\[
+\tan \left( \theta_a^{(i)}\right) \leq \left[ \frac{\lambda_{n-\ell-1}}{\lambda_{a}}
+\right]^i \tan \left( \Theta^{(0)}\right) 
+\]
+where $\theta_a^{(i)}$ is the angle between $x_a$ and
+$\subit \Scal{i}$ (see~\cite{Parlett:1998tv} pp.332-3).
+
+When the QR factorization is added to the picture, by adding
+Line~\ref{lst:line:QR} to Algorithm~\ref{alg:SubIt}, one can formulate
+the convergence to single eigenvectors in a more compact and effective
+manner 
+\begin{theorem}
+\label{th:convsaad}
+Let $\subit \Pcal{i}$ and $P_1$ being the orthogonal projectors onto the
+subspaces $\subit \Scal{i}$ and $\Rcal (X_1)$ respectively and assume
+that $\her{X} \subit V{0}$ is invertible. Then for each eigenvector
+$x_a$ of $A$ with $a=1,\dots ,\ell$ there exists a unique vector $v_a$
+in $\subit \Scal{0}$ such that $P_1 v_a = x_a$ and the following
+inequality is satisfied
+  \[
+  \left\|\left(I - \subit \Pcal{i} \right)x_a\right\| \leq \|x_a - v_a
+  \| \left( \left|\frac{\lambda_{n-\ell-1}}{\lambda_{n-k}}\right| +
+    \varepsilon_i \right)^i
+  \]
+\end{theorem}
+(see \cite{Saad:2011tu} pp.119-20 for a demonstration). This theorem
+guarantees the existence and uniqueness of the solution within the
+subspace $\subit \Scal{i}$ and at the same time bounds from above the
+ratio of convergence (in the case where $A$ is diagonalizable a bound
+for sequence of $\varepsilon_i$ can also be found). In practice the
+computation of the actual subspace is benefitted by the QR
+factorization which eliminates rank deficient occurrencies.  It is
+worth mentioning that the orthonormalization is already introduced by
+Rutishauser~\cite{Rutishauser:1969ub}. In particular, he suggests to
+combine few iterations together before performing the
+orthonormalization, so as to avoid eccessive computation and extract
+the most benefit out of it. As already mentioned, the same paper
+introduces already a Ritz iteration which is performed on the product
+$\her{\subit V{i}} \subit V{i} = \her{\subit{R}{i}} \subit{R}{i}$.
+While this trick reduces the overall amount of floating point
+operations, it has the limiting feature of being possible only for
+positive definite $A$.
+
+A more general, even if more expensive, alternative is to perform a
+Raleigh-Ritz (R-R) step as introduced in~\cite{Stewart:1969cq}. In
+this paper the author shows how such a step enhances the
+convergence of the quotient iteration in the case of Hermitian
+eigenproblems. Through backward perturbation analysis one can infer
+that the Ritz vector $w_a$ maintains a linear convergence
+\[
+\sin \angle \left(x_a, \subit Q{i} \subit w{i}_a\right) = \odg{\theta_a^{(i)}}
+\]
+while the Ritz value $\tilde{\lambda}_a$ has the additional feature of converging
+quadratically 
+\[
+\left| \subit{\tilde{\lambda}}{i}_a -\lambda_a \right| = \odg{\left[\theta_a^{(i)}\right]^2}
+\]
+as long as the uniform separation condition is satisfied
+(\cite{Stewart:2001id} pp. 286-90). In addition it can be shown that
+R-R minimizes the residual of a computed eigenpair and that if such a
+residual is small then the computed eigenpair is shown to be an exact
+eigenpair of the perturbed matrix $(A + E)$ (\cite{Stewart:2001id}
+p.61-3). For the latter reasons the standard stopping criterion for a
+subspace iteration is based on the computation of eigenpair residuals
+(see Line~\ref{lst:line:resid}) and not on the error. Historically
+Rutishauser uses a termination criterion based on the stagnation of
+the angles $\theta_a^{(i)}$ and does not compute the residual before
+the angle is accepted. While this criterion ensures that the algorithm
+will terminate even when the requested accuracy cannot be achieved, it
+limits the its flexibility when lower accuracies are required.
+{\bf need some refining here. Read Parlett book on R-R and perhaps add
+or modified material.} 
+
+\end{comment}
+% For
+% instance, introduces a re-orthogonalization of the vectors spanning
+% the approximate subspace, shows how projecting the eigenproblem onto
+% this subspace accelerate convergence of eigenvectors and use a filter
+% based on Chebyshev polynomials to further accelerate convergence.
+% In this publication some additional technical
+% details are introduced such as a search space larger than the required
+% subspace, and strategy to sombine iteration so as to avoid eccessive
+% re-orthogonalization.
+
+ 
+% \begin{remunerate}
+% \item Convergence theorems for subspace iteration (Stew p.57 [1
+%   vector], pp.389-90 [subspace]), (GvL pp.410-11), (Rutishauer 1969
+%   although the demonstrations here are rather simplistic and unclear),
+%   (Saad theorem 5.2). Stewart makes a spectral decomposition
+%   subdividing the spetrum in 3 parts: the wanted spectrum, the extra
+%   search space and the unwanted spectrum. The demonstration gives just
+%   the order of magnitude of the angle between computed subspace and
+%   eigenspace without QR re-orthogonalization.
+% \item Golub-vanLoan gives a more complex demonstration including QR
+%   but using only a spectral decomposition in two parts. Rutishauser
+%   also introduces QR by suggesting that it needs to be done only every
+%   so often. Refer to Stewart paper (1969)
+% \item Rayleigh-Ritz enhances convergence for eigenvalues and
+%   eigenvectors for Hermitian eigenproblems. An erlier verion of Ritz
+%   projection was also proposed by Rutishauser (1969, 1970). One can
+%   refer to Stewart paper on Non-Hermitian matrices of (1976) which
+%   introduces a slightly more sophisticated R-R using Schur
+%   complement. Look also at Parlett book (which described Ritzit
+%   anyway).If \( \sin(\theta) \) is the angle between X and the
+%   computed eigenvectors \( \tilde{X} \) then (Stew pp.286-90):
+% \begin{description}
+% \item[Eigenvalues] \( \tilde{\Lambda} \) converge with a rate
+%                          proportional to \( \mathcal{O}(\theta^2) \)
+% \item[Eigenvectors] \( \tilde{X} \) converge with a rate proportional
+%                           to \( \mathcal{O}(\theta) \)
+% \end{description}
+% \item Convergence criterion makes use of residuals (instead of
+%   solution error as used by Rutishauser 1969 and 1970).
+% \begin{description}
+% \item[The Rayleigh quotient] minimize the residual of a computed vector (Stew p.63)
+% \item[Backward analysis] if residual is small then the computed
+%              eigenvector is shown to be an exact eigenvector of (A +
+%              E) (Stew p.61)
+% \end{description}
+% \item Role of starting vectors (mentioned already in Rutishauser
+%   1969). This can be related to the convergence effectiveness and
+%   later on to motivate the importance of approximate vectors inputed
+%   to the algorithm (Stew p.60)
+% \end{remunerate}
+
+
+
+
+
+\subsection{A modern eigensolver based on Chebyshev Accelerated
+  Subspace iteration} 
+\label{sec-1-4}
+Let $A$ be a symmetric or complex Hermitian matrix of size $n$, having $n$
+real eigenvalues ordered such that the relation
+$\lambda_1\leq \lambda_2\leq \ldots \leq\lambda_n$ holds. The
+ascending ordering, which is the opposite of what is traditionally
+found in the literuture, is inspired by application to electronic
+structure calculations but it is otherwise equivalent to the more
+common descending ordering description. We are interested in the first 
+{\sf nev} eigenpairs---eigenvalues and their corresponding eigenvectors
+$(\lambda_1,x_1),(\lambda_2,x_2),\ldots,(\lambda_\nev,x_\nev)$---for $\nev\ll n$.
+The choice for the wanted part of the eigenspectrum is arbitrary but
+is in line with the examples presented in this work. Let us just
+remark that subspace iteration with a polynomial filter can be used
+equivalently for the highest part of the spectrum and not only to
+compute the smallest eigenpairs.
+
+\newlength{\dlen} \settowidth{\dlen}{{\sc Check for convergence}} 
+\newlength{\ylen} \settowidth{\ylen}{$Y$}
+\newlength{\clen}
+\settowidth{\clen}{\small{\sc Deflation \& Locking} (Start)}
+
+\begin{algorithm}[h!t]
+  \caption{ChASE: Chebyshev Accelerated Subspace iteration Eigensolver}
+  \label{alg:ChASE}
+  \begin{algorithmic}[1]
+  \Require Matrix $A$, {\it (optional) vector matrix 
+  $ \subit{V}{0} \equiv \left[
+    v^{(0)}_1, \ldots, v^{(0)}_{\nev} \right]$} 
+  \Ensure $\nev$ extremal eigenpairs $\left(\Lambda,Y\right)$ with
+  $\Lambda = \diag(\lambda_1, \ldots,\lambda_\nev)$ and $Y = \left[
+    y_1, \ldots, y_{\nev}\right]$.
+  %\item[]
+  \State Set the size of search space $\ell > \nev$ 
+  \State Initialize $\subit V{0} \gets {\rm randn}(n,\ell)$ \label{lst:line:init} %\left[ \subit{V}{0}, {\rm randn}(n,\ell-k) \right]$
+  \State Estimate $\lambda_1$, $\lambda_{\ell}$ and $\lambda_n$. \label{lst:line:lanczos} 
+  \Comment{\parbox{\clen}{\sc Lanczos}}
+  \While{size$(Y) < \nev$}
+  \State Filter the vectors, $\subit V{i} \gets \p i (A) \subit V{i-1}.$ \label{lst:line:cheby} 
+  \Comment{\parbox{\clen}{\sc Chebyshev filter}}
+  \State Orthonormalize $\subit Q{i} \gets \big[Y\; \subit V{i}\big] \inv{\subit{R}{i}}.$ \label{lst:line:QR} 
+  \Comment{\parbox{\clen}{\sc QR algorithm}} 
+  \State Compute Rayleigh quotient $\tilde{A} = \her{\subit Q{i}} A
+  \subit Q{i}.$ \label{lst:line:rrstarts} 
+  \Comment{\parbox{\clen}{{\sc Rayleigh-Ritz} (Start)}}
+  \State Solve the reduced problem $\tilde{A} \subit W{i} =\subit W{i}
+  \subit{\tilde{\Lambda}}{i}$.
+  \State Compute $\subit V{i} \gets \subit Q{i} \subit W{i}.$ \label{lst:line:rrends}
+  \Comment{\parbox{\clen}{{\sc Rayleigh-Ritz} (End)}}
+  \For{$a=\textsf{converged} \to \nev$ }  
+    \If{${\rm Res}(\subit{V_{:,a}}{i},\tilde{\lambda}_a)<\textsc{tol}$}
+    \Comment{\parbox{\clen}{{\sc Residuals}}}
+    \State $\parbox{\ylen}{$\Lambda$} \gets \big[\Lambda\;\tilde{\lambda}_a\big]$
+    \State $\parbox{\ylen}{$Y$} \gets \big[Y\;\subit{V_{:,a}}{i}\big]$ 
+    \Comment{\parbox{\clen}{{\sc Deflation \& Locking}}} \label{lst:line:dlstarts}
+    \EndIf
+    \EndFor 
+    \State $\subit V{i} \gets \big[\subit{V_{:,{\sf nonconverged}: \ell}}{i}\big]$ \label{lst:line:dlends}
+  \EndWhile
+\end{algorithmic}
+\end{algorithm}
+
+The ChASE algorithm Alg.~\ref{alg:ChASE} is a more sophisticated
+version of Rutishauser subspace iteration. The initial
+input requires only the matrix $A$ but can also accept a set of vectors
+$\subit V{0}$ which span the desired subspace. When specified as input, $\subit V{0}$ represents approximate solutions (e.g., when solving for a sequence of eigenproblems). When not specified, $\subit V{0}$ are initialized with normal random vectors ({\tt line~\ref{lst:line:init}}). The order $\ell$ of $\subit V{0}$
+is such that the search space is larger (but not much larger) than the
+desired number of eigenpairs $\nev$. 
+
+
+%It is important to stress that while
+%the full searched space is filtered by the Chebyshev polynomial, we
+%are concerned only with the convergence properties of the subspace
+%spanned by $k$ vectors $\subit{V_1}{i} \subset \subit{V}{i}$. 
+
+%As mentioned at the beginning of Section~\ref{sec-2-1}, in opposition
+%to Algorithm~\ref{alg:SubIt}, the desired part of the eigenspectrum is
+%the lowest one. Notice that, thanks to the properties of the Chebyshev
+%filter, solving for the highest part of the spectrum corresponds to
+%just substitute $A$ with $-A$.  
+
+In order to work efficiently the
+Chebyshev filter requires estimates for $\lambda_1, \lambda_\ell$ and
+$\lambda_n$. Only the latter has to be really bounded from above; the
+first two numbers can be estimated without compromising the
+effectiveness of the algorithm. All three values can be provided as
+part of the input or can be computed by running few Lanczos iterations
+({\tt line~\ref{lst:line:lanczos}}). Each time the body of the while
+loop is repeated, the vectors $\subit V{i}$ are filtered ({\tt
+  line~\ref{lst:line:cheby}}) by a Chebyshev polynomial with variable
+degree $m_i$. The resulting vectors are orthonormalized using a
+QR algorithm ({\tt line~\ref{lst:line:QR}}): this is the step which is the focus of this manuscript.  
+The orthonormalization is followed by a
+Rayleigh-Ritz projection ({\tt line~\ref{lst:line:rrstarts}}) at the
+end of which eigenvector residuals are computed,
+converged eigenpairs are deflated and locked ({\tt
+  line~\ref{lst:line:dlstarts}}) while the non-converged vectors are
+sent again to the filter to repeat the whole procedure ({\tt
+  line~\ref{lst:line:dlends}}).
+%\subsection{Locking, Deflation and Orthonormalization}
+This last step ensures that eigenpairs that already satisfy the stopping criterion
+are not further filtered which would unnecessarily increase the 
+number of floating-point operations (FLOPs) performed by ChASE. 
+%Therefore, 
+%it is good practice to remove the converged eigenvectors and eigenvalues 
+%from the arrays $V^{(i)}$ and $\Lambda^{(i)}$, and store them in the corresponding
+%output arrays $Y$ and $\Lambda$ ({\tt line~\ref{lst:line:dlstarts}-\ref{lst:line:dlends}}). 
+Only the remaining non-converged vectors are passed to the filtering step for
+further refinement.
+
+The orthonormalization phase is a key step of the algorithmic process. 
+In the Hermitian case, ChASE not only orthonormalizes
+the current search subspace but also ensures orthogonality against all previously
+converged eigenvectors. This step enhances convergence by removing components 
+of the space that correspond to already converged directions. Consequently, in 
+ChASE, the QR factorization is always applied to a matrix of size $n\times \ell$
+regardless of how many eigenpairs have already converged and been locked.
+For numerical robustness, this QR factorization is conventionally performed 
+using Householder QR implementation provided by LAPACK or ScaLAPACK. Numerical
+stability in this step is crucial for the convergence behavior of ChASE, particularly 
+during the initial iterations when the Chebyshev-filtered vectors can be 
+highly correlated. While stability is an important ingredient, the ChASE library pays a price in terms of  performance due to the use of a less than ideal algorithm (Householder QR).
+This is compounded by the observation that the QR factorization becomes increasingly
+important as more eigenpairs converge and are locked during the iteration process.
+When computing more than a small fraction of the spectrum, the orthonormalization
+step can thus become a critical performance bottleneck \cite{Wu2022chase}.
+
+
+\subsection{Replacing Householder QR with Communication-Avoiding CholeskyQR Variants}\label{sec:Replacing Householder QR with Communication-Avoiding CholeskyQR Variants}
+
+On distributed memory architectures, and particularly on GPUs, the traditional Householder QR factorization often becomes a major performance bottleneck. Although Householder QR provides excellent numerical stability, its performance is primarily constrained by communication rather than computation. The algorithm requires frequent synchronization and numerous small data exchanges between processes, especially during panel factorizations. These synchronization points introduce latency that scales poorly with the number of processes and are even more detrimental on GPU-based systems, where the deep memory hierarchy and kernel-launch overheads amplify the cost of fine-grained communication. Consequently, as the number of locked eigenpairs increases in ChASE and the subspace to be orthonormalized grows, the cumulative cost of Householder QR can dominate the overall runtime \cite{Wu2022chase}.
+
+To alleviate this bottleneck, we replaced the traditional Householder QR with communication avoiding (CA) variants of CholeskyQR~\cite{fukaya2014choleskyqr2,fukaya2020shifted}, which are more amenable to distributed and GPU-based architectures. In each iteration of ChASE, a QR factorization is performed on a rectangular matrix $\subit V{i} \in \mathbb{C}^{n \times k}$ with $n > k$. Among the available CAQR methods, we favor CholeskyQR over the tall-skinny QR (TSQR)~\cite{demmel2008communication}, even though both exhibit similar asymptotic communication costs. The main advantage of CholeskyQR lies in its simplicity: it relies on an additive reduction operation, while TSQR requires a QR factorization of a small matrix at every reduction step~\cite{fukaya2014choleskyqr2}. This difference simplifies the implementation and improves performance on hierarchical architectures, especially when efficient collective operations such as \texttt{MPI\_Allreduce} are available. Moreover, TSQR provides a clear performance advantage over ScaLAPACK’s Householder QR primarily when $n \gg k$~\cite{ballard2015reconstructing}, which is not typically the case in ChASE. For instance, in condensed-matter simulations, ChASE often targets about 10\% of the spectrum, leading to a moderate rather than an extreme $n/k$ ratios.
+
+Although CholeskyQR delivers superior performance and scalability, it suffers from a loss of orthogonality when the condition number of $\subit V{i}$ increases. This loss can be mitigated by performing the procedure twice, yielding the CholeskyQR2 algorithm~\cite{fukaya2014choleskyqr2} (see Algorithm \ref{alg:cholqr}). However, CholeskyQR2 remains limited by the requirement that the Cholesky factorization of the Gram matrix $R = X^H X$ succeeds, which only holds when the condition number $\kappa_2(X)$ does not exceed $\mathcal{O}(\mathbf{u}^{-1/2})$, where $\mathbf{u}$ is the unit round-off and $\kappa_2(X) = \frac{\sigma_{\max}(X)}{\sigma_{\min}(X)}$.
+
+\begin{algorithm}[htbp]
+\caption{CholeskyQR for $X = QR$} \label{alg:cholqr}
+\begin{algorithmic}[1]
+  \Function{CholeskyQR}{$X$, {\sf cholDeg}}
+    \For{$i = 1, \dots, ${\sf cholDeg}}
+      \State $R \leftarrow X^H X$
+      \State $[R, {\sf info}] \leftarrow \textsc{Cholesky}(R)$
+      \If{${\sf info} \neq 0$}
+        \State \Return {\sf Failure}
+      \EndIf
+      \State $X \leftarrow X R^{-1}$
+    \EndFor
+    \State \Return $X$
+  \EndFunction
+\end{algorithmic}
+\end{algorithm}
+
+
+To overcome this limitation, Fukaya et al.~\cite{fukaya2020shifted} proposed the shifted CholeskyQR2 (or $s$-CholeskyQR2) algorithm, which introduces a preconditioning step that shifts the Gram matrix $R$ by a small multiple of the identity. This shift effectively reduces the condition number of $X$, extending the applicability of CholeskyQR2 to matrices with $\kappa_2(X)$ up to $\mathcal{O}(\mathbf{u}^{-1})$.
+Table~\ref{tab:cond_for_qr} summarizes the condition number ranges for each of the QR variants. This characterization enables the dynamic selection of the most appropriate QR factorization variant to balance performance and numerical accuracy.
+
+\begin{table}[htbp]
+\footnotesize
+\renewcommand{\arraystretch}{1.}
+\caption{Maximal acceptable condition numbers for different QR variants. $\mathbf{u}$ denotes the unit round-off.}
+\label{tab:cond_for_qr}
+\centering
+\begin{tabular}{c|c|c|c|c}
+\toprule
+& CholeskyQR & CholeskyQR2 & $s$-CholeskyQR2 & HHQR \\
+\midrule
+$\kappa_2(X)$ & $\mathcal{O}(1)$ & $\mathcal{O}(\mathbf{u}^{-1/2})$ & $\mathcal{O}(\mathbf{u}^{-1})$ & Any \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Given its favorable performance characteristics, employing CholeskyQR and its variants within the ChASE library is highly attractive. At the same time, preserving numerical accuracy is essential and cannot be compromised. Achieving both performance and stability hinges on obtaining a reliable estimate of the condition number of the filtered vectors, $\kappa_2(V^{(i)})$. Directly computing this quantity is prohibitively expensive and would negate the performance gains offered by CholeskyQR. In this work, we demonstrate an alternative approach that provides a lightweight yet reliable estimate of the condition number without incurring significant overhead. We first present the resulting strategy and explain how it is used to adapt the QR step within the algorithm. The remainder of the paper is devoted to a rigorous derivation of these results and to numerical experiments that illustrate their impact on both the stability and performance of the ChASE library.
+
+
+\subsubsection{Condition number estimates and dynamic CAQR}
+
+For the simplest case when ChASE converges in one single step and does not optimize the polynomial degree (one degree for all vectors), we bound the condition number of the filtered vectors $\subit V{i}$ such that
+\begin{equation}
+\label{eq:simple-est}
+\cd \left(\subit V{i} \right) \leq \eta \rto 1{m},
+\end{equation}
+where $\rto 1{m}$ is the convergence ratio of the smallest eigenpair (see Definition \ref{def:conv_ratio}). When polynomial degree optimization is enabled, the filtering degree is adapted for each single column of the array $\subit V{i}$. In this case, the exponent in $\rto 1{m}$ is substituted with the highest polynomial degree which typically corresponds to the last vector of the search space $m_\ell$. 
+In the case when vectors are deflated and locked the expression for the bound gets further modified to
+\begin{equation}
+\label{eq:full-est}
+\cd (\subit V{i}) \lesssim \eta \rto {k+1}{m_{k+1}} \rto 1{m_\ell-m_{k+1}}. 
+\end{equation}
+where $m_k$ is the Chebyshev polynomial degree corresponds to the Ritz pair of index $k$, and $\subit V{i} \gets \big[Y\; \subit V{i}\big]$ is the rectangular matrix to be factorized, including the converged eigenvectors $Y$
+and newly filtered subspace .
+
+These estimations rely solely on data already available within ChASE---namely, the spectral bounds $(c, e)$, the computed Ritz values $\Lambda$, the optimized filter degrees $m_i$, and the number of locked eigenpairs $k$. 
+%\textsf{locked}. 
+As already mentioned, these estimations are based on a detailed spectral analysis of the Chebyshev-filtered subspace and constitute the central contribution of this paper which is exposed in the following sections.
+Based on the estimated condition number Eqs.~\eqref{eq:simple-est} and \eqref{eq:full-est}, we select the appropriate CholeskyQR variant following the heuristic in Algorithm~\ref{alg:caqr}. For double precision, if the estimated condition number exceeds $10^8$, the $s$-CholeskyQR2 variant is employed. For small condition numbers (below $20$), standard CholeskyQR suffices, while intermediate cases use CholeskyQR2. For robustness, a fallback mechanism (Algorithm~\ref{alg:caqr}, line~\ref{alg:line:scalapack_qr}) ensures that any failure in $s$-CholeskyQR2$ $ safely reverts to ScaLAPACK’s Householder QR routine.
+
+\begin{algorithm}[htbp]
+\caption{Dynamic CAQR selection in ChASE}\label{alg:caqr}
+\begin{algorithmic}[1]
+  \Function{Dynamic-CAQR}{$X$, \textsf{estCond}}
+    \If{\textsf{estCond} $> 10^8$} \Comment{High condition number: use $s$-CholeskyQR2}
+      \State $R \leftarrow X^H X$
+      \State ${\sf norm} \leftarrow \|X\|_F$
+      \State $s \leftarrow 11 (mn + n(n+1)) \, \mathbf{u} \, {\sf norm}$
+      \State $[R, {\sf info}] \leftarrow \textsc{Cholesky}(R + sI)$
+      \If{${\sf info} \neq 0$} \Comment{Cholesky failed, fallback to Householder QR}
+        \State $X \leftarrow \textsc{HouseholderQR}(X)$ \label{alg:line:scalapack_qr}
+      \Else
+        \State $X \leftarrow X R^{-1}$
+        \State $X \leftarrow \textsc{CholeskyQR}(X, \textsf{cholDeg}=2)$
+      \EndIf
+    \ElsIf{\textsf{estCond} $< 20$} \Comment{Well-conditioned: use single CholeskyQR}
+      \State $X \leftarrow \textsc{CholeskyQR}(X, \textsf{cholDeg}=1)$
+    \Else \Comment{Moderate conditioning: use CholeskyQR2}
+      \State $X \leftarrow \textsc{CholeskyQR}(X, \textsf{cholDeg}=2)$
+    \EndIf
+    \State \Return $X$
+  \EndFunction
+\end{algorithmic}
+\end{algorithm}
+
+In section \ref{sec-2}, we describe the spectral properties of the filtered vectors $\subit V{i}$ both in the case of generic polynomial degree and when such a degree is optimized for each single filtered vector. Section \ref{sec-3} provides a numerical analysis of the bounds for $\cd (\subit V{i})$ is all possible cases. Section \ref{sec-4} is devoted to numerical tests of the condition number bounds, comparison of dynamic CAQR with the traditional QR decomposition and some scaling tests. In section \ref{sec-5} we summarize and conclude.  
+
+%%% Local Variables: 
+%%% mode: latex
+%%% TeX-master: "main"
+%%% End:

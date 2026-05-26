@@ -1,0 +1,608 @@
+\section{Spectral decomposition of the subspace filtered by Chebyshev polynomials}
+\label{sec-2}
+In this section, we present a formal characterization of the subspace formed by vectors after the application of the filtering process. We begin by recalling the asymptotic properties of Chebyshev polynomials and then describe how these polynomials are employed to filter a matrix of vectors. Next, we introduce the notion of the convergence ratio associated with each eigenpair and demonstrate how these ratios naturally appear in the spectral decomposition of the filter. This framework allows us to express the filtered vectors through a matrix decomposition that clearly separates the components associated with the desired portion of the spectrum from those corresponding to the undesired part.
+
+
+\subsection{Chebyshev polynomials and their asymptotic properties}
+\label{sec-2-2}
+
+In order to address the general convergence properties of the
+Chebyshev acceleration of the subspace iteration algorithm, let us
+briefly recall the definition of the Chebyshev polynomials of the
+first kind and briefly describe their asymptotic properties.
+\begin{definition}[Chebyshev Polynomials]
+  The Chebyshev Polynomials $C_m(t)$ of degree $m$ on the interval
+  $\left[-1,1\right]$ are defined as
+	\begin{equation}
+	C_m(t)=\cos\left(m\cos^{-1}(t)\right), \quad \left| t\right| \leq 1
+	\label{eq:polydef}
+	\end{equation} 
+The domain of definition can be extended to the entire real axis by
+	\begin{equation*}
+	C_m(t)=\cosh\left(m\cosh^{-1}(t)\right), \quad t\in\R
+	\end{equation*}
+\end{definition}
+It customary and more practical to compute Chebyshev polynomials
+through a 3-terms recurrence relation, which can be easily derived
+from Prosthaphaeresis formula for the sum of two cosines (generalized
+to hyperbolic cosine using the Osborn's rule)
+\begin{equation}
+C_{m+1}(t)=2tC_m(t)-C_{m-1}(t)\ \qquad \forall\ t\in \R.
+\label{eq:recur}
+\end{equation}
+This recurrence relation together with the direct computation of
+$C_0(t)=1$ and $C_1(t)=t$ from eq.~(\ref{eq:polydef}) implies the
+Chebyshev Polynomials of any degree $m$ are indeed polynomials in $t$
+whose maximal degree is $m$.  While on the interval $[-1,1]$ a
+polynomial of degree $m$ reproduces an oscillating function with $m-1$
+extrema, for $|t| > 1$ the function diverges quite rapidly already for
+modest values of $m$.  This behavior can be easily quantified by
+expressing $C_m(t)$ as an implicit function of $t$.
+Let us define $\rho \doteq \exp(y)$, and write $\cosh(y)=\frac{\rho+\rho^{-1}}{2} = t$, 
+we obtain
+\begin{equation*}
+\rho^2-2t\rho+1=0
+\quad \Rightarrow \quad \rho=t \pm \sqrt{t^2-1},
+\end{equation*}
+which implies that both $\rho$ and $\rho^{-1}$ are admissible solutions. By convention we 
+choose 
+\[
+	|\rho| = \max_{\{\pm\}} \left|t \pm \sqrt{t^2-1}\right| \ , 
+        \quad |\rho|^{-1} = \min_{\{\pm\}} \left|t \pm \sqrt{t^2-1}\right|
+        \quad \textrm{for} \quad |t| >1 
+\]
+plug back in the definition of $\rho$ in order to express $y$
+\[
+	y = \acosh(t)=\ln\left|\rho\right|.
+\]
+Now the polynomial can be re-written as
+\begin{equation}
+	C_m(t)=\cosh\left(m\ln\left|\rho\right|\right) =
+%\frac{\exp\left(m\ln|\rho|\right)+\exp\left(-m\ln|\rho|\right)}{2}=
+        \frac{|\rho|^m+|\rho|^{-m}}{2}.
+\label{eq:polyas}
+\end{equation} 
+Since $|\rho|$ is, by definition, always bigger than one, the leading
+asymptotic behavior of the polynomial for $|t|>1$ is given by
+$C_m(t) \sim \frac{|\rho|^m}{2}$. In other words outside of the
+interval $[-1,1]$, $C_m(t)$ diverges as a polynomial of degree
+$m$. Incidentally inside this interval, the full expression for
+$C_m(t)$ is still valid. The only difference is that now $\rho$
+assumes complex values and so does the inverse hyperbolic function
+\[
+	\rho = t \pm i \sqrt{1-t^2} \quad \Rightarrow \quad \acosh(t) = \arg(t \pm i \sqrt{1-t^2}) = y,
+\]
+where $y$ is nothing else than the angle corresponding to a point on a
+circle of unit radius in the complex plane. Then eq.~(\ref{eq:polyas})
+now indicates the maximum value of $C_m(t)$ for $|t|<1$, namely 1.
+The following theorem~\cite{Saad:2011tu} provides the base for
+the Chebyshev acceleration of subspace iteration.
+\begin{theorem}
+  Let $\left|\gamma\right|>1$ and $\PP_m$ denote the set of
+  polynomials of degree smaller or equal to $m$. Then the extremum
+	\begin{equation*}
+	\min_{\{p\in \PP_m,p(\gamma)=1\}} \max_{\{t\in [-1,1]\}} {\left|p(t)\right|}
+	\end{equation*}
+is reached by
+	\[
+	{\rm p}_m (t) \doteq \frac{C_m(t)}{C_m(\gamma)}.
+	\]
+\label{th:approx}
+\end{theorem}
+In plain words, let's fix a point $\gamma$ and consider all
+polynomials which go through this point and which are maximal on a
+certain interval that does not contain $\gamma$. The smaller of these
+polynomials is uniquely realized by p$_m(t)$. Without affecting the
+theorem statement, the definition of p$_m(t)$ can be extended to
+generic $t$ but for our purpose it is most useful for $|\gamma|\geq|t|\geq  1$.
+
+This polynomial can be straightforwardly generalized to a generic
+interval $x \in [\alpha,\beta] \subset \R$. The following linear
+transformation $t(x)=\frac{x-c}{e}$ maps the interval $[\alpha,\beta]$
+onto $[-1,1]$ where $c=\frac{\alpha+\beta}{2}$ define the center of
+the interval and $e = \frac{\beta-\alpha}{2}$ its half-width. For large
+$m$ the leading order of $p_m(x)$ is then
+\begin{equation}
+\lim_{m\rightarrow \infty} {\rm p}_m(x_t) \doteq \frac{C_m(\frac{x_t-c}{e})}
+{C_m(\frac{x_{\gamma}-c}{e})} 
+\sim \frac{|\rho_{x_t}|^m}{|\rho_{x_{\gamma}}|^m}  \quad \textrm{with}
+\quad |\rho_{x_{\gamma}}|=\max_{\{\pm:\ x_\gamma\notin
+  [\alpha,\beta]\}} \left|\frac{x_\gamma-c}{e} \pm 
+\sqrt{\left(\frac{x_\gamma-c}{e}\right)^2-1}\right|.
+\label{eq:rho}
+\end{equation}
+When $x\in[\alpha,\beta]$ the asymptotic limit simplifies to p$_m(x)
+\sim \frac{1}{|\rho_{x_{\gamma}}|^m}$ since
+$\sup_{x\in[\alpha,\beta]} |\rho_x| = 1$. This asymptotic behavior is
+crucial for the use of such polynomials as accelerators of the
+subspace iteration.  
+
+\subsection{Filtering vectors with Chebyshev polynomials}
+\label{sec-2-3}
+
+Theorem~\ref{th:approx} provides the base on which to build a
+Chebyshev polynomial filter which enhances the convergence of the standard subspace iteration eigensolver. Initial input vectors $V$ are
+filtered exploiting the $3$-terms recurrence relation written
+implicitely as a function of the action of $A$ on the vectors $V$
+\begin{equation}
+\label{eq:3term}
+C_{m}(V) = 2\ A\ C_{m-1}(V) - C_{m-2}(V) \quad ; 
+\quad C_m(V) \eqdef C_m(A)\cdot V. 
+\end{equation}
+A polynomial filter improves the subspace iteration by manipulating
+the initial subspace in such a way that the components in the unwanted
+part of the spectrum relative to those in the wanted part are
+dramatically suppressed. This is graphically illustrated in Figure \ref{fig:enhance} where the part of the eigenspectrum in red is mapped to the interval $[-1, 1]$ and corresponds to the unwanted part of the spectrum.  
+
+\begin{comment}
+For sake of simplicity let us consider the
+case $k=1$ of just one desired eigenpair. A generic random vector can be
+written as an independent linear combination of all eigenvectors
+$X$
+\begin{equation*}
+v=\sum_{a=1}^ns^ax_a
+\end{equation*}
+for appropriate scalars $s^i$. 
+% In this specific case the subspace iteration method reduces to the
+% power method: one multiplies $v$ from the left with $A^m$ and found
+% out that $A^mv$ is pointing in the direction of the largest
+% eigenvector $w_n$. In general, one can use a polynomial of degree $m$
+% in $A$ in stead of just $A^m$. Then the power method generalizes to
+% $q_m(A)v$. Our aim is to identify the polynomial $q_m(A)$ which
+% obtains the optimal enhancement of the sought after eigenvector.
+Let us now assume that we have knowledge of the interval $[\alpha,\beta]$ that
+contains the unwanted part of the spectrum
+$\lambda_2\leq\ldots\leq\lambda_n$, such that
+$\lambda_1\notin [\alpha,\beta]$ (in general, such an interval
+is either known a priori or can be estimated). % For example an
+% upper bound for $\beta$ is computed by a few Lanczos steps while a
+% lower bound for $\alpha$ can be suggested by the specific application.
+Then, by setting $\lambda_1=x_{\gamma}$, theorem~\ref{th:approx}
+guarantees that the polynomial $\pl (\lambda)$ is the optimal choice
+for achieving such a target. From eq.~(\ref{eq:rho}) we then get
+\begin{eqnarray*}
+v^{(m)} = \pl (A)v &=& \sum_{a=1}^ns^a\pl (A) x_a=\sum_{a=1}^ns^a\pl
+                  (\lambda_a) x_a\\
+&=& s^1x_1 + \sum_{a=2}^ns^a \frac{C_m(\frac{\lambda_a-c}{e})}{C_m(\frac{\lambda_1-c}{e})}x_a\\
+&\approx& s^1x_1 + \sum_{i=2}^ns^a \frac{1}{\left|\rho_1\right|^m}x_a \sim s^1x_1\\ 
+\end{eqnarray*}
+where we used the fact that $|\rho_1|>1$ and all the terms
+proportional to $|\rho_1|^{-m}$ will therefore become negligible for
+sufficient large $m$. The resulting vector $v^{(m)}$ points in the
+direction of the first eigenvector $x_1$ and $|\rho_1|$ plays the role
+of a convergence ratio. This procedure clearly works for both end of
+the spectrum.
+
+The simple example above can be immediately generalized to $k$ vectors
+$V$ with the effect of enhancing the convergence to a subspace of the
+eigenspectrum of $A$. Formally one can define in the same manner a
+convergence ratio for each single eigenpair of such subspace as
+\end{comment}
+
+\begin{figure}[h]
+\begin{tabular}{l @{\hspace*{1mm}} l}
+	\begin{minipage}{0.48\textwidth}
+                \begin{flushleft}
+                  \pgfplotsset{every tick label/.append style={font=\Large}}
+                  \pgfplotstableread{figs/plotdata.csv}{\myfile}
+                  \begin{tikzpicture}[scale=0.68]
+                    \begin{axis}[
+                      xlabel=eigenspectrum,
+                      ylabel=Chebyshev polynomial,
+%                     ymode=log,
+                      xtick={-2,-1,0,1},
+                      xticklabels={$\lambda_1$,$\lambda_{\sf nev}$,$c$,$\lambda_{N}$},
+                      ytick={0,5e+3,1e+4,1.5e+4},
+                      legend style={at={(0.5,-0.3)},anchor=north}]
+                      ]
+                      \addplot[smooth, no marks, blue, very thick] table [x={ics},y={ipsilon}] {\myfile};
+                      \addlegendentry{ Polynomial degree m = 6 }
+                      \addplot[very thick, green, domain=-2:-1]{0*x};
+                      \addplot[very thick, red, domain=-1:1]{0*x};
+                 \end{axis}
+               \end{tikzpicture}
+             \end{flushleft}
+           \end{minipage}
+&
+            \begin{minipage}{0.48\textwidth}
+		\begin{flushleft}
+                  \pgfplotsset{every tick label/.append style={font=\Large}}
+                   \pgfplotstableread{figs/plotdats.csv}{\myfils}
+                  \begin{tikzpicture}[scale=0.68]
+                    \begin{axis}[
+                      xlabel=eigenspectrum,
+                      ylabel=Chebyshev polynomial,
+                      ymode=log,
+                      xtick={-2,-1,0,1},
+                      xticklabels={$\lambda_{1}$,$\lambda_{\sf nev}$,$c$,$\lambda_{N}$},
+                      ytick={0,1,1e+2,1e+4},
+                      legend style={at={(0.5,-0.3)},anchor=north}]
+                      ]
+                      \addplot[smooth, no marks, blue, very thick]
+                      table [x={ics},y={ipsilon}] {\myfils};
+                      \addlegendentry{ Polynomial degree m = 6 }
+                      \addplot[very thick, green,
+                      domain=-2:-1]{0*x+0.01};
+                      \addplot[very thick, red, domain=-1:1]{0*x+0.01};
+                    \end{axis}
+                  \end{tikzpicture}
+                \end{flushleft}
+              \end{minipage}
+\end{tabular}
+    \caption{Schematic use of the Chebyshev polynomial $C_m(\lambda)$ to enhance the components $V$ aligned to the eigenvectors corresponding to the desired portion of the spectrum $[\lambda_1, \lambda_{\sf nev}]$ (in green) of an Hermitian matrix $A$. Conversely the components of $V$ aligned with eigenpairs in the interval $[\lambda_{\sf nev}, \lambda_N]$ (in red) are suppressed. Here $\lambda_N$ indicates the largest eigenvalue of $A$.}
+    \label{fig:enhance}
+\end{figure}
+
+A value that quantify the amount of filtering operated by the Chebyshev polynomial is the convergence ratio defined through the variable $|\rho_a|$ where $a$ is the index of the eigenvalues outside of the interval $[\alpha,\beta]$.
+\begin{definition}
+  \label{def:conv_ratio}
+  The {\bf convergence ratio} for the eigenvector corresponding to
+  eigenvalue $\lambda_a$ is defined as
+	\[
+	\tau(\lambda_a) = |\rho_a|^{-1} = \min_{\{\pm :\lambda_a\notin
+          [\alpha,\beta]\} }\left|\frac{\lambda_a-c}{e}
+          \pm\sqrt{\left(\frac{\lambda_a-c}{e}\right)^2-1}\right|.
+	\]
+\end{definition}
+The further away $\lambda_a$ is from the interval $[\alpha,\beta]$ the
+larger is $|\rho_a|$ and the faster any filtered vector $v\in V$ should converge to
+the eigenvector $x_a$ corresponding to eigenvalue $\lambda_a$. In practice the statement that $|\rho_a|^{-1}$ represents the
+convergence ratio of $v$ is more a rule of thumb than a precise
+statement: a rigorous demonstration requires a
+substantial effort and it is not in the scope of this paper and our results do not depend on it. What is important to keep in mind is that $\forall \lambda_a \notin[\alpha,\beta]$\ , $|\rho_a| > 1$.
+
+When dealing with numerical implementation of Chebyshev acceleration,
+$\pl
+(\lambda)=\frac{C_m\left(\frac{\lambda_a-c}{e}\right)}{C_m\left(\frac{\lambda_1-c}{e}\right)}$
+is actually computed using the 3-term recurrence relation of
+eq.~(\ref{eq:3term}) for the action of the numerator of $\pl (A)$ on the vectors $V$. The calculation of the constant denominator $\eta_m \doteq C_m(\frac{\lambda_1-c}{e})$ is carried out separately from to the matrix
+numerator. By naming $\sigma_{m+1} \doteq \frac{\eta_m}{\eta_{m+1}}$ it is possible to recursively define
+$\sigma_{m}$ 
+\begin{equation}
+\sigma_m  = \frac{1}{\frac{2}{\sigma_1}-\sigma_{m-1}}
+\quad {\rm with} \quad
+\sigma_1 = \frac{\eta_0}{\eta_1} =\frac{e}{\lambda_1-c}.
+\end{equation}
+With this definition in hand, the action of $\pl (A)$ on $V$ can be expressed as a specialized 3-term recurrence relation 
+\begin{eqnarray*}
+  \pl (A)V &=& \frac{C_{m}\left(\frac{A-cI}{e}\right)}{\eta_{m}}V \\
+          &=& \frac{2\, \frac{A-cI}{e}\,C_{m-1}\left(\frac{A-cI}{e}\right)-
+              C_{m-2}\left(\frac{A-cI}{e}\right)}{\eta_{m}} V\\
+          &=& 2 \, \frac{A-c}{e}\, \frac{\eta_{m-1}}{\eta_{m}} 
+               \frac{C_{m-1}\left(\frac{A-cI}{e}\right)}{\eta_{m-1}}V  - 
+               \frac{\eta_{m-1}}{\eta_{m}}\,\frac{\eta_{m-2}}{\eta_{m-1}}\, 
+               \frac{C_{m-2}\left(\frac{A-cI}{e}\right)}{\eta_{m-2}}V \\
+          &=& 2 \, \frac{A-cI}{e}\, \sigma_{m} \, p_{m-1}(A)V -
+               \sigma_{m}\, \sigma_{m-1} \, p_{m-2}(A)V.
+\end{eqnarray*}
+In practical terms, the polynomial filter above is realized iteratively as illustrated in Algorithm~\ref{alg:filter}.
+\begin{algorithm}
+\caption{Chebyshev polynomial filter}
+\begin{algorithmic}
+\Require Matrix $A$, random vector $V$ and eigenvalue estimates $\tilde{\lambda}_1$ and $\tilde{\lambda}_{\sf nev}$.
+\Ensure Filtered vectors $V^{(m)}$.\\
+\State $c=\frac{\tilde{\lambda}_1+\tilde{\lambda}_{\sf nev}}{2}$\ ,  $e = \frac{\tilde{\lambda}_{\sf nev}-\tilde{\lambda}_1}{2}$\ , $\sigma_1 = \frac{e}{\tilde{\lambda}_1-c}$;\\
+\State $V^{(1)} = \frac{\sigma_1}{e}\, (A - c\, I_n)\, V$;\\
+\For {$i= 2 \to m$}\\
+\State $\sigma_i= \frac{1}{\frac{2}{\sigma_1}-\sigma_{i-1}}$;\\
+\State $V^{(i)}=\frac{2\sigma_{i}}{e}\left(A-c\, I_n\right)V^{(i-1)}-\sigma_{i-1}\sigma_{i}V^{(i-2)}$;\\
+\EndFor
+\end{algorithmic}
+\label{alg:filter}
+\end{algorithm}
+
+As mentioned above, it can be shown that the component of the random array of vectors $V$ converges to the subspace spanned by the eigenvectors $x_a$ corresponding to $\lambda_a \notin[\alpha,\beta]$ with a $\tau_a$ convergence ratio. Roughly speaking, this observation implies that each vector $v_a \in V$ could in theory be filtered with a polynomial degree just high enough to ensure the convergence to $x_a$ within a specific threshold. In the ChASE library this mechanism is implemented using a polynomial degree $m$ which is an ordered array of degrees with the same dimension of $V$ instead of just one value for all. Algorithm \ref{alg:filter} {\tt for} loop is then slightly modified with $m \rightarrow m_a$ and the addition of an if statement that stops filtering vectors $v_a$ as soon as $m_a < i$. The resulting algorithm optimizes for the minimum number of operations necessary to reach convergence. 
+
+\begin{comment}
+{\it
+\begin{remunerate}
+  \item Introduced by Rutishauser, it uses estimates of first
+    eigenvalue outside the spetrum slice (for
+    pos. def. matrices). Later generalized to non
+    pos. def. eigenproblems.
+  \item Convergence criterion redefined
+  \item bound for maximum polynomial degree also redefined
+\end{remunerate}
+
+Locking was suggested already by Rutishauser (1969) in order to
+decrease complexity. Describe how the locking and deflating has a role
+in
+\begin{description}
+\item[residuals bounds] for the converged vectors
+\item[computations] reduction in converging the whole subspace
+\end{description}
+}
+\end{comment}
+
+\subsection{Spectral decomposition of the filtered vectors}
+\label{sec-2-4}
+In this section we provide a simple spectral decomposition of $\pl (A) V$ which will then be used to derive some of the results on the condition number estimate of $\pl (A) V$ in the following sections.
+Using the spectral decomposition of $A = X \Lambda\ X^H$, let us represent the set of
+initial vectors $\subit V{0}$ by projecting them over the exact eigenvectors $X =
+\left(X_\ell X_3\ \right)$ which are respectively of order $\ell$, and $n-\ell$
+\begin{equation*}
+\subit V{0} \equiv X\ X^H \subit V{0} = X_\ell S_\ell + X_3 S_3
+\end{equation*}
+where $S_\ell \in \C^{\ell\times\ell}$, and $S_3 \in \C^{(n-\ell)\times\ell}$ (see~\cite{Stewart:2001id}). We want to emphasize here that the subspace of size $\ell$ can be further split in two subspaces $X_\ell = \left(X_1 X_2\right)$  with corresponding matrix of coefficients $S_1$ and $S_2$ with $S_1 \in \C^{k\times\ell}$, and $S_2 \in \C^{(\ell-k)\times\ell}$. This further subdivision is not used in the spectral representation below but it is useful to emphasize the difference between the subspace corresponding to the first \textsf{nev} eigenvalues and the remaining \textsf{nextra} in ChASE. In this paper such subdivision will also be useful when the considering the estimation of the condition number bound when some of the vectors are locked and deflated (see Sec. \ref{sec-3-3}).
+Let us temporarily drop the superscript index of $V$ and consider such
+decomposition for the vectors outputted by the filter (see {\tt
+  line~\ref{lst:line:cheby}} of the algorithm~\ref{alg:ChASE}) at a generic $(i)$ iteration in the case of constant degree $m$
+\begin{eqnarray}
+\label{eq-2-2-1}
+\pl (A) V = &\ 
+%X \pl(\Lambda) X^H V = X_\ell \pl (\Lambda_1) S_\ell + X_3
+%\pl (\Lambda_3)S_3 \\
+%          = & \rowmat{X_1}{X_2} \sqrmat{\Gamma_1^m}{0}{0}{\Gamma_2^m} 
+%              \colmat{S_1}{S_2} + X_3 \Gamma_3^m S_3
+X_\ell \Gamma_\ell^m S_\ell + X_3 \Gamma_3^m S_3
+\end{eqnarray}
+where the diagonal matrices $\pl (\Lambda_\ell) \doteq \Gamma_\ell^m \in \C^{\ell\times \ell}$, and $\pl (\Lambda_3) \doteq \Gamma_3^m \in \C^{(n-\ell)\times(n-\ell)}$. Even for moderately
+small values of $m$ these matrices are positive definite and so
+invertible. Unless the choice of vectors $V$\footnote{in \csi the initial vectors $\subit V{0}$ are chosen to be randomly generated and orthonormal, the vectors $\subit V{i}$ are by construction orthonormal and typically have a large overlap with the filtered subspace} is
+quite pathological, we can also safely assume that $S_\ell$ is of maximal rank and so invertible. 
+
+The expression \eqref{eq-2-2-1} for $\pl (A) V$ can be further manipulated so as to make a clear distinction between the desired subspace spanned by $X_\ell$ and the rest,
+\begin{eqnarray}
+\label{eq-2-2-2}
+\pl (A) V = %&\ \left(X_\ell \Gamma_\ell^m+ X_3 \Gamma_3^m S_3 \inv{S_\ell}\right) S_\ell
+&\ \left(X_\ell + X_3 \Gamma_3^m S_3 \inv{S_\ell} \inv{\Gamma_\ell^m}\right)\Gamma_\ell^m S_\ell.
+\end{eqnarray}
+The $\Gamma$-matrices are diagonal and, already for moderately small values of $m$, have the simple expressions
+\begin{eqnarray}
+\label{eq:gammas}
+\Gamma_\ell^{m}  =&\ \rto 1{-m} \times \diag (\rto 1{m}, \rto 2{m}, \dots, \rto \ell{m}) \nonumber \\ 
+\inv{\Gamma_\ell^{m}}  =&\ \rto 1{m} \times \diag (\rto{1}{-m}, \rto 2{-m}, \dots, \rto \ell{-m}) \\
+\Gamma_3^{m} =&\ \rto 1{-m} \times I. \nonumber
+\end{eqnarray}
+
+As illustrated at the end of Section \ref{sec-2-3}, in the case of degree optimization the polynomial degree $m$ is not an integer anymore but an array of integers $ m = (m_1, m_2, \dots, m_\ell)$, one for each of the column vectors of $V$, with $m_1\leq m_2 \leq \dots \leq m_\ell$. The expression $\pl (A)V$ then generalizes to signify
+\[
+\pl (A)V \equiv \left( \p{1} (A) v_1, \p{2} (A) v_2, \dots , \p{\ell}(A) v_\ell \right),
+\]
+where $V \equiv (v_1, v_2, \dots , v_\ell)$, with $v_a \in \C^n$. Despite the apparent complication, $\pl (A)V$ can still be expressed through $\Gamma$ matrices with the only difference that their expression in terms of the inverse of the ratio of convergence is modified to
+\begin{eqnarray}
+\label{eq:gammas-2}
+\Gamma_\ell^{m}  =& \diag (1, \frac{\rto 2{m_2}}{\rto 1{m_2}}, \dots, \frac{\rto \ell{m_\ell}}{\rto 1{m_\ell}}) \nonumber \\ 
+\inv{\Gamma_\ell^{m}}  =&\ \diag (1, \frac{\rto 1{m_2}}{\rto 2{m_2}}, \dots, \frac{\rto 1{m_\ell}}{\rto \ell{m_\ell}}) \\
+\Gamma_3^{m} =&\ \rto 1{-m_\ell} \times I. \nonumber
+\end{eqnarray}
+
+\subsubsection{The case of locked and deflated vectors}
+In the \csi library, as in any realization of the subspace iteration algorithm, all the steps from the filtering to the convergence check are repeated within a loop. When checking for convergence, each vector that has a residual below threshold is locked and deflated out of $V$ (see Algorithm \ref{alg:ChASE}). In this case, the spectral decomposition of the vectors to be re-orthogonalized takes a different structure that needs to be further analized.
+
+Without loss of generality, let us start from the the assumption that at a certain iteration $k$ vectors have been locked in the array $W \in \C^{n\times k}$. At the next iteration, after the filtering step, the QR algorithm then orthogonalizes the matrix $Z \equiv [W\ \pl (A) V]$, with $V \in \C^{n\times(\ell-k)}$. As before $\pl (A)V$ obeys the spectral decomposition of Equation \ref{eq-2-2-2} with the only difference that the matrices $S_{\ell,3}$ have now only $\ell-k$ columns. For $W$ we can define the following decomposition
+\begin{equation}
+    W = X_\ell Q_\ell + X_3 Q_3 \quad \textrm{with}\ Q_\ell \in \C^{\ell\times k}\ \textrm{and}\ Q_3 \in \C^{(n-\ell)\times k}.
+\end{equation}
+Despite the similarities, and because of the convergence check, the matrices $Q_{\ell,3}$ have quite a different properties than the $S_{\ell,3}$. This is because each column vector $w_i \in W$ satisfies the residual equation   
+\begin{equation}
+\label{eq:res}
+\|r_i\|_2 = \frac{\|Aw_i - \tilde{\lambda}_i w_i\|_2}{\|w_i\|_2} < \textsc{tol}.
+\end{equation}
+Moreover it is guaranteed \cite{Parlett:1998tv}[Sec-4.5] that each eigenvalue $\lambda_i$ lies in a interval defined by the computed eigenvalue $\tilde{\lambda}_i$ and the residual if the eigenvalues satisfy the uniform separation condition. In other words, if all interval $[\tilde{\lambda}_i - \|r_i\|_2, \tilde{\lambda}_i + \|r_i\|_2]$ are disjoint, it is guaranteed that $\tilde{\lambda}_i$ provide a unique approximation to $\lambda_i$\footnote{The case of clustered eigenvalues requires a bit more work and knowledge of the residual matrix of the clustered eigenvalues (see \cite{Parlett:1998tv}[Sec-11.5])}.
+
+\begin{proposition}
+Under the assumption that each eigenpairs $(w_i, \tilde{\lambda}_i)\quad i=1, \dots ,k$ satisfies the uniform separation condition and its residual $\|r_i\| < \textsc{tol}$, 
+$\exists\ \zeta_i = \min_{j\neq i} |\lambda_j - \lambda_i|$ such that $\forall j \neq i$
+\[
+\|(Q_\ell)^2_{:\neq i,i}\|^2_2 ,\ \|(Q_3)^2_{:,i}\|^2_2 \leq \left(\frac{\textsc{tol}}{\zeta_i}\right)^2 
+\]
+\end{proposition}
+\begin{proof}
+  Let us write $A$ in terms of its spectral decomposition $A=X\Lambda X^H$ and use the decomposition of $w_i = X_\ell (Q_\ell)_{:,i} + X_3 (Q_3)_{:,i}$, then the numerator of equation \eqref{eq:res} becomes
+  \begin{eqnarray*}
+  & \|Aw_i - \tilde{\lambda}_i w_i\|_2 =  \left[ \sum_{\substack{j=1\\j\neq i}}^\ell (\lambda_j - \tilde{\lambda}_i)^2 |Q_\ell|^2_{j,i} + (\lambda_i - \tilde{\lambda}_i)^2 |Q_\ell|^2_{i,i} + \sum_{j=1}^{n-\ell} (\lambda_j - \tilde{\lambda}_i)^2 |Q_3|^2_{j,i} \right]^{\frac{1}{2}} \\
+  & \geq  \left[ \sum_{\substack{j=1\\j\neq i}}^\ell (\lambda_j - \tilde{\lambda}_i)^2 |Q_\ell|^2_{j,i} + \sum_{j=1}^{n-\ell} (\lambda_j - \tilde{\lambda}_i)^2 |Q_3|^2_{j,i} \right]^{\frac{1}{2}}
+  \geq\ \zeta_i \left[ \sum_{\substack{j=1\\j\neq i}}^\ell |Q_\ell|^2_{j,i} + \sum_{j=1}^{n-\ell} |Q_3|^2_{j,i} \right]^{\frac{1}{2}}.
+  \end{eqnarray*}
+ Assuming that $w_i$ is normalized to Unity, the last inequality directly translates into
+ \[
+ \left(\frac{\textsc{tol}}{\zeta_i}\right)^2 \geq  \|(Q_\ell)^2_{:\neq i,i}\|_2^2 +  \|(Q_3)^2_{:,i}\|^2_2
+ \]
+ proving the statement of the proposition.
+\end{proof}
+
+For all practical purpose, $|\lambda_{\ell+j} - \tilde{\lambda}_i | \gg \zeta_i $ when $k < \ell$, which implies that $\left(\frac{\textsc{tol}}{\zeta_i}\right)^2 \gg \|(Q_3)^2_{:,i}\|^2_2$. It is then reasonable to assume that $W \approx X_\ell Q_\ell$. 
+Let's separate the subspace of size $\mathcal{X}_\ell = \mathcal{R}(X_\ell)$ in two parts spanned by the first $k$ eigenvectors $X_1$, corresponding to the number of locked vectors, and the remaining part spanned by $\ell-k$ eigenvectors $X_2$. Then, $Q_\ell = (Q_1^\top \ Q_2^\top)^\top$ and similarly $S_\ell = (S_1^\top \ S_2^\top)^\top$ with $S_1 \in \C^{k\times (\ell -k)}\ \textrm{and}\ S_2 \in \C^{(\ell-k)\times (\ell-k)}$. The decomposition of $W$ and $V$ are simply re-written as
+\[
+W = X_1 Q_1 + X_2 Q_2 \quad \textrm{and} \quad V = X_1 S_1 + X_2 S_2 + X_3 S_3.
+\]
+
+\begin{remark}
+\label{rm:QS}
+In the ChASE Algorithm \ref{alg:ChASE}, as soon as a number of vectors $W$ are deflated and locked, they are also made orthogonal by construction to the new array of vector $V$ that is the new output of the Chebyshev filter and the next subspace iteration. This implies that $\|W^H V\|_2 = \|Q_1^H S_1 + Q_2^H S_2\|_2 \leq \odg{\epsilon^\bot}$ with $\epsilon^\bot$ the orthogonality accuracy achieved during the Rayleigh-Ritz step. By construction, both $Q_1$ and $S_2$ are supposed to be full rank which implies that $\|Q_2\|_2$, $\|S_1\|_2 \sim \odg{\epsilon^\bot}$. This is an operational result and it depends on the orthogonality achieved by the direct/dense eigensolver used in the Rayleigh-Ritz step.
+\end{remark}
+Assuming the validity of the operational remark above, we can finally write the collection of vectors in $Z$ in the following fashion
+\begin{equation}
+\label{eq:ZMat}
+    Z = [W\ \ \pl (A) V] = \left[ X_1 Q_1\ \ \left(X_2 + X_3 \Gamma_3^m S_3 \inv{S_2} \inv{\Gamma_2^m}\right)\Gamma_2^m S_2 \right].
+\end{equation}
+
+\begin{comment}
+We can then define $S_3\inv{S_{12}} = \left(E_1 \ E_2\right)$, with
+$E_1 \in \C^{(n-\ell)\times k}$, and
+$E_2 \in \C^{(n-\ell)\times (\ell -k)}$ and pair together
+matrices with the same order. Finally we arrive at a decomposition of
+$\pl (A) \subit V{0}$ in two orthogonal subspaces
+\begin{equation}
+\label{eq:decomp}
+\pl (A) \subit V{0} = 
+\rowmat{X_1 + X_3\ \Gamma_3^m E_1 \inv{\Gamma_1^m}}%
+{X_2 + X_3\ \Gamma_3^m E_2 \inv{\Gamma_2^m}}
+\sqrmat{\Gamma_1^m}{0}{0}{\Gamma_2^m} \colmat{S_1}{S_2}.
+\end{equation}
+Since we are interested in the convergence of the subspace of
+dimension $k$ to the space spanned by $X_1$, only the properties of
+the first subspace are of real interest. As we will see later, the
+introduction of a search space of size $\ell$ larger than the desired
+subspace of size $k$ has the net effect of just increasing the
+convergence of $X_3\ \Gamma_3^m E_1 \inv{\Gamma_1^m}$ to zero. Without
+loss of generality, the above spectral decomposition can be considered
+for the general expression of $\subit V{i}$ and used to demonstrate
+the convergence of the subspace to the desired one. For later use, one
+identifies the subset
+$\subit{V_1}{i} = X_1 + X_3\ \Gamma_3^m E_1 \inv{\Gamma_1^m}$ as the
+order $k$ subspace converging to the desired eigenspace. 
+
+In this section we maintain a general approach and consider the full
+set of projected vectors $\subit V{i}$. From the schematical
+description of Chebyshev Subspace Iteration illustrated in
+algorithm~\ref{alg:ChASE}, one infers that at the end of each {\tt
+  while} loop (not including the locking and deflation), the subspace
+on which the filter iterates can be written as
+\begin{equation}
+\label{eq:subspit}
+\subit V{i} = \p{i} (A) \subit V{i-1} \inv{\subit R{i-1}} \subit W{i-1}
+= \p{i} (A)\subit V{i-1} \subit{\U}{i-1} =  \p{i} (A) \dots \p{1} (A) 
+\subit V{0} \subit{\U}{1} \dots \subit{\U}{i-1}.
+\end{equation}
+$\subit{\U}{j} = \inv{\subit R{j}} \subit W{j} ;\quad j\geq 1$ is the product
+of a full rank $\ell$ triangular matrix $R$ and a unitary matrix $W$
+whose columns are the eigenvectors of the reduced Rayleigh-Ritz
+eigenproblem. This rapresentation allows us to formulate the following
+lemma
+\begin{lemma}
+\label{th:lemma1}
+  Consider the Chebyshev Subspace Iteration eigensolver as described
+  by algorithm~\ref{alg:ChASE} with $\p{j}(t)$ being a Chebyshev
+  polynomial of the first kind as defined in theorem~\ref{th:approx}
+  and assume that $S_{12} = \colmat{X_1^H}{X_2^H} \subit V{0}$ is a
+  $\ell\times\ell$ invertible matrix, then
+\[
+\Rcal\left(\subit V{i}\right) = \Rcal\left(\p{i} (A) \dots \p{1} (A) 
+\subit V{0} \right) 
+\]
+\end{lemma}
+\begin{proof}
+Using the spectral decomposition of $A$ one can show by induction that
+if $\colmat{X_1^H}{X_2^H} \subit V{i-1}$ is invertible then 
+\[
+\colmat{X_1^H}{X_2^H} \subit V{i} = \colmat{X_1^H}{X_2^H} X \p{i} 
+(\Lambda) X^H \subit V{i-1} \subit{\U}{i-1} 
+= \sqrmat{\Gamma_1^{m_i}}{0}{0}{\Gamma_2^{m_i}} 
+\colmat{X_1^H}{X_2^H} \subit V{i-1} \subit{\U}{i-1}
+\] 
+is full rank $\ell$ and is invertible since
+$\sqrmat{\Gamma_1^{m_i}}{0}{0}{\Gamma_2^{m_i}}$ and $\subit{\U}{i-1}$
+are both full rank $\ell$ and invertible. Consequently $\subit{\U}{i-1}$
+does not change the range of $\subit V{i}$ and the statement of the
+lemma follows directly from
+$\subit V{1} = \p{1} (A) \subit V{0}$ and
+equation~\ref{eq:subspit}.
+\end{proof} 
+
+We just establish that the projection by Chebyshev polynomials
+preserves the dimension of the search space. Before presenting the
+main convergence theorem we need to generalize the
+decomposition~(\ref{eq:decomp}) to equation~(\ref{eq:subspit}). Let us
+first define the following sequences of matrices
+\begin{equation}
+\label{eq:matseq}
+\begin{array}{l l l l}
+\subit S{0} &=\ S_{12} & \qquad \subit{E_h}{0} & =\ E_h\\[2mm]
+\subit S{1} &=\ \sqrmat{\Gamma_1^{m_1}}{0}{0}{\Gamma_2^{m_1}} \subit S{0}
+ & \qquad \subit{E_h}{1} & =\ \Gamma_3^{m_1} \subit{E_h}{0} 
+\inv{\Gamma_h^{m_1}} \\[5mm]
+\subit S{2} &=\ \sqrmat{\Gamma_1^{m_2}}{0}{0}{\Gamma_2^{m_2}} \subit S{1}
+\subit{\U}{1} & \qquad \subit{E_h}{2} & =\ \Gamma_3^{m_2} \subit{E_h}{1} 
+\inv{\Gamma_h^{m_2}} \\[2mm]
+\vdots &=\ \qquad \qquad \qquad \quad \vdots & \qquad \vdots &=\ \qquad \quad \vdots \\[2mm]
+\subit S{j} &=\ \sqrmat{\Gamma_1^{m_j}}{0}{0}{\Gamma_2^{m_j}} \subit S{j-1}
+\subit{\U}{j-1} & \qquad \subit{E_h}{j} & =\ \Gamma_3^{m_j} \subit{E_h}{j-1} 
+\inv{\Gamma_h^{m_j}}
+\end{array},
+\end{equation}
+with $h = 1,2$. Then, with the implict definition $\subit{\U}{0}
+= I$,  eq.~(\ref{eq:subspit}) can be decomposed in two
+orthogonal subspaces exactly in the same fashion as (\ref{eq:decomp})
+\[
+\subit V{i} = \p{i} (A)\subit V{i-1} \subit{\U}{i-1} = 
+\rowmat{X_1 + X_3\ \subit{E_1}{i}}%
+{X_2 + X_3\ \subit{E_2}{i}} \subit S{i}.
+\]
+The square matrices $\subit S{j}$ are of order $\ell$ and invertible
+while the gamma matrices appearing in the definitions of the
+$\subit{E_h}{j}$ are always diagonal. Moreover, the asymptotic form of
+$\pl (A)$ in eq.~(\ref{eq:rho}) for any $m_j$ sufficently large
+implies that the gamma matrices have a simple structure
+\begin{eqnarray*}
+\inv{\Gamma_1^{m_j}}  =&\ \rto 1{m_j} \times \diag (\rto 1{-m_j}, \rto 2{-m_j}, \dots, \rto k{-m_j}) \\
+\inv{\Gamma_2^{m_j}}  =&\ \rto 1{m_j} \times \diag (\rto{k+1}{-m_j}, \dots, \rto \ell{-m_j}) \\
+\Gamma_3^{m_j} =&\ \rto 1{-m_j} \times I.
+\end{eqnarray*}
+It is then possible to to write the dependence of the $\subit{E_h}{j}$
+with respect to the convergence ratio $\rto a{-m_j}$. The
+$a$-th column of $\subit{E_h}{j}$ is simply
+\[
+(\subit{E_h}{j})_{:,a} = (\Gamma_3^{m_j} \subit{E_h}{j-1} 
+\inv{\Gamma_h^{m_j}})_{:,a} = (\subit{E_h}{j-1})_{:,a} 
+\times \rto a{-m_j},
+\]
+then using the definition~(\ref{eq:matseq}) recursively we obtain
+\begin{equation}
+\label{eq:Evsrho}
+(\subit{E_h}{i})_{:,a} =  (\subit{E_h}{0})_{:,a} 
+\times \prod_{j=1}^i \rto a{-m_j}.
+\end{equation}
+The expression above is at the base of the following
+generalization of Theorem~\ref{th:convsaad} adapted to algorithm~\ref{alg:ChASE}.
+\begin{theorem}
+\label{th:conv1}
+  Let us define with $\subit \Scal{i} = \Rcal\left(\subit V{i}\right)$
+  the subspace spanned by the column of $\subit V{i}$ and assume that
+  $\colmat{X_1^H}{X_2^H} \subit V{0}$ is a $\ell\times \ell$ invertible matrix. Let
+  $\subit \Pcal{i}$ being the orthogonal projector onto the subspace
+  $\subit \Scal{i}$ then for each eigenvector $x_a$ of $A$ with
+  $a=1,\dots ,\ell$ there is a constant $\eta_a$ such that
+  \[
+  \left\|\left(I - \subit \Pcal{i} \right)x_a\right\| \leq \eta_a \prod_{j=1}^i 
+  \rto a{-m_j}
+  \]
+\end{theorem}
+\begin{proof}
+  Let us define the vector $s_a = x_a + X_3\ (\subit{E_h}{i})_{:,a}$
+  with $h = 1$ for $a = 1,\dots , k$ and $h=2$ for
+  $a = k+1, \dots , \ell$. By lemma~\ref{th:lemma1},
+  $ \subit \Scal{i} = \span \rowmat{X_1 + X_3\ \subit{E_1}{i}}%
+  {X_2 + X_3\ \subit{E_2}{i}}, $
+  which implies that $s_a \in \subit \Scal{i}$. Then, using
+  eq.~(\ref{eq:Evsrho}) the difference between an element of
+  $\subit \Scal{i}$ and the $a$-th eigenvector of $A$ is expressed as
+  $(s_a - x_a) = X_3\ (\subit{E_h}{0})_{:,a} \times \prod_{j=1}^i \rto
+  a{-m_j}$. Hence we clearly have
+\[
+\|s_a - x_a \| \leq \|(\subit{E_h}{0})_{:,a}\| 
+\prod_{j=1}^i \rto a{-m_j} = \eta_a \prod_{j=1}^i \rto a{-m_j}
+\]
+where we defined the constant $\eta_a$ to be equal to
+$\|(\subit{E_h}{0})_{:,a}\|$. The statement of the theorem follows
+directly from the definition of the action of the orthogonal projector
+$\left\|\left(I - \subit \Pcal{i} \right)x_a\right\| =
+\displaystyle\min_{s \in \subit \Scal{i}} \|s_a - x_a \|$.
+\end{proof}
+
+The theorem above shows how filtering multiple times the initial set
+of vectors can quite dramatically enhance the convergence to the
+desired subspace. It could be argued that only one filtering action
+with a degree $m_{\rm tot} = \sum_{j=1}^i m_j$ would achieve the same
+result. In practice there are two reasons for not doing that: 1) each
+eigenpair has a distinct convergence ratio $\rto a{-1}$ and requires a
+differt $m_{\rm tot}$, most importantly 2) some filtered vectors
+would start diverge for too large values of $m_{\rm tot}$. The
+following sections will deal explicitely with these two aspects and
+explain why the overall polynomial degree should be optimized while
+each single $m_j$ should not take too high of a value.
+\end{comment}
+
+
+% Present a modern approach to the convergence of Chebyshev Subspace
+% Iteration with the following ingredients:
+% \begin{itemize}
+%   \item  Stewart decomposition of the spectrum in 3 parts
+%   \item The structure of Th. 5.2 a-la-Saad
+%   \item the internal loop which add multiple polynomial degrees
+%   \item includes the QR decomposition. Can it also be generalized to
+%     R-R by default? No need of that! By using the Th a-la-Saad one
+%     doesn't need to take into account also R-R. 
+% \end{itemize}
+% This initial part should be no more 2-3 theorems.

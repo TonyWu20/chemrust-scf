@@ -1,0 +1,109 @@
+{
+   "sources" : [
+      {
+         "usage" : "toplevel",
+         "filename" : "main.tex"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "figdata/condEst/AuAg-13k_Opt1.csv"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "figdata/condEst/AuAg-13k_OptN.csv"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "figdata/condEst/Cu2BaSnS4_80k_Opt1.csv"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "figdata/condEst/Cu2BaSnS4_80k_OptN.csv"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "figdata/condEst/HfO2-62k_Opt1.csv"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "figdata/condEst/HfO2-62k_OptN.csv"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "figdata/condEst/HfO2-76k_Opt1.csv"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "figdata/condEst/HfO2-76k_OptN.csv"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "figdata/condEst/In2O3-115k_Opt1.csv"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "figdata/condEst/In2O3-115k_OptN.csv"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "figdata/condEst/In2O3-76k_Opt1.csv"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "figdata/condEst/In2O3-76k_OptN.csv"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "figdata/condEst/NaCl-9k_Opt1.csv"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "figdata/condEst/NaCl-9k_OptN.csv"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "figdata/condEst/SiC_graphene_50k_Opt1.csv"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "figdata/condEst/SiC_graphene_50k_OptN.csv"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "figdata/condEst/TiO2-12k_Opt1.csv"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "figdata/condEst/TiO2-12k_OptN.csv"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "figdata/condEst/TiO2-29k_Opt1.csv"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "figdata/condEst/TiO2-29k_OptN.csv"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "figs/plotdata.csv"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "figs/plotdats.csv"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "siam10.clo"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "subeqn.clo"
+      }
+   ],
+   "spec_version" : 1,
+   "texlive_version" : "2025",
+   "process" : {
+      "compiler" : "pdflatex"
+   }
+}

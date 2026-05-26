@@ -1259,3 +1259,128 @@ pub fn apply_s_for_test(
         .map(|c| num_complex::Complex64::new(c.x, c.y))
         .collect())
 }
+
+/// Test-only wrapper for `chebyshev_filter` that handles GPU upload/download.
+///
+/// Mirrors `apply_s_for_test`: uploads ψ and V_eff to GPU, runs the existing
+/// `pub(crate) chebyshev_filter`, downloads the filtered ψ̂ back to CPU.
+///
+/// This allows external integration tests (in `tests/`) to measure orthogonality
+/// or condition number after Chebyshev filtering without duplicating the full
+/// GPU infrastructure setup.
+///
+/// # Arguments
+/// - `psi_host`: Input wavefunctions (CPU, column-major: flat[b*n_pw + g])
+/// - `v_eff_host`: Effective potential on wave grid (CPU, flat real-space array)
+/// - `n_bands`, `n_pw`: Wavefunction dimensions
+/// - `wave_grid`: G-vector grid metadata
+/// - `pw_coords`: Plane-wave Miller indices (length = n_pw)
+/// - `cell`: Cell geometry (needed for chebyshev_filter signature, not actually used)
+/// - `pots`: Pseudopotential set (needed for signature, not actually used)
+/// - `vnl_data`: Nonlocal pseudopotential data (already on GPU)
+/// - `min_veff`, `max_veff`: V_eff bounds for spectral estimation
+/// - `ndeg`: Chebyshev filter degree (8 for diagnostic)
+/// - `eigenvalues`: Optional prior eigenvalues for R-ChFSI (None for first call)
+/// - `blas`, `solver`, `stream`: GPU handles
+///
+/// # Returns
+/// Filtered wavefunctions ψ̂ on CPU (column-major, same layout as input).
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn chebyshev_filter_for_test(
+    psi_host: &[num_complex::Complex64],
+    v_eff_host: &[f64],
+    n_bands: usize,
+    n_pw: usize,
+    wave_grid: &GVectorGrid,
+    pw_coords: &[[i32; 3]],
+    cell: &CellGeometry,
+    pots: &PseudopotentialSet,
+    vnl_data: &VnlBatchData,
+    min_veff: f64,
+    max_veff: f64,
+    ndeg: usize,
+    eigenvalues: Option<&[f64]>,
+    blas: &BlasHandle,
+    solver: &SolverHandle,
+    stream: &Arc<CudaStream>,
+    ctx: &Arc<CudaContext>,
+) -> Result<Vec<num_complex::Complex64>, Error> {
+    use crate::device::pcie::PcieAccount;
+    use crate::layout::WavefunctionSet;
+
+    // Upload ψ to GPU
+    let psi_wfc = WavefunctionSet::<ColumnDistributed>::new(psi_host.to_vec(), n_bands, n_pw);
+    let mut pcie = PcieAccount::default();
+    let psi_gpu = Gpu::from_host_with(&psi_wfc, stream, &mut pcie)?;
+
+    // Upload V_eff to GPU
+    let [ngz, ngy, ngx] = wave_grid.grid();
+    let grid_size = ngx * ngy * ngz;
+    assert_eq!(
+        v_eff_host.len(),
+        grid_size,
+        "v_eff_host length {} does not match wave_grid size {}",
+        v_eff_host.len(),
+        grid_size
+    );
+
+    // V_eff is on wave grid, so wrap as WaveGridArray then upsample to FineGridArray
+    let v_eff_arr = ndarray::Array3::from_shape_vec(
+        (ngx, ngy, ngz),
+        v_eff_host.to_vec(),
+    ).map_err(|e| Error::Io(format!("v_eff shape error: {}", e)))?;
+    use crate::types::{WaveGridArray, FineGridArray};
+    let v_eff_wave = WaveGridArray::from_inner(v_eff_arr);
+    // For simplicity, assume wave_grid == fine_grid (true for Cu111_CO)
+    let v_eff_fine = FineGridArray::from_inner(v_eff_wave.into_inner());
+    let v_eff_inner = crate::types::EffectivePotential::from_inner(v_eff_fine);
+    let v_eff_gpu = Gpu::from_host_with(&v_eff_inner, stream, &mut pcie)?;
+
+    // Upload PW-to-FFT index map
+    let fft_idx: Vec<i32> = crate::pw_coords_to_fft_indices(pw_coords, wave_grid);
+    let fft_idx_dev: CudaSlice<i32> = stream.clone_htod(&fft_idx).map_err(Error::Cuda)?;
+
+    // Compile kernels
+    let kernels = CudaKernelSet::new(ctx)?;
+
+    // Dummy k-point (unused by chebyshev_filter)
+    let dummy_kpoint = KPoint { coords: [0.0, 0.0, 0.0] };
+
+    // Run chebyshev_filter
+    let (psi_filtered_row, _hpsi_row) = chebyshev_filter(
+        &psi_gpu,
+        &v_eff_gpu,
+        pots,
+        wave_grid,
+        &dummy_kpoint,
+        cell,
+        pw_coords,
+        vnl_data,
+        &fft_idx_dev,
+        min_veff,
+        max_veff,
+        &kernels,
+        &mut pcie,
+        eigenvalues,
+        ndeg,
+        blas,
+        solver,
+        stream,
+        ctx,
+        FilterMode::BareH, // Standard mode for diagnostic
+    )?;
+
+    // Download filtered ψ̂ from GPU (RowDistributed layout)
+    stream.synchronize()?;
+    let psi_filtered_raw = stream.clone_dtoh(psi_filtered_row.as_device_slice()).map_err(Error::Cuda)?;
+
+    // Convert RowDistributed (flat[b*n_pw + g]) back to column-major host layout
+    // Actually, chebyshev_filter returns RowDistributed which is the same memory
+    // layout as ColumnDistributed (both are flat[b*n_pw + g]), just a semantic marker.
+    // See comment at chebyshev.rs:1069-1080.
+    Ok(psi_filtered_raw
+        .into_iter()
+        .map(|c| num_complex::Complex64::new(c.x, c.y))
+        .collect())
+}

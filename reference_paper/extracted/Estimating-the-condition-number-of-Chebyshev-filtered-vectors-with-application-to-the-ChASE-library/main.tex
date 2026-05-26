@@ -1,0 +1,198 @@
+%-----------------------------
+% style and packages
+%-----------------------------
+\documentclass{siamart250211}
+%\usepackage{pstricks,pst-node}
+\usepackage[T1]{fontenc}
+\usepackage{ae,aecompl} % for Mario to have better quality output.
+\usepackage{amsfonts}
+\usepackage{amsmath}
+\usepackage{thmtools,thm-restate}
+%\usepackage[amsmath, thmmarks]{ntheorem} 
+\usepackage{amssymb}
+\usepackage{amsbsy}
+\usepackage{xcolor}
+\usepackage{graphicx}
+%\usepackage{epsfig}
+%\usepackage{showkeys}	% Draft mode only
+\usepackage{epstopdf}\usepackage{epsfig} % me, again
+\usepackage{array}
+\usepackage{enumerate}
+\usepackage{enumitem}
+%\usepackage{sectsty}
+\usepackage{appendix}
+\usepackage{multirow}
+\usepackage{cite}
+\usepackage{tensor}
+\usepackage{algorithm}
+\usepackage{algorithmicx}
+\usepackage{algpseudocode}
+%\usepackage{ulem} %for '\sout': it conflicts with \emph for the siam
+%bibliography style. 
+\setcounter{tocdepth}{3}
+\usepackage{bbold}
+\usepackage{comment}
+\usepackage{xspace}
+
+\usepackage{booktabs}
+\usepackage{array}        % for column types like p{width}, m{width}, etc.
+\usepackage{caption}      % for better caption formatting
+
+% ---------For figures---------------
+\usepackage{pgf}
+\usepackage{pgfplots}
+\usepackage{pgfplotstable}
+%\usepackage{filecontents}
+\usepackage{tikz}
+\usetikzlibrary{shapes,arrows}
+\usepgfplotslibrary{fillbetween}
+
+\usepackage{subfigure}
+%%-----------Page format ---------------
+\addtolength{\textwidth}{3cm}  \addtolength{\oddsidemargin}{0.3cm}
+\addtolength{\textheight}{3cm} \addtolength{\topmargin}{-1.3cm}
+%-----------Email addresses for authors-----
+\usepackage{url}
+\urldef{\mailsb}\path|e.di.napoli@fz-juelich.de|
+\urldef{\mailsc}\path|dinapoli@jara.rwth-aachen.de|  
+
+\newcolumntype{L}[1]{>{\raggedright\let\newline\\\arraybackslash\hspace{0pt}}m{#1}}
+\newcolumntype{C}[1]{>{\centering\let\newline\\\arraybackslash\hspace{0pt}}m{#1}}
+\newcolumntype{R}[1]{>{\raggedleft\let\newline\\\arraybackslash\hspace{0pt}}m{#1}}
+
+\newcommand{\condEstSubplot}[2]{%
+\begin{minipage}[b]{0.32\linewidth}
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+    width=\textwidth,
+    height={0.9*\textwidth},
+    ymode=log,
+    xlabel={Iteration index},
+    ylabel={cond},
+    xmin=0,
+    %legend style={draw=none, font=\small, at={(0.02,0.02)}, anchor=south west, fill=none},
+    legend entries={},
+    tick label style={font=\small},
+    label style={font=\small},
+    line width=1pt,
+]
+
+% Read the CSV files
+\pgfplotstableread[col sep=comma]{figdata/condEst/#1_OptN.csv}\dfno
+\pgfplotstableread[col sep=comma]{figdata/condEst/#1_Opt1.csv}\dfopt
+
+% Plot exact (no-opt)
+\addplot+[mark=o, solid, mark size=1.8pt] table[x=Iteration, y=exact_condition_number] {\dfno};
+%\addlegendentry{exact (no-opt)}
+
+% Plot cond(V) (no-opt)
+\addplot+[mark=o, dotted, mark size=1.8pt] table[x=Iteration, y=cond_V] {\dfno};
+%\addlegendentry{cond(V) (no-opt)}
+
+% Plot exact (opt)
+\addplot+[mark=triangle*, solid, mark size=1.8pt, color=black] table[x=Iteration, y=exact_condition_number] {\dfopt};
+%\addlegendentry{exact (opt)}
+
+% Plot cond(V) (opt)
+\addplot+[mark=triangle*, dotted, mark size=1.8pt, color=green!40!black] table[x=Iteration, y=cond_V] {\dfopt};
+%\addlegendentry{cond(V) (opt)}
+
+\end{axis}
+\end{tikzpicture}
+\vspace{-0.3em}
+\begin{center}
+\small #2
+\end{center}
+\end{minipage}%
+}
+%----------------------------
+% external inputs
+%----------------------------
+% 
+\input{symacros}
+%
+%
+%------------------------------------
+% Title page
+%------------------------------------
+
+\title{Estimating the condition number of Chebyshev filtered vectors with application to the ChASE library%\thanks{Article based on
+%    research supported by the Excellence Initiative of the German
+%    federal and state governments and the J\"ulich Aachen Research
+%    Alliance -- High-Performance Computing. (JARA-HPC)}
+    }
+            
+\author{Edoardo Di Napoli and Xinzhe Wu\footnotemark[3]}%
+%
+%
+%------------------------------------
+% The paper begins here
+%------------------------------------
+%
+\pgfplotsset{compat=1.18}
+\begin{document}
+
+\maketitle
+%\slugger{simax}
+
+\renewcommand{\thefootnote}{\fnsymbol{footnote}}
+
+% \footnotetext[2]{Department of Mathematics, Faculty of Science, University of Zagreb.
+% Bijeni\v{c}ka cesta 30, 10000--Zagreb, Republic of Croatia. \mailsa}
+
+\footnotetext[3]{J\"ulich Supercomputing Centre,% Institute for Advanced Simulation,\\
+Forschungszentrum J\"ulich.
+Wilhelm-Johnen stra\ss e, 52425--J\"ulich, Germany. \mailsb}
+%\footnotetext[4]{Aachen Institute for Advance Study in Computational Engineering Science.
+%Schinkelstra\ss e 2, 52072 Aachen, Germany. \mailsc}
+
+\renewcommand{\thefootnote}{\arabic{footnote}}
+
+\begin{abstract} % at least 70 and no more than 150 words
+  Chebyshev filtered subspace iteration is a well-known algorithm for the solution of (symmetric/Hermitian) algebraic eigenproblems which has been implemented in several application codes~\cite{Kronik:2006ff, abinit:2020} or in stand alone libraries~\cite{ChASE}. An essential part of the algorithm is the QR-factorization of the array of vectors spanning the active subspace that have been filtered by the Chebyshev filter. Typically such an array has an a-priori unknown high condition number that directly influences the choice of QR-factorization algorithm. In this work we show how such condition number can be bound from above with precise and inexpensive estimates. We then proceed to use these estimates to implement a mechanism for the choice of QR-factorization in the ChASE library. We show how such mechanism enhance the performance of the library without compromising on its accuracy.     
+\end{abstract}
+
+\begin{keywords}
+  Chebyshev polynomials, Subspace Iteration, Filtered vectors, Condition number
+  QR-factorization, numerical accuracy, High-performance Computing.
+\end{keywords}
+
+%\begin{AMS}
+%1.1, 1.2, 1.3
+%\end{AMS}
+
+\pagestyle{myheadings}
+\thispagestyle{plain}
+\markboth{
+E.~DI NAPOLI, X.~WU}{CONDITION NUMBER ESTIMATE AND OPTIMAL QR-FACTORIZATION}
+
+%-----------------------------------
+% Content starts here
+%-----------------------------------
+
+\input{section1}
+
+\input{section2}
+
+\input{section3}
+
+\input{section4}
+
+\input{section5}
+
+\section*{Acknowledgements}
+
+This research was in part supported by the Gauss Centre for Supercomputing e.V. (www.gauss-centre.eu) through the SiVeGCS project and the Joint Lab Virtual Materials Design (JL-VMD), a cross-center platform of the Helmholtz Association established in the Helmholtz Research Field 'Information'. We are thankful to the J\"ulich Supercomputing Center for the computing time made available to perform the numerical tests. Special thanks to the team members of the Simulation and Data Lab Quantum Materials for insightful discussions and the maintainers of the FLEUR, BSE UIUC and FHI-aims codes for generating and providing the matrices of the eigenproblems used in the numerical tests. 
+
+% Appendix
+%\appendix
+
+%\input{appendix}
+
+\bibliography{ChASE,mypab,soft}
+\bibliographystyle{siam}
+%\vspace{-0.1cm}
+
+\end{document}
+

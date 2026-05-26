@@ -22,6 +22,7 @@ scf_diag = []
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt"] }
+faer = { version = "0.24", features = ["std"] }
 
 [lib]
 name = "chemrust_scf"

@@ -1838,14 +1838,16 @@ pub fn run_scf_with_energy_gated(
                             if let Some(ref gate) = gate {
                                 #[cfg(any(test, feature = "scf_diag"))]
                                 if let Some(ref raw) = gate.parameters_raw {
-                                    castep_bin.parameters_raw = Some(raw.clone());
+                                    // Gate stores flattened Vec<u8>, CastepBin expects Vec<Vec<u8>>
+                                    // Wrap the single record in a Vec
+                                    castep_bin.parameters_raw = vec![raw.clone()];
                                 }
                             }
                             let out_path = std::env::var("CHEMRUST_CHECK_DUMP")
                                 .unwrap_or_else(|_| "chemrust_iter2.check".to_string());
                             if let Ok(mut file) = std::fs::File::create(&out_path) {
                                 match chemrust_hamiltonian_core::CheckFile::write(
-                                    &castep_bin, &mut file,
+                                    &mut file, &castep_bin,
                                 ) {
                                     Ok(()) => {
                                         tracing::info!(

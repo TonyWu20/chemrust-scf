@@ -5,6 +5,16 @@ pub mod mixing;
 pub mod density;
 pub mod device;
 pub(crate) mod eigensolver;
+
+// Re-export test-only helpers for integration tests
+#[doc(hidden)]
+pub use eigensolver::chebyshev::{apply_s_for_test, chebyshev_filter_for_test};
+#[doc(hidden)]
+pub use eigensolver::vnl_data::VnlBatchData;
+#[doc(hidden)]
+pub use device::blas::BlasHandle;
+#[doc(hidden)]
+pub use device::solver::SolverHandle;
 pub mod scf_capture;
 
 pub use types::{

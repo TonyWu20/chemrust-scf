@@ -1,0 +1,12 @@
+\section{Summary and conclusions}
+\label{sec-5}
+In this work, we investigate how to estimate the condition number of a set of vectors $V$ after they have undergone a transformation through a polynomial filter $\pl (A)$. Our study is motivated by the possibility of replacing the traditional Householder-based QR factorization with the more computationally efficient CholeskyQR algorithm. Although CholeskyQR offers improved performance and exposes greater parallelism, it is known to suffer from a loss of orthogonality when the condition number of the matrix of vectors $\pl (A) V$ becomes too large. To mitigate this issue, one can employ more robust variants such as CholeskyQR2 or, in cases of stronger ill-conditioning, the shifted CholeskyQR2 algorithm. Each of these approaches, however, remains reliable only within specific bounds of the condition number of $\pl (A) V$. Consequently, their effective use requires some prior knowledge or estimate of this quantity.
+
+Directly computing the exact condition number of $\pl (A) V$ would be prohibitively expensive and would compromise the performance benefits offered by the CholeskyQR-based methods. In this paper, we therefore address the problem by a careful numerical analysis of the spectral properties of the matrix of filtered vectors. Such analysis lead us to the introduction of a simple and inexpensive estimate of the condition number. The proposed estimate relies only on the convergence ratios of selected column vectors in $\pl (A) V$ together with the degree $m_i$ of the polynomial filter applied to them. Based on this estimate, we derive a practical model for dynamically selecting the most appropriate QR factorization variant, thereby maximizing performance and scalability while preserving numerical accuracy. The resulting strategy has been incorporated into version 1.6.0 of the ChASE library and thoroughly validated through numerical experiments.
+
+
+
+%%% Local Variables: 
+%%% mode: latex
+%%% TeX-master: "main"
+%%% End:

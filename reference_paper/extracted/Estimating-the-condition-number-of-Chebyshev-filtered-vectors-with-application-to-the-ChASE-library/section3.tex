@@ -1,0 +1,206 @@
+\section{Bounding the condition number of an array of filtered vectors}
+\label{sec-3}
+In this section, we build on the spectral decomposition introduced in Sec.~\ref{sec-2} to derive a sequence of theorems and propositions that provide upper bounds for the condition number of $\pl(A)V$. We begin by examining the simpler setting in which the same polynomial degree $m$ is applied uniformly to all vectors in $V$. We then extend the analysis to the more general case where the polynomial degree is optimized individually for each filtered vector. Finally, we present a general expression for estimating the condition number in the practical scenario where some vectors have already converged and are therefore deflated and locked.
+
+%\textit{
+%\begin{itemize}
+%    \item Subsection1: lemmas and main proposition for the case of filtering with a single polynomial degree for all vectors
+%    \item subsection2: generalization of the results of previous subsection to the case of a vector of optimized degrees
+%    \item subsection3: lemmas and propositions for the case that includes locking and deflation
+%\end{itemize}
+%}
+
+\subsection{Single polynomial degree and no locking mechanism}
+
+\begin{lemma}
+\label{th:2-1}
+Given the definition of the matrix elements in the spectral decomposition of equation \eqref{eq-2-2-2} the following expressions hold:
+\begin{enumerate}
+\setlength\itemsep{3pt}
+    \item $\cd(X_\ell \Gamma_\ell^m) = \cd(\Gamma_\ell^m) = \frac{\rto 1{m}}{\rto \ell{m}}$ 
+    \item $\cd(S_\ell) = 1$
+    \item $\|\Gamma_\ell^m S_\ell\|_2 \leq 1$
+    \item $\|S_\ell^+ \inv{\Gamma_\ell^m}\|_2 \leq \frac{\rto 1{m}}{\rto \ell{m}}$
+\end{enumerate}
+\end{lemma}
+\begin{proof}
+The condition number of a general rectangular matrix $M$ is defined through the pseudo-inverse $M^+$ as $\textrm{cond}_p(M) \doteq \|M\|_p \|M^+\|_p $. Specifically, when using the 2-norm ($p=2$), $\cd(M) = \frac{\sigma_{\textrm{max}}(M)}{\sigma_{\textrm{min}}(M)}$ with $\sigma_{\textrm{max}}(M)$ and $\sigma_{\textrm{min}}(M)$ being the largest and smallest non-zero singular values of $M$. 
+
+With the above definition in hand, each statement of the Lemma can be derived in few passages.
+\begin{enumerate}
+\setlength\itemsep{3pt}
+    \item Since $X_\ell$ is a unitary matrix by definition, $\|X_\ell \Gamma_\ell^m\|_2 = \|\Gamma_\ell^m\|_2$ and 
+    \[
+    \cd(X_\ell \Gamma_\ell^m) = \cd(\Gamma_\ell^m) = \frac{\sigma_1(\Gamma_\ell^m)}{\sigma_\ell(\Gamma_\ell^m)} = \frac{\rto 1{m}}{\rto \ell{m}}.
+    \]  
+    \item Using the definition of $S_\ell$, $\cd(S_\ell) = \|X_\ell^H V\|_2 \|(X_\ell^H V)^{-1}\|$. Because $V$ is by construction either \texttt{i.i.d.} (at subspace iteration 0) or orthonormal (at later subspace iterations), $\|X_\ell V\|_2 = \|V\|_2 = 1$. the same conclusion hold for the norm of the inverse of $S_\ell$.
+    \item The third statement follows from a simple chain of relations
+    \[
+    \|\Gamma_\ell^m S_\ell\|_2 \leq \|\Gamma_\ell^m\|_2 \|S_\ell\|_2 = \|\Gamma_\ell^m\|_2 = \sigma_{\textrm{max}}(\Gamma_\ell^m) = 1,
+    \]
+    where we have used the Schwarz inequality, the intermediate results from statement 2., and the definition of $\Gamma$s in equation \eqref{eq:gammas} whose values are in descending order from left to right.
+    \item Similarly to the previous statement, also the last one is deduced by a simple chain of inequalities 
+    \[
+    \|S_\ell^+ \inv{\Gamma_\ell^m}\|_2 \leq \|S_\ell^+\|_2 \|\inv{\Gamma_\ell^m}\|_2 = \|\inv{\Gamma_\ell^m}\|_2 = \frac{\rto 1{m}}{\rto \ell{m}}.
+    \]
+\end{enumerate}
+\end{proof}
+While simple, the results of the Lemma above are particularly relevant in the case $p=2$ norm thanks to the following inequality which holds for two rectangular matrices $A$ and $B$ with congruent dimensions
+\begin{equation}
+\label{eq-2-2-3}
+\cd(AB) \leq \cd(A) \cd(B).
+\end{equation}
+For instance, from the 3. and 4. statements and the definition of condition number, it automatically holds that $\cd(\Gamma_\ell^m S_\ell) \leq \frac{\rto 1{m}}{\rto \ell{m}}$. Moreover, we can now state and demonstrate the proposition below.
+
+\begin{proposition}
+\label{th:2-2}
+Given a square Hermitian matrix $A$, we filter an array of orthonormal vectors $V$ by a Chebyshev polynomial of degree $m$ defined by $\pl (A)$. For a given $m$, the subspace filtered by the polynomial can be built such that $1 < \rto \ell{m} < 1 + \sqrt{2}$, then the following inequality holds for a constant $\eta > 1$ 
+\begin{equation}
+\cd \left(\pl (A)V\right) \leq \eta \rto 1{m}
+\end{equation}
+\end{proposition}
+\begin{proof}
+For the sake of simplicity, let us define $E^m \doteq \Gamma_3^m S_3 \inv{S_\ell} \inv{\Gamma_\ell^m}$ and write again Equation~\eqref{eq-2-2-2} as
+\[
+\pl (A) V = (X_\ell + X_3 E^m) \Gamma_\ell^m S_\ell
+\]
+In the large $m$ limit we expect $X_\ell + X_3 E^m \longrightarrow X_\ell$. For some finite, but large enough values of $m$, one can treat the expression $X_3E^m$ as a perturbation of $X_\ell$ and write $X_3 E^m = - \delta X_\ell$, such that 
+\[
+\pl (A) V = (\Ibb - \delta X_\ell X_\ell^H) X_\ell \Gamma_\ell^m S_\ell = (\Ibb - D) X_\ell \Gamma_\ell^m S_\ell.
+\]
+From Equation \eqref{eq-2-2-3} follows that 
+\[
+\cd \left(\pl (A)V\right) \leq \cd (\Ibb - D) \cd (X_\ell \Gamma_\ell^m S_\ell) \leq \cd (\Ibb - D) \frac{\rto 1{m}}{\rto \ell{m}}.
+\]
+Following the definition of condition number $\cd (\Ibb - D) = \|(\Ibb - D)\|_2 \|\left(\Ibb - D\right)^{-1}\|_2$, we need to obtain bounds for the 2-norms on the RHS. From the triangle inequality $\|\Ibb - D \|_p \leq 1 + \|D\|_p$, while from Lemma 2.3.3 of Golub Van-Loan (3rd edition)~\cite{Golub:2012wt} one has that $\|\left(\Ibb - D\right)^{-1}\|_p \leq \left( \Ibb - \|D\|_p\right)^{-1}$ if $\|D\|_p < 1$ . All is left to do is to derive a bound for the norm $D$. It useful to express the latter in explicit form
+\[
+- D = X_3 \Gamma_3^m S_3 S_\ell^{-1} \inv{\Gamma_\ell^m} X_\ell^H = \left(X_3 \Gamma_3^m X_3^H\right) V V^H \inv{X_\ell \Gamma_\ell^m X_\ell^H}, 
+\]
+where in the last equality we have used the definition of the $S$ matrices. Taking the norm of $D$ and using successively the triangle inequality and the results from Lemma \ref{th:2-1}, we obtain the following inequality
+\[
+\|D\|_2 \leq \|X_3 \Gamma_3^m X_3^H\|_2 \|V V^H\|_2 \|\inv{X_\ell \Gamma_\ell^m X_\ell^H}\|_2 \leq \|\Gamma_3^m\|_2 \|\inv{\Gamma_\ell^m}\|_2 = \rto \ell{-m}.
+\]
+By assumption, $\rto \ell{m}$ is a always a number larger than 1, then we can plug in this last result into the definition of $\cd (\Ibb - D)$ and obtain
+\begin{equation}
+    \cd (\pl (A) V) \leq \frac{\rto 1{m}}{\rto \ell{m}} \cdot \frac{\rto \ell{m} + 1}{\rto \ell{m} -1}.
+\end{equation}
+Under the condition of the proposition $\eta \doteq \frac{\rto \ell{m} + 1}{\rto \ell{m} (\rto \ell{m} -1)} > 1$ which completes the proof.
+\end{proof}
+
+\begin{remark}
+\label{obs:2-1}
+In practical cases, $\rto \ell{m}$ is always a number larger than unity but almost never larger than 2. This is because the choice of subspace is such that the eigenvalue $\lambda_\ell$ is quite close to the extreme of the filtered interval of the spectrum but always included in it. The latter condition guarantee that $\rto \ell{m} > 1$ while its closeness to extreme ensure that it is never too large and always much smaller than $\rto 1{m}$. For this reason, the parameter $\eta$ is bigger than one but not by too much. We will see in the set of numerical experiments that it is fairly safe to choose the $\eta = 1$ and use a simplified version of the bound.
+\end{remark}
+
+\subsection{Optimized polynomial degree}
+As we have seen at the end of Section \ref{sec-2-3}, when the polynomial degree is optimized $m$ becomes a vector of size $\ell$ holding increasingly larger integer values as the vector index grows. In this case Lemma \ref{th:2-1} can be easily generalized by adding a simple condition.
+\begin{lemma}
+\label{th:2-3}
+Given the definition of the matrix elements in the spectral decomposition of equation \eqref{eq-2-2-2} with the $\Gamma$'s expressed by Equation \ref{eq:gammas-2}, and the additional condition that $\rto i{m_i} \rto 1{(m_{i+1} - m_i)} \geq \rto{i+1}{m_{i+1}}$  the following expressions hold:
+\begin{enumerate}
+\setlength\itemsep{3pt}
+    \item $\cd(X_\ell \Gamma_\ell^m) = \cd(\Gamma_\ell^m) = \frac{\rto 1{m_\ell}}{\rto \ell{m_\ell}}$ 
+    \item $\cd(S_\ell) = 1$
+    \item $\|\Gamma_\ell^m S_\ell\|_2 \leq 1$
+    \item $\|S_\ell^+ \inv{\Gamma_\ell^m}\|_2 \leq \frac{\rto 1{m_\ell}}{\rto \ell{m_\ell}}$
+\end{enumerate}
+\end{lemma}
+\begin{proof}
+The proof for statements 2. and 3. is exactly the same as for \cref{th:2-1}. The only difference for the remaining statements is in the structure of the $\Gamma$s. As long as the additional condition of the Lemma holds, the values of the diagonal elements of the $\Gamma$s are still written in descending ordered so that the same steps in the proof leads to the stated results. 
+\end{proof}
+
+A similar result is obtained for \cref{th:2-2} where now $ m \rightarrow m_\ell$. The end results is that, under the condition that $1 < \rto \ell{m_\ell} < 1 + \sqrt{2}$,
+\begin{equation}
+    \cd \left(\pl (A)V\right) \leq \eta \rto 1{m_\ell}
+\end{equation}
+with $\eta \doteq \frac{\rto \ell{m_\ell} + 1}{\rto \ell{m_\ell} (\rto \ell{m_\ell} -1)} > 1$. The proof of the statement follows exactly the same steps described in the proof of \cref{th:2-2} are not worth repeating here. The clue point is to recognize that the norm of the matrix $\|D\| \leq \rto \ell{m_\ell}$. Similarly to Remark \ref{obs:2-1}, as long as the value of $m_\ell$ is $\odg{10}$, $\rto \ell{m_\ell}$ is a number larger than 1 but still of $\odg{1}$ and for all practical purposes it can be ignored.
+
+\subsection{Locking and deflating the vectors}
+\label{sec-3-3}
+In this case bounding from above the condition number of $V$ is a bit more complex and requires understanding how the condition number of the spectral decomposition illustrated in Equation \eqref{eq:ZMat} is influenced by its components. Before attempting a rigorous analysis it is worth making a simple hand waving consideration. The first $k$ columns of the array $Z$ are made by a very well behaved sub-array, $X_1Q_1$, whose condition number is by construction likely to be as close to unity as it gets. In fact, this array represents the portion of $Z$ that has converged and has been deflated. Conversely the sub-array $\left(X_2 \Gamma_2^m S_2 + X_3 \Gamma_3^m S_3 \right)$ encloses the part of $Z$ that may be problematic. As such, one would expect only this part to contribute to the condition number of $Z$. In order to show this more rigorously, we state and demonstrate the following proposition.
+
+\begin{theorem}
+\label{th:deflation}
+Given two rectangular matrices $A$ and $B$ with $A \in \C^{n\times q}$ and $B \in \C^{n\times p}$, $n>q+p$ and $A^HB=0$ (or equivalently $B^HA=0$), the condition number of $M \doteq \left[A\ B\right] \in \C^{n\times\ell}$ is
+\begin{equation}
+    \cd (M) \leq \frac{\sigma_1(A) + \sigma_1(B)}{\inf\{\sigma_q(A), \sigma_p(B)\}}
+\end{equation}
+\end{theorem}
+\begin{proof}
+By definition, the condition number of $M$ is
+\begin{equation*}
+    \cd (M) = \|M\|_2 \|M^+\|_2 = \frac{\sigma_1(M)}{\sigma_\ell(M)}
+\end{equation*}
+where, as before, $M^+$ indicates the pseudo-inverse of $M$ and $\ell = q+p$. The series of inequalites below hold
+\[
+\sigma_1(M) = \|M\|_2 = \sqrt{\lambda_1(MM^H)} = \|AA^H + BB^H\|_2 \leq \|AA^H\|_2 + \|BB^H\|_2 = \sigma_1(A) + \sigma_1(B) 
+\]
+where $\lambda_1$ and $\sigma_1$ are respectively the largest eigenvalue and the largest singular value. The norm of the pseudo-inverse is a bit trickier. Since $M$ has $\ell$ independent columns the definition of pseudo-inverse is $M^+ = (M^HM)^{-1}M^H$. In block forms this becomes
+\[
+M^+ = \left[ \begin{pmatrix} A^H \\ B^H \end{pmatrix} \begin{pmatrix} A & B \end{pmatrix} \right]^{-1} \begin{pmatrix} A^H \\ B^H \end{pmatrix} = \begin{pmatrix} A^HA & 0 \\ 0 & B^HB \end{pmatrix}^{-1} \begin{pmatrix} A^H \\ B^H \end{pmatrix}
+\]
+\[
+= \begin{pmatrix} (A^HA)^{-1}A^H & 0 \\ 0 & (B^HB)^{-1}B^H \end{pmatrix} 
+ =  \begin{pmatrix} A^+ & 0 \\ 0 & B^+ \end{pmatrix}
+\]
+where we used the proposition assumption in the first step, and the fact that the inverse of block diagonal matrices are equal to the inverse of the blocks in the second step. With this expression we can now easily show that
+\[
+[\sigma_\ell(M)]^{-1} = \sigma_1(M^+) = \left\|\begin{pmatrix} A^+ & 0 \\ 0 & B^+ \end{pmatrix}\right\|_2 \leq \sup \{\|A^+\|_2, \|B^+\|_2\} = 
+\sup \{\sigma_1(A^+), \sigma_1(B^+)\}
+\]
+\[
+ = \sup \{\sigma_q(A)^{-1}, \sigma_p(B)^{-1}\} = \left[\inf \{\sigma_q(A), \sigma_p(B)\} \right]^{-1}
+\]
+The central inequality can be derived by using the definition of matrix norm $\|M^+\|_2 = \sup_{\|v\|=1}\|M^+ v\|_2$ with a vector $v$ defined as 
+\[
+v = \begin{pmatrix} a x \\ b y \end{pmatrix}\ \textrm{with}\quad a^2+b^2 = 1\ \textrm{and}\quad \|x\| = \|y\| = 1
+\]
+such that
+\[
+\|M^+\|^2_2 = a^2 \sup \|A^+ x\|^2_2 + b^2 \sup \|B^+ y\|^2_2 \leq (a^2+b^2) \sup \{\|A^+\|_2^2, \|B^+\|_2^2\} = \sup \{\|A^+\|_2, \|B^+\|_2\}^2  
+\]
+\end{proof}
+The statement of \cref{th:deflation} can be directly applied to the $Z$ matrix of \eqref{eq:ZMat}, with $M=Z$, $A=X_1Q_1$ and $B = X_2 \Gamma_2^m S_2 + X_3 \Gamma_3^m S_3$ and correspondingly $q=k$ and $p=\ell-k$. Because $A=X_1Q_1$ represents the array of deflated and locked vectors, it is a unitary matrix by construction. As such, $\sigma_k(X_1Q_1) \sim \sigma_1(X_1Q_1) = \|X_1Q_1\|_2 = 1$. Conversely
+
+\begin{eqnarray*}
+\sigma^2_{\ell-k}(B) &= \lambda_{\ell-k}\left(S^H_2 (\Gamma_2^m)^H \Gamma_2^m S_2 + S^H_3 (\Gamma_3^m)^H \Gamma_3^m S_3\right) = \inf_{\|v\|_2=1} v^H \left(S^H_2 (\Gamma_2^m)^H \Gamma_2^m S_2 + S^H_3 (\Gamma_3^m)^H \Gamma_3^m S_3\right) v \\
+ &= \inf_{\|v\|_2=1} (v^H S^H_2 (\Gamma_2^m)^H \Gamma_2^m S_2 v) + \inf_{\|v\|_2=1} (v^H S^H_3 (\Gamma_3^m)^H \Gamma_3^m S_3 v) \\
+ &= \inf_{\|z\|_2=1} (z^H (\Gamma_2^m)^H \Gamma_2^m z) + \inf_{\|u\|_2=1} (u^H S^H_3 (\Gamma_3^m)^H \Gamma_3^m S_3 u) = \sigma^2_{\ell-k}(\Gamma^m_2) + \sigma^2_{n-\ell}(\Gamma^m_3)
+\end{eqnarray*}
+
+
+Since $\Gamma^m_2$ and $\Gamma^m_3$ are positive definite and $\sigma_{\ell-k}(\Gamma_2^m) = \frac{\rto{\ell}{m\ell}}{\rto{1}{m_\ell}} \ll 1$ and $\sigma_{n-\ell}(\Gamma_3^m) = \frac{1}{\rto{1}{m_\ell}} \ll 1$ then
+\[
+\sigma_{\ell-k}(\Gamma_2^m S_2 + \Gamma_3^m S_3) \leq \sigma_{\ell-k}(\Gamma^m_2) + \sigma_{n-\ell}(\Gamma^m_3) \ll 1.
+\]
+Similarly, it can be argued that $\sigma_1((\Gamma_2^m S_2 + \Gamma_3^m S_3) \gg 1$. Putting all the pieces together one arrives at
+\[
+\label{eq:condZ}
+\cd (Z) \leq \frac{1 + \sigma_1((\Gamma_2^m S_2 + \Gamma_3^m S_3)}{\sigma_{\ell-k}(\Gamma_2^m S_2 + \Gamma_3^m S_3)} \approxeq \cd (\Gamma_2^m S_2 + \Gamma_3^m S_3)
+\]
+
+\begin{corollary}
+\label{cr:3-1}
+Given the polynomial filter $\pl (A)$ of degree $m$ generated by a square Hermitian matrix $A$, and a subspace $Z$ made by the union of the deflated and locked subspace $W$ and the filtered subspace $\pl (A)V$  the following inequality holds for $1 < \rto \ell{m_\ell} < 1 + \sqrt{2}$ and a constant $\eta > 1$ 
+\begin{equation}
+\cd (Z) \lesssim \eta \rto {k+1}{m_{k+1}} \rto 1{m_\ell-m_{k+1}}
+\end{equation}
+\end{corollary}
+\begin{proof}
+The proof of the corollary follows exactly the same steps of \cref{th:2-2}. We start from the \eqref{eq:condZ} write the condition number as a product of condition numbers
+\[
+\cd \left(\Gamma_2^m S_2 + \Gamma_3^m S_3)\right) \leq \cd (\Ibb - D) \cd (X_2 \Gamma_2^m S_2)
+\]
+with the only difference that now $D = X_3 \Gamma_3^m S_3 S_2^{-1} \inv{\Gamma_2^m} X_2^H$. Because the locking and deflation mechanism, $\Gamma_2^m$ has a different asymptotic form than $\Gamma_\ell^m$, namely
+\[
+\Gamma_2^{m}  = \diag (\frac{\rto{k+1}{m_{k+1}}}{\rto 1{m_{k+1}}}, \dots, \frac{\rto \ell{m_\ell}}{\rto 1{m_\ell}}).
+\]
+Consequently $\|D\|_2$ can be bound from above by $\rto \ell{-m_\ell}$ as in \ref{th:2-2} while  \[
+\cd (X_2 \Gamma_2^m S_2) \leq \frac{\rto{k+1}{m_{k+1}} \rto 1{m_\ell - m_{k+1}}}{\rto \ell{m_\ell}}
+\]
+Putting everything together results in
+\begin{equation}
+    \cd (Z) \lesssim \cd (\Gamma_2^m S_2 + \Gamma_3^m S_3) \leq \frac{\rto \ell{m} + 1}{\rto \ell{m}(\rto \ell{m} -1)} \cdot  \rto{k+1}{m_{k+1}} \rto 1{m_\ell - m_{k+1}}.
+\end{equation}
+Once again, under the condition of the corollary one can define $\eta \doteq \frac{\rto \ell{m} + 1}{\rto \ell{m} (\rto \ell{m} -1)} > 1$ which completes the proof.
+\end{proof}

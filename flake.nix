@@ -15,7 +15,7 @@
 
       # Pin claude-code to a specific version from GitHub ahead of nixpkgs.
       # Update the tag here, then rebuild: nix will fail with the correct npmDepsHash.
-      claude-code-rev = "v2.1.144";
+      claude-code-rev = "v2.1.150";
 
       claude-code-overlay = final: prev:
         let
@@ -30,7 +30,7 @@
                 version = final.lib.removePrefix "v" claude-code-rev;
                 src = final.fetchurl {
                   url = "${baseUrl}/${version}/${platformKey}/claude";
-                  sha256 = "sha256-FHSAd0Ry5XIP1eg2F7PpKZNE5yE++oTDJrJb1aDyC04=";
+                  sha256 = "sha256-bAhqD1+/aE1BSLtpYpJotPUQlJjBp751es8YxR/QT0s=";
                 };
               });
         };
