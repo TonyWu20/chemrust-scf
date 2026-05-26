@@ -1,114 +1,136 @@
-# Diagnostic 1 Implementation Status
+# Diagnostic 1 & 1b Implementation Status
 
-## Current State
+## ✅ Completed (2025-05-26)
 
-Created `tests/chebyshev_orthogonality_diagnostic.rs` with:
-- ✓ Test structure and discriminator thresholds
-- ✓ Helper functions: `condition_number_svd()`, `compute_s_overlap_matrix()`, `off_diagonal_stats()`
-- ✓ Unit tests for helper functions
-- ✗ Main diagnostic implementation (placeholder)
+### Diagnostic 1 (Original)
+- **Status**: ✅ Complete (commit c471b3d)
+- **Filter Mode**: BareH (baseline, physically incorrect for USPP)
+- **Result**: κ₂ = 1.0000e0, off-diagonal max = 7.6e-15
+- **Verdict**: Orthogonality is EXCELLENT
 
-## Blockers
+### Diagnostic 1b (Critical Validation)
+- **Status**: ✅ Complete (commit cc99f27)
+- **Filter Mode**: SinvHKeepHEig (production mode for USPP)
+- **Result**: κ₂ = 1.0000e0, off-diagonal max = 2.9e-15
+- **Verdict**: Orthogonality is EXCELLENT ✓ **CRITICAL FINDING**
 
-### 1. Library Compilation Errors (Pre-existing)
+### Diagnostic 1c (Optional)
+- **Status**: ✅ Complete (commit cc99f27)
+- **Filter Mode**: SinvHFullDas (full Das Algorithm 3)
+- **Result**: κ₂ = 1.0000e0, off-diagonal max = 2.0e-15
+- **Verdict**: Orthogonality is EXCELLENT
 
-The main `chemrust-scf` library has compilation errors unrelated to the diagnostic:
+---
 
-```
-error[E0308]: mismatched types
-    --> src/scf.rs:1841:65
-     |
-1841 | ...                   castep_bin.parameters_raw = Some(raw.clone());
-     |                       -------------------------   ^^^^^^^^^^^^^^^^^ expected `Vec<Vec<u8>>`, found `Option<Vec<u8>>`
+## Key Findings
 
-error[E0277]: the trait bound `&CastepBin: std::io::Write` is not satisfied
-    --> src/scf.rs:1848:37
-     |
-1847 | ...                   match chemrust_hamiltonian_core::CheckFile::write(
-1848 | ...                       &castep_bin, &mut file,
-     |                           ^^^^^^^^^^^ the trait `std::io::Write` is not implemented for `&CastepBin`
+### Critical Validation Gap Closed
 
-error[E0308]: mismatched types
-   --> src/scf_capture.rs:178:25
-    |
-178 |         parameters_raw: None,
-    |                         ^^^^ expected `Vec<Vec<u8>>`, found `Option<_>`
+**Problem**: Original Diagnostic 1 used `FilterMode::BareH`, which is physically incorrect for USPP systems. The production code uses `FilterMode::SinvHKeepHEig` (S^{-1}·H via Woodbury), which was never validated for orthogonality preservation.
 
-error[E0063]: missing fields `cell_raw`, `kpoint_weights` and `orig_cell_raw` in initializer of `CastepBin`
-   --> src/scf_capture.rs:170:10
-```
+**Solution**: Implemented Diagnostic 1b to test all three filter modes on the same Cu111_CO fixture.
 
-**Root cause**: `chemrust-hamiltonian-core` API changed (CastepBin struct fields, CheckFile::write signature).
+**Result**: All three filter modes preserve orthogonality perfectly (κ₂ = 1.0).
 
-**Impact**: Cannot compile tests until library compiles.
+### Implications
 
-**Note from ANALYSIS.md**:
-> These only affect the `.check`-file writing codepath, not the eigensolver or filter code paths.
+✅ **Factor C (USPP S^{-1} complexity) is NOT a blocker**
+- Woodbury-based S^{-1} at ζ=3.8e-15 is numerically stable
+- No need to investigate alternative S^{-1} methods
+- No need to pivot to Davidson or band-by-band CG due to filter issues
 
-### 2. Missing Dependency
+✅ **Cascade root cause confirmed**
+- Missing outer loop (no band-locking, no iterative refinement)
+- Single sweep per SCF step (vs CASTEP's 19-26 iterations)
+- NOT the filter operator or Woodbury precision
 
-The test needs `ndarray-linalg` for SVD computation:
+✅ **Green light for PARSEC Algorithm 4 implementation**
+- Proceed with outer loop + band-locking + Harmonic RR
+- Next: Diagnostics 2-5 to validate the outer loop approach
 
-```toml
-[dev-dependencies]
-ndarray-linalg = { version = "0.17", features = ["openblas-static"] }
-```
+---
 
-### 3. Eigensolver Infrastructure Access
+## Implementation Details
 
-The main diagnostic requires:
-1. Uploading ψ to GPU
-2. Running `chebyshev_filter()` (currently embedded in `ScfIteration::diagonalize()`)
-3. Downloading filtered ψ back to CPU
-4. Computing S-overlap matrix (USPP-aware via `apply_s_times`)
+### Changes Made (commit cc99f27)
 
-**Current architecture**: `chebyshev_filter()` is not exposed as a standalone function. It's called internally by `diagonalize()` in `src/scf.rs`.
+1. **Modified `chebyshev_filter_for_test()`** in `src/eigensolver/chebyshev.rs`:
+   - Added `filter_mode: FilterMode` parameter
+   - Removed hardcoded `FilterMode::BareH`
 
-**Options**:
-- **A**: Extract `chebyshev_filter()` into a public API in `src/eigensolver/chebyshev.rs`
-- **B**: Call `diagonalize()` and intercept the filtered wavefunctions before Rayleigh-Ritz
-- **C**: Duplicate the filter logic in the test (not recommended)
+2. **Exported `FilterMode`** from `src/lib.rs`:
+   - Added to test-only exports for integration tests
+
+3. **Refactored test** in `tests/chebyshev_orthogonality_diagnostic.rs`:
+   - Created helper function `run_orthogonality_diagnostic(filter_mode, mode_name)`
+   - Added three test variants:
+     - `diagnostic_1_orthogonality_after_chebyshev_filter()` - BareH
+     - `diagnostic_1b_orthogonality_sinvh_keep_h_eig()` - SinvHKeepHEig (production)
+     - `diagnostic_1c_orthogonality_sinvh_full_das()` - SinvHFullDas
+
+### Test Infrastructure
+
+- ✅ Test structure and discriminator thresholds
+- ✅ Helper functions: `condition_number_svd()`, `compute_s_overlap_matrix()`, `off_diagonal_stats()`
+- ✅ Unit tests for helper functions
+- ✅ Main diagnostic implementation with filter mode parameter
+- ✅ All three filter modes validated
+
+---
+
+## Documentation
+
+- **DIAGNOSTIC_1B_RESULT.md** - Detailed test results and analysis
+- **notes/diagnostic-1b-result.md** - Copy in notes directory
+- **notes/plans/diagnostic-1b-and-outer-loop-plan.md** - Full implementation plan
+- **HANDOFF.md** - Next session instructions
+
+---
 
 ## Next Steps
 
-### Immediate (Fix Blockers)
+### Diagnostic 2: Per-Band Residual Norms
 
-1. **Fix library compilation errors** in `src/scf.rs` and `src/scf_capture.rs`:
-   - Update `CastepBin` field initialization to match new API
-   - Fix `CheckFile::write()` argument order
-   - Add missing fields: `cell_raw`, `kpoint_weights`, `orig_cell_raw`
+**Goal**: Measure per-band residual norms after a single Chebyshev filter pass to establish baseline convergence characteristics.
 
-2. **Add `ndarray-linalg` to `Cargo.toml`**:
-   ```toml
-   [dev-dependencies]
-   ndarray-linalg = { version = "0.17", features = ["openblas-static"] }
-   ```
+**Implementation**:
+1. Load Cu111_CO fixture (converged state)
+2. Run one Chebyshev filter pass (ndeg=8, SinvHKeepHEig mode)
+3. Apply Gram-Schmidt orthonormalization
+4. Run standard Rayleigh-Ritz (ZHEGVD)
+5. Compute per-band residuals: r_b = H|ψ_b⟩ - λ_b·S|ψ_b⟩
+6. Compute S^{-1}-weighted norms: ||r_b||_{S^{-1}} = √⟨r_b | S^{-1}·r_b⟩
+7. Report statistics by band type (Cu 3d cluster vs well-separated)
 
-3. **Extract `chebyshev_filter()` as standalone function**:
-   - Move GPU upload/download logic out of `diagonalize()`
-   - Expose `chebyshev_filter()` in `src/eigensolver/chebyshev.rs`
-   - Add helper to compute S-overlap matrix on GPU
+**Expected Outcome**:
+- Cu 3d bands (1-14): High residuals due to degeneracy
+- Well-separated bands: Low residuals
+- Establishes baseline for "how many bands need more work"
 
-### After Blockers Resolved
+**Estimated Time**: 2-3 hours
 
-4. **Implement main diagnostic**:
-   - Load CASTEP fixture wavefunctions
-   - Upload to GPU
-   - Run Chebyshev filter (ndeg=8)
-   - Path A: Apply Gram-Schmidt (existing)
-   - Path B: Apply Cholesky QR (new, via cuSOLVER)
-   - Download filtered ψ to CPU
-   - Compute S-overlap matrix M
-   - Compute κ₂(M) via SVD
-   - Report statistics
+---
 
-5. **Run diagnostic and interpret results**:
-   - κ₂ < 10³: Proceed with either method
-   - κ₂ ~ 10⁶: Cholesky QR may be faster
-   - κ₂ > 10¹⁰: Abandon iterative Chebyshev, use CG
+## Test Commands
 
-## Recommendation
+```bash
+# Run all three diagnostic tests
+cargo test --test chebyshev_orthogonality_diagnostic -- --ignored --nocapture
 
-**Fix the library compilation errors first.** These are blocking all test compilation, not just the diagnostic. The errors are in the `.check` file writing code, which is orthogonal to the eigensolver work, but must be resolved to proceed.
+# Run specific tests
+cargo test --test chebyshev_orthogonality_diagnostic diagnostic_1_orthogonality_after_chebyshev_filter -- --ignored --nocapture
+cargo test --test chebyshev_orthogonality_diagnostic diagnostic_1b_orthogonality_sinvh_keep_h_eig -- --ignored --nocapture
+cargo test --test chebyshev_orthogonality_diagnostic diagnostic_1c_orthogonality_sinvh_full_das -- --ignored --nocapture
+```
 
-Once the library compiles, I can implement the full diagnostic.
+---
+
+## Historical Context
+
+### Original Blockers (Now Resolved)
+
+1. ~~Library compilation errors~~ - Fixed in earlier commits
+2. ~~Missing `ndarray-linalg` dependency~~ - Added
+3. ~~Eigensolver infrastructure access~~ - `chebyshev_filter_for_test()` created
+
+All blockers have been resolved. The diagnostic infrastructure is complete and validated.
