@@ -13,6 +13,9 @@ bon = "3.9.1"
 faer = "0.24"
 cudarc = { version = "0.19.7", features = ["cuda-12090", "cublas", "cufft", "cusolver", "nvrtc"] }
 
+[dev-dependencies]
+approx = "0.5"
+
 [lib]
 name = "chemrust_scf"
 crate-type = ["lib"]

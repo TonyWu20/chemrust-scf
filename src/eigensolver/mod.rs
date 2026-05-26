@@ -1,3 +1,4 @@
+pub(crate) mod cg_helpers;
 pub(crate) mod chebyshev;
 pub(crate) mod line_search;
 pub(crate) mod rayleigh_ritz;
