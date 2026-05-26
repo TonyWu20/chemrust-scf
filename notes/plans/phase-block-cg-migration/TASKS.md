@@ -307,15 +307,16 @@ Gate 1: Consistency Check
 **Kind**: `lib-tdd`
 
 **Description**:
-Verify that CG converges band-0 from pseudoatomic guess to within 1e-6 Ha of CASTEP reference.
+Verify that CG converges band-0 from random guess to within 1e-6 Ha of CASTEP reference.
 
 **Test procedure**:
 1. Load Cu111_CO .pot_fmt → extract V_eff
-2. Generate pseudoatomic guess for band-0 using chemrust-hamiltonian's Hubbard U module
-   - Call `atomic_solver::solve_pseudoatomic_scf()` for Cu 3d orbital
-   - Project onto plane-wave basis
-   - S-normalize
-3. Run CG: `band_cg_minimize(ψ_guess, V_eff, precond, [], max_steps=50, tol=1e-6)`
+2. Generate random wavefunction guess (CASTEP method='R', `wave.f90:1900-1949`):
+   - For each plane wave with E_k < 3.307 Ha (90 eV cutoff):
+     - ψ[g] = (rn1 - 0.5) + i·(rn2 - 0.5) where rn1, rn2 ~ Uniform(0,1)
+   - For plane waves with E_k ≥ 3.307 Ha: ψ[g] = 0
+   - S-normalize: ψ ← ψ / sqrt(⟨ψ|S|ψ⟩)
+3. Run CG: `band_cg_minimize(ψ_random, V_eff, precond, [], max_steps=50, tol=1e-6)`
 4. Assert:
    - Converged within 50 steps
    - ‖r_0‖_S < 1e-6 Ha
@@ -336,15 +337,16 @@ cargo test --test phase0_gate2_convergence -- --nocapture
 
 **Expected output**:
 ```
-Gate 2: Convergence from Pseudoatomic Guess
-  Generated pseudoatomic guess for Cu 3d (band-0)
-  Initial eigenvalue: -0.82 Ha
-  CG iteration 1: ε = -0.95 Ha, ‖r‖_S = 3.2e-2 Ha
-  CG iteration 2: ε = -1.01 Ha, ‖r‖_S = 8.1e-3 Ha
+Gate 2: Convergence from Random Guess
+  Generated random wavefunction (CASTEP method='R', 90 eV cutoff)
+  Initial S-norm: 1.0000, initial eigenvalue: +2.3 Ha (random)
+  CG iteration 1: ε = -0.45 Ha, ‖r‖_S = 0.18 Ha
+  CG iteration 2: ε = -0.82 Ha, ‖r‖_S = 0.09 Ha
+  CG iteration 3: ε = -0.98 Ha, ‖r‖_S = 0.04 Ha
   ...
-  CG iteration 12: ε = -1.055023 Ha, ‖r‖_S = 4.3e-7 Ha
-  CONVERGED in 12 steps
-  Final eigenvalue: -1.055023 Ha (target: -1.055023 Ha, diff: 3.2e-8 Ha)
+  CG iteration 18: ε = -1.055023 Ha, ‖r‖_S = 8.2e-7 Ha
+  CONVERGED in 18 steps
+  Final eigenvalue: -1.055023 Ha (target: -1.055023 Ha, diff: 1.5e-8 Ha)
   PASS: converged within 50 steps, ‖r‖_S < 1e-6 Ha
 ```
 
