@@ -49,6 +49,16 @@ type ChebyshevResult = Result<
     Error,
 >;
 
+/// Return type for `chebyshev_filter_for_test_gpu`: (psi, hpsi, kernels)
+type GpuFilterResult = Result<
+    (
+        Gpu<WavefunctionSet<RowDistributed>>,
+        Gpu<WavefunctionSet<RowDistributed>>,
+        CudaKernelSet,
+    ),
+    Error,
+>;
+
 // ---------------------------------------------------------------------------
 // Filter operator mode for the Chebyshev recurrence (A/B/C diagnostic sweep)
 // ---------------------------------------------------------------------------
@@ -1384,4 +1394,272 @@ pub fn chebyshev_filter_for_test(
         .into_iter()
         .map(|c| num_complex::Complex64::new(c.x, c.y))
         .collect())
+}
+
+/// GPU-resident variant: returns `(psi_row_gpu, hpsi_row_gpu, kernels)` directly.
+///
+/// Identical to `chebyshev_filter_for_test` but keeps results on the device
+/// so the caller can chain into `rayleigh_ritz_with_matrices` without an
+/// extra upload/download round-trip.  Also returns `CudaKernelSet` so the
+/// caller can pass it (unused) to the RR wrapper.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn chebyshev_filter_for_test_gpu(
+    psi_host: &[num_complex::Complex64],
+    v_eff_host: &[f64],
+    n_bands: usize,
+    n_pw: usize,
+    wave_grid: &GVectorGrid,
+    pw_coords: &[[i32; 3]],
+    cell: &CellGeometry,
+    pots: &PseudopotentialSet,
+    vnl_data: &VnlBatchData,
+    min_veff: f64,
+    max_veff: f64,
+    ndeg: usize,
+    eigenvalues: Option<&[f64]>,
+    filter_mode: FilterMode,
+    blas: &BlasHandle,
+    solver: &SolverHandle,
+    stream: &Arc<CudaStream>,
+    ctx: &Arc<CudaContext>,
+) -> GpuFilterResult {
+    use crate::device::pcie::PcieAccount;
+    use crate::layout::WavefunctionSet;
+
+    // Upload ψ to GPU
+    let psi_wfc = WavefunctionSet::<ColumnDistributed>::new(psi_host.to_vec(), n_bands, n_pw);
+    let mut pcie = PcieAccount::default();
+    let psi_gpu = Gpu::from_host_with(&psi_wfc, stream, &mut pcie)?;
+
+    // Upload V_eff to GPU
+    let [ngz, ngy, ngx] = wave_grid.grid();
+    let grid_size = ngx * ngy * ngz;
+    assert_eq!(v_eff_host.len(), grid_size);
+    let v_eff_arr = ndarray::Array3::from_shape_vec(
+        (ngx, ngy, ngz),
+        v_eff_host.to_vec(),
+    ).map_err(|e| Error::Io(format!("v_eff shape error: {}", e)))?;
+    use crate::types::{WaveGridArray, FineGridArray};
+    let v_eff_wave = WaveGridArray::from_inner(v_eff_arr);
+    let v_eff_fine = FineGridArray::from_inner(v_eff_wave.into_inner());
+    let v_eff_inner = crate::types::EffectivePotential::from_inner(v_eff_fine);
+    let v_eff_gpu = Gpu::from_host_with(&v_eff_inner, stream, &mut pcie)?;
+
+    // Upload PW-to-FFT index map
+    let fft_idx: Vec<i32> = crate::pw_coords_to_fft_indices(pw_coords, wave_grid);
+    let fft_idx_dev: CudaSlice<i32> = stream.clone_htod(&fft_idx).map_err(Error::Cuda)?;
+
+    // Compile kernels (needed by chebyshev_filter; caller reuses for RR)
+    let kernels = CudaKernelSet::new(ctx)?;
+
+    // Dummy k-point (unused by chebyshev_filter)
+    let dummy_kpoint = KPoint { coords: [0.0, 0.0, 0.0] };
+
+    // Run chebyshev_filter — keeps results GPU-resident
+    let (psi_filtered_row, hpsi_filtered_row) = chebyshev_filter(
+        &psi_gpu,
+        &v_eff_gpu,
+        pots,
+        wave_grid,
+        &dummy_kpoint,
+        cell,
+        pw_coords,
+        vnl_data,
+        &fft_idx_dev,
+        min_veff,
+        max_veff,
+        &kernels,
+        &mut pcie,
+        eigenvalues,
+        ndeg,
+        blas,
+        solver,
+        stream,
+        ctx,
+        filter_mode,
+    )?;
+
+    Ok((psi_filtered_row, hpsi_filtered_row, kernels))
+}
+
+/// GPU-resident residual norm computation (follows `davidson.rs:270-338`).
+///
+/// Takes GPU-resident RR output and computes per-band:
+///   r_b = H·ψ_b − λ_b · S·ψ_b
+///   ||r_b||₂  (unweighted L2)
+///   ||r_b||_{S⁻¹}  (physically correct USPP metric)
+///
+/// Returns `(sinv_norms, l2_norms)` — only `2 × n_bands` f64 scalars cross PCIe.
+/// All intermediate computation (rotate, apply S, axpy, apply S⁻¹, dotc) stays on GPU.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+pub fn compute_residual_norms_for_test(
+    psi_new_gpu: &Gpu<WavefunctionSet<ColumnDistributed>>,
+    hpsi_row_gpu: &Gpu<WavefunctionSet<RowDistributed>>,
+    eigenvalues: &[f64],
+    x: &[num_complex::Complex64],
+    n_bands: usize,
+    n_pw: usize,
+    vnl_data: &VnlBatchData,
+    blas: &BlasHandle,
+    solver: &SolverHandle,
+    stream: &Arc<CudaStream>,
+) -> Result<(Vec<f64>, Vec<f64>), Error> {
+    use cudarc::cublas::sys::{cublasZaxpy_v2, cublasZcopy_v2, cublasZdotc_v2};
+    use cudarc::driver::DevicePtrMut;
+
+    let n = n_bands as i32;
+    let k = n_pw as i32;
+    let n_elem = n_bands * n_pw;
+    let handle = blas.raw_handle();
+
+    // === 1. Upload X to GPU ===
+    let x_dev: CudaSlice<CudaComplex> = {
+        let x_cuda: Vec<CudaComplex> = x
+            .iter()
+            .map(|&c| CudaComplex { x: c.re, y: c.im })
+            .collect();
+        stream.clone_htod(&x_cuda).map_err(Error::Cuda)?
+    };
+
+    // === 2. Allocate working buffers ===
+    let mut hpsi_new_dev: CudaSlice<CudaComplex> =
+        stream.alloc_zeros(n_elem).map_err(Error::Cuda)?;
+    let mut spsi_new_dev: CudaSlice<CudaComplex> =
+        stream.alloc_zeros(n_elem).map_err(Error::Cuda)?;
+    let mut residual_dev: CudaSlice<CudaComplex> =
+        stream.alloc_zeros(n_elem).map_err(Error::Cuda)?;
+
+    // === 3. hpsi_new = hpsi_row · X  (rotate H·ψ into RR eigenbasis) ===
+    // hpsi_row is (n_pw × n_bands) col-major, X is (n_bands × n_bands) col-major
+    unsafe {
+        blas.gemm_c64(
+            crate::device::blas::ZgemmConfig {
+                transa: cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N,
+                transb: cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N,
+                m: k,
+                n,
+                k: n,
+                alpha: CudaComplex { x: 1.0, y: 0.0 },
+                lda: k,
+                ldb: n,
+                beta: CudaComplex { x: 0.0, y: 0.0 },
+                ldc: k,
+            },
+            hpsi_row_gpu.as_device_slice(),
+            &x_dev,
+            &mut hpsi_new_dev,
+        )?;
+    }
+
+    // === 4. spsi_new = S · psi_new (USPP overlap) ===
+    // Pre-copy psi_new → spsi_new (identity term), then accumulate β·Q·β^H
+    stream
+        .memcpy_dtod(psi_new_gpu.as_device_slice(), &mut spsi_new_dev)
+        .map_err(Error::Cuda)?;
+    unsafe {
+        apply_s_times(
+            psi_new_gpu.as_device_slice(),
+            &mut spsi_new_dev,
+            vnl_data,
+            n,
+            k,
+            blas,
+            stream,
+        )?;
+    }
+
+    // === 5. Per-band residual: r_b = hpsi_new_b − λ_b · spsi_new_b ===
+    unsafe {
+        let (hpsi_ptr, _) = hpsi_new_dev.device_ptr_mut(stream);
+        let (spsi_ptr, _) = spsi_new_dev.device_ptr_mut(stream);
+        let (residual_mut, _) = residual_dev.device_ptr_mut(stream);
+
+        for b in 0..n_bands {
+            let hpsi_b = (hpsi_ptr as *const CudaComplex).add(b * n_pw);
+            let spsi_b = (spsi_ptr as *const CudaComplex).add(b * n_pw);
+            let r_b = (residual_mut as *mut CudaComplex).add(b * n_pw);
+
+            // Copy hpsi_b → r_b
+            cublasZcopy_v2(
+                handle, k,
+                hpsi_b as *const _, 1,
+                r_b as *mut _, 1,
+            )
+            .result()
+            .map_err(Error::Blas)?;
+
+            // r_b += −λ_b · spsi_b
+            let neg_lambda = CudaComplex { x: -eigenvalues[b], y: 0.0 };
+            cublasZaxpy_v2(
+                handle, k,
+                &neg_lambda as *const _ as *const _,
+                spsi_b as *const _, 1,
+                r_b as *mut _, 1,
+            )
+            .result()
+            .map_err(Error::Blas)?;
+        }
+    }
+
+    // === 6. L2 norms: ||r_b||₂ = sqrt(Re⟨r_b | r_b⟩) ===
+    let mut l2_norms = vec![0.0_f64; n_bands];
+    unsafe {
+        let (res_ptr, _) = residual_dev.device_ptr_mut(stream);
+        for b in 0..n_bands {
+            let r_b = (res_ptr as *const CudaComplex).add(b * n_pw);
+            let mut dot = CudaComplex { x: 0.0, y: 0.0 };
+            cublasZdotc_v2(
+                handle, k,
+                r_b as *const _, 1,
+                r_b as *const _, 1,
+                &mut dot as *mut _ as *mut _,
+            )
+            .result()
+            .map_err(Error::Blas)?;
+            l2_norms[b] = dot.x.sqrt();
+        }
+    }
+
+    // === 7. S⁻¹ · residual_dev  (batch Woodbury, in-place on a copy) ===
+    let mut sinv_r_dev: CudaSlice<CudaComplex> =
+        stream.alloc_zeros(n_elem).map_err(Error::Cuda)?;
+    stream
+        .memcpy_dtod(&residual_dev, &mut sinv_r_dev)
+        .map_err(Error::Cuda)?;
+    unsafe {
+        apply_s_inverse(
+            &mut sinv_r_dev,
+            vnl_data,
+            n,
+            k,
+            blas,
+            stream,
+            solver,
+        )?;
+    }
+
+    // === 8. S⁻¹-weighted norms: ||r_b||_{S⁻¹} = sqrt(Re⟨r_b | S⁻¹·r_b⟩) ===
+    let mut sinv_norms = vec![0.0_f64; n_bands];
+    unsafe {
+        let (res_ptr, _) = residual_dev.device_ptr_mut(stream);
+        let (sinv_ptr, _) = sinv_r_dev.device_ptr_mut(stream);
+        for b in 0..n_bands {
+            let r_b = (res_ptr as *const CudaComplex).add(b * n_pw);
+            let sinv_b = (sinv_ptr as *const CudaComplex).add(b * n_pw);
+            let mut dot = CudaComplex { x: 0.0, y: 0.0 };
+            cublasZdotc_v2(
+                handle, k,
+                r_b as *const _, 1,
+                sinv_b as *const _, 1,
+                &mut dot as *mut _ as *mut _,
+            )
+            .result()
+            .map_err(Error::Blas)?;
+            sinv_norms[b] = dot.x.sqrt();
+        }
+    }
+
+    Ok((sinv_norms, l2_norms))
 }

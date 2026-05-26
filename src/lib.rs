@@ -8,7 +8,14 @@ pub(crate) mod eigensolver;
 
 // Re-export test-only helpers for integration tests
 #[doc(hidden)]
-pub use eigensolver::chebyshev::{apply_s_for_test, chebyshev_filter_for_test, FilterMode};
+pub use eigensolver::chebyshev::{
+    apply_s_for_test, chebyshev_filter_for_test, chebyshev_filter_for_test_gpu,
+    compute_residual_norms_for_test, CudaKernelSet, FilterMode,
+};
+/// Rayleigh-Ritz test wrapper (returns subspace matrices for diagnostics).
+/// Gated behind `scf_diag` (default feature) or `test` cfg.
+#[cfg(any(test, feature = "scf_diag"))]
+pub use eigensolver::rayleigh_ritz::rayleigh_ritz_with_matrices;
 #[doc(hidden)]
 pub use eigensolver::vnl_data::VnlBatchData;
 #[doc(hidden)]
