@@ -142,6 +142,9 @@ fn s_orthogonalize_against_one_band(
 ///   |ε_new − ε_old| < tol.
 /// * `apply_hs` — closure returning `(H|psi>, S|psi>)` for a given ψ.
 ///   H is the full Kohn-Sham Hamiltonian, S is the USPP overlap operator.
+/// * `apply_s` — closure returning `S|psi>` for a given ψ.  For norm-conserving
+///   pseudopotentials (S = I), this can be `|v| v.to_vec()`.  For USPP,
+///   this must apply the full S = I + beta*Q*beta† operator.
 ///
 /// # Returns
 ///
@@ -154,6 +157,7 @@ pub fn band_cg_minimize(
     max_steps: usize,
     tol: f64,
     apply_hs: &impl Fn(&[Complex64]) -> (Vec<Complex64>, Vec<Complex64>),
+    apply_s: &impl Fn(&[Complex64]) -> Vec<Complex64>,
 ) -> CgResult {
     // ---- 1. Initial setup: S-normalize psi ---------------------------------
     // electronic.f90:11865-11868
@@ -214,7 +218,11 @@ pub fn band_cg_minimize(
 
         // ---- 3d. S-orthogonalize g against converged lower bands -----------
         // electronic.f90:6377-6381 (wave_Sorthogonalise_to_lower)
-        let (g_orth, _sg_orth) = s_orthogonalize_against(&g, &g, converged_bands);
+        // NOTE: For USPP (S != I), we must use S|g> as the spsi argument to
+        // correctly compute the S-inner-product <psi_i|S|g> during
+        // orthogonalization.  Using g as both psi and spsi would assume S = I.
+        let sg = apply_s(&g);
+        let (g_orth, _sg_orth) = s_orthogonalize_against(&g, &sg, converged_bands);
 
         // ---- 3d. CG direction update ---------------------------------------
         // CASTEP electronic_CG_direction_bks (lines 6339-6431):
@@ -307,7 +315,23 @@ pub fn band_cg_minimize(
         // electronic.f90:6431
         d_old = d.clone();
 
-        // ---- 3h. Line search ------------------------------------------------
+        // ---- 3h. Residual-based convergence guard ----------------------------
+        // If the residual is already very small, the line search (which relies
+        // on ||d|| > 0) may blow up due to 1/||d|| singularity.  Return early
+        // rather than risk step_size ~ -1e10.
+        let r_norm = residual_bare_norm(&residual);
+        if r_norm < tol * 0.01 && r_norm < 1e-12 * eigenvalue.abs().max(1.0) {
+            return CgResult {
+                psi,
+                eigenvalue,
+                n_steps: step.saturating_sub(1),
+                converged: true,
+                residual_norm: r_norm,
+                step_type: current_step_type,
+            };
+        }
+
+        // ---- 3i. Line search ------------------------------------------------
         // electronic.f90:11913
         //   call electronic_ideal_step_size(bnd, nb, nk, ns, H_bnd,
         //       bnd_direction, bnd_temp, step, eigenvalue, temp, status)
@@ -464,6 +488,7 @@ mod tests {
                 .collect();
             (hv, v.to_vec())
         };
+        let apply_s = |v: &[Complex64]| v.to_vec();
 
         let converged_bands: Vec<(Vec<Complex64>, Vec<Complex64>)> = vec![];
 
@@ -474,6 +499,7 @@ mod tests {
             1,           // max_steps = 1
             1e-10,        // tol
             &apply_hs,
+            &apply_s,
         );
 
         // After 1 SD step, eigenvalue should decrease
@@ -525,6 +551,7 @@ mod tests {
                 .collect();
             (hv, v.to_vec())
         };
+        let apply_s = |v: &[Complex64]| v.to_vec();
 
         let converged_bands: Vec<(Vec<Complex64>, Vec<Complex64>)> = vec![];
 
@@ -537,6 +564,7 @@ mod tests {
             5,
             1e-10,
             &apply_hs,
+            &apply_s,
         );
 
         // With more steps, the eigenvalue should be lower (or equal) to
@@ -548,6 +576,7 @@ mod tests {
             10,
             1e-10,
             &apply_hs,
+            &apply_s,
         );
 
         assert!(
@@ -590,14 +619,15 @@ mod tests {
                 .collect();
             (hv, v.to_vec())
         };
+        let apply_s = |v: &[Complex64]| v.to_vec();
 
         let converged_bands: Vec<(Vec<Complex64>, Vec<Complex64>)> = vec![];
 
         let result_1 = band_cg_minimize(
-            &psi_init, &precond, &converged_bands, 1, 1e-14, &apply_hs,
+            &psi_init, &precond, &converged_bands, 1, 1e-14, &apply_hs, &apply_s,
         );
         let result_5 = band_cg_minimize(
-            &psi_init, &precond, &converged_bands, 5, 1e-14, &apply_hs,
+            &psi_init, &precond, &converged_bands, 5, 1e-14, &apply_hs, &apply_s,
         );
 
         // Residual after 5 steps should be smaller than after 1 step
@@ -632,6 +662,7 @@ mod tests {
                 .collect();
             (hv, v.to_vec())
         };
+        let apply_s = |v: &[Complex64]| v.to_vec();
 
         let converged_bands: Vec<(Vec<Complex64>, Vec<Complex64>)> = vec![];
 
@@ -643,6 +674,7 @@ mod tests {
             10,
             100.0, // very loose tolerance
             &apply_hs,
+            &apply_s,
         );
 
         assert!(
@@ -688,6 +720,7 @@ mod tests {
                 .collect();
             (hv, v.to_vec())
         };
+        let apply_s = |v: &[Complex64]| v.to_vec();
 
         // Converged bands are orthogonal to psi_init (bands at index 0 and 1)
         let band0: Vec<Complex64> = (0..n)
@@ -716,10 +749,10 @@ mod tests {
         ];
 
         let result_no_bands = band_cg_minimize(
-            &psi_init, &precond, &vec![], 3, 1e-14, &apply_hs,
+            &psi_init, &precond, &vec![], 3, 1e-14, &apply_hs, &apply_s,
         );
         let result_with_bands = band_cg_minimize(
-            &psi_init, &precond, &converged_bands, 3, 1e-14, &apply_hs,
+            &psi_init, &precond, &converged_bands, 3, 1e-14, &apply_hs, &apply_s,
         );
 
         // Results should be nearly identical since converged_bands
@@ -747,7 +780,8 @@ mod tests {
         let apply_hs = |_v: &[Complex64]| -> (Vec<Complex64>, Vec<Complex64>) {
             (vec![], vec![])
         };
-        band_cg_minimize(&psi, &precond, &vec![], 1, 1e-10, &apply_hs);
+        let apply_s = |v: &[Complex64]| v.to_vec();
+        band_cg_minimize(&psi, &precond, &vec![], 1, 1e-10, &apply_hs, &apply_s);
     }
 
     // -----------------------------------------------------------------------
@@ -764,6 +798,7 @@ mod tests {
             // H = 0, S = I
             (vec![Complex64::ZERO; n], v.to_vec())
         };
+        let apply_s = |v: &[Complex64]| v.to_vec();
 
         let result = band_cg_minimize(
             &psi_init,
@@ -772,6 +807,7 @@ mod tests {
             5,
             1e-10,
             &apply_hs,
+            &apply_s,
         );
 
         // With H=0, eigenvalue = 0, residual = 0, gradient = 0

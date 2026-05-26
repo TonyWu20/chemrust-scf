@@ -382,6 +382,10 @@ fn gate1_consistency_check() {
         (hv, sv)
     };
 
+    // S = I for Phase-0 (norm-conserving approximation; full USPP S is applied
+    // inside apply_hs but the band_cg S-orthogonalization uses S = I).
+    let apply_s = |v: &[Complex64]| v.to_vec();
+
     // ---- 13. Main loop: 1 CG step per band, track max drift -----------------
     let castep_eigs = &castep_bin.eigenvalues.kpoints[0].spins[0].eigenvalues;
     let mut max_drift = 0.0_f64;
@@ -440,7 +444,7 @@ fn gate1_consistency_check() {
 
         // ---- 13b. Run 1 CG step ---------------------------------------------
         let result = band_cg_minimize(
-            psi_b, &precond, &[], 1, 1e-20, &apply_hs,
+            psi_b, &precond, &[], 1, 1e-20, &apply_hs, &apply_s,
         );
 
         let drift = (result.eigenvalue - eps_in).abs();
@@ -474,7 +478,7 @@ fn gate1_consistency_check() {
 
         // ---- 13b. Run 1 CG step ---------------------------------------------
         let result = band_cg_minimize(
-            psi_b, &precond, &[], 1, 1e-20, &apply_hs,
+            psi_b, &precond, &[], 1, 1e-20, &apply_hs, &apply_s,
         );
 
         let drift = (result.eigenvalue - eps_in).abs();

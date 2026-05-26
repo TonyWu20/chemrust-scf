@@ -73,6 +73,18 @@ pub fn line_search_2d_quadratic(
         let ad = a * d;
         let bd = b * d;
 
+        // ---- Guard: bd too small -> numeric instability in division ----------
+        // When ||d|| -> 0 (near-converged state), bd -> 0 and r1 = (-ad + c +/- det)/bd
+        // blows up, producing step_size approx -1e10.  Return early (no step needed).
+        if bd.abs() < 1e-30 {
+            return LineSearchResult {
+                step_size: 0.0,
+                eigenvalue: a,
+                norm: 1.0,
+                status: -2,
+            };
+        }
+
         // electronic.f90:10078-10080
         // tmp = ad^2 - 2·ad·c + c^2 + b·bd
         let tmp = ad * ad - 2.0 * ad * c + c * c + b * bd;
