@@ -265,30 +265,47 @@ pub fn band_cg_minimize(
             beta_old = beta;
         }
 
-        // ---- 3e. S-orthogonalize d against current band --------------------
-        // electronic.f90:6422-6423 (wave_Sorthogonalise to the current band)
-        // We don't have S|d⟩ yet, so approximate with d itself (S ≈ I for
-        // most plane waves).  In a full implementation, S|d⟩ would be computed
-        // alongside H|d⟩ below.  For Phase-0 this approximation is acceptable
-        // because S ≈ I on the large PW basis.
-        //
-        // Actually, the correct approach: recompute S|d⟩ via apply_hs.
-        // But that requires an extra Hamiltonian application, which we want
-        // to avoid.  Instead, we use the fact that after S-orthogonalizing
-        // against converged bands, the direction should already be nearly
-        // S-orthogonal to the current band.  CASTEP's wave_Sorthogonalise
-        // to the current band is a safeguard; we skip it for now.
-        //
-        // TODO(Phase-1): implement proper S-orthogonalization to current band.
-
-        // ---- 3f. Save direction for next CG step ---------------------------
-        // electronic.f90:6431
-        d_old = d.clone();
-
-        // ---- 3g. Apply H and S to search direction -------------------------
+        // ---- 3f. Apply H and S to search direction -------------------------
         // electronic.f90:11908-11910
         //   call electronic_apply_H(bnd_direction, ...)
-        let (hdir, sdir) = apply_hs(&d);
+        //
+        // NOTE: We compute H|d⟩ and S|d⟩ BEFORE S-orthogonalizing d against
+        // the current band, because S|d⟩ is needed for the orthogonalization
+        // inner product.  H|d⟩ and S|d⟩ are then updated by linearity.
+        let (mut hdir, mut sdir) = apply_hs(&d);
+
+        // ---- 3e. S-orthogonalize d against current band --------------------
+        // electronic.f90:6422-6423 (wave_Sorthogonalise to the current band)
+        //
+        // The line search assumes ⟨ψ|S|d⟩ = 0 (no cross-term in the energy
+        // denominator).  Without this orthogonalization, the search direction
+        // has a component along ψ, making the line-search model incorrect and
+        // causing spurious eigenvalue drift (up to 0.08 Ha for Cu d-bands
+        // with strong USPP augmentation).
+        //
+        // Using the computed S|d⟩ from step 3f:
+        //   overlap = ⟨ψ|S|d⟩ = ⟨ψ|sdir⟩
+        //
+        // Then by linearity of H and S:
+        //   d_new    = d    - overlap · ψ
+        //   H|d_new⟩ = H|d⟩ - overlap · H|ψ⟩
+        //   S|d_new⟩ = S|d⟩ - overlap · S|ψ⟩
+        let overlap = inner_product(&psi, &sdir);
+        if overlap.norm() > 1e-30 {
+            for (d_i, p_i) in d.iter_mut().zip(psi.iter()) {
+                *d_i -= overlap * p_i;
+            }
+            for (h_i, hp_i) in hdir.iter_mut().zip(hpsi.iter()) {
+                *h_i -= overlap * hp_i;
+            }
+            for (s_i, sp_i) in sdir.iter_mut().zip(spsi.iter()) {
+                *s_i -= overlap * sp_i;
+            }
+        }
+
+        // ---- 3g. Save direction for next CG step ---------------------------
+        // electronic.f90:6431
+        d_old = d.clone();
 
         // ---- 3h. Line search ------------------------------------------------
         // electronic.f90:11913
