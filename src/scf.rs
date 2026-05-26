@@ -179,7 +179,7 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt> {
         // Extract V_eff as raw Array3<f64> via SpinPolicy::v_eff_for_spin
         let v_eff_ref = self.v_eff.as_ref().expect("VEffBuilt phase guarantees v_eff is Some");
         let v_eff_spin = S::v_eff_for_spin(v_eff_ref, 0);
-        let v_eff_arr = v_eff_spin.as_array();
+        let v_eff_arr = v_eff_spin.as_real_grid().as_real_array();
 
         // PCI-E transfer tracker (catches unexpected H2D/D2H in the hot path)
         let mut pcie = PcieAccount::default();
@@ -420,8 +420,11 @@ pub(crate) fn downsample_array_to_wave_grid(
     let [ngz, ngy, ngx] = wave_grid.grid();
     let [ngz_f, ngy_f, ngx_f] = fine_grid.grid();
 
+    // Wrap fine_arr in RealGrid for FFT
+    let fine_real = chemrust_hamiltonian_core::fft::RealGrid::from_inner(fine_arr.clone());
+
     // Forward FFT fine-grid V_eff → G-space
-    let fine_g = fft_forward_3d(fine_arr).map_err(|_| Error::NotImplemented)?;
+    let fine_g = fft_forward_3d(&fine_real).map_err(|_| Error::NotImplemented)?;
 
     // Truncate: copy only wave-grid G-vectors to a new G-space array
     let mut wave_g = Array3::<Complex64>::zeros((ngz, ngy, ngx).f());
@@ -438,13 +441,14 @@ pub(crate) fn downsample_array_to_wave_grid(
             let ix_f = f2ix(fx, ngx_f);
             let iy_f = f2ix(fy, ngy_f);
             let iz_f = f2ix(fz, ngz_f);
-            *coeff = fine_g[[iz_f, iy_f, ix_f]];
+            *coeff = fine_g.as_recip_array()[[iz_f, iy_f, ix_f]];
         });
 
     // Inverse FFT back to real space on wave grid
     let n_total_fine = (ngx_f * ngy_f * ngz_f) as f64;
-    let rho_wave = fft_inverse_3d(&wave_g).map_err(|_| Error::NotImplemented)?;
-    let result = rho_wave.mapv(|x| x / n_total_fine);
+    let wave_recip = chemrust_hamiltonian_core::fft::RecipGrid::from_inner(wave_g);
+    let rho_wave = fft_inverse_3d(&wave_recip).map_err(|_| Error::NotImplemented)?;
+    let result = rho_wave.into_inner().mapv(|x| x / n_total_fine);
 
     Ok(EffectivePotential::from_inner(FineGridArray::from_inner(result)))
 }
