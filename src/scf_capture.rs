@@ -130,8 +130,7 @@ pub fn capture_as_castep_bin<S: SpinPolicy>(
     // 2. Add augmentation density (if present)
     let rho_total = match &state.density_aug_fine {
         Some(aug) => {
-            let summed = rho_fine.as_real_array().to_owned() + aug.as_real_array();
-            summed
+            rho_fine.as_real_array().to_owned() + aug.as_real_array()
         }
         None => rho_fine.as_real_array().to_owned(),
     };

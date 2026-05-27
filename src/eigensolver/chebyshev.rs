@@ -1493,6 +1493,9 @@ pub fn chebyshev_filter_for_test_gpu(
 /// Returns `(psi_filtered_row, hpsi_filtered_row)` — both RowDistributed, GPU-resident.
 ///
 /// Designed for Diagnostic 3: 10-iteration outer loop where only psi changes.
+///
+/// **Note**: This wrapper hard-codes a gamma-point `KPoint { coords: [0.0, 0.0, 0.0] }`.
+/// It is only valid for Γ-only calculations.
 #[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
 pub fn chebyshev_filter_iteration_gpu(

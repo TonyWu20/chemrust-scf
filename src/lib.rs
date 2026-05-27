@@ -22,6 +22,8 @@ pub use eigensolver::vnl_data::VnlBatchData;
 pub use device::blas::BlasHandle;
 #[doc(hidden)]
 pub use device::solver::SolverHandle;
+#[doc(hidden)]
+pub use device::pcie::PcieAccount;
 pub mod scf_capture;
 
 pub use types::{
