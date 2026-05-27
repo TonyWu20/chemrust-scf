@@ -544,7 +544,7 @@ fn test_6_wavefunction_normalization() {
         &kpt_block.pw_grid_coord, pots, cell, &wave_grid, &k_point,
         &psi_data, n_bands, n_pw,
         None, None,
-        &stream, &mut pcie, &blas, &solver,
+        &stream, &mut pcie, &blas, &kernels, &solver,
     ).expect("VnlBatchData::precompute");
 
     // Run ndeg=0 diagonalization — Chebyshev filter is skipped, RR directly applied

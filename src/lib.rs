@@ -16,6 +16,8 @@ pub use eigensolver::chebyshev::{
 /// Gated behind `scf_diag` (default feature) or `test` cfg.
 #[cfg(any(test, feature = "scf_diag"))]
 pub use eigensolver::rayleigh_ritz::rayleigh_ritz_with_matrices;
+#[cfg(any(test, feature = "scf_diag"))]
+pub use eigensolver::d_screening::test_api;
 #[doc(hidden)]
 pub use eigensolver::vnl_data::VnlBatchData;
 #[doc(hidden)]

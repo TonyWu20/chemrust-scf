@@ -1,13 +1,7 @@
 // ---------------------------------------------------------------------------
-// GPU D-matrix screening for USPP V_NL
-// ---------------------------------------------------------------------------
+// GPU D-matrix screening for USPP V_NL.
 //
 // D_nm = D0_nm + (1/N) · Re{ Σ_G V_eff_fft(G) · exp(+iG·R) · conj(Q_nm(G)) }
-//
-// NOTE: This module is currently unused — the GPU D-screening path was reverted
-// to the CPU `compute_screened_d_from_fft` path due to a bug producing near-zero
-// screening terms for non-origin ions. Kept for future debugging.
-#![allow(dead_code)]
 //
 // Algorithm:
 //   1. w = V_eff_fft · conj(ion_sf)     via cpx_conj_mul kernel (grid-parallel)
@@ -36,7 +30,7 @@ use crate::types::Error;
 // ---------------------------------------------------------------------------
 
 /// Q_nm(G) for one species on the wave grid, lower-triangle pairs only.
-pub(crate) struct WaveQSpeciesEntry {
+pub struct WaveQSpeciesEntry {
     /// Flattened Q_nm(G): [n_lower_pairs × n_wave_grid], pair-major, grid-minor.
     pub q_nm: CudaSlice<CudaComplex>,
     /// Number of expanded projectors (Σ(2l+1)) for this species.
@@ -48,7 +42,7 @@ pub(crate) struct WaveQSpeciesEntry {
 }
 
 /// Structure factor exp(-iG·R_I) for one ion on the wave grid.
-pub(crate) struct WaveSfEntry {
+pub struct WaveSfEntry {
     pub sf: CudaSlice<CudaComplex>,
 }
 
@@ -57,12 +51,10 @@ pub(crate) struct WaveSfEntry {
 /// Built fresh inside VnlBatchData::precompute, replacing the old
 /// HashMap<String, Option<QOnGrid>> local cache with a GPU-resident
 /// data structure.
-pub(crate) struct WaveScreeningCache {
+pub struct WaveScreeningCache {
     pub species_entries: Vec<Option<WaveQSpeciesEntry>>,
     pub ion_sf: Vec<WaveSfEntry>,
-    #[allow(dead_code)]
     pub ion_species: Vec<usize>,
-    #[allow(dead_code)]
     pub wave_grid: [usize; 3],
 }
 
@@ -76,7 +68,7 @@ pub(crate) struct WaveScreeningCache {
 /// flattens to pair-major layout, and uploads to GPU. Structure factors
 /// are computed per ion.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn build_wave_screening_cache(
+pub fn build_wave_screening_cache(
     pots: &PseudopotentialSet,
     cell: &CellGeometry,
     wave_grid: &GVectorGrid,
@@ -128,11 +120,11 @@ pub(crate) fn build_wave_screening_cache(
             .unwrap_or(0);
 
         // Flatten Q arrays into GPU buffer: pair-major, grid-minor.
-        // q_arr is Array3<Complex64> in Fortran order (ngz, ngy, ngx).
-        // ndarray .iter() traverses in memory order (F-order here).
+        // .t() transposes so that .iter() traverses iz-fastest (Fortran
+        // order), matching the structure factor and V_eff_fft convention.
         let mut q_flat: Vec<CudaComplex> = Vec::with_capacity(n_lower_pairs * n_wave_grid);
         for ((_n, _m), q_arr) in &q_on_grid.pairs {
-            for &c in q_arr.iter() {
+            for &c in q_arr.t().iter() {
                 q_flat.push(CudaComplex { x: c.re, y: c.im });
             }
         }
@@ -193,7 +185,7 @@ pub(crate) fn build_wave_screening_cache(
 /// Returns the screened D matrix as an (n_expanded × n_expanded) real array,
 /// ready for upload as VnlIonData.d_matrix.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn screen_d_gpu(
+pub fn screen_d_gpu(
     cache: &WaveScreeningCache,
     v_eff_fft_dev: &CudaSlice<CudaComplex>,
     ion_idx: usize,
@@ -274,4 +266,100 @@ pub(crate) fn screen_d_gpu(
     }
 
     Ok(d_screen)
+}
+
+/// Debug variant of [`screen_d_gpu`]: returns intermediate `w` and `tmp` buffers
+/// alongside the final D matrix for diagnostic comparison.
+#[cfg(any(test, feature = "scf_diag"))]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+pub fn screen_d_gpu_debug(
+    cache: &WaveScreeningCache,
+    v_eff_fft_dev: &CudaSlice<CudaComplex>,
+    ion_idx: usize,
+    species_idx: usize,
+    d0_expanded: &[f64],
+    n_wave_grid: usize,
+    kernels: &CudaKernelSet,
+    blas: &BlasHandle,
+    stream: &Arc<CudaStream>,
+) -> Result<(Array2<f64>, Vec<CudaComplex>, Vec<CudaComplex>), Error> {
+    let species_entry = match cache.species_entries.get(species_idx).and_then(|e| e.as_ref()) {
+        Some(e) => e,
+        None => {
+            let ne = (d0_expanded.len() as f64).sqrt() as usize;
+            let mut d = Array2::<f64>::zeros((ne, ne));
+            for n in 0..ne {
+                for m in 0..ne {
+                    d[[n, m]] = d0_expanded[n * ne + m];
+                }
+            }
+            return Ok((d, vec![], vec![]));
+        }
+    };
+
+    let n_expanded = species_entry.n_expanded;
+    let n_lower_pairs = species_entry.n_lower_pairs;
+
+    let mut w: CudaSlice<CudaComplex> = stream.alloc_zeros(n_wave_grid).map_err(Error::Cuda)?;
+    unsafe {
+        stream
+            .launch_builder(&kernels.cpx_conj_mul)
+            .arg(&mut w)
+            .arg(v_eff_fft_dev)
+            .arg(&cache.ion_sf[ion_idx].sf)
+            .arg(&(n_wave_grid as i32))
+            .launch(LaunchConfig::for_num_elems(n_wave_grid as u32))
+    }
+    .map_err(Error::Cuda)?;
+
+    // D2H w for diagnostic
+    let w_host: Vec<CudaComplex> = stream.clone_dtoh(&w).map_err(Error::Cuda)?;
+
+    let mut tmp: CudaSlice<CudaComplex> = stream.alloc_zeros(n_lower_pairs).map_err(Error::Cuda)?;
+    let one = CudaComplex { x: 1.0, y: 0.0 };
+    let zero = CudaComplex { x: 0.0, y: 0.0 };
+    unsafe {
+        blas.gemv_c64(
+            op::C,
+            n_wave_grid as i32,
+            n_lower_pairs as i32,
+            one,
+            &species_entry.q_nm,
+            n_wave_grid as i32,
+            &w,
+            1,
+            zero,
+            &mut tmp,
+            1,
+        )
+        .map_err(Error::Blas)?;
+    }
+
+    // D2H tmp for diagnostic
+    let tmp_host: Vec<CudaComplex> = stream.clone_dtoh(&tmp).map_err(Error::Cuda)?;
+
+    let inv_n = 1.0 / (n_wave_grid as f64);
+    let mut d_screen = Array2::<f64>::zeros((n_expanded, n_expanded));
+
+    for (p, &(n, m)) in species_entry.pair_indices.iter().enumerate() {
+        let screening = tmp_host[p].x * inv_n;
+        let val = d0_expanded[n * n_expanded + m] + screening;
+        d_screen[[n, m]] = val;
+        d_screen[[m, n]] = val;
+    }
+
+    Ok((d_screen, w_host, tmp_host))
+}
+
+/// Re-exports for integration tests that need GPU D-screening items.
+#[cfg(any(test, feature = "scf_diag"))]
+pub mod test_api {
+    pub use super::{
+        build_wave_screening_cache,
+        screen_d_gpu,
+        screen_d_gpu_debug,
+        WaveQSpeciesEntry,
+        WaveScreeningCache,
+        WaveSfEntry,
+    };
 }

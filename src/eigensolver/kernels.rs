@@ -199,7 +199,6 @@ pub struct CudaKernelSet {
     pub(crate) transpose_row_to_col: CudaFunction,
     pub(crate) band_scale_axpy: CudaFunction,
     pub(crate) cpx_mul_inplace: CudaFunction,
-    #[allow(dead_code)]
     pub(crate) cpx_conj_mul: CudaFunction,
 }
 

@@ -3,7 +3,9 @@ use std::sync::Arc;
 use chemrust_hamiltonian_core::augment::beta_phi::{
     compute_beta_g, expanded_projector_count, expanded_projector_lm,
 };
-use chemrust_hamiltonian_core::nlpot::{build_d0_expanded, compute_screened_d_from_fft, precompute_q_on_grid};
+use chemrust_hamiltonian_core::nlpot::build_d0_expanded;
+use crate::eigensolver::d_screening::{build_wave_screening_cache, screen_d_gpu, WaveScreeningCache};
+use crate::eigensolver::chebyshev::CudaKernelSet;
 use chemrust_hamiltonian_core::pseudopotential::HasAugmentationData;
 use chemrust_hamiltonian_core::Pseudopotential;
 use cudarc::driver::{CudaSlice, CudaStream};
@@ -111,13 +113,14 @@ impl VnlBatchData {
         stream: &Arc<CudaStream>,
         pcie: &mut PcieAccount,
         blas: &crate::device::blas::BlasHandle,
+        kernels: &CudaKernelSet,
         solver: &SolverHandle,
     ) -> Result<Self, Error> {
         Self::precompute_with_d_override(
             pw_coords, pots, cell, wave_grid, k_point,
             psi_data, n_bands, n_pw, _occupations, v_eff_wave,
             None,
-            stream, pcie, blas, solver,
+            stream, pcie, blas, kernels, solver,
         )
     }
 
@@ -149,6 +152,7 @@ impl VnlBatchData {
         stream: &Arc<CudaStream>,
         pcie: &mut PcieAccount,
         blas: &crate::device::blas::BlasHandle,
+        kernels: &CudaKernelSet,
         solver: &SolverHandle,
     ) -> Result<Self, Error> {
         let kf = k_point.coords;
@@ -178,27 +182,40 @@ impl VnlBatchData {
         let mut per_ion_beta_flat: Vec<Vec<CudaComplex>> = Vec::new();
         let mut per_ion_ne: Vec<usize> = Vec::new();
 
-        // Precompute V_eff FFT once (CPU) for D-matrix screening.
-        // GPU D-screening (screen_d_gpu) was reverted due to a bug producing
-        // near-zero screening terms for non-origin ions. CPU path is correct.
+        // FFT V_eff once (CPU) → upload to GPU for D-matrix screening.
         let v_eff_fft = v_eff_wave.and_then(|v_eff| {
             chemrust_hamiltonian_core::fft_forward_3d(v_eff.as_real_grid()).ok()
         });
-        let q_on_grid_cache: std::collections::HashMap<String, Option<chemrust_hamiltonian_core::QOnGrid>> =
-            if v_eff_fft.is_some() {
-                cell.species_symbols.iter().filter_map(|symbol| {
-                    let pot = pots.get(symbol)?;
-                    let aug: &dyn HasAugmentationData = match pot {
-                        Pseudopotential::Usp(d) => d,
-                        _ => return None,
-                    };
-                    let q = precompute_q_on_grid(aug, wave_grid).ok();
-                    Some((symbol.clone(), q))
-                }).collect()
-            } else {
-                std::collections::HashMap::new()
-            };
-        let screening_h2d_bytes: usize = 0;
+
+        let [ngz, ngy, ngx] = wave_grid.grid();
+        let n_wave_grid = ngz * ngy * ngx;
+
+        // Snapshot pcie before screening-related H2D so we can report the budget.
+        let pcie_before_screening = pcie.h2d_bytes;
+
+        // Build GPU screening cache (Q arrays + structure factors, once per V_eff).
+        let screening_cache: Option<WaveScreeningCache> = if v_eff_fft.is_some() {
+            Some(build_wave_screening_cache(pots, cell, wave_grid, stream, pcie)?)
+        } else {
+            None
+        };
+
+        // Upload V_eff_fft to GPU (Fortran order via .t().iter()).
+        let v_eff_fft_dev: Option<CudaSlice<CudaComplex>> = match &v_eff_fft {
+            Some(fft) => {
+                let v_eff_flat: Vec<CudaComplex> = fft.as_recip_array()
+                    .t()
+                    .iter()
+                    .map(|c| CudaComplex { x: c.re, y: c.im })
+                    .collect();
+                let dev = stream.clone_htod(&v_eff_flat).map_err(Error::Cuda)?;
+                pcie.record_h2d(&dev);
+                Some(dev)
+            }
+            None => None,
+        };
+
+        let screening_h2d_bytes: usize = pcie.h2d_bytes - pcie_before_screening;
 
         for ion_idx in 0..cell.num_ions {
             let species_idx = cell.ion_species[ion_idx];
@@ -216,7 +233,8 @@ impl VnlBatchData {
             let d0_expanded = build_d0_expanded(aug);
             let n_expanded = beta_g.shape()[0] as i32;
 
-            // Compute screened D matrix: D = D0 + ∫ Q(r)·V_eff(r) dr  (CPU path)
+            // Compute screened D matrix: D = D0 + (1/N)·Re(Σ_G V_eff(G)·exp(+iG·R)·conj(Q_nm(G)))
+            // GPU path via screen_d_gpu; CPU reference is compute_screened_d_from_fft.
             //
             // T-prime override path: when `d_override[ion_idx]` is `Some`, replace
             // our computed D_screened with externally-supplied values (e.g. parsed
@@ -236,9 +254,14 @@ impl VnlBatchData {
                             "d_override reshape failed for ion {ion_idx}: {e}"
                         )))?
                 }
-                None => match (&v_eff_fft, q_on_grid_cache.get(symbol).and_then(|o| o.as_ref())) {
-                    (Some(fft), Some(q_on_grid)) => {
-                        compute_screened_d_from_fft(q_on_grid, fft, cell, ion_idx, wave_grid, &d0_expanded)
+                None => match (&screening_cache, &v_eff_fft_dev) {
+                    (Some(cache), Some(fft_dev)) => {
+                        let d0_flat: Vec<f64> = d0_expanded.iter().cloned().collect();
+                        screen_d_gpu(
+                            cache, fft_dev, ion_idx, species_idx,
+                            &d0_flat, n_wave_grid,
+                            kernels, blas, stream,
+                        )?
                     }
                     _ => d0_expanded.clone(),
                 },

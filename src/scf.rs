@@ -582,7 +582,7 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
             &psi_host, n_bands, n_pw, occupations,
             Some(&v_eff_for_d),
             d_override_per_ion,
-            &stream, &mut pcie, &blas, &solver,
+            &stream, &mut pcie, &blas, &kernels, &solver,
         )?;
 
         // Always pass eigenvalues=None. Das et al. (2025) main.tex:612 proves
@@ -722,7 +722,7 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
             &self.wave_grid, &self.k_point, &self.cell,
             &self.pw_coords,
             &vnl_data, &fft_idx_dev, min_veff, max_veff,
-            &kernels, &mut pcie, eig, ndeg, &blas, &solver, &stream, &ctx,
+            &kernels, &mut pcie, eig, None, ndeg, &blas, &solver, &stream, &ctx,
             filter_mode,
         )?;
 
@@ -786,7 +786,7 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
         assert_eq!(
             pcie.h2d_bytes,
             psi_bytes + veff_bytes + fft_idx_bytes + kinetic_bytes + vnl_bytes
-                + b_concat_bytes + lu_m_bytes + pin_h2d_bytes,
+                + b_concat_bytes + lu_m_bytes + vnl_data.screening_h2d_bytes + pin_h2d_bytes,
             "H2D tracking check failed",
         );
 
@@ -845,7 +845,7 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
             &self.wave_grid, &self.k_point,
             &psi_host, n_bands, n_pw, None,
             Some(&v_eff_for_d),
-            &stream, &mut pcie, &blas, &solver,
+            &stream, &mut pcie, &blas, &kernels, &solver,
         )?;
 
         let eig: Option<&[f64]> = None;
@@ -860,7 +860,7 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
             &self.wave_grid, &self.k_point, &self.cell,
             &self.pw_coords,
             &vnl_data, &fft_idx_dev, min_veff, max_veff,
-            &kernels, &mut pcie, eig, ndeg, &blas, &solver, &stream, &ctx,
+            &kernels, &mut pcie, eig, None, ndeg, &blas, &solver, &stream, &ctx,
             FilterMode::SinvHKeepHEig,
         )?;
 
@@ -912,7 +912,7 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
             &self.wave_grid, &self.k_point,
             &psi_host, n_bands, n_pw, occupations,
             Some(&v_eff_for_d),
-            &stream, &mut pcie, &blas, &solver,
+            &stream, &mut pcie, &blas, &kernels, &solver,
         )?;
 
         let fft_idx_dev: CudaSlice<i32> = stream.clone_htod(&self.pw_fft_indices)
@@ -947,6 +947,7 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
         let stream = ctx.default_stream();
         let blas = BlasHandle::new(stream.clone())?;
         let solver = SolverHandle::new(stream.clone())?;
+        let kernels = CudaKernelSet::new(&ctx)?;
 
         let v_eff_ref = self.v_eff.as_ref().expect("VEffBuilt phase guarantees v_eff is Some");
         let v_eff_spin = S::v_eff_for_spin(v_eff_ref, 0);
@@ -966,7 +967,7 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
             &self.wave_grid, &self.k_point,
             &psi_for_betapsi, n_bands_state, n_pw, None,
             Some(&v_eff_for_d),
-            &stream, &mut pcie, &blas, &solver,
+            &stream, &mut pcie, &blas, &kernels, &solver,
         )?;
 
         crate::eigensolver::chebyshev::apply_s_for_test(

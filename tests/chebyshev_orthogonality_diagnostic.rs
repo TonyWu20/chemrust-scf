@@ -24,8 +24,8 @@
 
 mod fixtures;
 
-use num_complex::Complex64;
 use ndarray::Array2;
+use num_complex::Complex64;
 
 fn gpu_available() -> bool {
     std::panic::catch_unwind(|| cudarc::driver::CudaContext::new(0).is_ok()).unwrap_or(false)
@@ -158,17 +158,20 @@ fn off_diagonal_stats(m: &Array2<Complex64>) -> (f64, f64, f64) {
 
 /// Helper function to run orthogonality diagnostic with a specific filter mode
 fn run_orthogonality_diagnostic(filter_mode: chemrust_scf::FilterMode, mode_name: &str) {
+    use chemrust_hamiltonian_core::GVectorGrid;
     use chemrust_scf::{BlasHandle, SolverHandle, VnlBatchData};
     use cudarc::driver::CudaContext;
     use std::sync::Arc;
-    use chemrust_hamiltonian_core::GVectorGrid;
 
     if !gpu_available() {
         eprintln!("SKIP: no GPU available");
         return;
     }
 
-    println!("\n=== Diagnostic 1: Orthogonality After Chebyshev Filtering ({}) ===\n", mode_name);
+    println!(
+        "\n=== Diagnostic 1: Orthogonality After Chebyshev Filtering ({}) ===\n",
+        mode_name
+    );
 
     let fx = fixtures::cu111_co::fixture();
 
@@ -197,6 +200,7 @@ fn run_orthogonality_diagnostic(filter_mode: chemrust_scf::FilterMode, mode_name
     let stream = ctx.default_stream();
     let blas = BlasHandle::new(stream.clone()).expect("Failed to create BLAS handle");
     let solver = SolverHandle::new(stream.clone()).expect("Failed to create solver handle");
+    let kernels = chemrust_scf::CudaKernelSet::new(&ctx).expect("CudaKernelSet");
 
     // Build VnlBatchData for USPP (with D-screening)
     let pw_coords = &kpt_block.pw_grid_coord;
@@ -210,10 +214,13 @@ fn run_orthogonality_diagnostic(filter_mode: chemrust_scf::FilterMode, mode_name
     let v_eff_for_d = HamEffectivePotential::from_inner(RealGrid::from_inner(fx.pot_fmt.clone()));
 
     // Compute occupations from eigenvalues (same as ca_scf_convergence.rs:524-531)
-    let n_electrons: f64 = fx.bin.cell
+    let n_electrons: f64 = fx
+        .bin
+        .cell
         .species_iter()
         .map(|info| {
-            fx.pots.get(info.symbol)
+            fx.pots
+                .get(info.symbol)
                 .and_then(|p| p.ionic_charge())
                 .unwrap_or(0.0)
                 * info.num_ions as f64
@@ -228,7 +235,10 @@ fn run_orthogonality_diagnostic(filter_mode: chemrust_scf::FilterMode, mode_name
         chemrust_scf::density::compute_occupations(&fx.bands_eigenvalues, &smearing, n_electrons)
             .expect("compute_occupations from CASTEP eigenvalues");
     let occ_sum: f64 = occupations.0.iter().sum();
-    println!("Occupations: Σocc = {:.4}  target N_e = {:.1}  μ = {:.6} Ha", occ_sum, n_electrons, chem_pot.0);
+    println!(
+        "Occupations: Σocc = {:.4}  target N_e = {:.1}  μ = {:.6} Ha",
+        occ_sum, n_electrons, chem_pot.0
+    );
     println!();
 
     let mut pcie = chemrust_scf::PcieAccount::default();
@@ -246,6 +256,7 @@ fn run_orthogonality_diagnostic(filter_mode: chemrust_scf::FilterMode, mode_name
         &stream,
         &mut pcie,
         &blas,
+        &kernels,
         &solver,
     )
     .expect("Failed to build VnlBatchData");
@@ -257,12 +268,18 @@ fn run_orthogonality_diagnostic(filter_mode: chemrust_scf::FilterMode, mode_name
     let min_veff = v_eff_flat.iter().copied().fold(f64::INFINITY, f64::min);
     let max_veff = v_eff_flat.iter().copied().fold(f64::NEG_INFINITY, f64::max);
 
-    println!("V_eff bounds: min = {:.4} Ha, max = {:.4} Ha", min_veff, max_veff);
+    println!(
+        "V_eff bounds: min = {:.4} Ha, max = {:.4} Ha",
+        min_veff, max_veff
+    );
     println!();
 
     // Run Chebyshev filter (ndeg=8, no prior eigenvalues)
     let ndeg = 8;
-    println!("Running Chebyshev filter with ndeg = {}, mode = {}...", ndeg, mode_name);
+    println!(
+        "Running Chebyshev filter with ndeg = {}, mode = {}...",
+        ndeg, mode_name
+    );
     let psi_filtered = chemrust_scf::chebyshev_filter_for_test(
         &psi_input,
         &v_eff_flat,
@@ -340,9 +357,16 @@ fn run_orthogonality_diagnostic(filter_mode: chemrust_scf::FilterMode, mode_name
     println!();
 
     // Sanity check: diagonal elements should be close to 1.0 (S-orthonormal)
-    let diag_min = (0..n_bands).map(|i| m[[i, i]].norm()).fold(f64::INFINITY, f64::min);
-    let diag_max = (0..n_bands).map(|i| m[[i, i]].norm()).fold(f64::NEG_INFINITY, f64::max);
-    println!("Diagonal elements: min = {:.4e}, max = {:.4e} (should be ≈ 1.0)", diag_min, diag_max);
+    let diag_min = (0..n_bands)
+        .map(|i| m[[i, i]].norm())
+        .fold(f64::INFINITY, f64::min);
+    let diag_max = (0..n_bands)
+        .map(|i| m[[i, i]].norm())
+        .fold(f64::NEG_INFINITY, f64::max);
+    println!(
+        "Diagonal elements: min = {:.4e}, max = {:.4e} (should be ≈ 1.0)",
+        diag_min, diag_max
+    );
     println!();
 
     // Don't assert on κ₂ being finite - it's a diagnostic, not a correctness test
@@ -457,7 +481,11 @@ fn mean_abs_err(rr_eigs: &[f64], ref_eigs: &[f64], indices: &[usize]) -> f64 {
     if indices.is_empty() {
         return f64::NAN;
     }
-    indices.iter().map(|&b| (rr_eigs[b] - ref_eigs[b]).abs()).sum::<f64>() / indices.len() as f64
+    indices
+        .iter()
+        .map(|&b| (rr_eigs[b] - ref_eigs[b]).abs())
+        .sum::<f64>()
+        / indices.len() as f64
 }
 
 /// Diagnostic 2: measure per-band residual norms after one Chebyshev filter + RR pass.
@@ -486,7 +514,11 @@ fn diagnostic_2_residual_norms_after_chebyshev_filter() {
     let fx = fixtures::cu111_co::fixture();
 
     // Extract wavefunction dimensions
-    let wfc = fx.check.wavefunction.as_ref().expect(".check must have wavefunction");
+    let wfc = fx
+        .check
+        .wavefunction
+        .as_ref()
+        .expect(".check must have wavefunction");
     let kpt_block = &wfc.kpt_data[0];
     let n_bands = kpt_block.bands.len();
     let n_pw = kpt_block.nplw;
@@ -503,20 +535,26 @@ fn diagnostic_2_residual_norms_after_chebyshev_filter() {
     let stream = ctx.default_stream();
     let blas = BlasHandle::new(stream.clone()).expect("Failed to create BLAS handle");
     let solver = SolverHandle::new(stream.clone()).expect("Failed to create solver handle");
+    let kernels = chemrust_scf::CudaKernelSet::new(&ctx).expect("CudaKernelSet");
 
     // Build VnlBatchData with D-screening (same as Diagnostic 1)
     let pw_coords = &kpt_block.pw_grid_coord;
-    let k_point = chemrust_scf::KPoint { coords: kpt_block.coords };
+    let k_point = chemrust_scf::KPoint {
+        coords: kpt_block.coords,
+    };
     let psi_input: Vec<num_complex::Complex64> = kpt_block.bands.concat();
 
     use chemrust_hamiltonian_core::{EffectivePotential as HamEffectivePotential, fft::RealGrid};
     let v_eff_for_d = HamEffectivePotential::from_inner(RealGrid::from_inner(fx.pot_fmt.clone()));
 
     // Compute occupations
-    let n_electrons: f64 = fx.bin.cell
+    let n_electrons: f64 = fx
+        .bin
+        .cell
         .species_iter()
         .map(|info| {
-            fx.pots.get(info.symbol)
+            fx.pots
+                .get(info.symbol)
                 .and_then(|p| p.ionic_charge())
                 .unwrap_or(0.0)
                 * info.num_ions as f64
@@ -531,58 +569,166 @@ fn diagnostic_2_residual_norms_after_chebyshev_filter() {
         chemrust_scf::density::compute_occupations(&fx.bands_eigenvalues, &smearing, n_electrons)
             .expect("compute_occupations");
     let occ_sum: f64 = occupations.0.iter().sum();
-    println!("Occupations: Σocc = {:.4}  target N_e = {:.1}  μ = {:.6} Ha\n", occ_sum, n_electrons, chem_pot.0);
+    println!(
+        "Occupations: Σocc = {:.4}  target N_e = {:.1}  μ = {:.6} Ha\n",
+        occ_sum, n_electrons, chem_pot.0
+    );
+
+    // Determine number of occupied bands (CASTEP logic: ceiling(n_electrons / 2) for spin-unpolarized)
+    let n_occ = (n_electrons / 2.0).ceil() as usize;
+    println!(
+        "Number of occupied bands: n_occ = {} (from N_e = {})\n",
+        n_occ, n_electrons
+    );
 
     let mut pcie = chemrust_scf::PcieAccount::default();
     let vnl_data = VnlBatchData::precompute(
-        pw_coords, &fx.pots, &fx.bin.cell, &wave_grid, &k_point, &psi_input,
-        n_bands, n_pw, Some(&occupations.0), Some(&v_eff_for_d),
-        &stream, &mut pcie, &blas, &solver,
-    ).expect("VnlBatchData::precompute");
+        pw_coords,
+        &fx.pots,
+        &fx.bin.cell,
+        &wave_grid,
+        &k_point,
+        &psi_input,
+        n_bands,
+        n_pw,
+        Some(&occupations.0),
+        Some(&v_eff_for_d),
+        &stream,
+        &mut pcie,
+        &blas,
+        &kernels,
+        &solver,
+    )
+    .expect("VnlBatchData::precompute");
 
     // CASTEP V_eff from pot_fmt (already on wave grid for Cu111_CO)
     let v_eff_flat: Vec<f64> = fx.pot_fmt.iter().copied().collect();
     let min_veff = v_eff_flat.iter().copied().fold(f64::INFINITY, f64::min);
     let max_veff = v_eff_flat.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    println!("V_eff bounds: min = {:.4} Ha, max = {:.4} Ha\n", min_veff, max_veff);
+    println!(
+        "V_eff bounds: min = {:.4} Ha, max = {:.4} Ha\n",
+        min_veff, max_veff
+    );
 
     // ------------------------------------------------------------------
     // Step 1: Run Chebyshev filter → GPU-resident (psi_row, hpsi_row, kernels)
     // ------------------------------------------------------------------
     let ndeg = 8;
+    let eigenvalues = fx.bands_eigenvalues.clone();
     println!("Running Chebyshev filter (ndeg={}, SinvHKeepHEig)...", ndeg);
     let (psi_row_gpu, hpsi_row_gpu, kernels) = chemrust_scf::chebyshev_filter_for_test_gpu(
-        &psi_input, &v_eff_flat, n_bands, n_pw, &wave_grid, pw_coords,
-        &fx.bin.cell, &fx.pots, &vnl_data, min_veff, max_veff, ndeg, None,
+        &psi_input,
+        &v_eff_flat,
+        n_bands,
+        n_pw,
+        &wave_grid,
+        pw_coords,
+        &fx.bin.cell,
+        &fx.pots,
+        &vnl_data,
+        min_veff,
+        max_veff,
+        ndeg,
+        Some(&eigenvalues),
+        Some(n_occ),
         chemrust_scf::FilterMode::SinvHKeepHEig,
-        &blas, &solver, &stream, &ctx,
-    ).expect("chebyshev_filter_for_test_gpu failed");
+        &blas,
+        &solver,
+        &stream,
+        &ctx,
+    )
+    .expect("chebyshev_filter_for_test_gpu failed");
     println!("Filter complete.\n");
+
+    // Verify post-GS S-orthonormality: GS should produce ψ with norm²_S = 1.0
+    {
+        use chemrust_scf::device::cuda_vec_to_complex;
+        let psi_gs_full: Vec<Complex64> = cuda_vec_to_complex(
+            stream.clone_dtoh(psi_row_gpu.as_device_slice())
+                .expect("clone_dtoh psi_row_gpu"),
+        );
+        let psi_band0 = &psi_gs_full[0..n_pw];
+        let spsi_band0 = chemrust_scf::apply_s_for_test(
+            psi_band0, 1, n_pw, &vnl_data, &blas, &stream,
+        )
+        .expect("apply_s_for_test post-GS");
+        let norm_sq_s_post_gs: f64 = psi_band0
+            .iter()
+            .zip(spsi_band0.iter())
+            .map(|(p, sp)| (p.conj() * sp).re)
+            .sum();
+        println!(
+            "[S-norm post-GS] band-0 norm²_S = {:.6e}  (≈1.0 for S-orthonormal)",
+            norm_sq_s_post_gs
+        );
+    }
 
     // ------------------------------------------------------------------
     // Step 2: Rayleigh-Ritz with matrices (returns subspace matrices for diagnostics)
     // ------------------------------------------------------------------
     println!("Running Rayleigh-Ritz (ZHEGVD)...");
     let rr = chemrust_scf::rayleigh_ritz_with_matrices(
-        &psi_row_gpu, &hpsi_row_gpu, &vnl_data, n_bands, n_pw,
-        &kernels, &mut pcie, &solver, &blas, &stream, &ctx,
-        None,  // no pinning (Procrustes would contaminate residual)
-        None,  // no pinning config
-    ).expect("rayleigh_ritz_with_matrices failed");
+        &psi_row_gpu,
+        &hpsi_row_gpu,
+        &vnl_data,
+        n_bands,
+        n_pw,
+        &kernels,
+        &mut pcie,
+        &solver,
+        &blas,
+        &stream,
+        &ctx,
+        None, // no pinning (Procrustes would contaminate residual)
+        None, // no pinning config
+    )
+    .expect("rayleigh_ritz_with_matrices failed");
     let psi_new_gpu = rr.0;
     let Cpu(rr_eigenvalues): Cpu<Vec<f64>> = rr.1;
     // X is returned as Cpu<Vec<CudaComplex>> — convert to num_complex::Complex64
     let x = chemrust_scf::device::cuda_vec_to_complex(rr.5.0);
     println!("RR complete.\n");
 
+    // Verify post-RR S-orthonormality: ZHEGVD should produce ψ with norm²_S = 1.0
+    {
+        use chemrust_scf::device::cuda_vec_to_complex;
+        let psi_post_rr_full: Vec<Complex64> = cuda_vec_to_complex(
+            stream.clone_dtoh(psi_new_gpu.as_device_slice())
+                .expect("clone_dtoh psi_new_gpu"),
+        );
+        let psi_band0 = &psi_post_rr_full[0..n_pw];
+        let spsi_band0 = chemrust_scf::apply_s_for_test(
+            psi_band0, 1, n_pw, &vnl_data, &blas, &stream,
+        )
+        .expect("apply_s_for_test post-RR");
+        let norm_sq_s_post_rr: f64 = psi_band0
+            .iter()
+            .zip(spsi_band0.iter())
+            .map(|(p, sp)| (p.conj() * sp).re)
+            .sum();
+        println!(
+            "[S-norm post-RR] band-0 norm²_S = {:.6e}  (≈1.0 for S-orthonormal)",
+            norm_sq_s_post_rr
+        );
+    }
+
     // ------------------------------------------------------------------
     // Step 3: Compute GPU-resident per-band residual norms
     // ------------------------------------------------------------------
     println!("Computing per-band residual norms (GPU)...");
     let (sinv_norms, l2_norms) = chemrust_scf::compute_residual_norms_for_test(
-        &psi_new_gpu, &hpsi_row_gpu, &rr_eigenvalues, &x,
-        n_bands, n_pw, &vnl_data, &blas, &solver, &stream,
-    ).expect("compute_residual_norms_for_test failed");
+        &psi_new_gpu,
+        &hpsi_row_gpu,
+        &rr_eigenvalues,
+        &x,
+        n_bands,
+        n_pw,
+        &vnl_data,
+        &blas,
+        &solver,
+        &stream,
+    )
+    .expect("compute_residual_norms_for_test failed");
 
     // ------------------------------------------------------------------
     // Step 4: Report + Assert
@@ -592,9 +738,14 @@ fn diagnostic_2_residual_norms_after_chebyshev_filter() {
 
     // ----- Report: per-band table -----
     println!("\n--- Per-Band Results ---\n");
-    println!("{0:>4} | {1:>12} | {2:>12} | {3:>12} | {4:>12} | {5:>10}",
-             "band", "RR_eig (Ha)", "ref_eig (Ha)", "sinv_resid", "l2_resid", "class");
-    println!("{:-<4}-+-{:-<12}-+-{:-<12}-+-{:-<12}-+-{:-<12}-+-{:-<10}", "", "", "", "", "", "");
+    println!(
+        "{0:>4} | {1:>12} | {2:>12} | {3:>12} | {4:>12} | {5:>10}",
+        "band", "RR_eig (Ha)", "ref_eig (Ha)", "sinv_resid", "l2_resid", "class"
+    );
+    println!(
+        "{:-<4}-+-{:-<12}-+-{:-<12}-+-{:-<12}-+-{:-<12}-+-{:-<10}",
+        "", "", "", "", "", ""
+    );
 
     for b in 0..n_bands {
         let cls = match classes[b] {
@@ -615,15 +766,29 @@ fn diagnostic_2_residual_norms_after_chebyshev_filter() {
 
     // ----- Per-group statistics -----
     println!("\n--- Per-Group Statistics ---\n");
-    for cls in &[BandClass::DeepCore, BandClass::Cu3d, BandClass::Valence,
-                 BandClass::NearFermi, BandClass::Conduction] {
+    for cls in &[
+        BandClass::DeepCore,
+        BandClass::Cu3d,
+        BandClass::Valence,
+        BandClass::NearFermi,
+        BandClass::Conduction,
+    ] {
         let (max_s, mean_s, med_s, cnt) = group_stats(&sinv_norms, &classes, *cls);
         let (max_l, mean_l, med_l, _) = group_stats(&l2_norms, &classes, *cls);
         let label = format!("{:?}", cls);
-        println!("{label:12} (n={cnt:3}): S⁻¹ norm   max={max_s:.3e}  mean={mean_s:.3e}  median={med_s:.3e}",
-                 cnt = cnt, max_s = max_s, mean_s = mean_s, med_s = med_s);
-        println!("{label:12}          L₂ norm     max={max_l:.3e}  mean={mean_l:.3e}  median={med_l:.3e}\n",
-                 max_l = max_l, mean_l = mean_l, med_l = med_l);
+        println!(
+            "{label:12} (n={cnt:3}): S⁻¹ norm   max={max_s:.3e}  mean={mean_s:.3e}  median={med_s:.3e}",
+            cnt = cnt,
+            max_s = max_s,
+            mean_s = mean_s,
+            med_s = med_s
+        );
+        println!(
+            "{label:12}          L₂ norm     max={max_l:.3e}  mean={mean_l:.3e}  median={med_l:.3e}\n",
+            max_l = max_l,
+            mean_l = mean_l,
+            med_l = med_l
+        );
     }
 
     // ----- Eigenvalue accuracy vs CASTEP reference -----
@@ -639,25 +804,40 @@ fn diagnostic_2_residual_norms_after_chebyshev_filter() {
             classes[b] != BandClass::Cu3d && gap > 0.01
         })
         .collect();
-    let cu3d: Vec<usize> = (0..n_bands).filter(|&b| classes[b] == BandClass::Cu3d).collect();
+    let cu3d: Vec<usize> = (0..n_bands)
+        .filter(|&b| classes[b] == BandClass::Cu3d)
+        .collect();
 
     let mae_sep = mean_abs_err(&rr_eigenvalues, &fx.bands_eigenvalues, &well_sep);
     let mae_cu3d = mean_abs_err(&rr_eigenvalues, &fx.bands_eigenvalues, &cu3d);
     println!("--- Eigenvalue Accuracy (MAE vs CASTEP) ---");
-    println!("  Well-separated bands (n={}): MAE = {:.3e} Ha", well_sep.len(), mae_sep);
-    println!("  Cu 3d cluster      (n={}): MAE = {:.3e} Ha", cu3d.len(), mae_cu3d);
+    println!(
+        "  Well-separated bands (n={}): MAE = {:.3e} Ha",
+        well_sep.len(),
+        mae_sep
+    );
+    println!(
+        "  Cu 3d cluster      (n={}): MAE = {:.3e} Ha",
+        cu3d.len(),
+        mae_cu3d
+    );
     println!("  Ratio (cu3d / sep): {:.2}\n", mae_cu3d / mae_sep);
 
     // ----- Overall metrics -----
     let max_sinv = sinv_norms.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     let max_l2 = l2_norms.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    let max_sinv_band = sinv_norms.iter().enumerate()
+    let max_sinv_band = sinv_norms
+        .iter()
+        .enumerate()
         .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
         .map(|(b, _)| b)
         .unwrap_or(0);
 
     println!("--- Summary ---");
-    println!("  Max S⁻¹ residual: {:.3e} Ha (band {})", max_sinv, max_sinv_band);
+    println!(
+        "  Max S⁻¹ residual: {:.3e} Ha (band {})",
+        max_sinv, max_sinv_band
+    );
     println!("  Max L2 residual:  {:.3e} Ha", max_l2);
     println!("  Band 0 S⁻¹ residual: {:.3e} Ha", sinv_norms[0]);
 
@@ -670,7 +850,9 @@ fn diagnostic_2_residual_norms_after_chebyshev_filter() {
         assert!(
             rr_eigenvalues[b] >= rr_eigenvalues[b - 1] - 1e-10,
             "Eigenvalues not sorted at band {}: {} < {}",
-            b, rr_eigenvalues[b], rr_eigenvalues[b - 1]
+            b,
+            rr_eigenvalues[b],
+            rr_eigenvalues[b - 1]
         );
     }
     println!("✓ Eigenvalues are sorted ascending");
@@ -679,26 +861,42 @@ fn diagnostic_2_residual_norms_after_chebyshev_filter() {
     assert!(
         max_sinv < 1.0,
         "Max S⁻¹ residual {:.3e} Ha exceeds 1.0 Ha sanity ceiling (band {})",
-        max_sinv, max_sinv_band
+        max_sinv,
+        max_sinv_band
     );
-    println!("✓ Max S⁻¹ residual {:.3e} Ha < 1.0 Ha sanity ceiling", max_sinv);
+    println!(
+        "✓ Max S⁻¹ residual {:.3e} Ha < 1.0 Ha sanity ceiling",
+        max_sinv
+    );
 
     // Anchor 1: well-separated eigenvalue MAE (reported, not fatal)
     if mae_sep > 0.01 {
-        eprintln!("NOTE: well-separated eigenvalue MAE = {:.3e} Ha > 0.01 Ha", mae_sep);
+        eprintln!(
+            "NOTE: well-separated eigenvalue MAE = {:.3e} Ha > 0.01 Ha",
+            mae_sep
+        );
         eprintln!("      May indicate filter spectral bounds or convergence issues.");
     } else {
-        println!("✓ Well-separated eigenvalue MAE = {:.3e} Ha < 0.01 Ha", mae_sep);
+        println!(
+            "✓ Well-separated eigenvalue MAE = {:.3e} Ha < 0.01 Ha",
+            mae_sep
+        );
     }
 
     // Anchor 2: Cu 3d MAE ratio (observational discriminator)
     let ratio = mae_cu3d / mae_sep;
-    println!("  Cu 3d / well-sep MAE ratio = {:.2} (>{:.0} = RR mixing expected)", ratio, 1.0);
+    println!(
+        "  Cu 3d / well-sep MAE ratio = {:.2} (>{:.0} = RR mixing expected)",
+        ratio, 1.0
+    );
 
     // Anchor 5: band 0 (deep core) should be among 5 lowest residuals
     let mut sorted_idx: Vec<usize> = (0..n_bands).collect();
     sorted_idx.sort_by(|&a, &b| sinv_norms[a].partial_cmp(&sinv_norms[b]).unwrap());
-    let rank0 = sorted_idx.iter().position(|&b| b == 0).unwrap_or(usize::MAX);
+    let rank0 = sorted_idx
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(usize::MAX);
     if rank0 < 5 {
         println!("✓ Band 0 is among the 5 lowest residuals (rank {})", rank0);
     } else {
@@ -856,6 +1054,104 @@ fn verify_band0_stability(history: &[Vec<f64>], lo: f64, hi: f64) {
     }
 }
 
+/// Validate S-orthonormality baseline of CASTEP .check wavefunctions.
+///
+/// CASTEP stores wavefunctions in grid-sum convention where
+/// Σ ψ*[i]·(S·ψ)[i] = 1 for an S-orthonormal wavefunction (no Ω/N_grid factor).
+/// This test verifies that our S-operator convention matches and that the
+/// norm²_S ≈ 1.0 expectation is correct, ruling out a false positive in the
+/// Gram-Schmidt diagnostic output.
+///
+/// Fast setup: GPU + vnl_data + 1-band apply_s_for_test → ~10 seconds.
+#[test]
+#[ignore = "requires GPU and CASTEP fixture data"]
+fn diagnostic_s_norm_baseline() {
+    use chemrust_scf::{BlasHandle, SolverHandle, VnlBatchData};
+    use cudarc::driver::CudaContext;
+    use std::sync::Arc;
+
+    if !gpu_available() {
+        eprintln!("SKIP: no GPU available");
+        return;
+    }
+
+    println!("\n=== S-Baseline: S-orthonormality Convention Validation ===\n");
+
+    let fx = fixtures::cu111_co::fixture();
+    let kpt_block = &fx.check.wavefunction.as_ref()
+        .expect(".check must have wavefunction").kpt_data[0];
+    let n_pw = kpt_block.nplw;
+    let psi_input: Vec<Complex64> = kpt_block.bands.concat();
+
+    let ctx = Arc::new(CudaContext::new(0).expect("CudaContext"));
+    let stream = ctx.default_stream();
+    let blas = BlasHandle::new(stream.clone()).expect("BlasHandle");
+    let solver = SolverHandle::new(stream.clone()).expect("SolverHandle");
+    let kernels = chemrust_scf::CudaKernelSet::new(&ctx).expect("CudaKernelSet");
+
+    // Compute occupations (needed for D-screening in VnlBatchData)
+    let n_electrons: f64 = fx.bin.cell.species_iter()
+        .map(|info| fx.pots.get(info.symbol).and_then(|p| p.ionic_charge()).unwrap_or(0.0) * info.num_ions as f64)
+        .sum();
+    let (occupations, _) = chemrust_scf::density::compute_occupations(
+        &fx.bands_eigenvalues,
+        &chemrust_scf::SmearingParams {
+            width: 0.1 * chemrust_scf::EV_TO_HARTREE,
+            electron_temperature: 0.1 * chemrust_scf::EV_TO_HARTREE,
+            scheme: chemrust_scf::SmearingScheme::Gaussian,
+        },
+        n_electrons,
+    ).expect("compute_occupations");
+
+    let wave_grid = chemrust_hamiltonian_core::GVectorGrid::new(
+        fx.check.wavefunction.as_ref().unwrap().grid[0],
+        fx.check.wavefunction.as_ref().unwrap().grid[1],
+        fx.check.wavefunction.as_ref().unwrap().grid[2],
+        fx.bin.cell.recip_lattice,
+    );
+
+    let mut pcie = chemrust_scf::PcieAccount::default();
+    let vnl_data = VnlBatchData::precompute(
+        &kpt_block.pw_grid_coord,
+        &fx.pots,
+        &fx.bin.cell,
+        &wave_grid,
+        &chemrust_scf::KPoint { coords: kpt_block.coords },
+        &psi_input,
+        kpt_block.bands.len(),
+        n_pw,
+        Some(&occupations.0),
+        Some(&chemrust_hamiltonian_core::EffectivePotential::from_inner(
+            chemrust_hamiltonian_core::fft::RealGrid::from_inner(fx.pot_fmt.clone()),
+        )),
+        &stream,
+        &mut pcie,
+        &blas,
+        &kernels,
+        &solver,
+    ).expect("VnlBatchData::precompute");
+
+    // Compute norm²_S for band 0 of the CASTEP .check wavefunction
+    let psi_band0_host = &psi_input[0..n_pw];
+    let spsi_band0 = chemrust_scf::apply_s_for_test(
+        psi_band0_host, 1, n_pw, &vnl_data, &blas, &stream,
+    ).expect("apply_s_for_test");
+    let norm_sq_s_baseline: f64 = psi_band0_host.iter()
+        .zip(spsi_band0.iter())
+        .map(|(p, sp)| (p.conj() * sp).re)
+        .sum();
+    println!(
+        "[S-norm baseline] CASTEP ψ₀: norm²_S = {:.6e}  (grid-sum convention; ≈1.0 expected)",
+        norm_sq_s_baseline
+    );
+    let deviation = (norm_sq_s_baseline - 1.0).abs();
+    if deviation < 0.01 {
+        println!("  ✓ Convention confirmed (deviation = {:.2e})\n", deviation);
+    } else {
+        println!("  ⚠ norm²_S ≠ 1.0 by {:.2e} — convention may differ\n", deviation);
+    }
+}
+
 /// Diagnostic 3: outer loop convergence test.
 ///
 /// Tests whether 10 iterations of Chebyshev filter → Rayleigh-Ritz → residual
@@ -866,15 +1162,15 @@ fn verify_band0_stability(history: &[Vec<f64>], lo: f64, hi: f64) {
 #[ignore = "requires GPU and CASTEP fixture data"]
 fn diagnostic_3_outer_loop_convergence() {
     use chemrust_scf::{
-        BlasHandle, Cpu, EffectivePotential, FilterMode, FineGridArray, Gpu,
-        SolverHandle, VnlBatchData, WaveGridArray,
+        BlasHandle, Cpu, EffectivePotential, FilterMode, FineGridArray, Gpu, SolverHandle,
+        VnlBatchData, WaveGridArray,
     };
     use cudarc::driver::{CudaContext, CudaSlice};
     use ndarray::Array3;
     use std::sync::Arc;
 
     use chemrust_hamiltonian_core::{
-        fft::RealGrid, EffectivePotential as HamEffectivePotential, GVectorGrid,
+        EffectivePotential as HamEffectivePotential, GVectorGrid, fft::RealGrid,
     };
 
     if !gpu_available() {
@@ -882,9 +1178,7 @@ fn diagnostic_3_outer_loop_convergence() {
         return;
     }
 
-    println!(
-        "\n=== Diagnostic 3: Outer Loop Convergence Test (10 iterations) ===\n"
-    );
+    println!("\n=== Diagnostic 3: Outer Loop Convergence Test (10 iterations) ===\n");
 
     let fx = fixtures::cu111_co::fixture();
 
@@ -899,10 +1193,7 @@ fn diagnostic_3_outer_loop_convergence() {
     let n_pw = kpt_block.nplw;
     let [ngx, ngy, ngz] = wfc.grid;
 
-    println!(
-        "System: Cu111_CO  n_bands = {}  n_pw = {}\n",
-        n_bands, n_pw
-    );
+    println!("System: Cu111_CO  n_bands = {}  n_pw = {}\n", n_bands, n_pw);
 
     // Build wave_grid
     let wave_grid = GVectorGrid::new(ngx, ngy, ngz, fx.bin.cell.recip_lattice);
@@ -912,6 +1203,7 @@ fn diagnostic_3_outer_loop_convergence() {
     let stream = ctx.default_stream();
     let blas = BlasHandle::new(stream.clone()).expect("Failed to create BLAS handle");
     let solver = SolverHandle::new(stream.clone()).expect("Failed to create solver handle");
+    let kernels = chemrust_scf::CudaKernelSet::new(&ctx).expect("CudaKernelSet");
 
     // Build VnlBatchData with D-screening
     let pw_coords = &kpt_block.pw_grid_coord;
@@ -920,8 +1212,7 @@ fn diagnostic_3_outer_loop_convergence() {
     };
     let psi_input: Vec<Complex64> = kpt_block.bands.concat();
 
-    let v_eff_for_d =
-        HamEffectivePotential::from_inner(RealGrid::from_inner(fx.pot_fmt.clone()));
+    let v_eff_for_d = HamEffectivePotential::from_inner(RealGrid::from_inner(fx.pot_fmt.clone()));
 
     // Compute occupations
     let n_electrons: f64 = fx
@@ -941,16 +1232,20 @@ fn diagnostic_3_outer_loop_convergence() {
         electron_temperature: 0.1 * chemrust_scf::EV_TO_HARTREE,
         scheme: chemrust_scf::SmearingScheme::Gaussian,
     };
-    let (occupations, chem_pot) = chemrust_scf::density::compute_occupations(
-        &fx.bands_eigenvalues,
-        &smearing,
-        n_electrons,
-    )
-    .expect("compute_occupations");
+    let (occupations, chem_pot) =
+        chemrust_scf::density::compute_occupations(&fx.bands_eigenvalues, &smearing, n_electrons)
+            .expect("compute_occupations");
     let occ_sum: f64 = occupations.0.iter().sum();
     println!(
         "Occupations: Σocc = {:.4}  target N_e = {:.1}  μ = {:.6} Ha\n",
         occ_sum, n_electrons, chem_pot.0
+    );
+
+    // Determine number of occupied bands (CASTEP logic: ceiling(n_electrons / 2) for spin-unpolarized)
+    let n_occ = (n_electrons / 2.0).ceil() as usize;
+    println!(
+        "Number of occupied bands: n_occ = {} (from N_e = {})\n",
+        n_occ, n_electrons
     );
 
     let mut pcie = chemrust_scf::PcieAccount::default();
@@ -968,20 +1263,15 @@ fn diagnostic_3_outer_loop_convergence() {
         &stream,
         &mut pcie,
         &blas,
+        &kernels,
         &solver,
     )
     .expect("VnlBatchData::precompute");
 
     // CASTEP V_eff from pot_fmt
     let v_eff_flat: Vec<f64> = fx.pot_fmt.iter().copied().collect();
-    let min_veff = v_eff_flat
-        .iter()
-        .copied()
-        .fold(f64::INFINITY, f64::min);
-    let max_veff = v_eff_flat
-        .iter()
-        .copied()
-        .fold(f64::NEG_INFINITY, f64::max);
+    let min_veff = v_eff_flat.iter().copied().fold(f64::INFINITY, f64::min);
+    let max_veff = v_eff_flat.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     println!(
         "V_eff bounds: min = {:.4} Ha, max = {:.4} Ha\n",
         min_veff, max_veff
@@ -1032,8 +1322,12 @@ fn diagnostic_3_outer_loop_convergence() {
     // Outer loop
     // ==================================================================
     let n_outer_iters = 10;
+    let ritz_tol = 1e-4; // Zhou 2014 Alg 5.1 step 10: Ritz convergence threshold (Ha)
     let mut residual_history: Vec<Vec<f64>> = Vec::with_capacity(n_outer_iters);
     let mut eigenvalue_history: Vec<Vec<f64>> = Vec::with_capacity(n_outer_iters);
+
+    // Initialize eigenvalues from CASTEP for first iteration (continuation scenario)
+    let mut eigenvalues_for_filter: Option<Vec<f64>> = Some(fx.bands_eigenvalues.clone());
 
     println!("Starting outer loop ({} iterations)...\n", n_outer_iters);
     println!(
@@ -1046,7 +1340,7 @@ fn diagnostic_3_outer_loop_convergence() {
     );
 
     for iter in 0..n_outer_iters {
-        // Step 1: Chebyshev filter with pre-built GPU state (no psi re-upload)
+        // Step 1: Chebyshev filter with eigenvalue feedback from previous iteration
         let (psi_row_gpu, hpsi_row_gpu) = chemrust_scf::chebyshev_filter_iteration_gpu(
             &psi_gpu,
             &v_eff_gpu,
@@ -1060,7 +1354,8 @@ fn diagnostic_3_outer_loop_convergence() {
             min_veff,
             max_veff,
             ndeg,
-            None,
+            eigenvalues_for_filter.as_deref(), // Use previous iteration's eigenvalues
+            Some(n_occ),                       // Pass n_occ for correct b_low
             FilterMode::SinvHKeepHEig,
             &blas,
             &solver,
@@ -1090,6 +1385,63 @@ fn diagnostic_3_outer_loop_convergence() {
         let Cpu(eigenvalues): Cpu<Vec<f64>> = rr.1;
         let x = chemrust_scf::device::cuda_vec_to_complex(rr.5.0);
 
+        // Zhou 2014 Alg 5.1 step 10: exit if Ritz values stop changing
+        if let Some(prev_ritz) = eigenvalue_history.last() {
+            let ritz_max_delta = eigenvalues
+                .iter()
+                .zip(prev_ritz.iter())
+                .map(|(r_new, r_old)| (r_new - r_old).abs())
+                .fold(0.0_f64, f64::max);
+            println!(
+                "  [Ritz check] max|ΔR| = {:.2e} Ha",
+                ritz_max_delta
+            );
+            if ritz_max_delta < ritz_tol {
+                println!(
+                    "  ✓ Ritz values converged at iter={} (max|ΔR| = {:.2e} < {:.2e})",
+                    iter + 1,
+                    ritz_max_delta,
+                    ritz_tol
+                );
+                // Store final eigenvalues and residual history before breaking
+                eigenvalue_history.push(eigenvalues.clone());
+                // Compute residuals one last time for the convergence record
+                let (sinv_final, _l2_final) = chemrust_scf::compute_residual_norms_for_test(
+                    &psi_new_gpu,
+                    &hpsi_row_gpu,
+                    &eigenvalues,
+                    &x,
+                    n_bands,
+                    n_pw,
+                    &vnl_data,
+                    &blas,
+                    &solver,
+                    &stream,
+                )
+                .expect("Final residual computation failed");
+                residual_history.push(sinv_final.clone());
+
+                // Print final iteration summary
+                let core_final = compute_mean_residual(&sinv_final, &core);
+                let cu3d_final = compute_mean_residual(&sinv_final, &cu3d);
+                let val_final = compute_mean_residual(&sinv_final, &val);
+                let nfermi_final = compute_mean_residual(&sinv_final, &nfermi);
+                let cond_final = compute_mean_residual(&sinv_final, &cond);
+                println!(
+                    "iter={:2} | {:>10.3e} | {:>10.3e} | {:>10.3e} | {:>10.3e} | {:>10.3e} | {:>12.6}",
+                    iter + 1,
+                    core_final,
+                    cu3d_final,
+                    val_final,
+                    nfermi_final,
+                    cond_final,
+                    eigenvalues[0],
+                );
+                psi_gpu = psi_new_gpu;
+                break;
+            }
+        }
+
         // Step 3: Compute per-band S⁻¹-weighted residuals
         let (sinv_norms, _l2_norms) = chemrust_scf::compute_residual_norms_for_test(
             &psi_new_gpu,
@@ -1108,6 +1460,9 @@ fn diagnostic_3_outer_loop_convergence() {
         // Track history
         residual_history.push(sinv_norms.clone());
         eigenvalue_history.push(eigenvalues.clone());
+
+        // Store eigenvalues for next iteration's filter
+        eigenvalues_for_filter = Some(eigenvalues.clone());
 
         // Print per-iteration summary
         let core_mean = compute_mean_residual(&sinv_norms, &core);
@@ -1141,8 +1496,7 @@ fn diagnostic_3_outer_loop_convergence() {
 
     // SC-2: Conduction Band Early Convergence
     println!("\n--- SC-2: Conduction Band Early Convergence ---");
-    let n_converged_at_iter5 =
-        count_converged_bands(&residual_history[4], &cond, 0.01);
+    let n_converged_at_iter5 = count_converged_bands(&residual_history[4], &cond, 0.01);
     println!(
         "  conduction bands converged at iter-5: {}/63 (need ≥50)",
         n_converged_at_iter5
@@ -1171,10 +1525,8 @@ fn diagnostic_3_outer_loop_convergence() {
     // SC-4: Eigenvalue Stability
     println!("\n--- SC-4: Eigenvalue Stability ---");
     for iter in 4..n_outer_iters {
-        let max_drift = compute_max_eigenvalue_drift(
-            &eigenvalue_history[iter - 1],
-            &eigenvalue_history[iter],
-        );
+        let max_drift =
+            compute_max_eigenvalue_drift(&eigenvalue_history[iter - 1], &eigenvalue_history[iter]);
         println!(
             "  iter {}-{}: max drift = {:.3e} Ha (need < 0.1 Ha)",
             iter,
@@ -1205,7 +1557,11 @@ fn test_condition_number_identity() {
     }
 
     let kappa = condition_number_svd(&m);
-    assert!((kappa - 1.0).abs() < 1e-10, "Identity matrix should have κ₂ = 1, got {}", kappa);
+    assert!(
+        (kappa - 1.0).abs() < 1e-10,
+        "Identity matrix should have κ₂ = 1, got {}",
+        kappa
+    );
 }
 
 #[test]
@@ -1217,7 +1573,11 @@ fn test_condition_number_ill_conditioned() {
     m[[2, 2]] = Complex64::new(0.001, 0.0);
 
     let kappa = condition_number_svd(&m);
-    assert!(kappa > 1e5, "Ill-conditioned matrix should have large κ₂, got {}", kappa);
+    assert!(
+        kappa > 1e5,
+        "Ill-conditioned matrix should have large κ₂, got {}",
+        kappa
+    );
 }
 
 #[test]
@@ -1236,7 +1596,19 @@ fn test_off_diagonal_stats() {
 
     let (max, median, mean) = off_diagonal_stats(&m);
 
-    assert!((max - 0.1).abs() < 1e-10, "max off-diagonal should be 0.1, got {}", max);
-    assert!(median > 0.0 && median < 0.1, "median should be between 0 and 0.1, got {}", median);
-    assert!(mean > 0.0 && mean < 0.1, "mean should be between 0 and 0.1, got {}", mean);
+    assert!(
+        (max - 0.1).abs() < 1e-10,
+        "max off-diagonal should be 0.1, got {}",
+        max
+    );
+    assert!(
+        median > 0.0 && median < 0.1,
+        "median should be between 0 and 0.1, got {}",
+        median
+    );
+    assert!(
+        mean > 0.0 && mean < 0.1,
+        "mean should be between 0 and 0.1, got {}",
+        mean
+    );
 }
