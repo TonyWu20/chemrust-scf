@@ -1,8 +1,22 @@
 # Critical Analysis: Why Previous Chebyshev Implementation Failed
 
-**Date**: 2026-05-26  
+**Date**: 2026-05-26 (Updated 2026-05-27)  
 **Context**: Reevaluation of eigensolver failure claims and proposed solutions  
-**Status**: Analysis complete, recommendations provided
+**Status**: Analysis complete, diagnostics in progress
+
+## Diagnostic Status Overview (2026-05-27)
+
+| # | Diagnostic | Status | Result |
+|---|-----------|--------|--------|
+| **1b** | Orthogonality with SinvHKeepHEig (production filter) | ✅ **PASSED** | κ₂=1.0 for ALL filter modes. Factor C is NOT a blocker. |
+| **2** | Per-band residual norms after single filter pass | ✅ **PASSED** | Max S⁻¹ residual 0.209 Ha (Cu 3d). Reasonable baseline for outer loop. |
+| **3** | Outer loop convergence (minimal prototype) | 🔄 **IN PROGRESS** | Being implemented/tested. |
+| **4** | Harmonic RR vs standard RR on Cu 3d cluster | ⬜ **QUEUED** | Awaiting Diagnostic 3 results. |
+| **5** | Band-locking behavior | ⬜ **QUEUED** | Awaiting Diagnostics 3-4 results. |
+
+**Critical gap closed**: Diagnostic 1b (commit after c471b3d) confirmed `SinvHKeepHEig` preserves orthogonality (κ₂=1.0). The original Diagnostic 1 used `BareH`, which was a physically incorrect test for USPP. This gap is now resolved.
+
+**Next**: Proceed with Diagnostic 3 (outer loop convergence). If residuals decrease monotonically, proceed to Diagnostics 4-5. If not, investigate Harmonic RR as the fix for degenerate cluster rotation.
 
 **🚨 CRITICAL FINDING**: Diagnostic 1 (commit c471b3d) validated orthogonality with `FilterMode::BareH`, but the production code uses `FilterMode::SinvHKeepHEig`. The κ₂=1.0 result does NOT validate the production filter mode. This must be revalidated FIRST (Diagnostic 1b) before proceeding with any outer loop implementation.
 
@@ -424,9 +438,11 @@ This is the right approach — validate the hypothesis with minimal code changes
 
 **Goal**: Observe per-band residual behavior and convergence characteristics with a minimal outer loop prototype.
 
-#### Diagnostic 1b: Revalidate Orthogonality with SinvHKeepHEig Filter Mode
+#### Diagnostic 1b: Revalidate Orthogonality with SinvHKeepHEig Filter Mode ✅ **PASSED**
 
-**CRITICAL GAP IDENTIFIED**: The existing Diagnostic 1 (commit c471b3d) used `FilterMode::BareH`, which is **physically incorrect for USPP**. The κ₂=1.0 result only validates the BareH filter, not the production SinvHKeepHEig filter that applies S^{-1}·H.
+**CRITICAL GAP IDENTIFIED — NOW CLOSED**: The existing Diagnostic 1 (commit c471b3d) used `FilterMode::BareH`, which is **physically incorrect for USPP**. The κ₂=1.0 result only validates the BareH filter, not the production SinvHKeepHEig filter that applies S^{-1}·H.
+
+**Result** (2026-05-26): κ₂=1.0 for ALL three filter modes (BareH, SinvHKeepHEig, SinvHFullDas). See `DIAGNOSTIC_1B_RESULT.md` for details.
 
 **What to test**:
 1. Run the same orthogonality test with `FilterMode::SinvHKeepHEig`
@@ -445,9 +461,11 @@ This is the right approach — validate the hypothesis with minimal code changes
 
 ---
 
-#### Diagnostic 2: Per-Band Residual Norms After Single Filter Pass
+#### Diagnostic 2: Per-Band Residual Norms After Single Filter Pass ✅ **PASSED**
 
-**What to measure**:
+**Result** (2026-05-27): All assertions green. Max S⁻¹ residual 0.209 Ha (Cu 3d band 10). Conduction bands converge well (mean 0.026 Ha). Occupied bands (81 bands) need outer loop work. See `DIAGNOSTIC_2_RESULT.md` for details.
+
+**What to measure** (completed):
 1. After one Chebyshev filter pass (ndeg=8) + Gram-Schmidt + standard RR
 2. Compute per-band residuals: `r_b = H|ψ_b⟩ - λ_b·S|ψ_b⟩`
 3. Compute S⁻¹-weighted norms: `||r_b||_S^(-1) = √⟨r_b | S^(-1)·r_b⟩`
@@ -462,7 +480,9 @@ This is the right approach — validate the hypothesis with minimal code changes
 
 ---
 
-#### Diagnostic 3: Outer Loop Convergence (Minimal Prototype)
+#### Diagnostic 3: Outer Loop Convergence (Minimal Prototype) 🔄 **IN PROGRESS**
+
+**Status**: Implementation split into A1 (GPU-resident filter iteration function), A2 (helper functions), A3 (diagnostic test). See `notes/plans/diagnostic-3-outer-loop/`.
 
 **What to implement**:
 1. Simple outer loop (5-10 iterations) around existing Chebyshev filter

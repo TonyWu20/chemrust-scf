@@ -6,6 +6,8 @@
 Rayleigh quotients (no ZHEGVD) is viable, or whether we should proceed with
 band-by-band CG (as planned on `feat/phase-block-cg-migration`).
 
+**Related**: See [`docs/chebyshev-filter-paper-findings.md](../docs/chebyshev-filter-paper-findings.md) for the Zhou 2014 spectral bounds and n_occ/s analysis. See [`docs/abinit-chebyshev-scf-inner-loop.md](../docs/abinit-chebyshev-scf-inner-loop.md) for ABINIT's inner-loop implementation reference.
+
 ---
 
 ## 1. What the PARSEC Paper Teaches
@@ -205,16 +207,21 @@ outer iterations are needed to lock >80% of bands?
 
 ## 5. Decision Matrix
 
-| Diag 1 (orth) | Diag 3 (residuals) | Diag 4 (convergence) | Conclusion |
+| Diag 1 (orth) | Diag 2 (residual baseline) | Diag 3 (convergence) | Conclusion |
 |:---:|:---:|:---:|---|
-| **κ₂ = 1.0 ✅** | max ‖r‖ < 0.1 Ha | >80% lock in 3-5 iters | **Iterative Chebyshev works. Implement.** ← **WE ARE HERE** |
-| κ₂ < 10³ | max ‖r‖ > 0.5 Ha | >80% lock in 6-10 iters | **Iterative Chebyshev viable but slower. Worth using.**
-| κ₂ ~ 10⁶ | max ‖r‖ < 0.1 Ha | >80% lock in 3-5 iters | **Iterative Chebyshev works. Store Cholesky QR. |
-| κ₂ ~ 10⁶ | max ‖r‖ > 0.5 Ha | <50% lock in 10 iters | **Iterative Chebyshev marginal. Try CG. |
-| κ₂ > 10¹⁰ | any | any | **Orthogonality too broken. Use CG (preconditioned). |
+| **κ₂ = 1.0 ✅** | **max ‖r‖_S⁻¹ = 0.209 Ha ✅** (reasonable, not catastrophic) | TBD | **Iterative Chebyshev still viable. Awaiting Diagnostic 3.** ← **CURRENT** |
+| κ₂ = 1.0 | max ‖r‖ < 0.1 Ha | >80% lock in 3-5 iters | **Iterative Chebyshev works. Implement.**
+| κ₂ = 1.0 | max ‖r‖ > 0.5 Ha | >80% lock in 6-10 iters | **Iterative Chebyshev viable but slower. Worth using.**
+| κ₂ < 10³ | any | >80% lock in ≤10 iters | **Iterative Chebyshev viable. May need Cholesky QR.**
+| any | any | <50% lock in 10 iters | **Iterative Chebyshev marginal. Use CG.** |
 
-**Status**: Diagnostic 1 passed with κ₂ = 1.0 (perfect orthogonality). Proceed to
-Diagnostic 3 (per-band Rayleigh quotient residuals) to measure convergence rate.
+**Status** (2026-05-27):
+- ✅ **Diagnostic 1**: κ₂ = 1.0 (perfect orthogonality)
+- ✅ **Diagnostic 1b**: κ₂ = 1.0 for ALL filter modes including production SinvHKeepHEig
+- ✅ **Diagnostic 2**: Per-band residuals established — max S⁻¹ residual 0.209 Ha, reasonable baseline
+- 🔄 **Diagnostic 3**: Outer loop convergence — being implemented/tested
+- ⬜ **Diagnostic 4**: Harmonic RR — queued
+- ⬜ **Diagnostic 5**: Band-locking — queued
 
 ---
 

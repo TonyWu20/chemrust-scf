@@ -4,6 +4,12 @@
 **Branch**: `diag/iterative-chebyshev-viability`  
 **Status**: ✅ Diagnostic 2 validated, ready for Diagnostic 3
 
+## Reevaluation Context
+
+This branch tests whether iterative Chebyshev filtering (PARSEC Algorithm 4 with outer loop) is viable for USPP metallic systems. Prior conclusions on `feat/phase-global-woodbury` deemed Chebyshev-RR "architecturally unsuitable," but that assessment was based on a single-sweep implementation (no outer loop, no band-locking). Diagnostics 1/1b (κ₂=1.0, perfect orthogonality for all filter modes) and Diagnostic 2 (reasonable residual baseline) have falsified the "unsuitable" claim. The outer loop (Diagnostic 3) is the remaining question.
+
+**Status tracking**: See `notes/diagnostics-status-and-evaluation.md` for comprehensive tracking of all diagnostic results and the reevaluation decision matrix.
+
 ---
 
 ## What Was Accomplished This Session
