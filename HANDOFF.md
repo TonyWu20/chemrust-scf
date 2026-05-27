@@ -1,242 +1,129 @@
-# Handoff: Diagnostic 1b Complete — Ready for Diagnostic 2
+# Handoff: Diagnostic 2 Complete — Per-Band Residual Baseline Established
 
-**Date**: 2025-05-26  
+**Date**: 2026-05-27  
 **Branch**: `diag/iterative-chebyshev-viability`  
-**Status**: ✅ Diagnostic 1b validated, ready for next phase
+**Status**: ✅ Diagnostic 2 validated, ready for Diagnostic 3
 
 ---
 
 ## What Was Accomplished This Session
 
-### Critical Validation Gap Closed
+### Diagnostic 2: Per-Band Residual Norms After Chebyshev Filter + RR
 
-**Problem Identified**: The original Diagnostic 1 (commit c471b3d) used `FilterMode::BareH`, which is physically incorrect for USPP systems. The production code uses `FilterMode::SinvHKeepHEig` (S^{-1}·H via Woodbury), which was never validated for orthogonality preservation.
+**Implementation**:
+- `chebyshev_filter_for_test_gpu()` — GPU-resident filter returning `(psi_row_gpu, hpsi_row_gpu, kernels)` for RR chaining
+- `compute_residual_norms_for_test()` — all-GPU residual computation following `davidson.rs:270-338`: gemm rotation, apply_s_times, per-band zcopy+zaxpy, batch S^{-1} via Woodbury, zdotc norms
+- `diagnostic_2` integration test — 5 anchored assertions, per-band table, per-group statistics
 
-**Solution Implemented**: 
-- Modified `chebyshev_filter_for_test()` to accept a `filter_mode` parameter
-- Created three test variants to compare all filter modes
-- Ran comprehensive orthogonality tests on Cu111_CO fixture
+**Result**: ✅ **Test passed (93.31s). All assertions green.**
 
-**Result**: ✅ **All three filter modes preserve orthogonality perfectly (κ₂ = 1.0)**
-
-| Filter Mode | κ₂ | Off-Diagonal Max | Status |
-|-------------|-----|------------------|--------|
-| BareH (baseline) | 1.0000e0 | 7.6e-15 | ✓ |
-| **SinvHKeepHEig (production)** | 1.0000e0 | 2.9e-15 | ✓ |
-| SinvHFullDas (full Das) | 1.0000e0 | 2.0e-15 | ✓ |
+| Group | Count | S⁻¹ Max | S⁻¹ Mean | L2 Max | L2 Mean |
+|-------|-------|---------|---------|--------|---------|
+| DeepCore (band 0) | 1 | 4.2e-2 | 4.2e-2 | 5.7e-2 | 5.7e-2 |
+| **Cu 3d** (bands 1-14) | 14 | **2.09e-1** | **1.55e-1** | **5.02e-1** | **3.37e-1** |
+| Valence | 67 | 1.68e-1 | 1.32e-1 | 3.59e-1 | 2.70e-1 |
+| NearFermi | 15 | 1.05e-1 | 7.88e-2 | 2.00e-1 | 1.42e-1 |
+| Conduction | 63 | 5.70e-2 | **2.60e-2** | 8.62e-2 | **4.31e-2** |
 
 ### Key Findings
 
-1. **Factor C (USPP S^{-1} complexity) is NOT a blocker**
-   - Woodbury-based S^{-1} at ζ=3.8e-15 is numerically stable
-   - No need to investigate alternative S^{-1} methods
-   - No need to pivot away from Chebyshev filtering
+1. **Conduction bands converge well**: S⁻¹ residuals ~0.026 Ha mean after one pass — these would lock early with band-locking (Diagnostic 5).
 
-2. **Cascade root cause confirmed**
-   - Missing outer loop (no band-locking, no iterative refinement)
-   - Single sweep per SCF step (vs CASTEP's 19-26 iterations)
-   - NOT the filter operator or Woodbury precision
+2. **Occupied bands (Cu 3d + valence, 81 bands) need more work**: Residuals ~0.13-0.21 Ha after one pass. The outer loop (Diagnostic 3-5) has a substantial workload — this is not "one sweep is enough."
 
-3. **Green light for PARSEC Algorithm 4**
-   - Proceed with outer loop + band-locking + Harmonic RR
-   - Continue with Diagnostics 2-5 to validate approach
+3. **Cu 3d RR mixing confirmed**: MAE ratio (cu3d/separated) = 1.44, and Cu 3d residuals are the highest of any group. Degenerate subspace rotation is structural.
+
+4. **Well-separated eigenvalue MAE = 0.0138 Ha** (slightly above the 0.01 Ha note threshold, not a failure). Conduction bands recover well despite this.
+
+5. **Band 0 surprise**: Ranked 58th in residual (4.2e-2 Ha), not in top 5. This may be a filter spectral bound issue — band 0 at -1.055 Ha sits near the edge of the Chebyshev passband. The filter amplifies components near the passband center, and band 0 may be too far from center.
+
+6. **n_pw = 60067** (different from earlier 9477 — this is the full PW basis at the actual cutoff, not a test subset)
+
+### What This Means for Diagnostics 3-5
+
+- The outer loop has a clear signal to work with: ~0.1-0.2 Ha residuals for 81 occupied bands
+- Conduction bands (~63 bands) already near convergence — band-locking will help
+- Filter spectral bounds (b_low=0.0894 from max_veff) may be mis-identifying the lower bound — the filter window may not be centered optimally for the full spectral range
+- Harmonic RR (Diagnostic 4) is worth testing: the Cu 3d cluster shows clear mixing
 
 ### Files Modified
 
-- `src/eigensolver/chebyshev.rs` - Added `filter_mode` parameter to `chebyshev_filter_for_test()`
-- `src/lib.rs` - Exported `FilterMode` for test access
-- `tests/chebyshev_orthogonality_diagnostic.rs` - Refactored into helper function + 3 test variants
-
-### Documentation Created
-
-- `DIAGNOSTIC_1B_RESULT.md` - Detailed test results and analysis
-- `docs/DIAGNOSTIC_PLAN.md` - Full diagnostic-first implementation plan
-- Memory: `diagnostic_1b_validated.md` - Project status update
+- `src/eigensolver/chebyshev.rs` — Added `chebyshev_filter_for_test_gpu()` + `compute_residual_norms_for_test()` + type alias
+- `src/lib.rs` — Added re-exports for the new wrappers and `rayleigh_ritz_with_matrices`
+- `tests/chebyshev_orthogonality_diagnostic.rs` — Added Diagnostic 2 test + helpers
 
 ---
 
 ## What To Do Next Session
 
-### Immediate Next Step: Diagnostic 2
+### Immediate Next Step: Diagnostic 3
 
-**Goal**: Measure per-band residual norms after a single Chebyshev filter pass to establish baseline convergence characteristics.
+**Goal**: Test if residuals decrease monotonically with a simple outer loop (5-10 iterations).
 
-**Implementation** (in `tests/chebyshev_orthogonality_diagnostic.rs`):
+**Implementation** (in the same test file or a new one):
 
 ```rust
 #[test]
 #[ignore = "requires GPU and CASTEP fixture data"]
-fn diagnostic_2_per_band_residuals() {
-    // 1. Load Cu111_CO fixture (converged state)
-    // 2. Run one Chebyshev filter pass (ndeg=8, SinvHKeepHEig mode)
-    // 3. Apply Gram-Schmidt orthonormalization
-    // 4. Run standard Rayleigh-Ritz (ZHEGVD)
-    // 5. Compute per-band residuals: r_b = H|ψ_b⟩ - λ_b·S|ψ_b⟩
-    // 6. Compute S^{-1}-weighted norms: ||r_b||_{S^{-1}} = √⟨r_b | S^{-1}·r_b⟩
-    // 7. Report statistics:
-    //    - Which bands have residuals < 0.1 Ha, < 0.01 Ha, < 0.001 Ha
-    //    - Cu 3d cluster (bands 1-14) vs well-separated bands
-    //    - Histogram of residual norms
+fn diagnostic_3_outer_loop_convergence() {
+    // For each iteration 1..N:
+    //   1. Run Chebyshev filter (all bands, no locking yet)
+    //   2. Run standard Rayleigh-Ritz
+    //   3. Compute per-band S⁻¹-weighted residuals
+    //   4. Track per-band residual evolution
+    //   5. Track eigenvalue drift
+    // Report:
+    //   - Residual trajectories per band cluster
+    //   - Total residual sum over iterations
+    //   - Which bands converge and at what rate
 }
 ```
 
-**Expected Outcome**:
-- Cu 3d bands (1-14): High residuals due to degeneracy
-- Well-separated bands: Low residuals
-- Establishes baseline for "how many bands need more work"
-
-**Estimated Time**: 2-3 hours
-
----
-
-### Subsequent Diagnostics (After Diagnostic 2)
-
-#### Diagnostic 3: Outer Loop Convergence (Minimal Prototype)
-
-**Goal**: Test if residuals decrease monotonically with a simple outer loop.
-
-**Implementation**:
-- Add 5-10 iteration outer loop around existing Chebyshev filter
-- No band-locking yet (all bands filtered every iteration)
-- Track per-band residuals across iterations
-- Use standard RR (not Harmonic RR yet)
-
-**Decision Point**: 
-- If residuals decrease → proceed to Diagnostic 4
+**Decision Point**:
+- If residuals decrease → proceed to Diagnostic 4 (Harmonic RR)
 - If residuals plateau → need Harmonic RR for degenerate clusters
 - If residuals increase → fundamental problem with approach
 
 **Estimated Time**: 1 day
 
----
+### Subsequent Diagnostics (After Diagnostic 3)
 
 #### Diagnostic 4: Harmonic RR vs. Standard RR
 
-**Goal**: Test if Harmonic Rayleigh-Ritz stabilizes the Cu 3d degenerate cluster.
-
-**Implementation**:
-- Extract Cu 3d cluster (bands 1-14, eigenvalues within 0.07 Ha)
-- Run 5 outer iterations with standard RR
-- Run 5 outer iterations with Harmonic RR (σ = center of cluster)
-- Compare residual convergence rates and eigenvector stability
-
-**Expected Outcome**:
-- Standard RR: May produce spurious rotations
-- Harmonic RR: Should stabilize eigenvectors
+Test if Harmonic Rayleigh-Ritz stabilizes the Cu 3d degenerate cluster by using a shift σ near the cluster center.
 
 **Estimated Time**: 1-2 days
 
----
-
 #### Diagnostic 5: Band-Locking Behavior
 
-**Goal**: Test if band-locking works without causing regression.
-
-**Implementation**:
-- Implement simple band-locking (skip converged bands in filter)
-- Run 10 outer iterations with lock_tol = 0.01 Ha
-- Track which bands lock and when
-- Verify locked bands stay converged
-
-**Expected Outcome**:
-- Well-separated bands lock early (iterations 1-3)
-- Cu 3d cluster locks late (iterations 5-10)
-- No regression in locked bands
+Test if band-locking works without causing regression. Conduction bands are prime candidates for early locking.
 
 **Estimated Time**: 1 day
 
----
-
 ### Decision Point After Diagnostics 2-5
 
-**If all diagnostics pass**:
-- ✅ Residuals decrease monotonically with outer loop
-- ✅ Harmonic RR stabilizes Cu 3d cluster
-- ✅ Band-locking works without regression
+**If all diagnostics pass** → Proceed to Phase 1: Full implementation of outer loop + band-locking + Harmonic RR.
 
-**Then proceed to Phase 1**: Full implementation of PARSEC Algorithm 4 (1-2 weeks)
-
-**If any diagnostic fails**:
-- Investigate root cause
-- May need spectrum slicing or different approach
-- Pivot before investing in full implementation
+**If any diagnostic fails** → Investigate root cause. May need spectrum slicing, different filter bounds, or the already-proven Davidson v1 (which has locking built in).
 
 ---
 
 ## Reference Documents
 
-- **DIAGNOSTIC_PLAN.md** - Full diagnostic-first implementation plan (copied from `/home/tony/.claude/plans/note-that-handoff-md-and-smooth-fog.md`)
-- **DIAGNOSTIC_1B_RESULT.md** - Detailed Diagnostic 1b test results
-- **HANDOFF.md** (this file in PARSEC paper analysis) - Original re-evaluation that identified the validation gap
-- **PROPOSAL.md** - Original per-band RQ proposal (NOT recommended per plan analysis)
-
----
-
-## Key Insights from This Session
-
-1. **Terminology matters**: "Single-sweep" refers to the outer loop (1 filter+orth+RR cycle per SCF), not the polynomial degree (already 8 iterations)
-
-2. **Zhou's claim is conditional**: "One sweep per SCF" likely applies to insulators with large HOMO-LUMO gaps, not metals with degenerate bands
-
-3. **PARSEC Algorithm 4 is the proven solution**: Outer loop + band-locking + Harmonic RR, as described in the PARSEC paper
-
-4. **Per-band RQ approach is experimental**: No convergence theory for degenerate eigenvalues, contradicts PARSEC reference, high risk
-
-5. **Diagnostic-first is the right approach**: Validate hypotheses with minimal code before investing 1-2 weeks in full implementation
+- **DIAGNOSTIC_PLAN.md** — Full diagnostic-first implementation plan
+- **HANDOFF.md** (this file) — Session log and status
+- **DIAGNOSTIC_1B_RESULT.md** — Detailed Diagnostic 1b test results
 
 ---
 
 ## Commands to Resume Work
 
 ```bash
-# Navigate to project
 cd /home/tony/programming/chemrust-scf-chebyshev-iter
 
-# Check current branch
-git status
+# Run Diagnostic 2 (verify results)
+cargo test --test chebyshev_orthogonality_diagnostic diagnostic_2_residual_norms_after_chebyshev_filter -- --ignored --nocapture
 
-# Run Diagnostic 2 (once implemented)
-cargo test --test chebyshev_orthogonality_diagnostic diagnostic_2_per_band_residuals -- --ignored --nocapture
-
-# View plan
-cat docs/DIAGNOSTIC_PLAN.md
-
-# View Diagnostic 1b results
-cat DIAGNOSTIC_1B_RESULT.md
+# Run Diagnostics 1-2
+cargo test --test chebyshev_orthogonality_diagnostic -- --ignored --nocapture
 ```
-
----
-
-## Questions to Consider
-
-1. Should Diagnostic 2 use CASTEP's converged state or iter-0 state?
-   - **Recommendation**: Start with converged state (easier to debug), then test iter-0 if diagnostics pass
-
-2. What lock tolerance should we use for Diagnostic 5?
-   - **Recommendation**: Start with 0.01 Ha, then tighten to 0.001 Ha if needed
-
-3. Should we implement Cholesky QR before or after the outer loop?
-   - **Recommendation**: After outer loop validation (Diagnostic 3), before full implementation
-
----
-
-## Success Criteria
-
-### Minimum Viable Product (MVP)
-1. ✅ **Prevents cascade**: SCF converges to within 0.1 eV of CASTEP reference
-2. ✅ **Fits in memory**: Peak VRAM usage < 7 GB
-3. ✅ **Reasonable performance**: Total SCF time < 10 minutes for Cu111_CO
-
-### Stretch Goals
-1. ✅ **Matches CASTEP precision**: Final energy within 0.001 eV
-2. ✅ **Competitive performance**: Total SCF time < 5 minutes
-3. ✅ **Robust**: Works for other systems (not just Cu111_CO)
-
----
-
-## Contact Points
-
-- **Plan file**: `docs/DIAGNOSTIC_PLAN.md`
-- **Memory system**: `/home/tony/.claude/projects/-home-tony-programming-chemrust-scf-chebyshev-iter/memory/`
-- **Test file**: `tests/chebyshev_orthogonality_diagnostic.rs`
-- **Main implementation**: `src/eigensolver/chebyshev.rs`
