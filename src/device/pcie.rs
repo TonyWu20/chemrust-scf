@@ -42,7 +42,8 @@ impl PcieAccount {
 // ---------------------------------------------------------------------------
 
 impl<T: DeviceMapped> Gpu<T> {
-    pub(crate) fn from_host_with(
+    #[doc(hidden)]
+    pub fn from_host_with(
         value: &T,
         stream: &Arc<CudaStream>,
         acc: &mut PcieAccount,

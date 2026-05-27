@@ -10,7 +10,7 @@ pub(crate) mod eigensolver;
 #[doc(hidden)]
 pub use eigensolver::chebyshev::{
     apply_s_for_test, chebyshev_filter_for_test, chebyshev_filter_for_test_gpu,
-    compute_residual_norms_for_test, CudaKernelSet, FilterMode,
+    chebyshev_filter_iteration_gpu, compute_residual_norms_for_test, CudaKernelSet, FilterMode,
 };
 /// Rayleigh-Ritz test wrapper (returns subspace matrices for diagnostics).
 /// Gated behind `scf_diag` (default feature) or `test` cfg.

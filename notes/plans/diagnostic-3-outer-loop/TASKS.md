@@ -26,16 +26,157 @@
 
 ## Task Groups
 
-### Group A: Core Implementation (1 task)
+### Group A: Core Implementation (3 tasks)
 
 **Dependencies**: Diagnostic 2 infrastructure (chebyshev_filter_for_test_gpu, compute_residual_norms_for_test, rayleigh_ritz_with_matrices)
 
 ---
 
-## TASK-A1: Implement Outer Loop Convergence Test
+## TASK-A1: GPU-Resident Filter Iteration Function
 
-**Kind**: lib-tdd  
-**Goal**: Test if residuals decrease monotonically over 10 outer loop iterations (Chebyshev filter → RR → residual check → repeat).
+**Kind**: direct  
+**Goal**: Add `chebyshev_filter_iteration_gpu` — a `#[doc(hidden)] pub fn` that wraps the internal `chebyshev_filter` (chebyshev.rs:542), accepting pre-built GPU state instead of building from scratch.
+
+### Changes
+
+**New function** in `src/eigensolver/chebyshev.rs` (after `chebyshev_filter_for_test_gpu` at line 1484):
+
+```rust
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn chebyshev_filter_iteration_gpu(
+    psi_gpu: &Gpu<WavefunctionSet<ColumnDistributed>>,
+    v_eff_gpu: &Gpu<EffectivePotential>,
+    fft_idx_dev: &CudaSlice<i32>,
+    kernels: &CudaKernelSet,
+    wave_grid: &GVectorGrid,
+    pw_coords: &[[i32; 3]],
+    cell: &CellGeometry,
+    pots: &PseudopotentialSet,
+    vnl_data: &VnlBatchData,
+    min_veff: f64,
+    max_veff: f64,
+    ndeg: usize,
+    eigenvalues: Option<&[f64]>,
+    filter_mode: FilterMode,
+    blas: &BlasHandle,
+    solver: &SolverHandle,
+    stream: &Arc<CudaStream>,
+    ctx: &Arc<CudaContext>,
+) -> ChebyshevResult
+```
+
+Body: constructs dummy `KPoint { coords: [0.0, 0.0, 0.0] }`, creates internal `PcieAccount`, calls `chebyshev_filter(...)`. ~5 lines.
+
+**Visibility change** in `src/device/pcie.rs`:
+- `Gpu::from_host_with` changed from `pub(crate)` to `#[doc(hidden)] pub` — needed so integration tests can upload V_eff to GPU for pre-built state. All parameter types and return types were already public.
+
+**Re-export** in `src/lib.rs`:
+- Added `chebyshev_filter_iteration_gpu` to the `#[doc(hidden)] pub use` list.
+
+---
+
+## TASK-A2: Helper and Verification Functions
+
+**Kind**: direct  
+**Goal**: Add CPU-side helper functions used by the diagnostic test.
+
+### Changes
+
+All added to `tests/chebyshev_orthogonality_diagnostic.rs`:
+
+| Function | Signature | Purpose |
+|----------|-----------|---------|
+| `upload_psi_to_gpu_column` | `(psi_host, n_bands, n_pw, stream, pcie) -> Gpu<WavefunctionSet<ColumnDistributed>>` | Uploads CPU wavefunction data to GPU as ColumnDistributed layout |
+| `compute_mean_residual` | `(norms, band_indices) -> f64` | Mean residual over band indices |
+| `count_converged_bands` | `(norms, band_range, threshold) -> usize` | Count bands with residual below threshold |
+| `compute_max_eigenvalue_drift` | `(eigs_a, eigs_b) -> f64` | Max |λ_i[N] - λ_i[N-1]| |
+| `verify_residual_monotonicity` | `(history, groups)` | SC-1: ≤2 non-consecutive violations, 20% reduction by iter-5 or iter-10 |
+| `verify_band0_stability` | `(history, lo, hi)` | SC-5: band 0 eigenvalue in [lo, hi] across all iterations |
+
+No library-level changes needed — all verification helpers are standalone CPU-side math on `Vec<f64>`.
+
+---
+
+## TASK-A3: Diagnostic Test
+
+**Kind**: direct  
+**Goal**: Add `diagnostic_3_outer_loop_convergence` test that runs 10 iterations of Chebyshev filter → RR → residual check, verifying SC-1 through SC-5.
+
+### Corrected Outer Loop Flow
+
+Key differences from the original pseudocode:
+
+1. **No `upload_check_wavefunctions_column`** — replaced with `upload_psi_to_gpu_column` (takes raw `&[Complex64]`, not fixture reference)
+2. **No `update_psi_gpu_for_next_iteration`** — move semantics: `psi_gpu = psi_new_gpu` drops the old `Gpu` (frees its device memory) and takes ownership of the RR output
+3. **V_eff upload done inline** in the test using public types (`WaveGridArray`, `FineGridArray`, `EffectivePotential`, `Gpu`)
+4. **FFT indices uploaded inline** via `chemrust_scf::pw_coords_to_fft_indices` + `stream.clone_htod`
+5. **Pre-built GPU state** (`v_eff_gpu`, `fft_idx_dev`, `kernels`) reused across all 10 iterations — no re-upload of V_eff, no kernel recompilation
+6. **First iteration uses same flow** as subsequent iterations (no special first-iter code path)
+7. **`CudaStream::new(&ctx)` replaced with `ctx.default_stream()`** — matches Diagnostic 2 pattern
+
+### Corrected Test Structure
+
+```rust
+#[test]
+#[ignore = "requires GPU and CASTEP fixture data"]
+fn diagnostic_3_outer_loop_convergence() {
+    // === Setup (same as Diagnostic 2) ===
+    // - GPU check, fixture, dimensions, wave_grid, pw_coords, k_point
+    // - GPU context, stream (=ctx.default_stream()), blas, solver
+    // - VnlBatchData::precompute (14 params)
+    // - min_veff, max_veff from fx.pot_fmt
+    // - ndeg = 8
+    
+    // === One-time GPU setup ===
+    // - Upload V_eff: Array3::from_shape_vec → WaveGridArray → FineGridArray → EffectivePotential → Gpu::from_host_with
+    // - Upload FFT indices: pw_coords_to_fft_indices → stream.clone_htod
+    // - Compile kernels: CudaKernelSet::new(&ctx)
+    // - Upload initial psi: upload_psi_to_gpu_column(psi_input, n_bands, n_pw, &stream, &mut pcie)
+    
+    // === Outer loop (10 iterations) ===
+    for iter in 0..n_outer_iters {
+        // Step 1: chebyshev_filter_iteration_gpu(&psi_gpu, &v_eff_gpu, &fft_idx_dev, &kernels, ...)
+        //         → (psi_row_gpu, hpsi_row_gpu)  [GPU-resident]
+        // Step 2: rayleigh_ritz_with_matrices(psi_row, hpsi_row, ...)
+        //         → (psi_new, Cpu(eigenvalues), ..., X)
+        // Step 3: compute_residual_norms_for_test(psi_new, hpsi_row, eigenvalues, x, ...)
+        //         → (sinv_norms, l2_norms)
+        // Step 4: track history
+        // Step 5: psi_gpu = psi_new  (move)
+    }
+    
+    // === Verify SC-1 through SC-5 ===
+}
+```
+
+### Band Group Definitions
+
+```rust
+let core: Vec<usize> = (0..1).collect();    // band 0
+let cu3d: Vec<usize> = (1..15).collect();    // bands 1-14
+let val: Vec<usize> = (15..82).collect();    // bands 15-81
+let nfermi: Vec<usize> = (82..97).collect(); // bands 82-96
+let cond: Vec<usize> = (97..160).collect();  // bands 97-159
+```
+
+Note: groups are `Vec<usize>` (not `Range<usize>`) since `compute_mean_residual` takes `&[usize]`.
+
+### Acceptance
+
+```bash
+# Compilation check
+cargo check --workspace
+
+# Run Diagnostic 3 (requires GPU + fixture data)
+cargo test --release --test chebyshev_orthogonality_diagnostic \
+  diagnostic_3_outer_loop_convergence -- --ignored --nocapture
+
+# Expected output:
+# - Per-iteration table showing residual evolution (6-column: iter, core, cu3d, val, nFermi, cond, band0_eig)
+# - All 5 success criteria assertions pass
+# - Runtime: ~15-20 minutes (10 iterations × ~90s per iteration)
+```
 
 ### Success Criteria
 
@@ -90,7 +231,22 @@ Add test function `diagnostic_3_outer_loop_convergence()` with the following str
 fn diagnostic_3_outer_loop_convergence() {
     // Setup (same as Diagnostic 2)
     let fx = fixture();
-    let mut state = build_scf_state_for_diagnostic(&fx);
+    
+    // Initialize GPU context and handles
+    let ctx = Arc::new(CudaContext::new(0).expect("Failed to create CUDA context"));
+    let stream = Arc::new(CudaStream::new(&ctx).expect("Failed to create CUDA stream"));
+    let blas = BlasHandle::new(&ctx).expect("Failed to create cuBLAS handle");
+    let solver = SolverHandle::new(&ctx).expect("Failed to create cuSOLVER handle");
+    let mut pcie = PcieAccount::new();
+    
+    // Build VNL data
+    let vnl_data = VnlBatchData::precompute(
+        &fx.pots, &fx.bin.cell, fx.bin.n_bands, fx.bin.n_pw,
+        &blas, &stream, &ctx,
+    ).expect("Failed to precompute VNL data");
+    
+    let n_bands = fx.bin.n_bands;
+    let n_pw = fx.bin.n_pw;
     
     // Band group definitions
     let core_bands = 0..1;
@@ -99,8 +255,12 @@ fn diagnostic_3_outer_loop_convergence() {
     let nfermi_bands = 82..97;
     let cond_bands = 97..160;
     
-    // Load CASTEP reference eigenvalues
-    let castep_eigenvalues = load_castep_eigenvalues(&fx);
+    // Load CASTEP reference eigenvalues from fixture
+    let castep_eigenvalues = &fx.bands_eigenvalues;
+    
+    // Initialize psi_input_gpu from CASTEP .check file (ColumnDistributed)
+    let mut psi_input_gpu = upload_check_wavefunctions_column(&fx, &ctx, &stream)
+        .expect("Failed to upload initial wavefunctions");
     
     // Outer loop
     let n_outer_iters = 10;
@@ -108,26 +268,45 @@ fn diagnostic_3_outer_loop_convergence() {
     let mut eigenvalue_history = Vec::new();
     
     for iter in 0..n_outer_iters {
+        println!("\n=== Iteration {} ===", iter + 1);
+        
         // 1. Run Chebyshev filter (all bands, no locking)
         let (psi_filtered, hpsi_filtered, kernels) = 
-            chebyshev_filter_for_test_gpu(&state, FilterMode::SinvHKeepHEig);
+            chebyshev_filter_for_test_gpu(
+                &psi_input_gpu, &fx.pot_fmt, &fx.bin.cell, &fx.pots,
+                n_bands, n_pw, FilterMode::SinvHKeepHEig,
+                &blas, &solver, &stream, &ctx, &mut pcie,
+            ).expect("Chebyshev filter failed");
         
         // 2. Run standard Rayleigh-Ritz
-        let (eigenvalues, eigenvectors) = 
-            rayleigh_ritz_with_matrices(&psi_filtered, &hpsi_filtered, ...);
+        let rr = rayleigh_ritz_with_matrices(
+            &psi_filtered, &hpsi_filtered, &vnl_data, n_bands, n_pw,
+            &kernels, &mut pcie, &solver, &blas, &stream, &ctx,
+            None,  // no Procrustes pinning
+            None,  // no pin config
+        ).expect("Rayleigh-Ritz failed");
+        
+        let psi_new_gpu = rr.0;  // Gpu<WavefunctionSet<ColumnDistributed>>
+        let Cpu(eigenvalues): Cpu<Vec<f64>> = rr.1;
+        let x = chemrust_scf::device::cuda_vec_to_complex(rr.5.0);
         
         // 3. Compute per-band S⁻¹-weighted residuals
-        let residuals = compute_residual_norms_for_test(&state, &eigenvectors, &eigenvalues);
+        let (sinv_norms, _l2_norms) = compute_residual_norms_for_test(
+            &psi_new_gpu, &hpsi_filtered, &eigenvalues, &x,
+            n_bands, n_pw, &vnl_data, &blas, &solver, &stream,
+        ).expect("Residual computation failed");
         
         // 4. Track history
-        residual_history.push(residuals.clone());
+        residual_history.push(sinv_norms.clone());
         eigenvalue_history.push(eigenvalues.clone());
         
-        // 5. Update state.psi_dev for next iteration
-        update_psi_dev_for_next_iteration(&mut state, eigenvectors);
+        // 5. Update psi_input_gpu for next iteration (device-to-device memcpy)
+        update_psi_gpu_for_next_iteration(&mut psi_input_gpu, &psi_new_gpu, &stream)
+            .expect("Failed to update psi_input_gpu");
         
         // Print per-iteration summary
-        print_iteration_summary(iter + 1, &residuals, &eigenvalues, &castep_eigenvalues);
+        print_iteration_summary(iter + 1, &sinv_norms, &eigenvalues, castep_eigenvalues,
+                                &core_bands, &cu3d_bands, &val_bands, &nfermi_bands, &cond_bands);
     }
     
     // Verify SC-1: Residual Monotonicity
@@ -157,17 +336,12 @@ fn diagnostic_3_outer_loop_convergence() {
     for iter in 4..10 {
         let max_drift = compute_max_eigenvalue_drift(&eigenvalue_history[iter-1], &eigenvalue_history[iter]);
         assert!(max_drift < 0.1,
-            "SC-4 failed: max eigenvalue drift at iter-{} = {:.3} Ha (expected <0.1 Ha)",
+            "SC-4 failed: max eigenvalue drift at iter- = {:.3} Ha (expected <0.1 Ha)",
             iter + 1, max_drift);
     }
     
     // Verify SC-5: No Cascade
-    for (iter, eigenvalues) in eigenvalue_history.iter().enumerate() {
-        let band0_eig = eigenvalues[0];
-        assert!(band0_eig >= -1.10 && band0_eig <= -1.01,
-            "SC-5 failed: band 0 eigenvalue at iter-{} = {:.3} Ha (expected [-1.10, -1.01] Ha)",
-            iter + 1, band0_eig);
-    }
+    verify_band0_stability(&eigenvalue_history, -1.10, -1.01);
     
     println!("\n=== Diagnostic 3 Complete: All Success Criteria Passed ===");
 }
@@ -175,13 +349,21 @@ fn diagnostic_3_outer_loop_convergence() {
 
 **Helper functions to add**:
 
-1. `update_psi_dev_for_next_iteration()` — Copy rotated eigenvectors back to `state.psi_dev`
-2. `print_iteration_summary()` — Print per-iteration table (iter, core_mean, cu3d_mean, val_mean, nFermi_mean, cond_mean, n_locked)
-3. `verify_residual_monotonicity()` — Check SC-1 for each group
-4. `count_converged_bands()` — Count bands with residual < threshold
-5. `compute_mean_residual()` — Mean residual for a band range
-6. `compute_max_eigenvalue_drift()` — Max |λ_i[N] - λ_i[N-1]|
-7. `load_castep_eigenvalues()` — Read reference eigenvalues from Cu111_CO.bands
+1. `upload_check_wavefunctions_column()` — Upload CASTEP .check wavefunctions to GPU in ColumnDistributed layout
+2. `update_psi_gpu_for_next_iteration()` — Device-to-device memcpy from RR output to psi_input_gpu
+   ```rust
+   fn update_psi_gpu_for_next_iteration(
+       psi_input: &mut Gpu<WavefunctionSet<ColumnDistributed>>,
+       psi_new: &Gpu<WavefunctionSet<ColumnDistributed>>,
+       stream: &Arc<CudaStream>,
+   ) -> Result<(), Error>
+   ```
+3. `print_iteration_summary()` — Print per-iteration table (iter, core_mean, cu3d_mean, val_mean, nFermi_mean, cond_mean)
+4. `verify_residual_monotonicity()` — Check SC-1 for each group
+5. `count_converged_bands()` — Count bands with residual < threshold
+6. `compute_mean_residual()` — Mean residual for a band range
+7. `compute_max_eigenvalue_drift()` — Max |λ_i[N] - λ_i[N-1]|
+8. `verify_band0_stability()` — Check SC-5 (band 0 eigenvalue stays within range across all iterations)
 
 ### Acceptance
 
@@ -204,6 +386,13 @@ cargo test --release --test chebyshev_orthogonality_diagnostic \
 3. SC-4 "after iteration 3" was ambiguous — clarified to mean iteration-to-iteration drift for N ≥ 4
 4. SC-5 range was asymmetric — fixed to [-1.10, -1.01] Ha (±0.05 Ha around -1.055 Ha)
 
+**API corrections from strict-code-reviewer audit (2026-05-27)**:
+1. Removed non-existent `build_scf_state_for_diagnostic()` — follow Diagnostic 2 pattern with direct GPU buffer management
+2. Fixed `rayleigh_ritz_with_matrices()` call — replaced `...` placeholder with actual 13 parameters
+3. Fixed `compute_residual_norms_for_test()` call — corrected parameter order to match actual signature (10 parameters)
+4. Removed redundant `load_castep_eigenvalues()` — use `fx.bands_eigenvalues` directly from fixture
+5. Clarified `update_psi_gpu_for_next_iteration()` — device-to-device memcpy using `stream.memcpy_dtod`, no host round-trip
+
 **Baseline from Diagnostic 2**:
 - Conduction bands already near convergence (mean 0.026 Ha) — expect fast convergence
 - Occupied bands need work (mean 0.15 Ha) — outer loop has clear signal
@@ -219,14 +408,29 @@ cargo test --release --test chebyshev_orthogonality_diagnostic \
 
 ## Implementation Notes
 
-**Reuse from Diagnostic 2**:
-- `chebyshev_filter_for_test_gpu()` — already exported, returns `(psi_row_gpu, hpsi_row_gpu, kernels)`
-- `compute_residual_norms_for_test()` — already exported, all-GPU residual computation
-- `rayleigh_ritz_with_matrices()` — already exported, standard RR with ZHEGVD
+**Reused from Diagnostic 2**:
+- `chebyshev_filter_for_test_gpu()` — used as reference for setup code pattern (src/eigensolver/chebyshev.rs:1407-1484)
+- `compute_residual_norms_for_test()` — already exported (src/eigensolver/chebyshev.rs:1497-1665), returns `(sinv_norms, l2_norms)`
+- `rayleigh_ritz_with_matrices()` — already exported (src/eigensolver/rayleigh_ritz.rs:696-947), returns 6-tuple
+- `fixture()` — already exists (tests/fixtures/cu111_co.rs:70-72), returns `&'static Cu111CoFixture`
+- `fx.bands_eigenvalues` — CASTEP reference eigenvalues already loaded in fixture
+- `classify_bands`, `group_stats`, `mean_abs_err` — existing helpers in test file
 
-**New infrastructure needed**:
-- `update_psi_dev_for_next_iteration()` — must handle GPU→GPU copy of rotated eigenvectors
-- Helper functions for SC verification (all CPU-side, operate on Vec<f64> residual/eigenvalue history)
+**New infrastructure**:
+- `chebyshev_filter_iteration_gpu()` (src/eigensolver/chebyshev.rs:1486) — GPU-resident filter wrapper accepting pre-built state
+- `Gpu::from_host_with` made `#[doc(hidden)] pub` (src/device/pcie.rs:45) — exposed for integration test V_eff upload
+- `upload_psi_to_gpu_column()` — uploads psi host data to GPU as ColumnDistributed (test file)
+- Verification helpers (`verify_residual_monotonicity`, `count_converged_bands`, `compute_mean_residual`, `compute_max_eigenvalue_drift`, `verify_band0_stability`) — all in test file
+
+**What changed vs original pseudocode**:
+- No `upload_check_wavefunctions_column(fx, ctx, stream)` — replaced with `upload_psi_to_gpu_column(psi_host, n_bands, n_pw, stream, pcie)` that takes raw slice
+- No `update_psi_gpu_for_next_iteration()` — move semantics: `psi_gpu = psi_new_gpu`
+- No `PcieAccount::new()` — uses `PcieAccount::default()` (matches Diagnostic 2)
+- No `CudaStream::new(&ctx)` — uses `ctx.default_stream()` (matches Diagnostic 2)
+- V_eff upload/FFT index/kernel compilation done inline in test using library types
+- `chebyshev_filter_iteration_gpu()` called directly with pre-built state (17 params)
+- Groups are `Vec<usize>` not `Range<usize>`
+- `print_iteration_summary` inlined in loop body instead of separate function
 
 **Memory considerations**:
 - 10 iterations × 160 bands × 2 Vec<f64> (residuals + eigenvalues) = ~25 KB total history

@@ -1483,6 +1483,48 @@ pub fn chebyshev_filter_for_test_gpu(
     Ok((psi_filtered_row, hpsi_filtered_row, kernels))
 }
 
+/// GPU-resident single iteration of Chebyshev filter.
+///
+/// Takes pre-built GPU resources (`v_eff_gpu`, `fft_idx_dev`, `kernels`) that are
+/// constant across outer-loop iterations and new `psi_gpu` (ColumnDistributed).
+/// Delegates to the internal `chebyshev_filter` without re-uploading V_eff,
+/// re-bulding FFT indices, or re-compiling kernels.
+///
+/// Returns `(psi_filtered_row, hpsi_filtered_row)` — both RowDistributed, GPU-resident.
+///
+/// Designed for Diagnostic 3: 10-iteration outer loop where only psi changes.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn chebyshev_filter_iteration_gpu(
+    psi_gpu: &Gpu<WavefunctionSet<ColumnDistributed>>,
+    v_eff_gpu: &Gpu<crate::types::EffectivePotential>,
+    fft_idx_dev: &CudaSlice<i32>,
+    kernels: &CudaKernelSet,
+    wave_grid: &GVectorGrid,
+    pw_coords: &[[i32; 3]],
+    cell: &CellGeometry,
+    pots: &PseudopotentialSet,
+    vnl_data: &VnlBatchData,
+    min_veff: f64,
+    max_veff: f64,
+    ndeg: usize,
+    eigenvalues: Option<&[f64]>,
+    filter_mode: FilterMode,
+    blas: &BlasHandle,
+    solver: &SolverHandle,
+    stream: &Arc<CudaStream>,
+    ctx: &Arc<CudaContext>,
+) -> ChebyshevResult {
+    let dummy_kpoint = KPoint { coords: [0.0, 0.0, 0.0] };
+    let mut pcie = PcieAccount::default();
+    chebyshev_filter(
+        psi_gpu, v_eff_gpu, pots, wave_grid, &dummy_kpoint, cell,
+        pw_coords, vnl_data, fft_idx_dev, min_veff, max_veff,
+        kernels, &mut pcie, eigenvalues, ndeg,
+        blas, solver, stream, ctx, filter_mode,
+    )
+}
+
 /// GPU-resident residual norm computation (follows `davidson.rs:270-338`).
 ///
 /// Takes GPU-resident RR output and computes per-band:
