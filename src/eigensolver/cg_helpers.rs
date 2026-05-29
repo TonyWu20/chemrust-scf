@@ -14,6 +14,7 @@
 #![allow(dead_code)]
 
 use num_complex::Complex64;
+use rayon::prelude::*;
 
 // ---------------------------------------------------------------------------
 // Helper: plain Euclidean inner product
@@ -68,8 +69,8 @@ pub fn compute_residual(
     let epsilon = h_expect / s_expect;
 
     let residual: Vec<Complex64> = hpsi
-        .iter()
-        .zip(spsi.iter())
+        .par_iter()
+        .zip(spsi.par_iter())
         .map(|(h, s)| h - Complex64::new(epsilon, 0.0) * s)
         .collect();
 
@@ -91,7 +92,7 @@ pub fn compute_residual(
 /// `uspp_preconditioner.rs`) and then compute sqrt(⟨r|S⁻¹·r⟩).
 pub fn residual_bare_norm(residual: &[Complex64]) -> f64 {
     residual
-        .iter()
+        .par_iter()
         .map(|c| c.norm_sqr())
         .sum::<f64>()
         .sqrt()

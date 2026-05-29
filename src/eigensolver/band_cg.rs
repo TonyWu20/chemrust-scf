@@ -54,6 +54,7 @@
 #![allow(dead_code)]
 
 use num_complex::Complex64;
+use rayon::prelude::*;
 
 use super::cg_helpers::{compute_residual, s_orthogonalize_against, residual_bare_norm};
 use super::line_search::line_search_2d_quadratic;
@@ -86,7 +87,10 @@ pub struct CgResult {
 
 fn inner_product(a: &[Complex64], b: &[Complex64]) -> Complex64 {
     assert_eq!(a.len(), b.len());
-    a.iter().zip(b.iter()).map(|(x, y)| x.conj() * y).sum()
+    a.par_iter()
+        .zip(b.par_iter())
+        .map(|(x, y)| x.conj() * y)
+        .sum()
 }
 
 // ---------------------------------------------------------------------------
@@ -174,11 +178,11 @@ pub fn band_cg_minimize(
     let inv_norm = 1.0 / norm_init;
 
     let mut psi: Vec<Complex64> =
-        psi_initial.iter().map(|c| c * inv_norm).collect();
+        psi_initial.par_iter().map(|c| c * inv_norm).collect();
     let mut hpsi: Vec<Complex64> =
-        hpsi_init.iter().map(|c| c * inv_norm).collect();
+        hpsi_init.par_iter().map(|c| c * inv_norm).collect();
     let mut spsi: Vec<Complex64> =
-        spsi_init.iter().map(|c| c * inv_norm).collect();
+        spsi_init.par_iter().map(|c| c * inv_norm).collect();
 
     // ---- 2. Compute initial eigenvalue and residual ------------------------
     // electronic.f90:11878-11879

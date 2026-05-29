@@ -29,6 +29,7 @@ use faer::linalg::solvers::DenseSolveCore;
 use faer::Mat;
 use ndarray::Array2;
 use num_complex::Complex64;
+use rayon::prelude::*;
 
 /// USPP-aware preconditioner.
 ///
@@ -82,20 +83,21 @@ impl UsppPreconditioner {
 
         // Step 1: tpa_r = T⁻¹·r
         let tpa_r: Vec<Complex64> = residual
-            .iter()
-            .zip(self.tpa_diag.iter())
+            .par_iter()
+            .zip(self.tpa_diag.par_iter())
             .map(|(r, t)| r * t)
             .collect();
 
         // Step 2: w = β†·tpa_r
+        // Each projector column is independent; parallelize over projectors.
         let mut w = vec![Complex64::new(0.0, 0.0); n_proj];
-        for p in 0..n_proj {
+        w.par_iter_mut().enumerate().for_each(|(p, w_p)| {
             let mut sum = Complex64::new(0.0, 0.0);
             for g in 0..n_pw {
                 sum += self.beta_g[[g, p]].conj() * tpa_r[g];
             }
-            w[p] = sum;
-        }
+            *w_p = sum;
+        });
 
         // Step 3: w_R = R·w
         let mut w_r = vec![Complex64::new(0.0, 0.0); n_proj];
@@ -109,18 +111,21 @@ impl UsppPreconditioner {
 
         // Step 4: delta = β·w_R
         let mut delta = vec![Complex64::new(0.0, 0.0); n_pw];
-        for g in 0..n_pw {
-            let mut sum = Complex64::new(0.0, 0.0);
-            for p in 0..n_proj {
-                sum += self.beta_g[[g, p]] * w_r[p];
-            }
-            delta[g] = sum;
-        }
+        delta
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(g, d_g)| {
+                let mut sum = Complex64::new(0.0, 0.0);
+                for p in 0..n_proj {
+                    sum += self.beta_g[[g, p]] * w_r[p];
+                }
+                *d_g = sum;
+            });
 
         // Step 5: result = tpa_r + T⁻¹·delta
         tpa_r
-            .into_iter()
-            .zip(delta.iter().zip(self.tpa_diag.iter()))
+            .into_par_iter()
+            .zip(delta.par_iter().zip(self.tpa_diag.par_iter()))
             .map(|(t, (d, td))| t + d * td)
             .collect()
     }
