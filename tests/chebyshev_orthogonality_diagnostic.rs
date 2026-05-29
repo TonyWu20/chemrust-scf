@@ -1152,6 +1152,297 @@ fn diagnostic_s_norm_baseline() {
     }
 }
 
+/// Validate V_eff decomposition using `VEffBuilder`.
+///
+/// Uses `VEffBuilder::assemble_on_fine_grid` to reconstruct V_eff from the
+/// wave-grid density (which includes NLCC via `reconstruct_rho_core`) and
+/// compares against the reference V_eff from `.pot_fmt`.
+///
+/// If max|residual| ≈ 0, the Hamiltonian potential matches our reconstruction,
+/// narrowing the H mismatch to kinetic energy, D_screened, or FFT conventions.
+/// If max|residual| ≫ 0, the V_eff construction itself is the root cause.
+///
+/// CPU-only (no GPU needed).
+#[test]
+fn diagnostic_veff_decomposition() {
+    use chemrust_hamiltonian_core::{
+        GVectorGrid,
+        band_structure::VEffBuilder,
+        NonSpin,
+    };
+
+    println!("\n=== V_eff Decomposition: VEffBuilder vs pot_fmt ===\n");
+
+    let fx = fixtures::cu111_co::fixture();
+
+    let wave_grid = GVectorGrid::new(
+        fx.bin.density.grid[0],
+        fx.bin.density.grid[1],
+        fx.bin.density.grid[2],
+        fx.bin.cell.recip_lattice,
+    );
+    let fg_dims = fx.check.fine_grid.expect(".check must have fine_grid");
+    let fine_grid = GVectorGrid::new(fg_dims[0], fg_dims[1], fg_dims[2], fx.bin.cell.recip_lattice);
+
+    // Build V_eff via VEffBuilder (handles V_ion, V_H, NLCC → V_xc automatically)
+    let builder = VEffBuilder::<NonSpin>::new(&fx.bin.cell, &fx.pots, &wave_grid);
+    let veff_reconstructed = builder
+        .assemble_on_fine_grid(&fx.bin.density.charge, &wave_grid, &fine_grid)
+        .expect("VEffBuilder::assemble_on_fine_grid failed");
+    let veff_rec_arr = veff_reconstructed.as_real_grid().as_real_array();
+
+    // Reference V_eff from .pot_fmt
+    let veff_ref_arr = &fx.pot_fmt;
+
+    // Residual: reconstructed vs reference
+    let residual: ndarray::Array3<f64> = veff_rec_arr - veff_ref_arr;
+
+    fn mi(x: &ndarray::Array3<f64>) -> f64 { x.iter().cloned().fold(f64::INFINITY, f64::min) }
+    fn ma(x: &ndarray::Array3<f64>) -> f64 { x.iter().cloned().fold(f64::NEG_INFINITY, f64::max) }
+    fn me(x: &ndarray::Array3<f64>) -> f64 { x.iter().sum::<f64>() / x.len() as f64 }
+
+    println!("               min          max          mean");
+    println!("V_rec  : [{:>10.4e}, {:>10.4e}, {:>10.4e}]", mi(veff_rec_arr), ma(veff_rec_arr), me(veff_rec_arr));
+    println!("V_ref  : [{:>10.4e}, {:>10.4e}, {:>10.4e}]", mi(veff_ref_arr), ma(veff_ref_arr), me(veff_ref_arr));
+    let mr = residual.iter().map(|x| x.abs()).fold(0.0_f64, f64::max);
+    println!("residual: [{:>10.4e}, {:>10.4e}]  max|r|={:.4e}", mi(&residual), ma(&residual), mr);
+
+    if mr < 1e-10 {
+        println!("  ✓ V_eff reconstruction matches reference to machine precision");
+    } else if mr < 1e-4 {
+        println!("  ~ V_eff reconstruction: max|r| = {:.2e} (likely fine-grid upsample rounding)", mr);
+    } else {
+        println!("  ⚠ V_eff mismatch: max|r| = {:.4e} — VEffBuilder != pot_fmt", mr);
+    }
+    println!();
+}
+
+/// Compute per-band kinetic energy expectation T_b = Σ|ψ_b(G)|² × ½|G|².
+///
+/// Compares against CASTEP eigenvalues to isolate the non-local (D_screened)
+/// contribution: ⟨V_nl⟩_b ≈ ε_b − T_b. Since V_eff is already validated,
+/// the residual ε_b − T_b − ⟨V_eff⟩_b depends only on D_screened correctness.
+///
+/// CPU-only (no GPU needed).
+#[test]
+fn diagnostic_kinetic_energy() {
+    println!("\n=== Kinetic Energy: T_b = Σ|ψ_b(G)|² × ½|G|² ===\n");
+
+    let fx = fixtures::cu111_co::fixture();
+    let kpt_block = &fx.check.wavefunction.as_ref()
+        .expect(".check must have wavefunction").kpt_data[0];
+    let pw_coords = &kpt_block.pw_grid_coord;
+    let r = fx.bin.cell.recip_lattice.as_array();
+
+    // ½|G|² per PW component
+    let kinetic: Vec<f64> = pw_coords.iter()
+        .map(|&[h, k, l]| {
+            let (hf, kf, lf) = (h as f64, k as f64, l as f64);
+            let gx = hf * r[0][0] + kf * r[1][0] + lf * r[2][0];
+            let gy = hf * r[0][1] + kf * r[1][1] + lf * r[2][1];
+            let gz = hf * r[0][2] + kf * r[1][2] + lf * r[2][2];
+            0.5 * (gx * gx + gy * gy + gz * gz)
+        })
+        .collect();
+
+    let kinetic_max = kinetic.iter().cloned().fold(0.0_f64, f64::max);
+    let kinetic_min = kinetic.iter().cloned().fold(f64::INFINITY, f64::min);
+    println!("Kinetic energy per PW: min={:.4e} Ha, max={:.4e} Ha", kinetic_min, kinetic_max);
+    println!();
+
+    // T_b per band
+    println!("{:>6} {:>14} {:>14} {:>14} {:>14}", "band", "T_b (Ha)", "ε_b (Ha)", "ε_b−T_b", "label");
+    for (b, psi_band) in kpt_block.bands.iter().enumerate() {
+        let t_band: f64 = psi_band.iter()
+            .zip(kinetic.iter())
+            .map(|(&c, &ke)| c.norm_sqr() * ke)
+            .sum();
+        let eps_b = fx.bands_eigenvalues[b];
+        let label = if b < 1 { "core" }
+            else if b < 15 { "cu3d" }
+            else if b < 82 { "val" }
+            else if b < 93 { "nFermi" }
+            else if b < 97 { "near-F" }
+            else { "cond" };
+        println!("{:>6} {:>14.6e} {:>14.6e} {:>14.6e} {:>6}", b, t_band, eps_b, eps_b - t_band, label);
+    }
+    println!();
+}
+
+/// Differential H·ψ diagnostic: compare ⟨ψ|H|ψ⟩/⟨ψ|S|ψ⟩ against CASTEP ε.
+///
+/// Starts from CASTEP .check wavefunctions (S-orthonormal, exact eigenfunctions
+/// of CASTEP's H). Applies our full Hamiltonian H·ψ = (T+V_eff+V_nl)·ψ,
+/// then computes per-band Rayleigh quotients RQ_b = ⟨ψ_b|H|ψ_b⟩/⟨ψ_b|S|ψ_b⟩.
+///
+/// Δ_b = RQ_b − ε_b(CASTEP) — if non-zero, our H differs from CASTEP's H.
+#[test]
+#[ignore = "requires GPU and CASTEP fixture data"]
+fn diagnostic_h_psi_differential() {
+    use chemrust_scf::{
+        BlasHandle, CudaKernelSet, EffectivePotential, FineGridArray, Gpu,
+        SolverHandle, VnlBatchData, WaveGridArray, apply_h_components_for_test,
+        apply_s_for_test, HComponentsForTest,
+    };
+    use cudarc::driver::CudaContext;
+    use std::sync::Arc;
+
+    if !gpu_available() {
+        eprintln!("SKIP: no GPU available");
+        return;
+    }
+
+    println!("\n=== H·ψ Differential: ⟨ψ|H|ψ⟩/⟨ψ|S|ψ⟩ vs CASTEP ε ===\n");
+
+    let fx = fixtures::cu111_co::fixture();
+    let wfc = fx.check.wavefunction.as_ref()
+        .expect(".check must have wavefunction");
+    let kpt_block = &wfc.kpt_data[0];
+    let n_bands = kpt_block.bands.len();
+    let n_pw = kpt_block.nplw;
+    let psi_input: Vec<num_complex::Complex64> = kpt_block.bands.concat();
+
+    // GPU setup
+    let ctx = Arc::new(CudaContext::new(0).expect("CudaContext"));
+    let stream = ctx.default_stream();
+    let blas = BlasHandle::new(stream.clone()).expect("BlasHandle");
+    let solver = SolverHandle::new(stream.clone()).expect("SolverHandle");
+    let kernels = CudaKernelSet::new(&ctx).expect("CudaKernelSet");
+    let wave_grid = chemrust_hamiltonian_core::GVectorGrid::new(
+        wfc.grid[0], wfc.grid[1], wfc.grid[2],
+        fx.bin.cell.recip_lattice,
+    );
+
+    let mut pcie = chemrust_scf::PcieAccount::default();
+    let pw_coords = &kpt_block.pw_grid_coord;
+    let k_point = chemrust_scf::KPoint { coords: kpt_block.coords };
+
+    let n_electrons: f64 = fx.bin.cell.species_iter()
+        .map(|info| fx.pots.get(info.symbol).and_then(|p| p.ionic_charge()).unwrap_or(0.0) * info.num_ions as f64)
+        .sum();
+    let (occupations, _) = chemrust_scf::density::compute_occupations(
+        &fx.bands_eigenvalues,
+        &chemrust_scf::SmearingParams {
+            width: 0.1 * chemrust_scf::EV_TO_HARTREE,
+            electron_temperature: 0.1 * chemrust_scf::EV_TO_HARTREE,
+            scheme: chemrust_scf::SmearingScheme::Gaussian,
+        }, n_electrons,
+    ).expect("compute_occupations");
+
+    let v_eff_for_d = chemrust_hamiltonian_core::EffectivePotential::from_inner(
+        chemrust_hamiltonian_core::fft::RealGrid::from_inner(fx.pot_fmt.clone()));
+    let vnl_data = VnlBatchData::precompute(
+        pw_coords, &fx.pots, &fx.bin.cell, &wave_grid, &k_point,
+        &psi_input, n_bands, n_pw, Some(&occupations.0), Some(&v_eff_for_d),
+        &stream, &mut pcie, &blas, &kernels, &solver,
+    ).expect("VnlBatchData");
+
+    // Upload V_eff to GPU
+    let v_eff_arr = ndarray::Array3::from_shape_vec(
+        (wave_grid.grid()[2], wave_grid.grid()[1], wave_grid.grid()[0]),
+        fx.pot_fmt.iter().copied().collect(),
+    ).unwrap();
+    let v_eff_wave = WaveGridArray::from_inner(v_eff_arr);
+    let v_eff_fine = FineGridArray::from_inner(v_eff_wave.into_inner());
+    let v_eff_gpu = Gpu::from_host_with(
+        &chemrust_scf::EffectivePotential::from_inner(v_eff_fine),
+        &stream, &mut pcie,
+    ).expect("V_eff upload");
+
+    // Upload psi to GPU
+    let psi_gpu = upload_psi_to_gpu_column(&psi_input, n_bands, n_pw, &stream, &mut pcie);
+
+    // FFT index map
+    let fft_idx: Vec<i32> = chemrust_scf::pw_coords_to_fft_indices(pw_coords, &wave_grid);
+    let fft_idx_dev = stream.clone_htod(&fft_idx).expect("FFT indices");
+
+    // Apply full Hamiltonian: H·ψ (returns CPU Vec<Complex64> directly)
+    let h_components: HComponentsForTest = apply_h_components_for_test(
+        &psi_gpu, &v_eff_gpu, &wave_grid, pw_coords, &vnl_data,
+        &fft_idx_dev, &kernels, &blas, &stream,
+    ).expect("apply_h_components_for_test");
+
+    // Download ψ from GPU to CPU for dot products
+    let psi_raw: Vec<num_complex::Complex64> = stream.clone_dtoh(psi_gpu.as_device_slice())
+        .expect("psi D2H")
+        .into_iter()
+        .map(|c| num_complex::Complex64::new(c.x, c.y))
+        .collect();
+
+    // Apply S·ψ (returns CPU Vec<Complex64> directly)
+    let spsi = apply_s_for_test(&psi_input, n_bands, n_pw, &vnl_data, &blas, &stream)
+        .expect("apply_s_for_test");
+
+    // Per-band diagnostics
+    struct BandDiag { b: usize, rq: f64, eps: f64, delta: f64,
+        t_expect: f64, tv_expect: f64, s_norm: f64, label: String }
+    let mut diags: Vec<BandDiag> = Vec::with_capacity(n_bands);
+
+    for b in 0..n_bands {
+        let off = b * n_pw;
+        let psi_b = &psi_raw[off..off + n_pw];
+        let h_b = &h_components.hpsi_full[off..off + n_pw];
+        let tv_b = &h_components.hpsi_tv[off..off + n_pw];
+        let t_b = &h_components.hpsi_t[off..off + n_pw];
+        let s_b = &spsi[off..off + n_pw];
+
+        let h_dot: f64 = psi_b.iter().zip(h_b).map(|(p, h)| (p.conj() * h).re).sum();
+        let tv_dot: f64 = psi_b.iter().zip(tv_b).map(|(p, h)| (p.conj() * h).re).sum();
+        let t_dot: f64 = psi_b.iter().zip(t_b).map(|(p, h)| (p.conj() * h).re).sum();
+        let s_dot: f64 = psi_b.iter().zip(s_b).map(|(p, s)| (p.conj() * s).re).sum();
+
+        let rq = if s_dot.abs() > 1e-30 { h_dot / s_dot } else { 0.0 };
+        let eps = fx.bands_eigenvalues[b];
+        let delta = rq - eps;
+
+        let label = if b < 1 { "core" } else if b < 15 { "cu3d" }
+            else if b < 82 { "val" } else if b < 93 { "nFermi" }
+            else { "cond" };
+
+        diags.push(BandDiag { b, rq, eps, delta, t_expect: t_dot, tv_expect: tv_dot, s_norm: s_dot, label: label.into() });
+    }
+
+    // Print summary: max|Δ| per group
+    println!("Group       bands  max|Δ| (Ha)  max|Δ|/|ε|  band@max  ⟨S⟩ range");
+    for (gname, gbands) in [("core", 0..1), ("cu3d", 1..15), ("val", 15..82), ("nFermi", 82..93), ("cond", 93..160)] {
+        let mut max_delta = 0.0_f64;
+        let mut max_b = 0usize;
+        let mut s_min = f64::INFINITY;
+        let mut s_max = 0.0_f64;
+        for d in diags.iter().filter(|d| gbands.contains(&d.b)) {
+            let ad = d.delta.abs();
+            if ad > max_delta { max_delta = ad; max_b = d.b; }
+            s_min = s_min.min(d.s_norm);
+            s_max = s_max.max(d.s_norm);
+        }
+        let eps_at_max = diags[max_b].eps;
+        let rel = if eps_at_max.abs() > 1e-10 { max_delta / eps_at_max.abs() } else { max_delta };
+        println!("{:<10} {b:>3}..{e:<3} {max_delta:>10.3e}  {rel:>10.3e}  {max_b:>5}  [{s_min:.4}, {s_max:.4}]",
+            gname, b=gbands.start, e=gbands.end-1, max_delta=max_delta, rel=rel, max_b=max_b, s_min=s_min, s_max=s_max);
+    }
+
+    // Top offenders
+    diags.sort_by(|a, b| b.delta.abs().partial_cmp(&a.delta.abs()).unwrap());
+    println!("\nTop 10 bands by |Δ|:");
+    println!("  band |  Δ (Ha)  | RQ (Ha)  | ε (Ha)  | label | ⟨S⟩");
+    for d in diags.iter().take(10) {
+        println!("  {:>4} | {:>8.2e} | {:>8.4} | {:>8.4} | {:<6} | {:.4}",
+            d.b, d.delta, d.rq, d.eps, d.label, d.s_norm);
+    }
+
+    // Component breakdown for band 0
+    let b0 = diags.iter().find(|d| d.b == 0).unwrap();
+    println!("\nComponent breakdown (band 0):");
+    println!("  ⟨T⟩      = {:.6e} Ha", b0.t_expect);
+    println!("  ⟨T+V_eff⟩= {:.6e} Ha", b0.tv_expect);
+    println!("  ⟨V_nl⟩   = {:.6e} Ha  (H_full − H_tv)", b0.rq * b0.s_norm - b0.tv_expect);
+    println!("  ⟨S⟩      = {:.6e}", b0.s_norm);
+    println!("  RQ       = {:.6e} Ha  (⟨H⟩/⟨S⟩)", b0.rq);
+    println!("  ε_ref    = {:.6e} Ha", b0.eps);
+    println!("  Δ        = {:.6e} Ha", b0.delta);
+    println!();
+}
+
 /// Diagnostic 3: outer loop convergence test.
 ///
 /// Tests whether 10 iterations of Chebyshev filter → Rayleigh-Ritz → residual
@@ -1356,6 +1647,7 @@ fn diagnostic_3_outer_loop_convergence() {
             ndeg,
             eigenvalues_for_filter.as_deref(), // Use previous iteration's eigenvalues
             Some(n_occ),                       // Pass n_occ for correct b_low
+            Some(14.70),                       // ecut (400 eV in Ha) — ABINIT-style bounds
             FilterMode::SinvHKeepHEig,
             &blas,
             &solver,
@@ -1611,4 +1903,301 @@ fn test_off_diagonal_stats() {
         "mean should be between 0 and 0.1, got {}",
         mean
     );
+}
+
+/// Diagnostic: compute GPU H·psi per-band expectations using the REFERENCE
+/// V_eff (pot_fmt) and compare against CASTEP eigenvalues.
+///
+/// The key difference from test_5: test_5 uses a RECONSTRUCTED V_eff from
+/// VEffBuilder (via build_v_eff()). This test uses the REFERENCE pot_fmt V_eff.
+/// If the residuals are smaller here, V_eff reconstruction is the problem.
+/// If residuals are the same size, the error is in V_NL.
+///
+/// Also decomposes into kinetic (CPU-computed, exact) and V_NL (via subtraction)
+/// to show which component contributes the gap.
+#[test]
+#[ignore = "requires GPU and CASTEP fixture data"]
+fn diagnostic_h_psi_component_breakdown() {
+    use chemrust_scf::{
+        BlasHandle, CudaKernelSet, EffectivePotential, FineGridArray,
+        Gpu, SolverHandle, VnlBatchData, WaveGridArray, apply_h_components_for_test,
+        apply_s_for_test,
+    };
+    use cudarc::driver::{CudaContext, CudaSlice};
+    use std::sync::Arc;
+
+    if !gpu_available() {
+        eprintln!("SKIP: no GPU available");
+        return;
+    }
+
+    println!("\n=== H·ψ component breakdown: REFERENCE V_eff vs CASTEP ε ===\n");
+
+    let fx = fixtures::cu111_co::fixture();
+    let wfc = fx.check.wavefunction.as_ref()
+        .expect(".check must have wavefunction");
+    let kpt_block = &wfc.kpt_data[0];
+    let n_bands = kpt_block.bands.len();
+    let n_pw = kpt_block.nplw;
+    let psi_input: Vec<Complex64> = kpt_block.bands.concat();
+
+    // GPU setup
+    let ctx = Arc::new(CudaContext::new(0).expect("CudaContext"));
+    let stream = ctx.default_stream();
+    let blas = BlasHandle::new(stream.clone()).expect("BlasHandle");
+    let solver = SolverHandle::new(stream.clone()).expect("SolverHandle");
+    let kernels = CudaKernelSet::new(&ctx).expect("CudaKernelSet");
+    let wave_grid = chemrust_hamiltonian_core::GVectorGrid::new(
+        wfc.grid[0], wfc.grid[1], wfc.grid[2],
+        fx.bin.cell.recip_lattice,
+    );
+    let mut pcie = chemrust_scf::PcieAccount::default();
+    let pw_coords = &kpt_block.pw_grid_coord;
+    let k_point = chemrust_scf::KPoint { coords: kpt_block.coords };
+    let cell = &fx.bin.cell;
+
+    // Occupations from CASTEP eigenvalues
+    let n_electrons: f64 = cell.species_iter()
+        .map(|info| fx.pots.get(info.symbol).and_then(|p| p.ionic_charge()).unwrap_or(0.0) * info.num_ions as f64)
+        .sum();
+    let (occupations, _) = chemrust_scf::density::compute_occupations(
+        &fx.bands_eigenvalues,
+        &chemrust_scf::SmearingParams {
+            width: 0.1 * chemrust_scf::EV_TO_HARTREE,
+            electron_temperature: 0.1 * chemrust_scf::EV_TO_HARTREE,
+            scheme: chemrust_scf::SmearingScheme::Gaussian,
+        }, n_electrons,
+    ).expect("compute_occupations");
+
+    // Build VnlBatchData using REFERENCE V_eff (pot_fmt), not reconstructed
+    let v_eff_for_d = chemrust_hamiltonian_core::EffectivePotential::from_inner(
+        chemrust_hamiltonian_core::fft::RealGrid::from_inner(fx.pot_fmt.clone()));
+    let vnl_data = VnlBatchData::precompute(
+        pw_coords, &fx.pots, cell, &wave_grid, &k_point,
+        &psi_input, n_bands, n_pw, Some(&occupations.0), Some(&v_eff_for_d),
+        &stream, &mut pcie, &blas, &kernels, &solver,
+    ).expect("VnlBatchData");
+
+    // Upload reference V_eff to GPU
+    let v_eff_arr = ndarray::Array3::from_shape_vec(
+        (wave_grid.grid()[2], wave_grid.grid()[1], wave_grid.grid()[0]),
+        fx.pot_fmt.iter().copied().collect(),
+    ).unwrap();
+    let v_eff_wave = WaveGridArray::from_inner(v_eff_arr);
+    let v_eff_fine = FineGridArray::from_inner(v_eff_wave.into_inner());
+    let v_eff_gpu = Gpu::from_host_with(
+        &chemrust_scf::EffectivePotential::from_inner(v_eff_fine),
+        &stream, &mut pcie,
+    ).expect("V_eff upload");
+
+    // Upload psi to GPU using the existing helper
+    let psi_gpu = upload_psi_to_gpu_column(&psi_input, n_bands, n_pw, &stream, &mut pcie);
+
+    // FFT index map
+    let fft_idx: Vec<i32> = chemrust_scf::pw_coords_to_fft_indices(pw_coords, &wave_grid);
+    let fft_idx_dev = stream.clone_htod(&fft_idx).expect("FFT indices");
+
+    // GPU: get H·psi components
+    let h_components = apply_h_components_for_test(
+        &psi_gpu, &v_eff_gpu, &wave_grid, pw_coords, &vnl_data,
+        &fft_idx_dev, &kernels, &blas, &stream,
+    ).expect("apply_h_components_for_test");
+
+    // Download psi + spsi for per-band dot products
+    let psi_raw: Vec<Complex64> = stream.clone_dtoh(psi_gpu.as_device_slice())
+        .expect("psi D2H")
+        .into_iter()
+        .map(|c| Complex64::new(c.x, c.y))
+        .collect();
+    let spsi = apply_s_for_test(&psi_input, n_bands, n_pw, &vnl_data, &blas, &stream)
+        .expect("apply_s_for_test");
+
+    // CPU kinetic expectation (purely geometric, should match GPU exactly)
+    let r = cell.recip_lattice.as_array();
+    let kinetic_g2: Vec<f64> = pw_coords.iter()
+        .map(|&[h, k, l]| {
+            let gx = h as f64 * r[0][0] + k as f64 * r[1][0] + l as f64 * r[2][0];
+            let gy = h as f64 * r[0][1] + k as f64 * r[1][1] + l as f64 * r[2][1];
+            let gz = h as f64 * r[0][2] + k as f64 * r[1][2] + l as f64 * r[2][2];
+            0.5 * (gx * gx + gy * gy + gz * gz)
+        })
+        .collect();
+    let mut t_cpu = vec![0.0_f64; n_bands];
+    for b in 0..n_bands {
+        let off = b * n_pw;
+        t_cpu[b] = psi_input[off..off + n_pw].iter()
+            .zip(kinetic_g2.iter())
+            .map(|(&c, &ke)| c.norm_sqr() * ke)
+            .sum();
+    }
+
+    // Per-band diagnostics
+    struct BandDiag { b: usize, t_gpu: f64, tv_gpu: f64, h_gpu: f64,
+        s_norm: f64, rq_gpu: f64, t_cpu: f64, eps: f64, delta: f64, label: String }
+    let mut diags: Vec<BandDiag> = Vec::with_capacity(n_bands);
+
+    for b in 0..n_bands {
+        let off = b * n_pw;
+        let psi_b = &psi_raw[off..off + n_pw];
+        let h_b = &h_components.hpsi_full[off..off + n_pw];
+        let tv_b = &h_components.hpsi_tv[off..off + n_pw];
+        let t_b = &h_components.hpsi_t[off..off + n_pw];
+        let s_b = &spsi[off..off + n_pw];
+
+        let h_dot: f64 = psi_b.iter().zip(h_b).map(|(p, h)| (p.conj() * h).re).sum();
+        let tv_dot: f64 = psi_b.iter().zip(tv_b).map(|(p, h)| (p.conj() * h).re).sum();
+        let t_dot: f64 = psi_b.iter().zip(t_b).map(|(p, h)| (p.conj() * h).re).sum();
+        let s_dot: f64 = psi_b.iter().zip(s_b).map(|(p, s)| (p.conj() * s).re).sum();
+
+        let rq = if s_dot.abs() > 1e-30 { h_dot / s_dot } else { 0.0 };
+        let eps = fx.bands_eigenvalues[b];
+        let delta = rq - eps;
+        let label = if b < 1 { "core" } else if b < 15 { "cu3d" }
+            else if b < 82 { "val" } else if b < 93 { "nFermi" } else { "cond" };
+
+        diags.push(BandDiag { b, t_gpu: t_dot, tv_gpu: tv_dot, h_gpu: h_dot,
+            s_norm: s_dot, rq_gpu: rq, t_cpu: t_cpu[b], eps, delta, label: label.into() });
+    }
+
+    // ---- Report ----
+    println!("Group       bands  max|Δ|_refV  mean|Δ|_refV  worst_b");
+    println!("  (refV_eff means using REFERENCE pot_fmt V_eff)");
+    for (gname, gb) in [("core", 0..1), ("cu3d", 1..15), ("val", 15..82),
+                         ("nFermi", 82..93), ("cond", 93..160)] {
+        let mut max_ad = 0.0_f64;
+        let mut sum_ad = 0.0_f64;
+        let mut cnt = 0usize;
+        let mut wb = 0usize;
+        for d in diags.iter().filter(|d| gb.contains(&d.b)) {
+            let ad = d.delta.abs();
+            if ad > max_ad { max_ad = ad; wb = d.b; }
+            sum_ad += ad;
+            cnt += 1;
+        }
+        let mean_ad = sum_ad / cnt.max(1) as f64;
+        println!("{:<10} {:>3}..{:<3}  {:>10.3e}  {:>10.3e}  {:>7}",
+            gname, gb.start, gb.end-1, max_ad, mean_ad, wb);
+    }
+    println!();
+
+    // Top 10 by |Δ|
+    diags.sort_by(|a, b| b.delta.abs().partial_cmp(&a.delta.abs()).unwrap());
+    println!("Top 10 bands by |Δ| (ref V_eff RQ vs CASTEP ε):");
+    println!("  band |  Δ (Ha)    | RQ (Ha)   | ε (Ha)    | label  | ⟨S⟩    | K gap");
+    for d in diags.iter().take(10) {
+        let k_gap = (d.t_gpu - d.t_cpu).abs();
+        println!("  {:>4} | {:>+9.2e} | {:>9.4} | {:>9.4} | {:<6} | {:>7.4} | {:>6.1e}",
+            d.b, d.delta, d.rq_gpu, d.eps, d.label, d.s_norm, k_gap);
+    }
+    println!();
+
+    // Band 0 detailed breakdown
+    let b0 = diags.iter().find(|d| d.b == 0).unwrap();
+    println!("Band 0 detailed breakdown:");
+    println!("  T_gpu       = {:.10e} Ha", b0.t_gpu);
+    println!("  T_cpu       = {:.10e} Ha  |Δ| = {:.2e}", b0.t_cpu, (b0.t_gpu - b0.t_cpu).abs());
+    println!("  ⟨T+V_eff⟩   = {:.10e} Ha", b0.tv_gpu);
+    println!("  ⟨V_eff⟩     = {:.10e} Ha", b0.tv_gpu - b0.t_gpu);
+    println!("  ⟨V_nl⟩_gpu  = {:.10e} Ha  (h_full − h_tv)", b0.h_gpu - b0.tv_gpu);
+    println!("  ⟨S⟩         = {:.10e}", b0.s_norm);
+    println!("  RQ_gpu      = {:.10e} Ha", b0.rq_gpu);
+    println!("  ε_CASTEP    = {:.10e} Ha", b0.eps);
+    println!("  Δ           = {:.10e} Ha", b0.delta);
+    println!();
+
+    // Comparison with test_5 results (reconstructed V_eff):
+    // test_5 band 0: |Δ| = 0.013097 Ha  (reconstructed V_eff)
+    // This test band 0 Δ = ?
+    // If |Δ|_test < |Δ|_test5 → V_eff reconstruction adds error
+    // If |Δ|_test ≈ |Δ|_test5 → V_eff not the problem, V_NL is
+    // If |Δ|_test > |Δ|_test5 → somehow reconstructed V_eff is better (unlikely)
+    // Download c_proj from GPU and compare against CPU beta_phi for first Cu ion
+    let first_cu_ion = cell.ion_species.iter().position(|&s| {
+        cell.species_symbols.get(s).map_or(false, |sym| *sym == "Cu")
+    }).unwrap_or(0);
+
+    if let Some(entry) = vnl_data.entries.get(first_cu_ion) {
+        let ne = entry.n_expanded as usize;
+        let n_pw_i32 = n_pw as i32;
+        let n_bands_i32 = n_bands as i32;
+        let one = chemrust_scf::device::CudaComplex { x: 1.0, y: 0.0 };
+        let zero = chemrust_scf::device::CudaComplex { x: 0.0, y: 0.0 };
+
+        // Compute c_proj on GPU: beta_g^H · psi
+        let mut c_proj_dev: CudaSlice<chemrust_scf::device::CudaComplex> = stream
+            .alloc_zeros(ne * n_bands).expect("alloc c_proj");
+        unsafe {
+            blas.gemm_c64(
+                chemrust_scf::device::blas::ZgemmConfig {
+                    transa: chemrust_scf::device::blas::op::C,
+                    transb: chemrust_scf::device::blas::op::N,
+                    m: ne as i32,
+                    n: n_bands_i32,
+                    k: n_pw_i32,
+                    alpha: one,
+                    lda: n_pw_i32,
+                    ldb: n_pw_i32,
+                    beta: zero,
+                    ldc: ne as i32,
+                },
+                &entry.beta_g,
+                psi_gpu.as_device_slice(),
+                &mut c_proj_dev,
+            ).expect("gemm c_proj");
+        }
+        let c_proj_host: Vec<chemrust_scf::device::CudaComplex> =
+            stream.clone_dtoh(&c_proj_dev).expect("c_proj D2H");
+
+        // Compute beta_phi on CPU using the Gamma-point-aware formula
+        use chemrust_hamiltonian_core::augment::beta_phi::compute_beta_phi;
+        use chemrust_hamiltonian_core::types::KptWaveBlock;
+        let cpu_block = KptWaveBlock {
+            coords: kpt_block.coords,
+            nplw: n_pw,
+            pw_grid_coord: pw_coords.clone(),
+            bands: psi_input.chunks(n_pw).map(|chunk| chunk.to_vec()).collect(),
+        };
+        let sym = &cell.species_symbols[cell.ion_species[first_cu_ion]];
+        let pot = fx.pots.get(sym).unwrap();
+        let k_cart = [0.0; 3];
+        if let chemrust_hamiltonian_core::Pseudopotential::Usp(aug) = pot {
+            let beta_phi_cpu = compute_beta_phi(
+                &cpu_block, aug, cell, first_cu_ion, &wave_grid,
+                pot.gmax(), k_cart,
+            ).expect("compute_beta_phi");
+
+            // Compare GPU c_proj vs CPU beta_phi for band 0
+            let gpu_b0: Complex64 = Complex64::new(c_proj_host[0].x, c_proj_host[0].y);
+            let cpu_b0 = beta_phi_cpu[[0, 0]];
+            let ratio = if cpu_b0.norm_sqr() > 1e-30 { gpu_b0 / cpu_b0 } else { Complex64::ZERO };
+            println!("\nGamma convention check (Cu ion {}, band 0, proj 0):", first_cu_ion);
+            println!("  GPU c_proj (β^H·ψ, complex gemm): ({:+.6e}, {:+.6e})", gpu_b0.re, gpu_b0.im);
+            println!("  CPU beta_phi (Gamma formula):     ({:+.6e}, {:+.6e})", cpu_b0.re, cpu_b0.im);
+            println!("  Ratio GPU/CPU: {:+.6e}", ratio);
+
+            let gpu_b0_1 = Complex64::new(c_proj_host[1].x, c_proj_host[1].y);
+            let cpu_b0_1 = beta_phi_cpu[[1, 0]];
+            let ratio_1 = if cpu_b0_1.norm_sqr() > 1e-30 { gpu_b0_1 / cpu_b0_1 } else { Complex64::ZERO };
+            println!("  GPU c_proj (proj 1): ({:+.6e}, {:+.6e})", gpu_b0_1.re, gpu_b0_1.im);
+            println!("  CPU beta_phi (proj 1): ({:+.6e}, {:+.6e})", cpu_b0_1.re, cpu_b0_1.im);
+            println!("  Ratio GPU/CPU: {:+.6e}", ratio_1);
+
+            if (ratio - Complex64::ONE).norm() > 1e-10 {
+                println!("  ⚠ GPU and CPU c_proj DIFFER — Gamma-point convention mismatch!");
+            } else {
+                println!("  ✓ GPU and CPU c_proj match — Gamma-point convention is correct.");
+            }
+        }
+    }
+
+    println!("\nComparison with test_5 (reconstructed V_eff):");
+    println!("  test_5 band 0: |Δ| = 0.013097 Ha (using RECONSTRUCTED V_eff)");
+    println!("  this test     : |Δ| = {:.6e} Ha (using REFERENCE pot_fmt V_eff)", b0.delta.abs());
+    let ref_better = b0.delta.abs() < 0.013;
+    println!("  -> Reference V_eff gives {} residuals than reconstructed V_eff",
+        if ref_better { "SMALLER" } else { "SIMILAR or LARGER" });
+    if !ref_better {
+        println!("  -> V_eff reconstruction is NOT the dominant error source.");
+        println!("  -> V_NL (D screening or assembly formula) is the likely culprit.");
+    }
 }

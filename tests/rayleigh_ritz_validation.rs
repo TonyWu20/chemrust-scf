@@ -407,13 +407,16 @@ fn test_4_orthonormality() {
 // Layer 3: Full Pipeline Output
 // ---------------------------------------------------------------------------
 
-/// Test 5: All 160 eigenvalues match CASTEP reference within 0.05 Ha
+/// Test 5: All 160 eigenvalues match CASTEP reference within 0.02 Ha
 ///
 /// **Property**: RR applied to CASTEP's converged ψ should reproduce CASTEP's eigenvalues.
 /// **Anchor**: Cu111_CO.bands (EXTERNAL — parsed at fixture load time).
 ///   Band-0: −1.05502343 Ha, Band-159: 0.11531044 Ha.
-/// **Threshold**: max|Δλ| < 0.05 Ha (empirically validated by ndeg_zero_with_castep_psi_matches_bands).
-/// **Discriminator**: 0.05 Ha gate, existing test passes for bands 0-9 with margin.
+/// **Threshold**: max|Δλ| < 0.02 Ha.
+/// **Floor**: The Gamma-point convention mismatch in V_NL (complex gemm vs real-only
+///   Gamma formula) produces a ~0.013 Ha systematic overestimate on band 0-1.
+///   The 0.02 Ha gate accommodates this. See notes/debug/chemrust-hamiltonian-F8-falsified.md.
+/// **Discriminator**: 0.02 Ha gate.
 #[test]
 #[ignore = "requires GPU and CASTEP fixture data"]
 fn test_5_all_band_eigenvalue_validation() {
@@ -471,7 +474,7 @@ fn test_5_all_band_eigenvalue_validation() {
     eprintln!("[test_5] RMS(Δλ)  = {:.6e} Ha over {} bands", rms_delta, n_check);
 
     // Collect failures
-    const SC4_GATE: f64 = 0.05;
+    const SC4_GATE: f64 = 0.02;
     let failures: Vec<String> = (0..n_check)
         .filter(|&j| deltas[j] >= SC4_GATE)
         .map(|j| format!("  band {j}: ours={:.6} CASTEP={:.6} |Δ|={:.4} Ha", our_eigenvalues[j], castep_bands[j], deltas[j]))

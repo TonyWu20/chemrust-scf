@@ -893,6 +893,31 @@ keep this index lightweight for SCF-wide debug sessions.
 - `tests/ca_scf_convergence.rs::overlap_helper_self_test` (NEW in
   `44796f5`) — diagnostic self-test for `apply_s_for_test`. PASSes.
 
+### 2026-05-29 update: cascade is NOT eigensolver-specific
+
+Both Davidson and Chebyshev-RR cascade from iter-3 onward,
+ruling out ZHEGVD permutation as the primary mechanism.
+
+**Evidence:** `CHEMRUST_EIGENSOLVER=davidson` SCF run shows:
+- Iter-1: band-0 within spec, total energy -24,188.66 eV
+- Iter-2: band-0 drifts (same magnitude as Chebyshev-RR)
+- Iter-3+: continues to diverge (CASTEP checkpoint at iter-2 recovers cleanly)
+
+Since Davidson uses a fundamentally different subspace method
+(block expansion vs polynomial filtering), the cascade is NOT
+driven by the eigensolver. Root cause is in the **SCF infrastructure**:
+density reconstruction, V_eff reassembly, D_screening, or mixing.
+The `iter2_band0_with_castep_d_injection` T-prime discriminator
+remains the best tool to isolate whether D_screening is the
+amplification point — needs `D_band_debug.dat` from the
+chemrust-hamiltonian F8 fixture set.
+
+**Implication:** Fixing §14 requires auditing the SCF rebuild
+pipeline, not just the Rayleigh-Ritz pinning strategy. The
+per-iteration V_eff change at ion centres (where Q functions
+concentrate) should be compared between CASTEP and our pipeline
+to find the amplification point.
+
 ## 15. Iter-1 total energy off by factor of Ω (~22,300×) — energy-assembly unit bug
 
 **Status (2026-05-24): RESOLVED** — two compounding bugs.
@@ -964,3 +989,54 @@ within 20 mHa per-component gate). Q2 still RED — blocked by §14 rotation cas
 - §15 RESOLUTION.md: `notes/debug/debug-20260524-0715/RESOLUTION.md`
 - §14 (rotation cascade — Q2 ship gate, see proposal)
 - Q1 test: `tests/ca_scf_convergence.rs::iter1_drift_from_castep_state_is_bounded`
+
+## 16. chemrust-hamiltonian F8 resolution (subspace-diagonalisation floor) falsified
+
+**Status (2026-05-29):** FALISIFIED.
+
+The chemrust-hamiltonian debug session F8 concluded that a 1.28e-2 Ha residual
+in band eigenvalues is an "algorithmic floor" from using diagonal expectation
+values vs CASTEP's full subspace diagonalisation (`wave_diagonalise` in
+`electronic.f90:685,735`). See `~/programming/chemrust-hamiltonian/notes/debug/
+debug-20260529-1250-f8-band-expectation-subspace/RESOLUTION.md`.
+
+**Falsifying evidence:** `test_5_all_band_eigenvalue_validation` performs
+FULL subspace diagonalisation via ZHEGVD on H_sub = psi^dag·H·psi and
+S_sub = psi^dag·S·psi (the exact fix the resolution prescribes). Results:
+
+- Band 0: |Δ| = 0.0131 Ha (same as diagonal expectation residual)
+- Max |Δ| = 0.0193 Ha (band 128, conduction)
+- RMS = 4.55e-3 Ha
+
+Subspace diagonalisation does NOT close the gap. The residual originates
+from H·psi application, not the diagonalisation method.
+
+**Root cause (not found):** All individual components verified against
+CASTEP anchors (D < 2.5e-5 Ha, beta_g ratio 1.000000, V_eff 3.97e-6 Ha,
+kinetic exact to 1e-16). The V_NL formula matches CASTEP's structurally.
+But the composed V_NL operator gives eigenvalues different from CASTEP's
+by ~1.6%. Gamma-point convention checked and rejected (zeroing imag parts
+of c_proj made V_NL 26× worse).
+
+**Gate:** `test_5` tightened from 0.05 → 0.02 Ha (passing, max|Δ| = 0.0193 Ha).
+The 0.02 Ha threshold represents the empirical floor for H-operator comparison
+on this system.
+
+**Key diagnostic tests added:**
+- `diagnostic_h_psi_cpu_vs_gpu_crosscheck` (`chebyshev_orthogonality_diagnostic.rs`)
+  — compares GPU H·psi components against CPU expectations and CASTEP eigenvalues
+- `diagnostic_h_psi_component_breakdown` — per-band Rayleigh quotients from
+  reference V_eff (pot_fmt), ruling out V_eff reconstruction as the source
+
+**Implication for this project:** The 1.3e-2 Ha error is systematic across
+all eigenvalues (always positive, our eigenvalues < CASTEP's). It is NOT the
+SCF cascade cause — the eigenvalue drift from the cascade is 40× larger
+(~0.57 Ha). See §14 for the cascade, which is now known to be
+eigensolver-independent (both Davidson and Chebyshev-RR cascade).
+
+**If this error needs to be fixed (future work):** Line-by-line comparison
+of chemrust's V_NL assembly (`apply_v_nl_hamiltonian` + `VnlBatchData`)
+against CASTEP's `nlpot_apply` in `ion.f90`. Focus on: (1) D-screening
+convention for V_local component, (2) Q function normalization at G=0,
+(3) the conj(β) vs β conjugation chain. The error is small (~1.6%) and
+uniformly signed — suggests a missing factor, not a structural bug.
