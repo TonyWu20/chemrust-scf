@@ -2942,17 +2942,21 @@ fn iter2_band0_with_castep_d_injection() {
     eprintln!("[T-prime] CASTEP reference band-0:          {:.6} Ha", CASTEP_BAND0);
     eprintln!("[T-prime] |Δ| vs CASTEP:                    {:.4e} Ha", delta);
 
-    // ---- Discriminator (50 mHa, 2× margin over T3's |Δ| = 9.8 mHa) ----
+    // ---- Discriminator (25 mHa, 2× the iter-1 V_NL floor) ----
     //
-    // T3 (V_eff substitution) achieves |Δ| ≈ 9.8 mHa per REVIEW_PROMPT.md. If
-    // T-prime's D injection is a similarly clean substitution, |Δ| should be
-    // in the same ballpark (≤ 50 mHa with discriminator margin).
+    // T-prime result (2026-05-29): iter-2 band-0 with CASTEP D = −1.0337 Ha,
+    // |Δ| = 0.0213 Ha vs CASTEP reference. The iter-1 baseline (test_5 with
+    // our D) gives |Δ| = 0.013 Ha. The extra 0.008 Ha is from V_eff change
+    // between iter-1 and iter-2 (frozen D isolates V_eff drift).
     //
-    // PASS interpretation: D-screening is the post-rotation blocker, fix is
-    //                      iterative D refinement (chemrust-hamiltonian side).
+    // Gate set at 0.025 Ha: tight enough to catch D-screening regressions
+    // while accommodating the residual V_eff drift floor.
+    //
+    // PASS interpretation: D-screening is the post-rotation blocker; fix is
+    //                      iterative D refinement or D-screening damping.
     // FAIL interpretation: eigensolver rotation drives cascade independently
     //                      of D quality; fix is GS+RR stabilization here.
-    let pass = delta < 0.05;
+    let pass = delta < 0.025;
     if pass {
         eprintln!(
             "[T-prime] PASS — cascade stopped with CASTEP D. \
@@ -4946,7 +4950,7 @@ fn test_iter2_check_discriminator() {
     let state = fixtures::cu111_co::build_scf_state(fx);
 
     let gate = chemrust_scf::ScfDivergenceGate {
-        parameters_raw: fx.check.parameters_raw.clone(),
+        parameters_raw: fx.check.parameters_raw.first().cloned(),
         ..Default::default()
     };
 

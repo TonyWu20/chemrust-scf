@@ -907,16 +907,28 @@ Since Davidson uses a fundamentally different subspace method
 (block expansion vs polynomial filtering), the cascade is NOT
 driven by the eigensolver. Root cause is in the **SCF infrastructure**:
 density reconstruction, V_eff reassembly, D_screening, or mixing.
-The `iter2_band0_with_castep_d_injection` T-prime discriminator
-remains the best tool to isolate whether D_screening is the
-amplification point — needs `D_band_debug.dat` from the
-chemrust-hamiltonian F8 fixture set.
 
-**Implication:** Fixing §14 requires auditing the SCF rebuild
-pipeline, not just the Rayleigh-Ritz pinning strategy. The
-per-iteration V_eff change at ion centres (where Q functions
-concentrate) should be compared between CASTEP and our pipeline
-to find the amplification point.
+### 2026-05-29 update: T-prime discriminator confirms D-driven cascade
+
+`iter2_band0_with_castep_d_injection` with `CASTEP_FIXTURE_DIR=/export/
+public_castep_jobs/tony/Cu111_CO_Single_Point_0528_vnl_dump`:
+- Iter-1 band-0 (our D): −1.0419 Ha (|Δ| = 0.0131 Ha vs CASTEP)
+- Iter-2 band-0 (CASTEP D injected): **−1.0337 Ha** (|Δ| = 0.0213 Ha)
+- Without D injection: iter-2 band-0 ≈ −0.864 Ha (full cascade)
+
+**Result:** PASS — D-screening IS the post-rotation blocker. But even
+with CASTEP's exact D, iter-2 is 0.008 Ha worse than iter-1 (0.021 vs
+0.013 Ha). The excess is from V_eff drift between iterations (eigenvector
+rotation → density change → V_eff change → eigenvalue shift).
+
+**Fix direction:** D_screen stability. Our D_screen differs from CASTEP's
+`nlpot_calculate_d` — likely in Q-function normalization or V_local
+screening convention. The investigation belongs in chemrust-hamiltonian-core
+(`compute_screened_d`, `precompute_q_on_grid`).
+
+**Tests tightened (2026-05-29):**
+- `test_5` gate: 0.05 → 0.02 Ha (passing)
+- T-prime gate: 0.05 → 0.025 Ha (passing at 0.0213 Ha)
 
 ## 15. Iter-1 total energy off by factor of Ω (~22,300×) — energy-assembly unit bug
 
