@@ -515,27 +515,30 @@ fn gate2_convergence_from_random_init() {
     eprintln!("[Gate 2] Diagonalizing subspace ({N_BANDS}×{N_BANDS}) and rotating...");
     let diag_eigs = diagonalize_and_rotate(&h_sub, &s_sub, &mut bands);
 
-    // ---- 14d. Assert: eigenvalues match CASTEP .check within 1e-10 ----------
+    // ---- 14d. Diagnostic: compare subspace diag eigenvalues vs CASTEP .check ---
+    // NOTE: With random starting wavefunctions, the subspace spans a random
+    // 160-dimensional subspace of a 60067-dimensional PW space.  The Ritz
+    // values (eigenvalues of H_sub) are NOT the true eigenvalues — they only
+    // converge to the true eigenvalues as the subspace approaches the invariant
+    // subspace over SCF iterations.  CASTEP's wave_diagonalise_H_ks is called
+    // with wavefunctions from the PREVIOUS SCF iteration (already near-converged).
+    // We print the comparison for diagnostics but do NOT assert against .check.
     let castep_eigvals: Vec<f64> = castep_bin.eigenvalues.kpoints[0].spins[0].eigenvalues.clone();
     let mut max_delta = 0.0_f64;
+    let mut min_delta = f64::MAX;
     let mut max_band = 0;
     for (i, (diag_e, castep_e)) in diag_eigs.iter().zip(castep_eigvals.iter()).enumerate() {
         let delta = (diag_e - castep_e).abs();
-        if delta > max_delta {
-            max_delta = delta;
-            max_band = i;
-        }
-        assert!(
-            delta < 1e-10,
-            "band {i}: |epsilon_subspace_diag(={diag_e:.10e}) - epsilon_castep(={castep_e:.10e})| = {delta:.2e} >= 1e-10"
-        );
+        if delta > max_delta { max_delta = delta; max_band = i; }
+        if delta < min_delta { min_delta = delta; }
     }
-    eprintln!("  ✓ ALL {N_BANDS} bands match CASTEP .check: max|Δε| = {max_delta:.2e} (band {max_band})");
+    eprintln!("  Subspace diag eigenvalues (random ψ subspace):");
+    eprintln!("    max|Δε| = {max_delta:.4e} (band {max_band}), min|Δε| = {min_delta:.4e}");
 
     // ---- 15. Band-by-band CG refinement (from subspace-diag basis) ----------
     eprintln!();
     eprintln!("[Gate 2] Running band-by-band CG refinement on all {N_BANDS} bands...");
-    eprintln!("  Starting from subspace-diagonalized basis (max 15 steps/band)");
+    eprintln!("  Starting from subspace-diagonalized basis (max 50 steps/band)");
 
     let mut converged_bands: Vec<(Vec<Complex64>, Vec<Complex64>)> = Vec::new();
     let mut band_results = Vec::new();
@@ -547,7 +550,7 @@ fn gate2_convergence_from_random_init() {
             &psi_init,
             &precond,
             &converged_bands,  // lower bands already converged
-            15,                // max_steps per band (reduced from 50)
+            50,                // max_steps per band
             1e-6,              // tol (eigenvalue change)
             &apply_hs,
             &apply_s,
@@ -564,22 +567,22 @@ fn gate2_convergence_from_random_init() {
         }
     }
 
-    // ---- 16. Check band-0 as probe against subspace-diag reference ------------
+    // ---- 16. Check band-0 as probe against CASTEP .check reference ------------
     eprintln!();
     eprintln!("[Gate 2] Band-0 (probe) results:");
     let result = &band_results[0];
-    let diag_eps_0 = diag_eigs[0];
+    let castep_eps_0 = castep_eigvals[0];
     eprintln!("  converged              = {}", result.converged);
     eprintln!("  n_steps                = {}", result.n_steps);
     eprintln!("  ε_final                = {:.8e} Ha", result.eigenvalue);
     eprintln!("  ‖r‖_S                  = {:.4e}", result.residual_norm);
-    eprintln!("  ε_subspace_diag (band0) = {:.8e} Ha", diag_eps_0);
-    eprintln!("  |Δε| (CG vs diag)       = {:.4e} Ha", (result.eigenvalue - diag_eps_0).abs());
+    eprintln!("  ε_CASTEP (.check band0) = {:.8e} Ha", castep_eps_0);
+    eprintln!("  |Δε| (CG vs CASTEP)     = {:.4e} Ha", (result.eigenvalue - castep_eps_0).abs());
 
     // ---- Gate 2 assertions --------------------------------------------------
     assert!(
         result.converged,
-        "Gate 2 FAILED: CG did not converge within 15 steps (n_steps={})",
+        "Gate 2 FAILED: CG did not converge within 50 steps (n_steps={})",
         result.n_steps,
     );
 
@@ -589,10 +592,10 @@ fn gate2_convergence_from_random_init() {
         result.residual_norm,
     );
 
-    let delta_eps = (result.eigenvalue - diag_eps_0).abs();
+    let delta_eps = (result.eigenvalue - castep_eps_0).abs();
     assert!(
         delta_eps < 1e-6,
-        "Gate 2 FAILED: |ε_CG - ε_subspace_diag| = {:.4e} >= 1e-6 Ha",
+        "Gate 2 FAILED: |ε_CG - ε_CASTEP| = {:.4e} >= 1e-6 Ha",
         delta_eps,
     );
 
