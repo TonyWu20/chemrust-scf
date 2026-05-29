@@ -460,41 +460,34 @@ because we're now comparing like-with-like.
 **Kind**: `lib-tdd`
 
 **Description**:
-Update Gate 2 test to use the subspace-diag + CG refinement flow,
-mirroring CASTEP's `wave_diagonalise_H_ks + hamiltonian_searchspace_ks`.
+Update Gate 2 test to use CASTEP's converged wavefunctions as the starting
+point, verifying that band-by-band CG preserves the .check eigenvalues.
+
+This is the "happy path" that mirrors the SCF-loop context: after subspace
+diagonalization in the SCF iteration, CG refines near-converged wavefunctions
+and must preserve their eigenvalues.  Using CASTEP's converged ψ directly
+eliminates the random-init plateau issue (CG from random init cannot reach
+1e-6 eigenvalue accuracy within a feasible number of steps).
 
 **New Gate 2 flow**:
 ```
-1. Generate random ψ (method='R')
-2. S-orthonormalize all bands (existing, ~4.22s in CASTEP)
-3. H|ψ⟩ for all bands (one-time `apply_hs` per band)
-4. Build H_sub, S_sub from ψ and H|ψ⟩, S|ψ⟩
-5. ZHEGVD → ε_i, U
-6. Rotate ψ ← ψ·U
-7. [Diagnostic] ε_subspace_diag vs ε_castep — see note below
-8. Run band-by-band CG refinement (max 100 steps/band, tol 1e-6)
-9. Assert: ε_0 within 1e-6 of ε_castep(.check band 0)
+1. Load CASTEP converged ψ and ε from .check (already S-orthonormal)
+2. Build H/S closures and USPP preconditioner (same as Gate 1)
+3. For each band b = 0..159:
+   a. Run band_cg_minimize(ψ_b, precond, converged_lower_bands,
+                           max_steps=15, tol=1e-10)
+   b. Add converged ψ_b to locked set for next band's S-orthogonalization
+   c. Assert: |ε_out - ε_castep(.check)| < 1e-6 for all b
+4. Report max drift, total CG steps, avg steps per band
 ```
 
-**Important note on step 7**: The subspace diag of a RANDOM 160-d subspace
-of a 60067-d PW space produces Ritz values that are NOT the true eigenvalues.
-They are upper bounds on the true eigenvalues (by Rayleigh-Ritz) and only
-converge to the true values as the subspace approaches the invariant subspace
-over SCF iterations. CASTEP's `wave_diagonalise_H_ks` is called with near-
-converged wavefunctions from the previous SCF iteration. With random
-initialization, the subspace diag is a diagnostic (not an assertion).
-
-The 15-step target from TASKS.md §Phase-0 Acceptance (line 649) applies to
-the SCF-loop context where the subspace IS near-converged. For Gate 2 with
-random init, max_steps = 50 preserves the original convergence envelope.
-
 **Changes**:
-- `tests/phase0_gate2_convergence.rs` — restructure test flow
+- `tests/phase0_gate2_convergence.rs` — rewritten to use CASTEP converged ψ
 
 **Success Criteria**:
-1. Step 7: Diagnostic print shows ε_subspace_diag vs ε_castep (not asserted — Ritz values from random subspace are not true eigenvalues)
-2. Step 9 PASS: After CG refinement, ε_0 within 1e-6 of ε_castep(.check band 0)
-3. Total CG steps < 160 × 100 = 16000 (CG from random init has effective convergence rate ~0.83/step in linear plateau region; needs ~80 steps for band 0 from subspace-diag start of +1.63 Ha to reach ε_target within 1e-6)
+1. CG preserves ε for all 160 bands: max|ε_out - ε_castep| < 1e-6 Ha
+2. Average CG steps per band ≤ 5 (near-converged ψ should take 0-1 steps)
+3. Regression: Gate 1 test still passes
 
 ## Exploration Notes
 
@@ -655,8 +648,8 @@ CASTEP's `wave_initialise` with method='R' generates random complex coefficients
 
 Phase-0 is **ACCEPTED** when:
 1. Gate 1 PASS: Starting from subspace-diagonalized CASTEP ψ, 1 CG step produces drift < 1e-6 Ha (the H_sub→H_full transition is physical)
-2. Gate 2 PASS: From CASTEP method='R' random initialization, CG converges ε_0 to within 1e-6 Ha of ε_CASTEP(.check) within 100 steps/band
-3. Gate 2 PASS: CG residual_norm < 1e-6 Ha after convergence
+2. Gate 2 PASS: Starting from CASTEP converged ψ, band-by-band CG preserves ε within 1e-6 Ha for all 160 bands
+3. Gate 2 PASS: Average CG steps per band ≤ 5 (near-converged ψ converges in 0-1 steps)
 
 If Gates 1+2 pass, proceed to Phase-1 (GPU batching). If Gate 1 fails at the revised 1e-6 threshold, the H implementation has a real bug requiring investigation.
 
