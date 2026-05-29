@@ -11,6 +11,7 @@ num-complex = "0.4.6"
 thiserror = "2.0.18"
 bon = "3.9.1"
 faer = "0.24"
+rayon = "1.10"
 cudarc = { version = "0.19.7", features = ["cuda-12090", "cublas", "cufft", "cusolver", "nvrtc"] }
 
 [dev-dependencies]

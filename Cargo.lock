@@ -144,6 +144,7 @@ dependencies = [
  "faer",
  "ndarray",
  "num-complex",
+ "rayon",
  "thiserror 2.0.18",
 ]
 

@@ -1,4 +1,5 @@
 pub mod band_cg;
+pub mod subspace_diag;
 pub(crate) mod cg_helpers;
 pub(crate) mod chebyshev;
 pub(crate) mod line_search;
