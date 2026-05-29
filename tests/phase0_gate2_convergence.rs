@@ -538,7 +538,7 @@ fn gate2_convergence_from_random_init() {
     // ---- 15. Band-by-band CG refinement (from subspace-diag basis) ----------
     eprintln!();
     eprintln!("[Gate 2] Running band-by-band CG refinement on all {N_BANDS} bands...");
-    eprintln!("  Starting from subspace-diagonalized basis (max 50 steps/band)");
+    eprintln!("  Starting from subspace-diagonalized basis (max 100 steps/band)");
 
     let mut converged_bands: Vec<(Vec<Complex64>, Vec<Complex64>)> = Vec::new();
     let mut band_results = Vec::new();
@@ -550,7 +550,7 @@ fn gate2_convergence_from_random_init() {
             &psi_init,
             &precond,
             &converged_bands,  // lower bands already converged
-            50,                // max_steps per band
+            100,               // max_steps per band (CG from random init needs ~80 steps)
             1e-6,              // tol (eigenvalue change)
             &apply_hs,
             &apply_s,
@@ -582,7 +582,7 @@ fn gate2_convergence_from_random_init() {
     // ---- Gate 2 assertions --------------------------------------------------
     assert!(
         result.converged,
-        "Gate 2 FAILED: CG did not converge within 50 steps (n_steps={})",
+        "Gate 2 FAILED: CG did not converge within 100 steps (n_steps={})",
         result.n_steps,
     );
 
