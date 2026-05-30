@@ -91,6 +91,32 @@ pub(crate) fn rayleigh_ritz(
         )?;
     }
 
+    // Debug: dump H_sub before diagonalization (set CHEMRUST_DUMP_H_SUB=<path>)
+    if let Ok(path) = std::env::var("CHEMRUST_DUMP_H_SUB") {
+        if !path.is_empty() {
+            let h_sub_host: Vec<CudaComplex> = stream
+                .clone_dtoh(&h_sub_dev)
+                .map_err(Error::Cuda)?;
+            if let Ok(mut file) = std::fs::File::create(&path) {
+                use std::io::Write;
+                let _ = writeln!(file, "{}", n_bands);
+                for j in 0..n_bands {
+                    for i in 0..n_bands {
+                        let val = h_sub_host[i + j * n_bands];
+                        let _ = writeln!(
+                            file,
+                            "{:6} {:6} {:26.16e} {:26.16e}",
+                            i + 1,
+                            j + 1,
+                            val.x,
+                            val.y
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     // ---- Step 2: S_sub = psi^dag * psi  (n_bands x n_bands) ----
     let mut s_sub_dev: CudaSlice<CudaComplex> =
         stream.alloc_zeros(n_bands * n_bands).map_err(Error::Cuda)?;

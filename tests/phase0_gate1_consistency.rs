@@ -17,7 +17,7 @@ use num_complex::Complex64;
 use chemrust_hamiltonian_core::{
     CheckFile, GVectorGrid, EffectivePotential, RealGrid,
     PseudopotentialSet, Pseudopotential,
-    hamiltonian::{apply_full_hamiltonian, inner_product},
+    hamiltonian::{apply_full_hamiltonian, inner_product, local_potential_expectation},
     formatted::{parse_pot_fmt, usp::parse_usp},
     augment::beta_phi::{compute_beta_g, expanded_projector_count, expanded_projector_lm},
     nlpot::{build_d0_expanded, precompute_q_on_grid, compute_screened_d_from_fft, QOnGrid},
@@ -35,12 +35,14 @@ use chemrust_scf::eigensolver::{
 // ---------------------------------------------------------------------------
 
 /// CASTEP-checkpoint file with converged wavefunctions and eigenvalues.
+/// Must match the CASTEP run that produced the H_sub dump.
 const CHECK_PATH: &str =
-    "/export/public_castep_jobs/tony/Cu111_CO_SinglePoint/Cu111_CO.check";
+    "/export/public_castep_jobs/tony/Cu111_CO_H_dump/Cu111_CO.check";
 
 /// Formatted local potential V_eff on the fine FFT grid.
+/// Must match the CASTEP run that produced the H_sub dump.
 const POT_PATH: &str =
-    "/export/public_castep_jobs/tony/Cu111_CO_SinglePoint/Cu111_CO.pot_fmt";
+    "/export/public_castep_jobs/tony/Cu111_CO_H_dump/Cu111_CO.pot_fmt";
 
 /// Pseudopotential file directory.
 const POT_DIR: &str = "/export/Potentials";
@@ -385,6 +387,234 @@ fn gate1_consistency_check() {
     // S = I for Phase-0 (norm-conserving approximation; full USPP S is applied
     // inside apply_hs but the band_cg S-orthogonalization uses S = I).
     let apply_s = |v: &[Complex64]| v.to_vec();
+
+    // ---- 12a. Compute H_sub = <ψ_i|H|ψ_j> for all bands (reference CPU path) ---
+    // This is the reference H_sub using the same CPU Hamiltonian as the CG loop.
+    // We dump it to a file and optionally compare against CASTEP's H_sub dump.
+    const CHEMRUST_H_SUB_PATH: &str = "h_sub_chemrust_debug.dat";
+    const CASTEP_H_SUB_PATH: &str =
+        "/export/public_castep_jobs/tony/Cu111_CO_H_dump/Cu111_CO.H_sub_debug.dat";
+
+    eprintln!("[Gate 1] Computing full H_sub matrix for {nbands} bands...");
+    let mut h_psi_all: Vec<Vec<Complex64>> = Vec::with_capacity(nbands);
+    for b in 0..nbands {
+        let psi_b = &kpt0.bands[b];
+        let (hv, _sv) = apply_hs(psi_b);
+        h_psi_all.push(hv);
+    }
+    let mut h_sub = vec![vec![Complex64::ZERO; nbands]; nbands];
+    for j in 0..nbands {
+        for i in 0..nbands {
+            h_sub[i][j] = inner_product(&kpt0.bands[i], &h_psi_all[j]);
+        }
+    }
+
+    // Dump H_sub to file (same format as CASTEP: "nbands\n i j re im")
+    if let Ok(mut file) = std::fs::File::create(CHEMRUST_H_SUB_PATH) {
+        use std::io::Write;
+        let _ = writeln!(file, "{nbands}");
+        for j in 0..nbands {
+            for i in 0..nbands {
+                let val = h_sub[i][j];
+                let _ = writeln!(
+                    file,
+                    "{:6} {:6} {:26.16e} {:26.16e}",
+                    i + 1,
+                    j + 1,
+                    val.re,
+                    val.im
+                );
+            }
+        }
+        eprintln!("[Gate 1] H_sub dumped to {CHEMRUST_H_SUB_PATH}");
+    }
+
+    // Compare against CASTEP H_sub dump (if accessible)
+    if let Ok(data) = std::fs::read_to_string(CASTEP_H_SUB_PATH) {
+        let castep_lines: Vec<&str> = data.lines().collect();
+        if let Ok(castep_nbands) = castep_lines[0].trim().parse::<usize>() {
+            if castep_nbands == nbands {
+                let mut castep_h_sub = vec![vec![Complex64::ZERO; nbands]; nbands];
+                for line in &castep_lines[1..] {
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    if parts.len() >= 4 {
+                        let i: usize = parts[0].parse().unwrap_or(1) - 1;
+                        let j: usize = parts[1].parse().unwrap_or(1) - 1;
+                        if i < nbands && j < nbands {
+                            let re: f64 = parts[2].parse().unwrap_or(0.0);
+                            let im: f64 = parts[3].parse().unwrap_or(0.0);
+                            castep_h_sub[i][j] = Complex64::new(re, im);
+                        }
+                    }
+                }
+
+                // Element-wise comparison
+                let mut max_diff = 0.0_f64;
+                let mut max_i = 0;
+                let mut max_j = 0;
+                for j in 0..nbands {
+                    for i in 0..nbands {
+                        let diff = (h_sub[i][j] - castep_h_sub[i][j]).norm();
+                        if diff > max_diff {
+                            max_diff = diff;
+                            max_i = i;
+                            max_j = j;
+                        }
+                    }
+                }
+                eprintln!("[Gate 1] H_sub vs CASTEP: max|Δ| = {max_diff:.6e} Ha at ({max_i},{max_j})");
+
+                // Diagonal element difference
+                let max_diag_diff = (0..nbands)
+                    .map(|i| (h_sub[i][i] - castep_h_sub[i][i]).norm())
+                    .fold(0.0_f64, f64::max);
+                eprintln!("[Gate 1] H_sub vs CASTEP: max|Δ_diag| = {max_diag_diff:.6e} Ha");
+
+                // ---- Component decomposition: T, V_NL, V_loc ----
+                eprintln!();
+                eprintln!("[Gate 1] Decomposing H_sub into T, V_NL, V_loc components...");
+
+                // T_sub[i][j] from kinetic formula: <ψ_i|0.5|k+G|²|ψ_j>
+                // Compute kinetic energy per PW: 0.5|k+G|²
+                let t_per_pw: Vec<f64> = gcart.iter().map(|&gc| {
+                    let kg = [k_cart[0] + gc[0], k_cart[1] + gc[1], k_cart[2] + gc[2]];
+                    0.5 * (kg[0] * kg[0] + kg[1] * kg[1] + kg[2] * kg[2])
+                }).collect();
+                let mut t_sub = vec![vec![Complex64::ZERO; nbands]; nbands];
+                let mut t_psi_all: Vec<Vec<Complex64>> = Vec::with_capacity(nbands);
+                for b in 0..nbands {
+                    let psi_b = &kpt0.bands[b];
+                    let t_psi: Vec<Complex64> = psi_b.iter().zip(t_per_pw.iter())
+                        .map(|(&c, &ek)| c * ek).collect();
+                    t_psi_all.push(t_psi);
+                }
+                for j in 0..nbands {
+                    for i in 0..nbands {
+                        t_sub[i][j] = inner_product(&kpt0.bands[i], &t_psi_all[j]);
+                    }
+                }
+
+                // V_NL_sub[i][j] = Σ_ion Σ_nm D_nm · conj(<ψ_i|β_n>) · <β_m|ψ_j>
+                let mut vnl_sub = vec![vec![Complex64::ZERO; nbands]; nbands];
+                for ion in &ion_data {
+                    let n_exp = ion.d.shape()[0];
+                    // Pre-compute beta_phi for this ion: beta_phi[n][b] = <ψ_b|β_n>
+                    let mut bp = vec![vec![Complex64::ZERO; nbands]; n_exp];
+                    for n in 0..n_exp {
+                        let bg_row = ion.beta_g.row(n);
+                        for b in 0..nbands {
+                            let psi_b = &kpt0.bands[b];
+                            bp[n][b] = psi_b.iter().map(|c| c.conj())
+                                .zip(bg_row.iter())
+                                .map(|(cg, &bg)| cg * bg)
+                                .sum();
+                        }
+                    }
+                    // V_NL contribution from this ion
+                    for n in 0..n_exp {
+                        for m in 0..n_exp {
+                            let d_nm = ion.d[[n, m]];
+                            if d_nm.abs() > 1e-30 {
+                                let cd = Complex64::new(d_nm, 0.0);
+                                for i in 0..nbands {
+                                    let bphi_ni_conj = bp[n][i].conj();
+                                    for j in 0..nbands {
+                                        vnl_sub[i][j] += cd * bphi_ni_conj * bp[m][j];
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // V_loc_sub = H_sub - T_sub - V_NL_sub
+                let mut vloc_sub = vec![vec![Complex64::ZERO; nbands]; nbands];
+                for i in 0..nbands {
+                    for j in 0..nbands {
+                        vloc_sub[i][j] = h_sub[i][j] - t_sub[i][j] - vnl_sub[i][j];
+                    }
+                }
+
+                // Print decomposition for the worst bands
+                fn fmt_sign(v: f64) -> String {
+                    format!("{:+10.6e}", v)
+                }
+
+                // Find top 5 bands by diagonal |Δ|
+                let mut diag_diffs: Vec<(usize, f64)> = (0..nbands)
+                    .map(|i| (i, (h_sub[i][i] - castep_h_sub[i][i]).norm()))
+                    .collect();
+                diag_diffs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+                eprintln!("  Band    H_sub(chemrust)    H_sub(CASTEP)        Δ       Δ(T)      Δ(V_loc)    Δ(V_NL)");
+                for &(b, _) in diag_diffs.iter().take(5) {
+                    let delta = h_sub[b][b] - castep_h_sub[b][b];
+                    let delta_t = (t_sub[b][b] - castep_h_sub[b][b]).re;
+                    let delta_vloc = vloc_sub[b][b].re;
+                    let delta_vnl = vnl_sub[b][b].re;
+                    eprintln!(
+                        "  {b:4}  {}  {}  {}  {}  {}  {}",
+                        fmt_sign(h_sub[b][b].re),
+                        fmt_sign(castep_h_sub[b][b].re),
+                        fmt_sign(delta.re),
+                        fmt_sign(delta_t),
+                        fmt_sign(delta_vloc),
+                        fmt_sign(delta_vnl),
+                    );
+                }
+
+                // ---- Sanity: verify V_NL_sub against nlpot_expectation ----------
+                let mut vnl_check_ok = true;
+                for b in 0..nbands.min(3) {
+                    let mut vnl_expect = 0.0_f64;
+                    for ion in &ion_data {
+                        let n_exp = ion.d.shape()[0];
+                        let mut bp = vec![Complex64::ZERO; n_exp];
+                        for n in 0..n_exp {
+                            let bg_row = ion.beta_g.row(n);
+                            bp[n] = kpt0.bands[b].iter().map(|c| c.conj())
+                                .zip(bg_row.iter())
+                                .map(|(cg, &bg)| cg * bg)
+                                .sum();
+                        }
+                        for n in 0..n_exp {
+                            let bphi_n_conj = bp[n].conj();
+                            for m in 0..n_exp {
+                                let d_nm = ion.d[[n, m]];
+                                if d_nm.abs() > 1e-30 {
+                                    vnl_expect += d_nm * (bphi_n_conj * bp[m]).re;
+                                }
+                            }
+                        }
+                    }
+                    let vnl_decomp = vnl_sub[b][b].re;
+                    let vnl_diff = (vnl_expect - vnl_decomp).abs();
+                    if vnl_diff > 1e-10 {
+                        vnl_check_ok = false;
+                        eprintln!("[Gate 1] V_NL MISMATCH band {b}: nlpot_expect={vnl_expect:.10e} vs decomp={vnl_decomp:.10e} diff={vnl_diff:.10e}");
+                    }
+                }
+                if vnl_check_ok {
+                    eprintln!("[Gate 1] V_NL sanity check: OK (nlpot_expectation matches decomposition)");
+                }
+
+                // ---- Cross-check: V_loc from local_potential_expectation ----------
+                for &b in &[0usize, 1] {
+                    let psi_b = &kpt0.bands[b];
+                    let vloc_expect = local_potential_expectation(
+                        psi_b, &fft_indices, &veff_wave, &gvg_wave,
+                    ).unwrap_or(0.0);
+                    let vloc_decomp = vloc_sub[b][b].re;
+                    let vloc_diff = (vloc_expect - vloc_decomp).abs();
+                    if vloc_diff > 1e-10 {
+                        eprintln!("[Gate 1] V_loc MISMATCH band {b}: expect={vloc_expect:.10e} vs decomp={vloc_decomp:.10e} diff={vloc_diff:.10e}");
+                    } else {
+                        eprintln!("[Gate 1] V_loc OK band {b}: expect={vloc_expect:.10e} decomp={vloc_decomp:.10e}");
+                    }
+                }
+            }
+        }
+    }
 
     // ---- 13. Main loop: 1 CG step per band, track max drift -----------------
     let castep_eigs = &castep_bin.eigenvalues.kpoints[0].spins[0].eigenvalues;
