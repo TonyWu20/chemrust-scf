@@ -21,6 +21,8 @@ use crate::types::{Error, KPoint};
 pub struct VnlIonData {
     pub beta_g: CudaSlice<CudaComplex>,
     pub d_matrix: CudaSlice<CudaComplex>,
+    /// Raw D0 (unscreened) used for re-screening each SCF step.
+    pub d0_expanded: Vec<f64>,
     /// Expanded USPP Q augmentation matrix (n_expanded × n_expanded).
     pub q_matrix: CudaSlice<CudaComplex>,
     pub n_expanded: i32,
@@ -32,6 +34,9 @@ pub struct VnlBatchData {
     /// H2D bytes uploaded for GPU D-matrix screening (V_eff FFT + Q cache + SF).
     /// Used by the PCI-E accounting assertion in the hot path.
     pub screening_h2d_bytes: usize,
+    /// GPU screening cache (Q matrices + structure factors), built once at init
+    /// and reused for D-matrix re-screening every SCF step with the current V_eff.
+    pub screening_cache: Option<WaveScreeningCache>,
     /// Concatenated β-projectors: n_pw × n_total_expanded (col-major).
     pub b_concat: CudaSlice<CudaComplex>,
     /// LU factor (P·L·U) of M = Q⁻¹ + B^H·B (n_total_expanded × n_total_expanded).
@@ -193,12 +198,10 @@ impl VnlBatchData {
         // Snapshot pcie before screening-related H2D so we can report the budget.
         let pcie_before_screening = pcie.h2d_bytes;
 
-        // Build GPU screening cache (Q arrays + structure factors, once per V_eff).
-        let screening_cache: Option<WaveScreeningCache> = if v_eff_fft.is_some() {
-            Some(build_wave_screening_cache(pots, cell, wave_grid, stream, pcie)?)
-        } else {
-            None
-        };
+        // Build GPU screening cache (Q arrays + structure factors). Always built
+        // so it is available for D-matrix re-screening every SCF step.
+        let screening_cache: Option<WaveScreeningCache> =
+            Some(build_wave_screening_cache(pots, cell, wave_grid, stream, pcie)?);
 
         // Upload V_eff_fft to GPU (Fortran order via .t().iter()).
         let v_eff_fft_dev: Option<CudaSlice<CudaComplex>> = match &v_eff_fft {
@@ -371,9 +374,11 @@ impl VnlBatchData {
             per_ion_beta_flat.push(beta_this_ion);
             per_ion_ne.push(ne);
 
+            let d0_flat: Vec<f64> = d0_expanded.iter().cloned().collect();
             entries.push(VnlIonData {
                 beta_g: beta_dev,
                 d_matrix: d_dev,
+                d0_expanded: d0_flat,
                 q_matrix: q_dev,
                 n_expanded,
             });
@@ -468,10 +473,66 @@ impl VnlBatchData {
         Ok(VnlBatchData {
             entries,
             screening_h2d_bytes,
+            screening_cache,
             b_concat,
             lu_m: lu_m_dev,
             lu_ipiv: lu_ipiv_dev,
             n_total_expanded,
         })
+    }
+
+    /// Re-screen D matrices using the current V_eff (called each SCF step).
+    ///
+    /// FFTs V_eff to reciprocal space on CPU, uploads to GPU, and calls
+    /// `screen_d_gpu` for each ion. Updates `d_matrix` on GPU in-place.
+    pub fn rescreen_d(
+        &mut self,
+        v_eff_real: &ndarray::Array3<f64>,
+        stream: &Arc<CudaStream>,
+        kernels: &CudaKernelSet,
+        blas: &crate::device::blas::BlasHandle,
+    ) -> Result<(), Error> {
+        let cache = match &self.screening_cache {
+            Some(c) => c,
+            None => return Ok(()),
+        };
+        let [ngz, ngy, ngx] = cache.wave_grid;
+        let n_wave_grid = ngz * ngy * ngx;
+
+        // FFT V_eff real → reciprocal on CPU.
+        let real_grid = chemrust_hamiltonian_core::fft::RealGrid::from_inner(v_eff_real.clone());
+        let v_eff_fft = chemrust_hamiltonian_core::fft_forward_3d(&real_grid)
+            .map_err(|e| Error::Nvrtc(format!("V_eff FFT failed: {e}")))?;
+
+        // Upload to GPU (Fortran order).
+        let v_eff_flat: Vec<CudaComplex> = v_eff_fft.as_recip_array()
+            .t()
+            .iter()
+            .map(|c| CudaComplex { x: c.re, y: c.im })
+            .collect();
+        let v_eff_fft_dev = stream.clone_htod(&v_eff_flat).map_err(Error::Cuda)?;
+
+        // Re-screen each ion.
+        for (ion_idx, entry) in self.entries.iter_mut().enumerate() {
+            let species_idx = cache.ion_species[ion_idx];
+            let d_screened = screen_d_gpu(
+                cache,
+                &v_eff_fft_dev,
+                ion_idx,
+                species_idx,
+                &entry.d0_expanded,
+                n_wave_grid,
+                kernels,
+                blas,
+                stream,
+            )?;
+            // Upload new D matrix to GPU, replacing old one.
+            let d_flat: Vec<CudaComplex> =
+                d_screened.iter().map(|&d| CudaComplex { x: d, y: 0.0 }).collect();
+            let d_dev = stream.clone_htod(&d_flat).map_err(Error::Cuda)?;
+            entry.d_matrix = d_dev;
+        }
+
+        Ok(())
     }
 }

@@ -295,7 +295,7 @@ unsafe fn step_inner(
     let n_bands_i32 = n_bands as i32;
     let n_elem_i32 = (n_pw * n_bands) as i32;
     let inv_ntotal = 1.0 / gs as f64;
-    let kd = &h.kpts[ik];
+    let kd = &mut h.kpts[ik];
 
     // Use CASTEP-provided kinetic energies (pw_ek_data = 0.5*|G+k|^2)
     let ke_castep: Vec<f64> = unsafe { std::slice::from_raw_parts(kinetic_data, n_pw) }.to_vec();
@@ -360,6 +360,11 @@ unsafe fn step_inner(
         eprintln!("[Diag-Veff] GPU first 5: {:.6e} {:.6e} {:.6e} {:.6e} {:.6e}",
             ve_gpu_back[0], ve_gpu_back[1], ve_gpu_back[2], ve_gpu_back[3], ve_gpu_back[4]);
     }
+
+    // Re-screen D matrices using the current V_eff (must happen before
+    // Hamiltonian application so V_NL reflects the updated potential).
+    kd.vnl.rescreen_d(veff.as_fine_array(), &h.stream, &h.kernels, &h.blas)
+        .map_err(|e| { eprintln!("[chemrust] D re-screen failed: {e}"); CHEM_EIG_CUDA_ERROR })?;
 
     // Upload FFT index
     let fft_idx: Vec<i32> = unsafe { std::slice::from_raw_parts(fft_idx_data as *const c_int, n_pw) }.to_vec();
@@ -621,7 +626,10 @@ unsafe fn step_inner(
 
         let center = (ecut + b_low) / 2.0;
         let radius = (ecut - b_low) / 2.0;
-        if radius <= 0.0 { return Err(CHEM_EIG_CUDA_ERROR); }
+        if radius <= 0.0 {
+            eprintln!("[chemrust] step_inner bounds FAILED ik={} ecut={ecut:.4} b_low={b_low:.4} radius={radius:.4}", ik);
+            return Err(CHEM_EIG_CUDA_ERROR);
+        }
         // Pre-filter beta_phi diagnostic (track if filter destroys atomic character)
         if i_iter == n_inner - 1 {
             let ne0 = kd.vnl.entries[0].n_expanded as usize;
@@ -994,17 +1002,17 @@ unsafe fn step_inner(
 
     // ---- Rayleigh-Ritz and download ----
     let psi_host: Vec<num_complex::Complex64> = {
-        let v = stream.clone_dtoh(&psi_curr).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
+        let v = stream.clone_dtoh(&psi_curr).map_err(|_| { eprintln!("[chemrust] clone_dtoh psi_curr failed ik={}", ik); CHEM_EIG_CUDA_ERROR })?;
         v.into_iter().map(|c| num_complex::Complex64::new(c.x, c.y)).collect()
     };
     let hpsi_host_rr: Vec<num_complex::Complex64> = {
-        let v = stream.clone_dtoh(&hpsi).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
+        let v = stream.clone_dtoh(&hpsi).map_err(|_| { eprintln!("[chemrust] clone_dtoh hpsi failed ik={}", ik); CHEM_EIG_CUDA_ERROR })?;
         v.into_iter().map(|c| num_complex::Complex64::new(c.x, c.y)).collect()
     };
     let psi_wfn = WavefunctionSet::<crate::layout::RowDistributed>::new(psi_host, n_bands, n_pw);
     let hpsi_wfn = WavefunctionSet::<crate::layout::RowDistributed>::new(hpsi_host_rr, n_bands, n_pw);
-    let psi_gpu_rr = crate::device::Gpu::from_host(&psi_wfn, stream).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
-    let hpsi_gpu_rr = crate::device::Gpu::from_host(&hpsi_wfn, stream).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
+    let psi_gpu_rr = crate::device::Gpu::from_host(&psi_wfn, stream).map_err(|_| { eprintln!("[chemrust] from_host psi failed ik={}", ik); CHEM_EIG_CUDA_ERROR })?;
+    let hpsi_gpu_rr = crate::device::Gpu::from_host(&hpsi_wfn, stream).map_err(|_| { eprintln!("[chemrust] from_host hpsi failed ik={}", ik); CHEM_EIG_CUDA_ERROR })?;
 
     let (psi_col, eig_cpu, _, _, _, x_cpu) = rayleigh_ritz_with_matrices(
         &psi_gpu_rr, &hpsi_gpu_rr, &kd.vnl,
