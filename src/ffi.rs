@@ -67,6 +67,10 @@ struct ChemrustHandle {
     ngx: i32, ngy: i32, ngz: i32,
     fft_plan: Option<BatchedFftPlan3d>,
     kpts: Vec<KptData>,
+    /// Cached GPU copy of V_eff for skip-upload optimization.
+    v_eff_cached: Option<CudaSlice<f64>>,
+    /// Max-norm of the cached V_eff, used for change detection.
+    v_eff_norm: f64,
 }
 
 impl ChemrustHandle {
@@ -239,6 +243,8 @@ fn init_inner(
     Ok(Box::into_raw(Box::new(ChemrustHandle {
         ctx, stream, blas, solver, kernels,
         ngx, ngy, ngz, fft_plan: None, kpts,
+        v_eff_cached: None,
+        v_eff_norm: 0.0,
     })))
 }
 
@@ -328,6 +334,8 @@ unsafe fn step_inner(
     // now expects Fortran order so the GPU upload via flatten_f64 produces
     // the correct x-fastest layout that cuFFT expects.
     let ve_host: Vec<f64> = unsafe { std::slice::from_raw_parts(v_eff_data as *const f64, gs) }.to_vec();
+    let ve_raw = unsafe { std::slice::from_raw_parts(v_eff_data as *const f64, gs) };
+    let ve_norm: f64 = ve_host.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
     let ve_min = ve_host.iter().fold(f64::INFINITY, |a, &b| a.min(b));
     let ve_max = ve_host.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
     let ve_mean = ve_host.iter().sum::<f64>() / gs as f64;
@@ -335,31 +343,60 @@ unsafe fn step_inner(
         h.ngx, h.ngy, h.ngz, gs, ve_min, ve_max, ve_mean);
     eprintln!("[Diag-Veff] first 5 raw: {:.6e} {:.6e} {:.6e} {:.6e} {:.6e}",
         ve_host[0], ve_host[1], ve_host[2], ve_host[3], ve_host[4]);
+
+    // V_eff GPU caching: skip H2D transfer if V_eff unchanged since last step.
+    // Uses max-norm for cheap change detection (threshold 1e-8 Ha).
+    let cache_reuse = h.v_eff_cached.as_ref().is_some_and(|_| (ve_norm - h.v_eff_norm).abs() < 1e-8);
+
     let arr = crate::device::unflatten_f64(ve_host, &[h.ngx as usize, h.ngy as usize, h.ngz as usize]);
     let veff = EffectivePotential(FineGridArray(arr));
-    // Verify round-trip: flatten back and compare
-    let ve_rt: Vec<f64> = crate::device::flatten_f64(veff.0.as_array());
-    let mut rt_err = 0.0f64;
-    let ve_raw = unsafe { std::slice::from_raw_parts(v_eff_data as *const f64, gs) };
-    for i in 0..gs.min(10) {
-        let d = (ve_rt[i] - ve_raw[i]).abs();
-        rt_err = rt_err.max(d);
-    }
-    eprintln!("[Diag-Veff] round-trip max error (first 10): {:.3e}", rt_err);
-    let v_eff_gpu = Gpu::from_host(&veff, &h.stream).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
-    // Verify GPU upload: read back from GPU and compare
-    {
-        let ve_gpu_back: Vec<f64> = h.stream.clone_dtoh(v_eff_gpu.as_device_slice())
-            .map_err(|_| CHEM_EIG_CUDA_ERROR)?;
-        let mut gpu_err = 0.0f64;
-        for i in 0..gs.min(10) {
-            let d = (ve_gpu_back[i] - ve_raw[i]).abs();
-            gpu_err = gpu_err.max(d);
+
+    let v_eff_gpu = if cache_reuse {
+        eprintln!("[chemrust] V_eff cache HIT norm={:.6e}", ve_norm);
+        // Allocate fresh GPU buffer and copy from cache via memcpy_dtod.
+        let mut slice: CudaSlice<f64> = h.stream.alloc_zeros::<f64>(gs).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
+        h.stream.memcpy_dtod(h.v_eff_cached.as_ref().unwrap(), &mut slice).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
+        Gpu::<EffectivePotential> {
+            slice,
+            shape: vec![h.ngx as usize, h.ngy as usize, h.ngz as usize],
+            ctx: h.ctx.clone(),
+            _marker: std::marker::PhantomData,
         }
-        eprintln!("[Diag-Veff] GPU upload verified: max error (first 10): {:.3e}", gpu_err);
-        eprintln!("[Diag-Veff] GPU first 5: {:.6e} {:.6e} {:.6e} {:.6e} {:.6e}",
-            ve_gpu_back[0], ve_gpu_back[1], ve_gpu_back[2], ve_gpu_back[3], ve_gpu_back[4]);
-    }
+    } else {
+        eprintln!("[chemrust] V_eff cache MISS norm={:.6e} prev={:.6e}", ve_norm, h.v_eff_norm);
+        // Verify round-trip: flatten back and compare
+        let ve_rt: Vec<f64> = crate::device::flatten_f64(veff.0.as_array());
+        let mut rt_err = 0.0f64;
+        for i in 0..gs.min(10) {
+            let d = (ve_rt[i] - ve_raw[i]).abs();
+            rt_err = rt_err.max(d);
+        }
+        eprintln!("[Diag-Veff] round-trip max error (first 10): {:.3e}", rt_err);
+        let vg = Gpu::from_host(&veff, &h.stream).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
+        // Verify GPU upload: read back from GPU and compare
+        {
+            let ve_gpu_back: Vec<f64> = h.stream.clone_dtoh(vg.as_device_slice())
+                .map_err(|_| CHEM_EIG_CUDA_ERROR)?;
+            let mut gpu_err = 0.0f64;
+            for i in 0..gs.min(10) {
+                let d = (ve_gpu_back[i] - ve_raw[i]).abs();
+                gpu_err = gpu_err.max(d);
+            }
+            eprintln!("[Diag-Veff] GPU upload verified: max error (first 10): {:.3e}", gpu_err);
+            eprintln!("[Diag-Veff] GPU first 5: {:.6e} {:.6e} {:.6e} {:.6e} {:.6e}",
+                ve_gpu_back[0], ve_gpu_back[1], ve_gpu_back[2], ve_gpu_back[3], ve_gpu_back[4]);
+        }
+        // Update cache: preserve GPU copy for next SCF step
+        if h.v_eff_cached.is_none() {
+            let mut cache = h.stream.alloc_zeros::<f64>(gs).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
+            h.stream.memcpy_dtod(vg.as_device_slice(), &mut cache).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
+            h.v_eff_cached = Some(cache);
+        } else {
+            h.stream.memcpy_dtod(vg.as_device_slice(), h.v_eff_cached.as_mut().unwrap()).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
+        }
+        h.v_eff_norm = ve_norm;
+        vg
+    };
 
     // Re-screen D matrices using the current V_eff (must happen before
     // Hamiltonian application so V_NL reflects the updated potential).
