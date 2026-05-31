@@ -722,11 +722,10 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
             &self.wave_grid, &self.k_point, &self.cell,
             &self.pw_coords,
             &vnl_data, &fft_idx_dev, min_veff, max_veff,
-            &kernels, &mut pcie, eig, None, ndeg, &blas, &solver, &stream, &ctx,
+            &kernels, &mut pcie, eig, ndeg, &blas, &solver, &stream, &ctx,
             filter_mode,
+            None,
         )?;
-
-        // Rayleigh-Ritz
         let pin_cfg = crate::eigensolver::rayleigh_ritz::RrPinConfig::from_env();
         let (psi_new_gpu, eigenvalues_cpu, beta_psi_gpu) = rayleigh_ritz(
             &psi_filtered_row, &hpsi_row, &vnl_data,
@@ -860,8 +859,9 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
             &self.wave_grid, &self.k_point, &self.cell,
             &self.pw_coords,
             &vnl_data, &fft_idx_dev, min_veff, max_veff,
-            &kernels, &mut pcie, eig, None, ndeg, &blas, &solver, &stream, &ctx,
+            &kernels, &mut pcie, eig, ndeg, &blas, &solver, &stream, &ctx,
             FilterMode::SinvHKeepHEig,
+            None,
         )?;
 
         let (_, eigenvalues_cpu, _, h_sub_cpu, s_sub_cpu, x_cpu) = rayleigh_ritz_with_matrices(

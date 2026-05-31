@@ -65,13 +65,36 @@ fn shape3(arr: &Array3<f64>) -> Vec<usize> {
     vec![arr.shape()[0], arr.shape()[1], arr.shape()[2]]
 }
 
-fn flatten_f64(arr: &Array3<f64>) -> Vec<f64> {
-    arr.iter().copied().collect()
+pub(crate) fn flatten_f64(arr: &Array3<f64>) -> Vec<f64> {
+    // Flatten in Fortran order (x fastest) to match cuFFT 3-D layout.
+    // ndarray's default C-order iterator would put z-first on GPU,
+    // which disagrees with how cuFFT and CASTEP index the grid.
+    let (nx, ny, nz) = (arr.shape()[0], arr.shape()[1], arr.shape()[2]);
+    let mut out = Vec::with_capacity(nx * ny * nz);
+    for z in 0..nz {
+        for y in 0..ny {
+            for x in 0..nx {
+                out.push(arr[[x, y, z]]);
+            }
+        }
+    }
+    out
 }
 
-fn unflatten_f64(data: Vec<f64>, shape: &[usize]) -> Array3<f64> {
-    Array3::from_shape_vec(ndarray::Ix3(shape[0], shape[1], shape[2]), data)
-        .expect("DeviceMapped: valid 3-D shape")
+pub(crate) fn unflatten_f64(data: Vec<f64>, shape: &[usize]) -> Array3<f64> {
+    // Inverse of flatten_f64 — interprets flat data as Fortran order.
+    let (nx, ny, nz) = (shape[0], shape[1], shape[2]);
+    let mut arr = Array3::zeros((nx, ny, nz));
+    let mut idx = 0;
+    for z in 0..nz {
+        for y in 0..ny {
+            for x in 0..nx {
+                arr[[x, y, z]] = data[idx];
+                idx += 1;
+            }
+        }
+    }
+    arr
 }
 
 // ---------------------------------------------------------------------------

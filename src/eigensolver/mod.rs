@@ -6,3 +6,4 @@ pub(crate) mod d_screening;
 pub(crate) mod davidson;
 pub mod rayleigh_ritz;
 pub(crate) mod vnl_data;
+pub(crate) mod phase_a;

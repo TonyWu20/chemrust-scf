@@ -353,6 +353,9 @@ unsafe fn lanczos_upper_bound(
 /// Computed directly from the fractional G-vectors (from `pw_coords`) rather than
 /// from the full grid `g2()`, because the kernel `init_kinetic` indexes by
 /// plane-wave index (0..n_pw), not by grid position.
+///
+/// pw_coords are integer reciprocal-space grid coordinates (nx_coord, ny_coord,
+/// nz_coord), where G = nx_coord·b1 + ny_coord·b2 + nz_coord·b3.
 pub(crate) fn compute_kinetic_energies(
     pw_coords: &[[i32; 3]],
     recip_lattice: &chemrust_hamiltonian_core::RecipLattice,
@@ -538,6 +541,8 @@ pub(crate) unsafe fn transpose_row_to_col_on_gpu(
 ///
 /// `ndeg` is the Chebyshev polynomial degree.
 /// `eigenvalues` is `None` on the first SCF iteration, `Some(&[...])` thereafter.
+/// `external_kinetic` when `Some(&[...])` provides pre-computed kinetic energies
+/// from CASTEP (`pw_ek_data`), bypassing the internal `compute_kinetic_energies`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn chebyshev_filter(
     psi_gpu: &Gpu<WavefunctionSet<ColumnDistributed>>,
@@ -560,6 +565,7 @@ pub(crate) fn chebyshev_filter(
     stream: &Arc<CudaStream>,
     ctx: &Arc<CudaContext>,
     filter_mode: FilterMode,
+    external_kinetic: Option<&[f64]>,   // CASTEP-provided KE (bypasses pw_coords KE)
 ) -> ChebyshevResult {
     // ---- Dimensions ----
     let n_bands = psi_gpu.shape()[0];
@@ -575,10 +581,16 @@ pub(crate) fn chebyshev_filter(
     let grid_alloc = n_bands * grid_size;
 
     // ---- Precompute & upload kinetic energy (per-PW, not per-grid-point) ----
-    let kinetic_cpu = compute_kinetic_energies(pw_coords, wave_grid.recip_lattice());
+    // Use CASTEP-provided external KE when available (bypasses pw_coords-based
+    // computation which may not match CASTEP's pw_ek_data due to grid coordinate
+    // indexing conventions).
+    let kinetic_data: Vec<f64> = match external_kinetic {
+        Some(ke) => ke.to_vec(),
+        None => compute_kinetic_energies(pw_coords, wave_grid.recip_lattice()).0,
+    };
     let kinetic_dev: CudaSlice<f64> =
-        stream.clone_htod(&kinetic_cpu.0).map_err(Error::Cuda)?;
-    pcie.h2d_bytes += kinetic_cpu.0.len() * std::mem::size_of::<f64>();
+        stream.clone_htod(&kinetic_data).map_err(Error::Cuda)?;
+    pcie.h2d_bytes += kinetic_data.len() * std::mem::size_of::<f64>();
 
     // ---- FFT plan (batched C2C) ----
     // cuFFT uses row-major layout: n[0] is slowest-varying (outermost),
@@ -856,7 +868,7 @@ pub(crate) fn chebyshev_filter(
         // on iter-1 (eigenvalues=None). After §11a fix, eigenvalues is always
         // None in production (standard ChFSI path), so lam_source = h_eig always.
         let lam_source: &[f64] = eigenvalues.unwrap_or(&h_eig);
-        let mut lam_y: Vec<f64> = if eigenvalues.is_some() || matches!(filter_mode, FilterMode::SinvHFullDas) {
+        let mut lam_y: Vec<f64> = if eigenvalues.is_some() {
             lam_source.iter().map(|l| sigma1_over_e * (l - c)).collect()
         } else {
             let val = -sigma1 * c / e;
@@ -925,7 +937,7 @@ pub(crate) fn chebyshev_filter(
 
             // Λ_X_new on CPU (main.tex:604)
             // Modes A/B: use h_eig; Mode C: use generalized eigenvalues (lam_source)
-            let has_eig = eigenvalues.is_some() || matches!(filter_mode, FilterMode::SinvHFullDas);
+            let has_eig = eigenvalues.is_some();
             let new_lam_x: Vec<f64> = if has_eig {
                 lam_y.iter().zip(lam_source.iter()).zip(lam_x.iter())
                     .map(|((ly, l), lx)| coeff * ly * l + coeff_c * ly + sigma_sigma2 * lx)
@@ -1270,6 +1282,75 @@ pub fn apply_s_for_test(
         .collect())
 }
 
+/// S-norm Gram-Schmidt orthonormalization for USPP wavefunctions.
+///
+/// Orthonormalizes `psi` columns (col-major: flat[b*n_pw + g]) with respect
+/// to the S-inner product: `<x|y>_S = x^H · S · y`.  Two passes for stability.
+pub(crate) fn gram_schmidt_s(
+    psi: &mut CudaSlice<CudaComplex>,
+    vnl_data: &VnlBatchData,
+    n_pw: usize, n_bands: usize,
+    blas: &BlasHandle, stream: &Arc<CudaStream>, solver: &SolverHandle,
+) -> Result<(), Error> {
+    let n_pw_i32 = n_pw as i32;
+    let mut gs_col: CudaSlice<CudaComplex> = stream.alloc_zeros(n_pw)?;
+    let mut gs_s_col: CudaSlice<CudaComplex> = stream.alloc_zeros(n_pw)?;
+    unsafe {
+        let (psi_ptr, _) = psi.device_ptr_mut(stream);
+        let (gs_col_ptr, _) = gs_col.device_ptr_mut(stream);
+        for _pass in 0..2 {
+            for b in 0..n_bands {
+                let col_b = (psi_ptr as *mut CudaComplex).add(b * n_pw);
+                cudarc::cublas::sys::cublasZcopy_v2(
+                    blas.raw_handle(), n_pw_i32,
+                    col_b as *const _, 1, gs_col_ptr as *mut _, 1,
+                ).result().map_err(Error::Blas)?;
+                stream.memcpy_dtod(&gs_col, &mut gs_s_col)?;
+                apply_s_times(&gs_col, &mut gs_s_col, vnl_data, 1, n_pw_i32, blas, stream)?;
+                let (gs_s_col_ptr, _) = gs_s_col.device_ptr_mut(stream);
+                let mut norm_sq_s = CudaComplex { x: 0.0, y: 0.0 };
+                cudarc::cublas::sys::cublasZdotc_v2(
+                    blas.raw_handle(), n_pw_i32,
+                    col_b as *const _, 1, gs_s_col_ptr as *const _, 1,
+                    &mut norm_sq_s as *mut _ as *mut _,
+                ).result().map_err(Error::Blas)?;
+                if b == 0 && _pass == 0 {
+                    eprintln!(
+                        "[GramSchmidt] band-0 pass-0: norm²_S = {:.6e} (grid-sum convention; ≈1.0 for S-orthonormal input)",
+                        norm_sq_s.x
+                    );
+                }
+                for j in 0..b {
+                    let col_j = (psi_ptr as *mut CudaComplex).add(j * n_pw);
+                    let mut dot = CudaComplex { x: 0.0, y: 0.0 };
+                    cudarc::cublas::sys::cublasZdotc_v2(
+                        blas.raw_handle(), n_pw_i32,
+                        col_j as *const _, 1, gs_s_col_ptr as *const _, 1,
+                        &mut dot as *mut _ as *mut _,
+                    ).result().map_err(Error::Blas)?;
+                    let neg_dot = CudaComplex { x: -dot.x, y: -dot.y };
+                    cudarc::cublas::sys::cublasZaxpy_v2(
+                        blas.raw_handle(), n_pw_i32,
+                        &neg_dot as *const _ as *const _,
+                        col_j as *const _, 1, col_b as *mut _, 1,
+                    ).result().map_err(Error::Blas)?;
+                    norm_sq_s.x -= dot.x * dot.x + dot.y * dot.y;
+                }
+                let norm_s = norm_sq_s.x.sqrt();
+                if norm_s > 1e-30 {
+                    let inv_norm = CudaComplex { x: 1.0 / norm_s, y: 0.0 };
+                    cudarc::cublas::sys::cublasZscal_v2(
+                        blas.raw_handle(), n_pw_i32,
+                        &inv_norm as *const _ as *const _,
+                        col_b as *mut _, 1,
+                    ).result().map_err(Error::Blas)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Test-only wrapper for `chebyshev_filter` that handles GPU upload/download.
 ///
 /// Mirrors `apply_s_for_test`: uploads ψ and V_eff to GPU, runs the existing
@@ -1380,6 +1461,7 @@ pub fn chebyshev_filter_for_test(
         stream,
         ctx,
         filter_mode,
+        None,
     )?;
 
     // Download filtered ψ̂ from GPU (RowDistributed layout)
@@ -1478,6 +1560,7 @@ pub fn chebyshev_filter_for_test_gpu(
         stream,
         ctx,
         filter_mode,
+        None,
     )?;
 
     Ok((psi_filtered_row, hpsi_filtered_row, kernels))
@@ -1524,7 +1607,7 @@ pub fn chebyshev_filter_iteration_gpu(
         psi_gpu, v_eff_gpu, pots, wave_grid, &dummy_kpoint, cell,
         pw_coords, vnl_data, fft_idx_dev, min_veff, max_veff,
         kernels, &mut pcie, eigenvalues, ndeg,
-        blas, solver, stream, ctx, filter_mode,
+        blas, solver, stream, ctx, filter_mode, None,
     )
 }
 

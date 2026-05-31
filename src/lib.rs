@@ -5,6 +5,7 @@ pub mod mixing;
 pub mod density;
 pub mod device;
 pub(crate) mod eigensolver;
+pub mod ffi;
 
 // Re-export test-only helpers for integration tests
 #[doc(hidden)]

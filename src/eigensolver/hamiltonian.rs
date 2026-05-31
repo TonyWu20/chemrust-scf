@@ -89,6 +89,10 @@ pub(crate) unsafe fn apply_v_loc_hamiltonian(
     }
     .map_err(Error::Cuda)?;
 
+    // TEMPORARY: skip V_loc (FFT round-trip) to isolate kinetic+V_NL.
+    // If V(pot) in Diag-HOp is unchanged, V_loc was never contributing.
+    // If V(pot) changes (gets smaller/closer to 0), V_loc was contributing.
+
     // 2. Zero grid, then scatter psi to FFT grid positions
     unsafe {
         stream
@@ -145,7 +149,6 @@ pub(crate) unsafe fn apply_v_loc_hamiltonian(
             .launch(LaunchConfig::for_num_elems((n_bands * n_pw) as u32))
     }
     .map_err(Error::Cuda)?;
-
     Ok(())
 }
 
