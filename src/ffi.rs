@@ -440,7 +440,7 @@ unsafe fn step_inner(
     // Cold-start inner loop: repeat filter+RR with b_low from RR eigenvalues.
     // Zhou et al. Algorithm 5.1 — itmax=3-4 iterations of filter→RR→update_b_low
     // bootstraps spectral bounds without an initial diagonalization.
-    let n_inner: usize = 1;
+    let n_inner: usize = 3;
     let mut prev_rr_eig: Option<Vec<f64>> = None;
     let mut psi_col_holder: Option<CudaSlice<CudaComplex>> = None;
 
@@ -594,7 +594,7 @@ unsafe fn step_inner(
         // Use H·psi as the input vector instead of psi. One application of H
         // builds beta-character through V_NL = beta·D·beta^H, which introduces
         // atomic projector overlap that the S-operator requires.
-        let (warm_psi_ptr, warm_hpsi_ptr, warm_spsi_ptr) = if false { // warm start disabled
+        let (warm_psi_ptr, warm_hpsi_ptr, warm_spsi_ptr) = if i_iter > 0 { // warm start enabled for inner iterations > 0
             // Save H·psi → psi_curr (warm_psi = H·psi₀)
             stream.memcpy_dtod(&hpsi, &mut psi_curr).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
             // Compute H·(H·psi₀) → hpsi (overwrite; warm_hpsi)
@@ -1086,12 +1086,26 @@ unsafe fn step_inner(
         None, None,
     ).map_err(|e| { eprintln!("[chemrust] RR failed: {e}"); CHEM_EIG_CUDA_ERROR })?;
 
+    // Convergence check (Zhou Algorithm 5.1 step 12):
+    // if max|eps_i^(k) - eps_i^(k-1)| < tol, break early.
+    let conv_tol: f64 = 1e-5; // Hartree
+    let converged_this_iter = if let Some(ref prev) = prev_rr_eig {
+        let max_delta = eig_cpu.0.iter().zip(prev.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
+        eprintln!("[Diag-Conv] ik={} iter={} max|Delta_eps|={:.3e} tol={:.3e}",
+            ikpt, i_iter, max_delta, conv_tol);
+        max_delta < conv_tol
+    } else {
+        false
+    };
+
     // Save RR eigenvalues for next inner iteration (Algorithm 5.1 step 11)
     prev_rr_eig = Some(eig_cpu.0.clone());
 
     // Copy psi_col to psi_col_holder for the next inner iteration
     // (psi_col lives on GPU; we need a persistent copy)
-    if i_iter < n_inner - 1 {
+    if i_iter < n_inner - 1 && !converged_this_iter {
         if psi_col_holder.is_none() {
             psi_col_holder = Some(stream.alloc_zeros(n_elem).map_err(|_| CHEM_EIG_CUDA_ERROR)?);
         }
@@ -1099,8 +1113,9 @@ unsafe fn step_inner(
             .map_err(|_| CHEM_EIG_CUDA_ERROR)?;
     }
 
-    // Run diagnostics only on the final inner iteration
-    if i_iter == n_inner - 1 {
+    // Run diagnostics and write-back on final iteration OR early convergence
+    let is_final = i_iter == n_inner - 1 || converged_this_iter;
+    if is_final {
     // Diagnostic: verify RR output S-orthonormality
     // Compute S·psi_new on GPU and check psi_new^H·(S·psi_new) ≈ I
     {
@@ -1417,8 +1432,16 @@ unsafe fn step_inner(
         std::slice::from_raw_parts_mut(eigenvalues_ptr as *mut f64, n_bands).copy_from_slice(eig_cpu.0.as_slice());
     }
 
-    unsafe { *converged = 1 };
-    } // end of if i_iter == n_inner - 1 (writeback)
+    // Set converged flag: true if inner loop converged within tolerance
+    // or if n_inner=1 (single filter, no delta to check).
+    let actual_converged = if n_inner > 1 { converged_this_iter } else { true };
+    unsafe { *converged = actual_converged as c_int };
+    } // end of if is_final (writeback)
+
+    if converged_this_iter {
+        eprintln!("[Diag-Conv] ik={} breaking inner loop after iter={}", ikpt, i_iter);
+        break;
+    }
     } // end of inner loop (for i_iter in 0..n_inner)
     Ok(())
 }
