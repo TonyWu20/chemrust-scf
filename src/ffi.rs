@@ -969,6 +969,35 @@ unsafe fn step_inner(
                 ).result().map_err(|_| CHEM_EIG_CUDA_ERROR)?;
             }
         }
+
+        // Diagnostic: compute identity norm <psi|psi> AFTER S-normalization.
+        // For USPP, <psi|S|psi> = <psi|psi> + <psi|aug|psi>. Since we normalize
+        // <psi|S|psi> = 1, the identity norm <psi|psi> is < 1. If CASTEP's
+        // density builder expects <psi|psi> = 1 (identity normalization), the
+        // density will be too small — but we observe the opposite (2.7x too large).
+        // Tracking this helps isolate whether the density discrepancy comes from
+        // wavefunction normalization or augmentation density weights.
+        let mut id_norms = vec![0.0f64; n_bands];
+        unsafe {
+            let blas_raw = blas.raw_handle();
+            let psi_ptr = psi_curr.device_ptr(stream).0 as *const CudaComplex;
+            for b in 0..n_bands {
+                let mut idot = CudaComplex { x: 0.0, y: 0.0 };
+                cudarc::cublas::sys::cublasZdotc_v2(
+                    blas_raw, n_pw_i32,
+                    psi_ptr.add(b * n_pw) as *const _, 1,
+                    psi_ptr.add(b * n_pw) as *const _, 1,
+                    &mut idot as *mut _ as *mut _,
+                ).result().map_err(|_| CHEM_EIG_CUDA_ERROR)?;
+                id_norms[b] = idot.x.max(1e-30);
+            }
+        }
+        let id_min = id_norms.iter().cloned().fold(f64::INFINITY, f64::min);
+        let id_max = id_norms.iter().cloned().fold(0.0f64, f64::max);
+        let id_mean = id_norms.iter().sum::<f64>() / n_bands as f64;
+        let aug_fraction = 1.0 - id_mean; // fraction of norm in augmentation channel
+        eprintln!("[Diag-SNorm] ik={} <psi|psi> after S-norm: min={:.6e} max={:.6e} mean={:.6e} aug_frac={:.4}",
+            ikpt, id_min, id_max, id_mean, aug_fraction);
     }
 
     // Diagnostic: track beta_phi from post-filter psi_curr (before RR)
@@ -1260,6 +1289,12 @@ unsafe fn step_inner(
         let mean_n2 = norms2.iter().sum::<f64>() / n_bands as f64;
         eprintln!("[Diag-Norm] ik={} |psi_b(G)|^2 range=[{:.6}, {:.6}] mean={:.6} (expected ~1.0 per band)",
             ikpt, min_n2, max_n2, mean_n2);
+        let total_n2: f64 = norms2.iter().sum();
+        // Expected soft density sum: total_n2 × inv_ntotal × 1/inv_omega = total_n2 × 1.0
+        // (inv_omega = 1.0, inv_ntotal = 1/gs). This is the smooth PW density
+        // component before augmentation. Compare against CASTEP F8_RHO_SOFT_SUM.
+        eprintln!("[Diag-RhoSum] ik={} total |psi|^2 = {:.6e} n_bands={} (rho_soft_sum ~ {:.6e} x occupations)",
+            ikpt, total_n2, n_bands, total_n2);
         // Also print occupied band norms (first few)
         let n_show = n_bands.min(10);
         let detail: Vec<String> = norms2.iter().take(n_show).enumerate()
