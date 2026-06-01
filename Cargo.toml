@@ -26,4 +26,4 @@ faer = { version = "0.24", features = ["std"] }
 
 [lib]
 name = "chemrust_scf"
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]

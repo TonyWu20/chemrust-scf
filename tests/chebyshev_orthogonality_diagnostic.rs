@@ -630,7 +630,6 @@ fn diagnostic_2_residual_norms_after_chebyshev_filter() {
         max_veff,
         ndeg,
         Some(&eigenvalues),
-        Some(n_occ),
         chemrust_scf::FilterMode::SinvHKeepHEig,
         &blas,
         &solver,
@@ -1646,8 +1645,6 @@ fn diagnostic_3_outer_loop_convergence() {
             max_veff,
             ndeg,
             eigenvalues_for_filter.as_deref(), // Use previous iteration's eigenvalues
-            Some(n_occ),                       // Pass n_occ for correct b_low
-            Some(14.70),                       // ecut (400 eV in Ha) — ABINIT-style bounds
             FilterMode::SinvHKeepHEig,
             &blas,
             &solver,
