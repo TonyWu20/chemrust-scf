@@ -5,7 +5,7 @@ pub(crate) mod hamiltonian;
 pub(crate) mod kernels;
 pub(crate) mod preconditioner;
 pub(crate) mod d_screening;
-pub(crate) mod davidson;
+pub mod davidson;
 pub mod rayleigh_ritz;
 pub(crate) mod vnl_data;
 pub(crate) mod phase_a;

@@ -33,6 +33,8 @@ pub use eigensolver::preconditioner::TpaPreconditioner;
 pub use eigensolver::davidson_types::PwCoefficients;
 #[doc(hidden)]
 pub use eigensolver::davidson_types::PreconditionerVector;
+#[doc(hidden)]
+pub use eigensolver::davidson::{check_inner_convergence, BandConvStatus};
 /// Rayleigh-Ritz test wrapper (returns subspace matrices for diagnostics).
 /// Gated behind `scf_diag` (default feature) or `test` cfg.
 #[cfg(any(test, feature = "scf_diag"))]

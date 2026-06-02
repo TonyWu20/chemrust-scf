@@ -624,6 +624,103 @@ pub(crate) fn check_band_converged(prev: f64, new: f64, tol_abs: f64) -> bool {
 }
 
 // ======================================================================
+// Inner-loop convergence check (block-level Davidson)
+// ======================================================================
+
+/// Result of convergence check for one band in the inner Davidson loop.
+///
+/// Reference: hamiltonian.f90:1178-1228
+#[derive(Debug, Clone)]
+#[doc(hidden)]
+pub struct BandConvStatus {
+    /// Band converged by absolute tolerance.
+    pub converged: bool,
+    /// Band hit optional stop condition (stagnation or relative break).
+    pub opt_stopped: bool,
+}
+
+/// Check convergence after subspace rotation in the inner Davidson loop.
+///
+/// Implements CASTEP's inner-loop exit logic (hamiltonian.f90:1178-1228):
+///
+/// (a) **Absolute tolerance**: band converges when
+///     `|ΔE| < max(tol_abs, 2*|new_eig|*EPS)`.
+///     The EPS guard prevents false-negatives for large eigenvalues where
+///     machine precision exceeds a fixed tol_abs.
+///
+/// (b) **Relative break condition**:
+///     - First step: store `|ΔE|` as `break_cond_tol` (no convergence yet).
+///     - Subsequent steps: if `tol_rel > 0` and `|ΔE| < break_cond_tol * tol_rel`
+///       → band converged, opt_stopped.
+///     - Fallback (tol_rel ≤ 0): if `< break_cond_tol * 0.3` and not last outer
+///       iteration → opt_stopped only. The 0.3 factor is CASTEP's heuristic:
+///       improvement slowed to <30% of first-step improvement → stagnation.
+///
+/// (c) **Uphill detection**: if `prev - new < -100·max(EPS, EPS·|prev|)`,
+///     the eigenvalue increased (numerical noise). Overrides absolute tolerance
+///     — band is NOT marked converged.
+///
+/// # Arguments
+/// - `prev_eig`: eigenvalue before subspace rotation
+/// - `new_eig`: eigenvalue after subspace rotation
+/// - `tol_abs`: absolute convergence tolerance (Hartree)
+/// - `tol_rel`: relative convergence tolerance (ratio, dimensionless).
+///   Pass 0.0 to use the CASTEP 0.3 stagnation heuristic.
+/// - `break_cond_tol`: accumulator for first-step |ΔE|, used as reference
+///   for stagnation detection. Updated in-place on first step.
+/// - `is_first_step`: `true` for the first convergence check (sets baseline).
+/// - `outer_iter`: current outer Davidson iteration index (0-based).
+/// - `max_outer_iter`: maximum outer iterations.
+#[doc(hidden)]
+pub fn check_inner_convergence(
+    prev_eig: f64,
+    new_eig: f64,
+    tol_abs: f64,
+    tol_rel: f64,
+    break_cond_tol: &mut f64,
+    is_first_step: bool,
+    outer_iter: usize,
+    max_outer_iter: usize,
+) -> BandConvStatus {
+    let delta_e = (prev_eig - new_eig).abs();
+    let eps_guard = 2.0 * new_eig.abs() * f64::EPSILON;
+    let threshold = tol_abs.max(eps_guard);
+
+    let mut converged = false;
+    let mut opt_stopped = false;
+
+    // (a) Absolute tolerance check
+    if delta_e < threshold {
+        converged = true;
+    }
+
+    // (b) Relative break condition
+    if is_first_step {
+        *break_cond_tol = delta_e;
+    } else if delta_e < *break_cond_tol * 1e-15 {
+        // If delta_e is essentially zero relative to break_cond_tol,
+        // the band is numerically converged (or delta_e already below
+        // machine precision). Neither abs tol nor stagnation matters.
+    } else if tol_rel > 0.0 && delta_e < *break_cond_tol * tol_rel {
+        converged = true;
+        opt_stopped = true;
+    } else if tol_rel <= 0.0 && outer_iter + 1 < max_outer_iter {
+        if delta_e < *break_cond_tol * 0.3 {
+            opt_stopped = true;
+        }
+    }
+
+    // (c) Uphill detection — eigenvalue went UP → numerical noise
+    //     Override convergence: band is NOT marked converged.
+    let uphill_threshold = -100.0 * (f64::EPSILON).max(f64::EPSILON * prev_eig.abs());
+    if prev_eig - new_eig < uphill_threshold {
+        converged = false;
+    }
+
+    BandConvStatus { converged, opt_stopped }
+}
+
+// ======================================================================
 // Outer Davidson loop with subspace diagonalization (Phase 1B)
 // ======================================================================
 
@@ -707,6 +804,10 @@ pub(crate) unsafe fn davidson_diagonalise(
     let mut h_correct = false;
 
     let mut n_outer_completed: usize = 0;
+
+    // Per-band break_cond_tol accumulator for inner convergence check.
+    // Initialized to 0.0; first inner step sets it to |prev_eig - new_eig|.
+    let mut break_cond_tols = vec![0.0_f64; n_bands];
 
     // ------------------------------------------------------------------
     // Outer loop
@@ -1085,13 +1186,19 @@ pub(crate) unsafe fn davidson_diagonalise(
             }
         }
 
-        // Step f-g: convergence check
+        // Step f-g: convergence check using inner-loop convergence criteria
         for b in 0..n_bands {
-            if check_band_converged(prev_eigenvalues[b], eigenvalues[b], tol_abs) {
-                band_converged[b] = true;
-            } else {
-                band_converged[b] = false;
-            }
+            let result = check_inner_convergence(
+                prev_eigenvalues[b],
+                eigenvalues[b],
+                tol_abs,
+                0.0, // tol_rel not yet configurable at this level
+                &mut break_cond_tols[b],
+                iteration == 0,
+                iteration,
+                max_outer_iter,
+            );
+            band_converged[b] = result.converged;
         }
 
         // Step h: after rotation, H·ψ is stale
