@@ -760,6 +760,118 @@ pub unsafe fn apply_preconditioner(
 }
 
 // ---------------------------------------------------------------------------
+// Preconditioner preparation builder (USPP assembly pipeline)
+// ---------------------------------------------------------------------------
+
+/// Result of `prepare_preconditioner`.
+pub struct PreconditionerPrepResult {
+    /// TPA preconditioner vector R(G) on CPU.
+    pub r_vector: Vec<f64>,
+    /// Per-ion R_beta = (−Q⁻¹ − C)⁻¹ matrices.
+    pub r_beta_per_ion: Vec<Array2<Complex64>>,
+    /// Global Q_RCQ = −Q + C·Q − R_beta·(C·Q) matrix.
+    pub q_rcq: Array2<Complex64>,
+}
+
+/// Prepare the USPP preconditioner matrices.
+///
+/// This orchestrates the preconditioner setup for a Davidson outer iteration:
+/// 1. Compute R(G) TPA preconditioner vector from kinetic energies
+/// 2. Compute C = β^H·diag(R)·β per ion
+/// 3. Invert Q⁻¹ per ion (SPD Cholesky inverse)
+/// 4. Assemble R_beta = (−Q⁻¹ − C)⁻¹ per ion
+/// 5. Assemble Q_RCQ = −Q + C·Q − R_beta·(C·Q) global matrix
+///
+/// All computation happens on CPU. The caller is responsible for uploading
+/// results to GPU as needed.
+///
+/// Reference: CASTEP nlpot.f90:13525-14736 (nlpot_prepare_precon)
+#[bon::builder]
+pub fn prepare_preconditioner(
+    pw_ek: &[f64],
+    mean_ek: f64,
+    n_pw: usize,
+    beta_g_per_ion: &[Array2<Complex64>],
+    q_matrices: &[Vec<f64>],
+    ion_n_expanded: &[usize],
+    mixture_weights: &[f64],
+) -> Result<PreconditionerPrepResult, Error> {
+    // 1. Compute R(G) on CPU: R(G) = tpa(pw_ek / mean_ek)
+    let r_vector: Vec<f64> = pw_ek
+        .iter()
+        .take(n_pw)
+        .map(|&ek| tpa(ek / mean_ek))
+        .collect();
+
+    // 2-4. Per-ion: C matrix, Q⁻¹, R_beta
+    let n_ions = beta_g_per_ion.len();
+    let mut c_per_ion = Vec::with_capacity(n_ions);
+    let mut q_inv_per_ion = Vec::with_capacity(n_ions);
+    let mut r_beta_per_ion_vec = Vec::with_capacity(n_ions);
+    let mut ion_offsets = Vec::with_capacity(n_ions + 1);
+    let mut cum = 0usize;
+    ion_offsets.push(0);
+
+    for i in 0..n_ions {
+        let ne = ion_n_expanded[i];
+        cum += ne;
+        ion_offsets.push(cum);
+
+        // Convert Array2<Complex64> from (n_pw, ne) to flat (ne, n_pw) layout
+        // for compute_c_matrix
+        let beta_shape = beta_g_per_ion[i].shape();
+        assert_eq!(
+            beta_shape[0], n_pw,
+            "beta_g_per_ion[{i}] has {} rows, expected {n_pw}",
+            beta_shape[0]
+        );
+        assert_eq!(
+            beta_shape[1], ne,
+            "beta_g_per_ion[{i}] has {} cols, expected {ne}",
+            beta_shape[1]
+        );
+
+        let mut beta_flat: Vec<CudaComplex> = Vec::with_capacity(ne * n_pw);
+        for n in 0..ne {
+            for g in 0..n_pw {
+                let val = beta_g_per_ion[i][[g, n]];
+                beta_flat.push(CudaComplex {
+                    x: val.re,
+                    y: val.im,
+                });
+            }
+        }
+
+        // 2. C = β^H · diag(R) · β
+        let c = compute_c_matrix(&beta_flat, &r_vector, ne, n_pw);
+        c_per_ion.push(c);
+
+        // 3. Q⁻¹
+        let q_inv = invert_q_matrix(&q_matrices[i], ne);
+        q_inv_per_ion.push(q_inv);
+
+        // 4. R_beta = (−Q⁻¹ − C)⁻¹
+        let r_beta = assemble_r_beta(&q_inv_per_ion[i], &c_per_ion[i], ne, mixture_weights[i]);
+        r_beta_per_ion_vec.push(r_beta);
+    }
+
+    // 5. Q_RCQ = −Q + C·Q − R_beta·(C·Q)
+    let q_rcq = assemble_q_rcq(
+        q_matrices,
+        &c_per_ion,
+        &r_beta_per_ion_vec,
+        &ion_offsets,
+        mixture_weights,
+    );
+
+    Ok(PreconditionerPrepResult {
+        r_vector,
+        r_beta_per_ion: r_beta_per_ion_vec,
+        q_rcq,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
