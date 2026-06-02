@@ -41,7 +41,9 @@ use crate::device::CudaComplex;
 use crate::eigensolver::davidson_types::*;
 use ndarray::Array2;
 use num_complex::Complex64;
-use crate::eigensolver::hamiltonian::{apply_full_hamiltonian, apply_s_inverse, apply_s_times};
+use crate::eigensolver::hamiltonian::{apply_full_hamiltonian, apply_s_times};
+#[cfg(feature = "scf_diag")]
+use crate::eigensolver::hamiltonian::apply_s_inverse;
 use crate::eigensolver::kernels::CudaKernelSet;
 use crate::eigensolver::preconditioner::{apply_preconditioner, compute_r_vector, TpaPreconditioner};
 use crate::eigensolver::vnl_data::VnlBatchData;
@@ -969,7 +971,7 @@ pub(crate) unsafe fn davidson_diagonalise(
                 // D2H: copy into CPU super_hamiltonian
                 let h_init_cpu: Vec<CudaComplex> = stream.clone_dtoh(&h_init).map_err(Error::Cuda)?;
                 eprintln!("[davidson]     initial H_sub diag[0..3]: [{:.6}, {:.6}, {:.6}]",
-                    h_init_cpu[0 * k + 0].x, h_init_cpu[1 * k + 1].x, h_init_cpu[2 * k + 2].x);
+                    h_init_cpu[0].x, h_init_cpu[k + 1].x, h_init_cpu[2 * k + 2].x);
 
                 // CPU dot-product cross-check: download just first column (n_pw elems)
                 // of super_wvfn and h_super_wvfn, compute ⟨psi|H·psi⟩ manually
@@ -1222,11 +1224,118 @@ pub(crate) unsafe fn davidson_diagonalise(
         eprintln!("[davidson] after convergence check: {n_conv}/{n_bands} converged, eigenvalues: [{:.6}, ..., {:.6}]",
                   eigenvalues[0], eigenvalues[n_bands-1]);
 
-        // Step h: after rotation, H·ψ is stale
-        h_correct = false;
+        // Step h: after rotation, H·ψ has been back-copied from the rotated super-space,
+        // so H_correct = true
+        h_correct = true;
 
         n_outer_completed = iteration + 1;
     }
+
+    // ------------------------------------------------------------------
+    // Diagnostics: compute S⁻¹-weighted residual norms
+    // ------------------------------------------------------------------
+    let residual_norms_values: Vec<f64> = {
+        #[cfg(feature = "scf_diag")]
+        {
+            // Allocate temp buffer for residual = hpsi - λ·psi
+            let mut residual_dev = PwCoefficients::new(
+                stream.alloc_zeros(n_elem).map_err(Error::Cuda)?);
+            stream
+                .memcpy_dtod(&*hpsi_dev, &mut residual_dev.0)
+                .map_err(Error::Cuda)?;
+
+            let (psi_ptr, _) = psi_dev.device_ptr(stream);
+            let (residual_mut, _) = residual_dev.device_ptr_mut(stream);
+
+            for b in 0..n_bands {
+                let psi_b = (psi_ptr as *const CudaComplex).add(b * n_pw);
+                let r_b = (residual_mut as *mut CudaComplex).add(b * n_pw);
+                let neg_eig = CudaComplex { x: -eigenvalues[b], y: 0.0 };
+                cublasZaxpy_v2(
+                    handle,
+                    n_pw as i32,
+                    &neg_eig as *const _ as *const _,
+                    psi_b as *const _,
+                    1,
+                    r_b as *mut _,
+                    1,
+                )
+                .result()
+                .map_err(Error::Blas)?;
+            }
+
+            // S⁻¹ norm: sinv_r = S⁻¹ · residual
+            let mut sinv_r_dev = PwCoefficients::new(
+                stream.alloc_zeros(n_elem).map_err(Error::Cuda)?);
+            stream
+                .memcpy_dtod(&*residual_dev, &mut sinv_r_dev.0)
+                .map_err(Error::Cuda)?;
+            unsafe {
+                apply_s_inverse()
+                    .hpsi_dev(&mut sinv_r_dev)
+                    .vnl_data(vnl_data)
+                    .n_bands(n_bands as i32)
+                    .n_pw(n_pw as i32)
+                    .blas(blas)
+                    .stream(stream)
+                    .solver(solver)
+                    .call()?;
+            }
+
+            // ⟨r | S⁻¹·r⟩ → sqrt for each band
+            let (residual_ptr, _) = residual_dev.device_ptr(stream);
+            let (sinv_ptr, _) = sinv_r_dev.device_ptr(stream);
+            let mut norms = Vec::with_capacity(n_bands);
+            for b in 0..n_bands {
+                let r_b = (residual_ptr as *const CudaComplex).add(b * n_pw);
+                let sinv_b = (sinv_ptr as *const CudaComplex).add(b * n_pw);
+                let mut dot = CudaComplex { x: 0.0, y: 0.0 };
+                cublasZdotc_v2(
+                    handle,
+                    n_pw as i32,
+                    r_b as *const _,
+                    1,
+                    sinv_b as *const _,
+                    1,
+                    &mut dot as *mut _ as *mut _,
+                )
+                .result()
+                .map_err(Error::Blas)?;
+                norms.push(dot.x.sqrt());
+            }
+            norms
+        }
+        #[cfg(not(feature = "scf_diag"))]
+        {
+            vec![0.0_f64; n_bands]
+        }
+    };
+
+    // ------------------------------------------------------------------
+    // Diagnostics: populate DAVIDSON_LAST_DIAG
+    // ------------------------------------------------------------------
+    let n_locked_final = band_converged.iter().filter(|&&c| c).count();
+    let max_res = residual_norms_values.iter().cloned().fold(0.0_f64, f64::max);
+    *DAVIDSON_LAST_DIAG.lock().unwrap() = Some(DavidsonDiagnostic {
+        n_locked: n_locked_final,
+        n_unconverged: n_bands - n_locked_final,
+        locked_indices: band_converged
+            .iter()
+            .enumerate()
+            .filter(|&(_, &c)| c)
+            .map(|(i, _)| i)
+            .collect(),
+        unconv_indices: band_converged
+            .iter()
+            .enumerate()
+            .filter(|&(_, &c)| !c)
+            .map(|(i, _)| i)
+            .collect(),
+        residual_norms_sinv: ResidualSInvNorm::new(residual_norms_values.clone()),
+        max_residual_sinv: max_res,
+        lock_tol: tol_abs,
+        eigenvalue_deltas: vec![0.0_f64; n_bands],
+    });
 
     // ------------------------------------------------------------------
     // Result
@@ -1234,8 +1343,8 @@ pub(crate) unsafe fn davidson_diagonalise(
     Ok(DavidsonResult {
         psi_out: psi_dev.0,
         eigenvalues,
-        n_locked: band_converged.iter().filter(|&&c| c).count(),
-        residual_norms_sinv: ResidualSInvNorm::new(vec![0.0_f64; n_bands]),
+        n_locked: n_locked_final,
+        residual_norms_sinv: ResidualSInvNorm::new(residual_norms_values),
         n_outer_iterations: n_outer_completed,
     })
 }
@@ -1587,12 +1696,23 @@ pub(crate) unsafe fn s_orthogonalise(
     Ok(())
 }
 
-/// Modified Gram-Schmidt with L2 normalization for search directions.
+/// Modified Gram-Schmidt with S-norm normalization for search directions.
 ///
-/// For each column j:
-/// 1. Skip if L2 norm is below threshold (band already in superspace)
-/// 2. Orthogonalize against earlier columns i < j
-/// 3. L2 normalize
+/// Uses S-inner products throughout, matching CASTEP's
+/// `wave_Sorthonormalise_slice` (wave.f90:11573-11677).
+///
+/// Algorithm (S-norm MGS):
+///   1. Precompute S·search_j for current column j
+///   2. Compute S-norm: nrm = sqrt(⟨search_j | S | search_j⟩)
+///   3. Skip if below threshold (band already in superspace)
+///   4. Orthogonalize against earlier columns i < j using S-inner products:
+///      dot = ⟨search_i | S | search_j⟩ = zdotc(search_i, S·search_j)
+///      search_j -= dot · search_i
+///   5. Recompute S·search_j (search_j changed in step 4)
+///   6. S-norm normalize
+///
+/// NOTE: This uses O(2 · ncol) S-applications via apply_s_times. With
+/// ncol ≤ 4 in typical Davidson blocks the cost is acceptable.
 #[builder]
 #[allow(unsafe_op_in_unsafe_fn)]
 pub(crate) unsafe fn s_orthonormalise(
@@ -1600,41 +1720,96 @@ pub(crate) unsafe fn s_orthonormalise(
     ncol: usize,
     n_pw: usize,
     n_pw_i32: i32,
+    vnl_data: &VnlBatchData,
+    blas: &BlasHandle,
     stream: &Arc<CudaStream>,
     handle: cublasHandle_t,
+    s_orth_in: &mut PwCoefficients,
+    s_orth_out: &mut PwCoefficients,
 ) -> Result<(), Error> {
     let (search_mut, _) = search_dev.device_ptr_mut(stream);
 
     for j in 0..ncol {
         let search_j = (search_mut as *mut CudaComplex).add(j * n_pw);
 
-        // Skip zero residual (band already in superspace)
-        let mut nrm = CudaComplex { x: 0.0, y: 0.0 };
+        // ------------------------------------------------------------------
+        // Step 1: Precompute S·search_j -> s_orth_out
+        // ------------------------------------------------------------------
+        {
+            let (s_in_mut, _) = s_orth_in.device_ptr_mut(stream);
+            cublasZcopy_v2(
+                handle,
+                n_pw_i32,
+                search_j as *const _,
+                1,
+                s_in_mut as *mut _,
+                1,
+            )
+            .result()
+            .map_err(Error::Blas)?;
+
+            let (s_out_mut, _) = s_orth_out.device_ptr_mut(stream);
+            cublasZcopy_v2(
+                handle,
+                n_pw_i32,
+                search_j as *const _,
+                1,
+                s_out_mut as *mut _,
+                1,
+            )
+            .result()
+            .map_err(Error::Blas)?;
+
+            unsafe {
+                apply_s_times()
+                    .psi_dev(&*s_orth_in)
+                    .spsi_dev(&mut *s_orth_out)
+                    .vnl_data(vnl_data)
+                    .n_bands(1_i32)
+                    .n_pw(n_pw_i32)
+                    .blas(blas)
+                    .stream(stream)
+                    .call()?;
+            }
+        }
+
+        // ------------------------------------------------------------------
+        // Step 2: Compute S-norm: nrm = sqrt(⟨search_j | S | search_j⟩)
+        // ------------------------------------------------------------------
+        let (s_out_ptr, _) = s_orth_out.device_ptr(stream);
+        let mut nrm_sq = CudaComplex { x: 0.0, y: 0.0 };
         cublasZdotc_v2(
             handle,
             n_pw_i32,
             search_j as *const _,
             1,
-            search_j as *const _,
+            s_out_ptr as *const _,
             1,
-            &mut nrm as *mut _ as *mut _,
+            &mut nrm_sq as *mut _ as *mut _,
         )
         .result()
         .map_err(Error::Blas)?;
-        if nrm.x < 1e-30 {
+
+        // Step 3: Skip zero residual (band already in superspace)
+        if nrm_sq.x < 1e-30 {
             continue;
         }
 
-        // Orthogonalize against earlier search columns (MGS)
+        // ------------------------------------------------------------------
+        // Step 4: Orthogonalize against earlier search columns (S-norm MGS)
+        // ------------------------------------------------------------------
         for i in 0..j {
             let search_i = (search_mut as *const CudaComplex).add(i * n_pw);
+
+            // S-inner product: dot = ⟨search_i | S | search_j⟩
+            // Uses precomputed S·search_j in s_orth_out
             let mut dot = CudaComplex { x: 0.0, y: 0.0 };
             cublasZdotc_v2(
                 handle,
                 n_pw_i32,
                 search_i as *const _,
                 1,
-                search_j as *const _,
+                s_out_ptr as *const _,
                 1,
                 &mut dot as *mut _ as *mut _,
             )
@@ -1658,20 +1833,65 @@ pub(crate) unsafe fn s_orthonormalise(
             .map_err(Error::Blas)?;
         }
 
-        // Normalize
-        let mut nrm2 = CudaComplex { x: 0.0, y: 0.0 };
+        // ------------------------------------------------------------------
+        // Step 5: Recompute S·search_j (search_j changed in step 4)
+        // ------------------------------------------------------------------
+        {
+            let (s_in_mut, _) = s_orth_in.device_ptr_mut(stream);
+            cublasZcopy_v2(
+                handle,
+                n_pw_i32,
+                search_j as *const _,
+                1,
+                s_in_mut as *mut _,
+                1,
+            )
+            .result()
+            .map_err(Error::Blas)?;
+
+            let (s_out_mut, _) = s_orth_out.device_ptr_mut(stream);
+            cublasZcopy_v2(
+                handle,
+                n_pw_i32,
+                search_j as *const _,
+                1,
+                s_out_mut as *mut _,
+                1,
+            )
+            .result()
+            .map_err(Error::Blas)?;
+
+            unsafe {
+                apply_s_times()
+                    .psi_dev(&*s_orth_in)
+                    .spsi_dev(&mut *s_orth_out)
+                    .vnl_data(vnl_data)
+                    .n_bands(1_i32)
+                    .n_pw(n_pw_i32)
+                    .blas(blas)
+                    .stream(stream)
+                    .call()?;
+            }
+        }
+
+        // ------------------------------------------------------------------
+        // Step 6: S-norm normalize
+        // ------------------------------------------------------------------
+        let (s_out_ptr, _) = s_orth_out.device_ptr(stream);
+        let mut nrm2_sq = CudaComplex { x: 0.0, y: 0.0 };
         cublasZdotc_v2(
             handle,
             n_pw_i32,
             search_j as *const _,
             1,
-            search_j as *const _,
+            s_out_ptr as *const _,
             1,
-            &mut nrm2 as *mut _ as *mut _,
+            &mut nrm2_sq as *mut _ as *mut _,
         )
         .result()
         .map_err(Error::Blas)?;
-        let inv_norm = 1.0 / nrm2.x.sqrt();
+
+        let inv_norm = 1.0 / nrm2_sq.x.sqrt();
         let scale = CudaComplex {
             x: inv_norm,
             y: 0.0,
@@ -1822,15 +2042,19 @@ pub(crate) unsafe fn build_search_direction(
             .call()?;
     }
 
-    // (5) Orthonormalize search directions among themselves
+    // (5) Orthonormalize search directions among themselves (S-norm MGS)
     unsafe {
         s_orthonormalise()
             .search_dev(&mut *search_dev)
             .ncol(ncol)
             .n_pw(n_pw)
             .n_pw_i32(n_pw_i32)
+            .vnl_data(vnl_data)
+            .blas(blas)
             .stream(stream)
             .handle(handle)
+            .s_orth_in(&mut *s_orth_in)
+            .s_orth_out(&mut *s_orth_out)
             .call()?;
     }
 
