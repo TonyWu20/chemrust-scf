@@ -45,7 +45,7 @@ use crate::eigensolver::hamiltonian::{apply_full_hamiltonian, apply_s_times};
 #[cfg(feature = "scf_diag")]
 use crate::eigensolver::hamiltonian::apply_s_inverse;
 use crate::eigensolver::kernels::CudaKernelSet;
-use crate::eigensolver::preconditioner::{apply_preconditioner, compute_r_vector, TpaPreconditioner};
+use crate::eigensolver::preconditioner::{apply_preconditioner, compute_r_vector, prepare_preconditioner, TpaPreconditioner};
 use crate::eigensolver::vnl_data::VnlBatchData;
 use crate::types::Error;
 use bon::builder;
@@ -790,10 +790,6 @@ pub(crate) unsafe fn davidson_diagonalise(
     tpa_preconditioner: &TpaPreconditioner,
     stream: &Arc<CudaStream>,
     _ctx: &Arc<CudaContext>,
-    // Optional USPP preconditioner matrices (computed externally by caller).
-    // When provided, the USPP NL correction is added in apply_preconditioner.
-    r_beta_per_ion: Option<&[Array2<Complex64>]>,
-    q_rcq: Option<&Array2<Complex64>>,
 ) -> Result<DavidsonResult, Error> {
     let n_elem = n_bands * n_pw;
     let n_pw_i32 = n_pw as i32;
@@ -834,6 +830,55 @@ pub(crate) unsafe fn davidson_diagonalise(
     let mut break_cond_tols = vec![0.0_f64; n_bands];
 
     davidson_diag!("[davidson] start: n_bands={n_bands} n_pw={n_pw} tol_abs={tol_abs:.1e} max_outer={max_outer_iter}");
+
+    // ------------------------------------------------------------------
+    // Preconditioner preparation (once per SCF step)
+    // ------------------------------------------------------------------
+    // Download kinetic energies from GPU (constant across outer iterations)
+    let kinetic_host: Vec<f64> = stream.clone_dtoh(&**kinetic_dev).map_err(Error::Cuda)?;
+    let mean_ek = kinetic_host.iter().sum::<f64>() / kinetic_host.len() as f64;
+
+    // TPA preconditioner R(G) vector on GPU (reused across all blocks/iterations)
+    let r_vector = compute_r_vector(kinetic_dev, mean_ek, n_pw, stream)?;
+
+    // USPP preconditioner: download beta_g and q_matrix from GPU, assemble
+    // r_beta_per_ion and q_rcq on CPU. For NCPP-only systems this produces
+    // empty matrices and the NL correction is a cheap no-op.
+    let ion_n_expanded: Vec<usize> = vnl_data.entries.iter()
+        .map(|e| e.n_expanded as usize)
+        .collect();
+    let mixture_weights: Vec<f64> = vec![1.0; vnl_data.entries.len()];
+
+    let mut beta_g_per_ion: Vec<Array2<Complex64>> = Vec::with_capacity(vnl_data.entries.len());
+    let mut q_matrices: Vec<Vec<f64>> = Vec::with_capacity(vnl_data.entries.len());
+    for entry in &vnl_data.entries {
+        let ne = entry.n_expanded as usize;
+        if ne > 0 {
+            let beta_host: Vec<CudaComplex> = stream.clone_dtoh(&entry.beta_g)
+                .map_err(Error::Cuda)?;
+            beta_g_per_ion.push(
+                Array2::from_shape_vec((n_pw, ne),
+                    beta_host.iter().map(|c| Complex64::new(c.x, c.y)).collect()
+                ).expect("beta_g shape (n_pw, ne) mismatch")
+            );
+            let q_host: Vec<CudaComplex> = stream.clone_dtoh(&entry.q_matrix)
+                .map_err(Error::Cuda)?;
+            q_matrices.push(q_host.iter().map(|c| c.x).collect());
+        } else {
+            beta_g_per_ion.push(Array2::zeros((n_pw, 0)));
+            q_matrices.push(Vec::new());
+        }
+    }
+
+    let precon_prep = prepare_preconditioner()
+        .pw_ek(&kinetic_host)
+        .mean_ek(mean_ek)
+        .n_pw(n_pw)
+        .beta_g_per_ion(&beta_g_per_ion)
+        .q_matrices(&q_matrices)
+        .ion_n_expanded(&ion_n_expanded)
+        .mixture_weights(&mixture_weights)
+        .call()?;
 
     // ------------------------------------------------------------------
     // Outer loop
@@ -879,11 +924,6 @@ pub(crate) unsafe fn davidson_diagonalise(
         let prev_eigenvalues = eigenvalues.clone();
         davidson_diag!("[davidson] prev eigenvalues: [{:.6}, ..., {:.6}]",
                   prev_eigenvalues[0], prev_eigenvalues[n_bands-1]);
-
-        // Compute TPA preconditioner R(G) vector (used by all blocks in this iter)
-        let kinetic_host: Vec<f64> = stream.clone_dtoh(&**kinetic_dev).map_err(Error::Cuda)?;
-        let mean_ek = kinetic_host.iter().sum::<f64>() / kinetic_host.len() as f64;
-        let r_vector = compute_r_vector(kinetic_dev, mean_ek, n_pw, stream)?;
 
         // ------------------------------------------------------------------
         // Block loop with superspace management
@@ -1051,7 +1091,7 @@ pub(crate) unsafe fn davidson_diagonalise(
                 blas, stream, handle,
                 v_eff_dev, kinetic_dev, fft_idx_dev,
                 fft_plan, kernels,
-                r_beta_per_ion, q_rcq,
+                Some(&precon_prep.r_beta_per_ion), Some(&precon_prep.q_rcq),
             )?;
 
             for _inner_iter in 0..max_inner_iter {
