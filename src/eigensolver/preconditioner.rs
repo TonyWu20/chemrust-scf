@@ -16,10 +16,12 @@ use faer::Side;
 use ndarray::Array2;
 use num_complex::Complex64;
 
+use crate::device::blas::{op, BlasHandle, ZgemmConfig};
 use crate::device::CudaComplex;
 use crate::eigensolver::davidson_types::{
     KineticPreconditioner, PreconditionerVector, PwCoefficients,
 };
+use crate::eigensolver::vnl_data::VnlBatchData;
 use crate::types::Error;
 
 // ---------------------------------------------------------------------------
@@ -519,16 +521,24 @@ impl TpaPreconditioner {
 
 /// Apply the TPA preconditioner to the residual vector.
 ///
-/// This is the norm-conserving pseudopotential (NCPP) path:
+/// NCPP path (always applied):
 ///
 ///   `precon[G,b] = (hpsi[G,b] - e[b] * psi[G,b]) * R(G)`
 ///
 /// where `R(G) = tpa(pw_ek(G) / mean_ek)` is the TPA preconditioner vector
 /// (computed once per outer iteration by [`compute_r_vector`]).
 ///
-/// For USPP, the NL correction `precon += Σ β · weight · R(G)` should be
-/// added after the TPA step (see CASTEP `nlpot_apply_precon_ES_slice`).
-/// That path is planned as a follow-up.
+/// USPP NL correction (applied when all optional USPP parameters are provided):
+///
+///   For each ion i with ne projectors:
+///     1. βψ[n,b] = Σ_G conj(β_n(G)) · ψ(G,b)           (beta_phi for psi)
+///     2. βψ_precon[n,b] = Σ_G conj(β_n(G)) · precon(G,b) (beta_phi for precon)
+///     3. E_beta[b] = eigenvalue[b] · βψ[:,b]           (scale by eigenvalues)
+///     4. weight = Q_RCQ_block · E_beta + R_beta_block · βψ_precon
+///     5. temp[G,b] = Σ_n β_n(G) · weight[n,b]          (NL correction)
+///     6. precon[G,b] += temp[G,b] · R(G)               (TPA-scaled accumulation)
+///
+/// Reference: CASTEP `nlpot_apply_precon_ES_slice` (nlpot.f90:15879-16231).
 ///
 /// # Safety
 ///
@@ -538,6 +548,7 @@ impl TpaPreconditioner {
 ///   `r_vector` >= `n_pw`
 /// - No other kernel on the same stream may read/write these buffers
 ///   concurrently.
+/// - When USPP params are provided, `vnl_data` and `blas` must be valid.
 #[bon::builder]
 pub unsafe fn apply_preconditioner(
     psi: &PwCoefficients,
@@ -548,11 +559,17 @@ pub unsafe fn apply_preconditioner(
     n_bands: usize,
     n_pw: usize,
     stream: &Arc<CudaStream>,
+    // Optional USPP NL correction parameters
+    vnl_data: Option<&VnlBatchData>,
+    r_beta_per_ion: Option<&[Array2<Complex64>]>,
+    q_rcq: Option<&Array2<Complex64>>,
+    blas: Option<&BlasHandle>,
 ) -> Result<PwCoefficients, Error> {
     let total = n_pw * n_bands;
     let out_dev: CudaSlice<CudaComplex> = stream.alloc_zeros(total).map_err(Error::Cuda)?;
     let mut precon = PwCoefficients::new(out_dev);
 
+    // Step 1: NCPP TPA step — always applied
     unsafe {
         tpa_preconditioner.apply_residual(
             &mut precon,
@@ -565,6 +582,179 @@ pub unsafe fn apply_preconditioner(
             stream,
         )
     }?;
+
+    // Step 2: USPP NL correction (only if all USPP params are provided)
+    if let (Some(vnl_data), Some(r_beta_per_ion), Some(q_rcq), Some(blas)) =
+        (vnl_data, r_beta_per_ion, q_rcq, blas)
+    {
+        // Early return if no species have augmentation (all NCPP)
+        if vnl_data.entries.iter().all(|e| e.n_expanded == 0) {
+            return Ok(precon);
+        }
+
+        // Download eigenvalues to CPU (needed for weight scaling in step 4)
+        let eigenvalues_cpu: Vec<f64> = stream
+            .clone_dtoh(eigenvalues)
+            .map_err(Error::Cuda)?;
+
+        // Build ion_offsets from cumulative n_expanded sums
+        let mut ion_offsets = Vec::with_capacity(vnl_data.entries.len() + 1);
+        let mut cum = 0usize;
+        for entry in &vnl_data.entries {
+            ion_offsets.push(cum);
+            cum += entry.n_expanded as usize;
+        }
+        ion_offsets.push(cum);
+
+        // For each ion with projectors
+        for (i, entry) in vnl_data.entries.iter().enumerate() {
+            let ne = entry.n_expanded as usize;
+            if ne == 0 {
+                continue;
+            }
+
+            // ---------------------------------------------------------------
+            // Step 3a: beta_phi for psi — beta_g^H · psi (ne × n_bands)
+            // ---------------------------------------------------------------
+            let mut beta_phi_psi_dev: CudaSlice<CudaComplex> = stream
+                .alloc_zeros(ne * n_bands)
+                .map_err(Error::Cuda)?;
+            unsafe {
+                blas.gemm_c64(
+                    ZgemmConfig {
+                        transa: op::C,
+                        transb: op::N,
+                        m: ne as i32,
+                        n: n_bands as i32,
+                        k: n_pw as i32,
+                        alpha: CudaComplex { x: 1.0, y: 0.0 },
+                        lda: n_pw as i32,
+                        ldb: n_pw as i32,
+                        beta: CudaComplex { x: 0.0, y: 0.0 },
+                        ldc: ne as i32,
+                    },
+                    &entry.beta_g,
+                    psi,
+                    &mut beta_phi_psi_dev,
+                )?;
+            }
+
+            // D2H: copy beta_phi_psi to CPU for weight computation
+            let beta_phi_psi_cpu: Vec<CudaComplex> = stream
+                .clone_dtoh(&beta_phi_psi_dev)
+                .map_err(Error::Cuda)?;
+
+            // ---------------------------------------------------------------
+            // Step 3b: beta_phi for precon — beta_g^H · precon (ne × n_bands)
+            // ---------------------------------------------------------------
+            let mut beta_phi_precon_dev: CudaSlice<CudaComplex> = stream
+                .alloc_zeros(ne * n_bands)
+                .map_err(Error::Cuda)?;
+            unsafe {
+                blas.gemm_c64(
+                    ZgemmConfig {
+                        transa: op::C,
+                        transb: op::N,
+                        m: ne as i32,
+                        n: n_bands as i32,
+                        k: n_pw as i32,
+                        alpha: CudaComplex { x: 1.0, y: 0.0 },
+                        lda: n_pw as i32,
+                        ldb: n_pw as i32,
+                        beta: CudaComplex { x: 0.0, y: 0.0 },
+                        ldc: ne as i32,
+                    },
+                    &entry.beta_g,
+                    &precon,
+                    &mut beta_phi_precon_dev,
+                )?;
+            }
+
+            // D2H: copy beta_phi_precon to CPU
+            let beta_phi_precon_cpu: Vec<CudaComplex> = stream
+                .clone_dtoh(&beta_phi_precon_dev)
+                .map_err(Error::Cuda)?;
+
+            // ---------------------------------------------------------------
+            // Step 4: Weight computation on CPU
+            // ---------------------------------------------------------------
+            // Convert to Array2<Complex64> for ndarray arithmetic
+            let beta_phi_psi_arr = Array2::from_shape_vec((ne, n_bands),
+                beta_phi_psi_cpu.iter().map(|c| Complex64::new(c.x, c.y)).collect()
+            ).expect("beta_phi_psi shape (ne, n_bands) must match data");
+
+            let beta_phi_precon_arr = Array2::from_shape_vec((ne, n_bands),
+                beta_phi_precon_cpu.iter().map(|c| Complex64::new(c.x, c.y)).collect()
+            ).expect("beta_phi_precon shape (ne, n_bands) must match data");
+
+            // Scale beta_phi_psi by eigenvalues: each column b ← eigenvalues[b] · column_b
+            let mut scaled_beta_phi = beta_phi_psi_arr.clone();
+            for b in 0..n_bands {
+                let e = eigenvalues_cpu[b];
+                for n in 0..ne {
+                    scaled_beta_phi[[n, b]] *= e;
+                }
+            }
+
+            // Extract Q_RCQ diagonal block for this ion
+            let offset = ion_offsets[i];
+            let q_block = q_rcq
+                .slice(ndarray::s![offset..offset + ne, offset..offset + ne])
+                .to_owned();
+
+            // weight = Q_RCQ_block · (E · beta_phi_psi) + R_beta_block · beta_phi_precon
+            let weight = q_block.dot(&scaled_beta_phi)
+                + r_beta_per_ion[i].dot(&beta_phi_precon_arr);
+
+            // Upload weight to GPU (ne × n_bands)
+            let weight_flat: Vec<CudaComplex> = weight.iter()
+                .map(|c| CudaComplex { x: c.re, y: c.im })
+                .collect();
+            let weight_dev = stream
+                .clone_htod(&weight_flat)
+                .map_err(Error::Cuda)?;
+
+            // ---------------------------------------------------------------
+            // Step 5: Apply NL correction with TPA scaling
+            // ---------------------------------------------------------------
+            // temp = beta_g · weight  (n_pw × n_bands)
+            let mut temp_dev: CudaSlice<CudaComplex> = stream
+                .alloc_zeros(n_pw * n_bands)
+                .map_err(Error::Cuda)?;
+            unsafe {
+                blas.gemm_c64(
+                    ZgemmConfig {
+                        transa: op::N,
+                        transb: op::N,
+                        m: n_pw as i32,
+                        n: n_bands as i32,
+                        k: ne as i32,
+                        alpha: CudaComplex { x: 1.0, y: 0.0 },
+                        lda: n_pw as i32,
+                        ldb: ne as i32,
+                        beta: CudaComplex { x: 0.0, y: 0.0 },
+                        ldc: n_pw as i32,
+                    },
+                    &entry.beta_g,
+                    &weight_dev,
+                    &mut temp_dev,
+                )?;
+            }
+
+            // Apply TPA scaling: precon += temp · R(G)
+            let temp_pw = PwCoefficients::new(temp_dev);
+            unsafe {
+                tpa_preconditioner.apply_add(
+                    &mut precon,
+                    &temp_pw,
+                    r_vector,
+                    n_pw,
+                    n_bands,
+                    stream,
+                )?;
+            }
+        }
+    }
 
     Ok(precon)
 }

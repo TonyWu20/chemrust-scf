@@ -39,6 +39,8 @@ use crate::device::fft::BatchedFftPlan3d;
 use crate::device::solver::SolverHandle;
 use crate::device::CudaComplex;
 use crate::eigensolver::davidson_types::*;
+use ndarray::Array2;
+use num_complex::Complex64;
 use crate::eigensolver::hamiltonian::{apply_full_hamiltonian, apply_s_inverse, apply_s_times};
 use crate::eigensolver::kernels::CudaKernelSet;
 use crate::eigensolver::preconditioner::{apply_preconditioner, compute_r_vector, TpaPreconditioner};
@@ -773,6 +775,10 @@ pub(crate) unsafe fn davidson_diagonalise(
     tpa_preconditioner: &TpaPreconditioner,
     stream: &Arc<CudaStream>,
     _ctx: &Arc<CudaContext>,
+    // Optional USPP preconditioner matrices (computed externally by caller).
+    // When provided, the USPP NL correction is added in apply_preconditioner.
+    r_beta_per_ion: Option<&[Array2<Complex64>]>,
+    q_rcq: Option<&Array2<Complex64>>,
 ) -> Result<DavidsonResult, Error> {
     let n_elem = n_bands * n_pw;
     let n_pw_i32 = n_pw as i32;
@@ -1076,6 +1082,7 @@ pub(crate) unsafe fn davidson_diagonalise(
                         .map_err(Error::Cuda)?;
 
                     // Apply TPA preconditioner: search = (hpsi - lambda·psi) * R(G)
+                    // Include USPP NL correction when r_beta_per_ion and q_rcq are provided.
                     let precon_result = unsafe {
                         apply_preconditioner()
                             .psi(&block_psi_temp)
@@ -1086,6 +1093,10 @@ pub(crate) unsafe fn davidson_diagonalise(
                             .n_bands(ncol)
                             .n_pw(n_pw)
                             .stream(stream)
+                            .vnl_data(vnl_data)
+                            .blas(blas)
+                            .maybe_r_beta_per_ion(r_beta_per_ion)
+                            .maybe_q_rcq(q_rcq)
                             .call()?
                     };
 
