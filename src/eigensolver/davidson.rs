@@ -43,6 +43,7 @@ use crate::eigensolver::hamiltonian::{apply_full_hamiltonian, apply_s_inverse, a
 use crate::eigensolver::kernels::CudaKernelSet;
 use crate::eigensolver::vnl_data::VnlBatchData;
 use crate::types::Error;
+use bon::builder;
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -144,6 +145,7 @@ pub(crate) fn lock_tol_for_iter(scf_iter: usize, target_tol: f64) -> f64 {
 ///
 /// All device pointers must be valid and of sufficient size. `psi_init` must
 /// be S-orthonormal (column-major, n_bands × n_pw).
+#[builder]
 #[allow(clippy::too_many_arguments, unsafe_op_in_unsafe_fn)]
 pub(crate) unsafe fn davidson_v1(
     psi_init: &PwCoefficients,
@@ -192,23 +194,23 @@ pub(crate) unsafe fn davidson_v1(
     // Steps 1–2: Compute Hψ and Sψ
     // ------------------------------------------------------------------
     unsafe {
-        apply_full_hamiltonian(
-            &psi_dev,
-            v_eff_dev,
-            kinetic_dev,
-            fft_idx_dev,
-            n_pw,
-            n_bands,
-            grid_size,
-            inv_ntotal,
-            fft_plan,
-            &mut hpsi_dev,
-            &mut grid_dev,
-            vnl_data,
-            blas,
-            kernels,
-            stream,
-        )?;
+        apply_full_hamiltonian()
+            .psi_dev(&psi_dev)
+            .v_eff_dev(v_eff_dev)
+            .kinetic_dev(kinetic_dev)
+            .fft_idx_dev(fft_idx_dev)
+            .n_pw(n_pw)
+            .n_bands(n_bands)
+            .grid_size(grid_size)
+            .inv_ntotal(inv_ntotal)
+            .fft_plan(fft_plan)
+            .hpsi_dev(&mut hpsi_dev)
+            .grid_dev(&mut grid_dev)
+            .vnl_data(vnl_data)
+            .blas(blas)
+            .kernels(kernels)
+            .stream(stream)
+            .call()?;
     }
 
     // Sψ: pre-copy ψ → spsi (identity term), then accumulate β·Q·β^H
@@ -216,15 +218,15 @@ pub(crate) unsafe fn davidson_v1(
         .memcpy_dtod(&*psi_dev, &mut spsi_dev.0)
         .map_err(Error::Cuda)?;
     unsafe {
-        apply_s_times(
-            &psi_dev,
-            &mut spsi_dev,
-            vnl_data,
-            n_bands_i32,
-            n_pw_i32,
-            blas,
-            stream,
-        )?;
+        apply_s_times()
+            .psi_dev(&psi_dev)
+            .spsi_dev(&mut spsi_dev)
+            .vnl_data(vnl_data)
+            .n_bands(n_bands_i32)
+            .n_pw(n_pw_i32)
+            .blas(blas)
+            .stream(stream)
+            .call()?;
     }
 
     // ------------------------------------------------------------------
@@ -306,15 +308,15 @@ pub(crate) unsafe fn davidson_v1(
         .memcpy_dtod(&*residual_dev, &mut sinv_r_dev.0)
         .map_err(Error::Cuda)?;
     unsafe {
-        apply_s_inverse(
-            &mut sinv_r_dev,
-            vnl_data,
-            n_bands_i32,
-            n_pw_i32,
-            blas,
-            stream,
-            solver,
-        )?;
+        apply_s_inverse()
+            .hpsi_dev(&mut sinv_r_dev)
+            .vnl_data(vnl_data)
+            .n_bands(n_bands_i32)
+            .n_pw(n_pw_i32)
+            .blas(blas)
+            .stream(stream)
+            .solver(solver)
+            .call()?;
     }
 
     let mut residual_norms_sinv = vec![0.0_f64; n_bands];
@@ -426,20 +428,20 @@ pub(crate) unsafe fn davidson_v1(
     let mut info_dev: CudaSlice<i32> = stream.alloc_zeros(1).map_err(Error::Cuda)?;
     let mut eigenvalues_k = vec![0.0_f64; k];
 
-    solve_block_zhegvd(
-        &psi_unconv_dev,
-        &hpsi_unconv_dev,
-        vnl_data,
-        k,
-        n_pw,
-        blas,
-        solver,
-        stream,
-        &mut eigenvalues_k,
-        &mut eig_dev,
-        &mut info_dev,
-        &mut psi_unconv_new,
-    )?;
+    solve_block_zhegvd()
+        .psi_block(&psi_unconv_dev)
+        .hpsi_block(&hpsi_unconv_dev)
+        .vnl_data(vnl_data)
+        .k(k)
+        .n_pw(n_pw)
+        .blas(blas)
+        .solver(solver)
+        .stream(stream)
+        .eigenvalues_out(&mut eigenvalues_k)
+        .eig_dev(&mut eig_dev)
+        .info_dev(&mut info_dev)
+        .psi_rotated(&mut psi_unconv_new)
+        .call()?;
 
     // Update eigenvalues for unconverged bands
     for (pos, &b) in unconv_idx.iter().enumerate() {
@@ -485,15 +487,15 @@ pub(crate) unsafe fn davidson_v1(
                 .result()
                 .map_err(Error::Blas)?;
                 unsafe {
-                    apply_s_times(
-                        &s_psi_in,
-                        &mut s_psi_out,
-                        vnl_data,
-                        1_i32,
-                        n_pw_i32,
-                        blas,
-                        stream,
-                    )?;
+                    apply_s_times()
+                        .psi_dev(&s_psi_in)
+                        .spsi_dev(&mut s_psi_out)
+                        .vnl_data(vnl_data)
+                        .n_bands(1_i32)
+                        .n_pw(n_pw_i32)
+                        .blas(blas)
+                        .stream(stream)
+                        .call()?;
                 }
 
                 // dot = ⟨S·ψ_locked | ψ_unconv_col⟩
@@ -602,6 +604,7 @@ pub(crate) unsafe fn davidson_v1(
 /// `psi_block` — n_pw × k block of wavefunction columns
 /// `hpsi_block` — n_pw × k block of H·ψ columns
 /// On return, `psi_rotated` holds the rotated eigenbasis.
+#[builder]
 #[allow(clippy::too_many_arguments)]
 unsafe fn solve_block_zhegvd(
     psi_block: &PwCoefficients,

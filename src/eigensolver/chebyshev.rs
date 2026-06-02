@@ -262,16 +262,34 @@ unsafe fn lanczos_upper_bound(
     for j in 0..k_steps {
         // Hv = H · v_cur
         unsafe {
-            apply_full_hamiltonian(
-                &v_cur, v_eff_dev, kinetic_dev, fft_idx_dev,
-                n_pw, 1, grid_size, inv_ntotal,
-                &plan1, &mut hv, &mut grid1, vnl_data, blas, kernels, stream,
-            )?;
+            apply_full_hamiltonian()
+                .psi_dev(&v_cur)
+                .v_eff_dev(v_eff_dev)
+                .kinetic_dev(kinetic_dev)
+                .fft_idx_dev(fft_idx_dev)
+                .n_pw(n_pw)
+                .n_bands(1)
+                .grid_size(grid_size)
+                .inv_ntotal(inv_ntotal)
+                .fft_plan(&plan1)
+                .hpsi_dev(&mut hv)
+                .grid_dev(&mut grid1)
+                .vnl_data(vnl_data)
+                .blas(blas)
+                .kernels(kernels)
+                .stream(stream)
+                .call()?;
             // Apply S⁻¹·H (global Woodbury) — wires S⁻¹ into the Lanczos
             // estimator so b_up reflects the preconditioned spectrum.
-            apply_s_inverse(
-                &mut hv, vnl_data, 1, n_pw as i32, blas, stream, solver,
-            )?;
+            apply_s_inverse()
+                .hpsi_dev(&mut hv)
+                .vnl_data(vnl_data)
+                .n_bands(1)
+                .n_pw(n_pw as i32)
+                .blas(blas)
+                .stream(stream)
+                .solver(solver)
+                .call()?;
         }
 
         // alpha[j] = <v_cur, H·v_cur>  (standard L2 dot product)
@@ -756,11 +774,23 @@ pub(crate) fn chebyshev_filter(
         // ------------------------------------------------------------
         // hpsi_dev = H·psi_input
         unsafe {
-            apply_full_hamiltonian(
-                &psi_input, v_eff_dev, &kinetic_dev, fft_idx_dev,
-                n_pw, n_bands, grid_size, inv_ntotal,
-                &fft_plan, &mut hpsi_dev, &mut grid_dev, vnl_data, blas, kernels, stream,
-            )?;
+            apply_full_hamiltonian()
+                .psi_dev(&psi_input)
+                .v_eff_dev(v_eff_dev)
+                .kinetic_dev(&kinetic_dev)
+                .fft_idx_dev(fft_idx_dev)
+                .n_pw(n_pw)
+                .n_bands(n_bands)
+                .grid_size(grid_size)
+                .inv_ntotal(inv_ntotal)
+                .fft_plan(&fft_plan)
+                .hpsi_dev(&mut hpsi_dev)
+                .grid_dev(&mut grid_dev)
+                .vnl_data(vnl_data)
+                .blas(blas)
+                .kernels(kernels)
+                .stream(stream)
+                .call()?;
         }
 
         // buf_y = hpsi_dev (copy, keeping hpsi_dev intact for diagnostics)
@@ -769,7 +799,15 @@ pub(crate) fn chebyshev_filter(
         if let Some(eig) = eigenvalues {
             // buf_sx = S·psi_input
             stream.memcpy_dtod(&*psi_input, &mut buf_sx.0).map_err(Error::Cuda)?;            unsafe {
-                apply_s_times(&psi_input, &mut buf_sx, vnl_data, n_bands_i32, n_pw_i32, blas, stream)?;
+                apply_s_times()
+                    .psi_dev(&psi_input)
+                    .spsi_dev(&mut buf_sx)
+                    .vnl_data(vnl_data)
+                    .n_bands(n_bands_i32)
+                    .n_pw(n_pw_i32)
+                    .blas(blas)
+                    .stream(stream)
+                    .call()?;
             }
             // Upload eigenvalues to GPU
             let lam_dev = upload_f64_slice(eig, stream)?;
@@ -888,15 +926,33 @@ pub(crate) fn chebyshev_filter(
 
             // H·R_Y then optionally S⁻¹·H·R_Y depending on filter mode
             unsafe {
-                apply_full_hamiltonian(
-                    &buf_ry, v_eff_dev, &kinetic_dev, fft_idx_dev,
-                    n_pw, n_bands, grid_size, inv_ntotal,
-                    &fft_plan, &mut hpsi_dev, &mut grid_dev, vnl_data, blas, kernels, stream,
-                )?;
+                apply_full_hamiltonian()
+                    .psi_dev(&buf_ry)
+                    .v_eff_dev(v_eff_dev)
+                    .kinetic_dev(&kinetic_dev)
+                    .fft_idx_dev(fft_idx_dev)
+                    .n_pw(n_pw)
+                    .n_bands(n_bands)
+                    .grid_size(grid_size)
+                    .inv_ntotal(inv_ntotal)
+                    .fft_plan(&fft_plan)
+                    .hpsi_dev(&mut hpsi_dev)
+                    .grid_dev(&mut grid_dev)
+                    .vnl_data(vnl_data)
+                    .blas(blas)
+                    .kernels(kernels)
+                    .stream(stream)
+                    .call()?;
                 if matches!(filter_mode, FilterMode::SinvHKeepHEig | FilterMode::SinvHFullDas) {
-                    apply_s_inverse(
-                        &mut hpsi_dev, vnl_data, n_bands_i32, n_pw_i32, blas, stream, solver,
-                    )?;
+                    apply_s_inverse()
+                        .hpsi_dev(&mut hpsi_dev)
+                        .vnl_data(vnl_data)
+                        .n_bands(n_bands_i32)
+                        .n_pw(n_pw_i32)
+                        .blas(blas)
+                        .stream(stream)
+                        .solver(solver)
+                        .call()?;
                 }
             }
 
@@ -975,7 +1031,15 @@ pub(crate) fn chebyshev_filter(
         stream.memcpy_dtod(&*buf_ry, &mut buf_a.0).map_err(Error::Cuda)?;
         if matches!(filter_mode, FilterMode::SinvHFullDas) {
             unsafe {
-                apply_s_inverse(&mut buf_a, vnl_data, n_bands_i32, n_pw_i32, blas, stream, solver)?;
+                apply_s_inverse()
+                    .hpsi_dev(&mut buf_a)
+                    .vnl_data(vnl_data)
+                    .n_bands(n_bands_i32)
+                    .n_pw(n_pw_i32)
+                    .blas(blas)
+                    .stream(stream)
+                    .solver(solver)
+                    .call()?;
             }
         }
         launch_band_scale_axpy(
@@ -1014,7 +1078,15 @@ pub(crate) fn chebyshev_filter(
                 ).result().map_err(Error::Blas)?;
                 // gs_s_col = S · gs_col
                 stream.memcpy_dtod(&*gs_col, &mut gs_s_col.0).map_err(Error::Cuda)?;
-                apply_s_times(&gs_col, &mut gs_s_col, vnl_data, 1, n_pw_i32, blas, stream)?;
+                apply_s_times()
+                    .psi_dev(&gs_col)
+                    .spsi_dev(&mut gs_s_col)
+                    .vnl_data(vnl_data)
+                    .n_bands(1)
+                    .n_pw(n_pw_i32)
+                    .blas(blas)
+                    .stream(stream)
+                    .call()?;
                 // Get device pointer from gs_s_col after mutable ops complete
                 let (gs_s_col_ptr, _) = gs_s_col.0.device_ptr_mut(stream);
                 // ‖col_b‖²_S = ⟨col_b, S·col_b⟩  (real part; S is Hermitian)
@@ -1081,11 +1153,23 @@ pub(crate) fn chebyshev_filter(
 
     // Compute final H|psi> for Rayleigh-Ritz
     unsafe {
-        apply_full_hamiltonian(
-            final_psi_buf, v_eff_dev, &kinetic_dev, fft_idx_dev,
-            n_pw, n_bands, grid_size, inv_ntotal,
-            &fft_plan, &mut hpsi_dev, &mut grid_dev, vnl_data, blas, kernels, stream,
-        )?;
+        apply_full_hamiltonian()
+            .psi_dev(final_psi_buf)
+            .v_eff_dev(v_eff_dev)
+            .kinetic_dev(&kinetic_dev)
+            .fft_idx_dev(fft_idx_dev)
+            .n_pw(n_pw)
+            .n_bands(n_bands)
+            .grid_size(grid_size)
+            .inv_ntotal(inv_ntotal)
+            .fft_plan(&fft_plan)
+            .hpsi_dev(&mut hpsi_dev)
+            .grid_dev(&mut grid_dev)
+            .vnl_data(vnl_data)
+            .blas(blas)
+            .kernels(kernels)
+            .stream(stream)
+            .call()?;
     }
 
     // Pass psi/hpsi as RowDistributed.
@@ -1188,27 +1272,50 @@ pub fn apply_h_components_for_test(
     let mut hpsi_tv = PwCoefficients::new(stream.alloc_zeros(n_elem).map_err(Error::Cuda)?);
     let psi_pw = PwCoefficients::new(psi_input.clone());
     unsafe {
-        apply_v_loc_hamiltonian(
-            &psi_pw, &mut hpsi_tv, &mut grid_dev,
-            &kinetic_dev, fft_idx_dev, v_eff_dev,
-            n_pw_i32, n_bands_i32, grid_size as i32, inv_ntotal,
-            &fft_plan, kernels, stream,
-        )?;
+        apply_v_loc_hamiltonian()
+            .psi_dev(&psi_pw)
+            .hpsi_dev(&mut hpsi_tv)
+            .grid_dev(&mut grid_dev)
+            .kinetic_dev(&kinetic_dev)
+            .fft_idx_dev(fft_idx_dev)
+            .v_eff_dev(v_eff_dev)
+            .n_pw(n_pw_i32)
+            .n_bands(n_bands_i32)
+            .grid_size(grid_size as i32)
+            .inv_ntotal(inv_ntotal)
+            .fft_plan(&fft_plan)
+            .kernels(kernels)
+            .stream(stream)
+            .call()?;
     }
 
     // Component 3: kinetic + V_loc + V_NL (full apply_full_hamiltonian).
     let mut hpsi_full = PwCoefficients::new(stream.alloc_zeros(n_elem).map_err(Error::Cuda)?);
     unsafe {
-        apply_v_loc_hamiltonian(
-            &psi_pw, &mut hpsi_full, &mut grid_dev,
-            &kinetic_dev, fft_idx_dev, v_eff_dev,
-            n_pw_i32, n_bands_i32, grid_size as i32, inv_ntotal,
-            &fft_plan, kernels, stream,
-        )?;
-        apply_v_nl_hamiltonian(
-            &psi_pw, &mut hpsi_full, vnl_data,
-            n_bands_i32, n_pw_i32, blas, stream,
-        )?;
+        apply_v_loc_hamiltonian()
+            .psi_dev(&psi_pw)
+            .hpsi_dev(&mut hpsi_full)
+            .grid_dev(&mut grid_dev)
+            .kinetic_dev(&kinetic_dev)
+            .fft_idx_dev(fft_idx_dev)
+            .v_eff_dev(v_eff_dev)
+            .n_pw(n_pw_i32)
+            .n_bands(n_bands_i32)
+            .grid_size(grid_size as i32)
+            .inv_ntotal(inv_ntotal)
+            .fft_plan(&fft_plan)
+            .kernels(kernels)
+            .stream(stream)
+            .call()?;
+        apply_v_nl_hamiltonian()
+            .psi_dev(&psi_pw)
+            .hpsi_dev(&mut hpsi_full)
+            .vnl_data(vnl_data)
+            .n_bands(n_bands_i32)
+            .n_pw(n_pw_i32)
+            .blas(blas)
+            .stream(stream)
+            .call()?;
     }
 
     stream.synchronize()?;
@@ -1268,15 +1375,15 @@ pub fn apply_s_for_test(
     let psi_pw = PwCoefficients(psi_dev);
     let mut spsi_pw = PwCoefficients(spsi_dev);
     unsafe {
-        apply_s_times(
-            &psi_pw,
-            &mut spsi_pw,
-            vnl_data,
-            n_bands as i32,
-            n_pw as i32,
-            blas,
-            stream,
-        )?;
+        apply_s_times()
+            .psi_dev(&psi_pw)
+            .spsi_dev(&mut spsi_pw)
+            .vnl_data(vnl_data)
+            .n_bands(n_bands as i32)
+            .n_pw(n_pw as i32)
+            .blas(blas)
+            .stream(stream)
+            .call()?;
     }
     stream.synchronize()?;
     let spsi_raw = stream.clone_dtoh(&*spsi_pw).map_err(Error::Cuda)?;
@@ -1310,7 +1417,15 @@ pub(crate) fn gram_schmidt_s(
                     col_b as *const _, 1, gs_col_ptr as *mut _, 1,
                 ).result().map_err(Error::Blas)?;
                 stream.memcpy_dtod(&*gs_col, &mut gs_s_col.0)?;
-                apply_s_times(&gs_col, &mut gs_s_col, vnl_data, 1, n_pw_i32, blas, stream)?;
+                apply_s_times()
+                    .psi_dev(&gs_col)
+                    .spsi_dev(&mut gs_s_col)
+                    .vnl_data(vnl_data)
+                    .n_bands(1)
+                    .n_pw(n_pw_i32)
+                    .blas(blas)
+                    .stream(stream)
+                    .call()?;
                 let (gs_s_col_ptr, _) = gs_s_col.0.device_ptr_mut(stream);
                 let mut norm_sq_s = CudaComplex { x: 0.0, y: 0.0 };
                 cudarc::cublas::sys::cublasZdotc_v2(
@@ -1693,15 +1808,15 @@ pub fn compute_residual_norms_for_test(
         .memcpy_dtod(&*psi_new_pw, &mut spsi_new_pw.0)
         .map_err(Error::Cuda)?;
     unsafe {
-        apply_s_times(
-            &psi_new_pw,
-            &mut spsi_new_pw,
-            vnl_data,
-            n,
-            k,
-            blas,
-            stream,
-        )?;
+        apply_s_times()
+            .psi_dev(&psi_new_pw)
+            .spsi_dev(&mut spsi_new_pw)
+            .vnl_data(vnl_data)
+            .n_bands(n)
+            .n_pw(k)
+            .blas(blas)
+            .stream(stream)
+            .call()?;
     }
 
     // === 5. Per-band residual: r_b = hpsi_new_b − λ_b · spsi_new_b ===
@@ -1763,15 +1878,15 @@ pub fn compute_residual_norms_for_test(
         .memcpy_dtod(&residual_dev, &mut sinv_r_pw.0)
         .map_err(Error::Cuda)?;
     unsafe {
-        apply_s_inverse(
-            &mut sinv_r_pw,
-            vnl_data,
-            n,
-            k,
-            blas,
-            stream,
-            solver,
-        )?;
+        apply_s_inverse()
+            .hpsi_dev(&mut sinv_r_pw)
+            .vnl_data(vnl_data)
+            .n_bands(n)
+            .n_pw(k)
+            .blas(blas)
+            .stream(stream)
+            .solver(solver)
+            .call()?;
     }
 
     // === 8. S⁻¹-weighted norms: ||r_b||_{S⁻¹} = sqrt(Re⟨r_b | S⁻¹·r_b⟩) ===

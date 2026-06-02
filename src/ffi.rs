@@ -456,16 +456,36 @@ unsafe fn step_inner(
         // Compute H*psi and S*psi for current psi_input
         let psi_pw = PwCoefficients::new(psi_input_slice.clone());
         unsafe {
-            crate::eigensolver::hamiltonian::apply_full_hamiltonian(
-                &psi_pw, v_eff_gpu.as_device_slice(), &kinetic_dev, &fft_idx_dev,
-                n_pw, n_bands, gs, inv_ntotal, &fft_plan, &mut hpsi, &mut grid_buf,
-                &kd.vnl, blas, kernels, stream,
-            ).map_err(|e| { eprintln!("[chemrust] H*psi iter={i_iter} failed: {e}"); CHEM_EIG_CUDA_ERROR })?;
+            crate::eigensolver::hamiltonian::apply_full_hamiltonian()
+                .psi_dev(&psi_pw)
+                .v_eff_dev(v_eff_gpu.as_device_slice())
+                .kinetic_dev(&kinetic_dev)
+                .fft_idx_dev(&fft_idx_dev)
+                .n_pw(n_pw)
+                .n_bands(n_bands)
+                .grid_size(gs)
+                .inv_ntotal(inv_ntotal)
+                .fft_plan(&fft_plan)
+                .hpsi_dev(&mut hpsi)
+                .grid_dev(&mut grid_buf)
+                .vnl_data(&kd.vnl)
+                .blas(blas)
+                .kernels(kernels)
+                .stream(stream)
+                .call()
+                .map_err(|e| { eprintln!("[chemrust] H*psi iter={i_iter} failed: {e}"); CHEM_EIG_CUDA_ERROR })?;
             // S·psi: identity + augmentation
             stream.memcpy_dtod(&*psi_pw, &mut spsi.0).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
-            crate::eigensolver::hamiltonian::apply_s_times(
-                &psi_pw, &mut spsi, &kd.vnl, n_bands_i32, n_pw_i32, blas, stream,
-            ).map_err(|e| { eprintln!("[chemrust] S*psi iter={i_iter} failed: {e}"); CHEM_EIG_CUDA_ERROR })?;
+            crate::eigensolver::hamiltonian::apply_s_times()
+                .psi_dev(&psi_pw)
+                .spsi_dev(&mut spsi)
+                .vnl_data(&kd.vnl)
+                .n_bands(n_bands_i32)
+                .n_pw(n_pw_i32)
+                .blas(blas)
+                .stream(stream)
+                .call()
+                .map_err(|e| { eprintln!("[chemrust] S*psi iter={i_iter} failed: {e}"); CHEM_EIG_CUDA_ERROR })?;
             // ABINIT: also save S·psi₀ for the Chebyshev recurrence of gsc
             stream.memcpy_dtod(&*spsi, &mut spsi_prev.0).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
         }
@@ -602,18 +622,38 @@ unsafe fn step_inner(
             let psi_curr_pw = PwCoefficients::new(psi_curr.clone());
             // Compute H·(H·psi₀) → hpsi (overwrite; warm_hpsi)
             unsafe {
-                crate::eigensolver::hamiltonian::apply_full_hamiltonian(
-                    &psi_curr_pw, v_eff_gpu.as_device_slice(), &kinetic_dev, &fft_idx_dev,
-                    n_pw, n_bands, gs, inv_ntotal, &fft_plan, &mut hpsi, &mut grid_buf,
-                    &kd.vnl, blas, kernels, stream,
-                ).map_err(|e| { eprintln!("[chemrust] warm H²*psi failed: {e}"); CHEM_EIG_CUDA_ERROR })?;
+                crate::eigensolver::hamiltonian::apply_full_hamiltonian()
+                    .psi_dev(&psi_curr_pw)
+                    .v_eff_dev(v_eff_gpu.as_device_slice())
+                    .kinetic_dev(&kinetic_dev)
+                    .fft_idx_dev(&fft_idx_dev)
+                    .n_pw(n_pw)
+                    .n_bands(n_bands)
+                    .grid_size(gs)
+                    .inv_ntotal(inv_ntotal)
+                    .fft_plan(&fft_plan)
+                    .hpsi_dev(&mut hpsi)
+                    .grid_dev(&mut grid_buf)
+                    .vnl_data(&kd.vnl)
+                    .blas(blas)
+                    .kernels(kernels)
+                    .stream(stream)
+                    .call()
+                    .map_err(|e| { eprintln!("[chemrust] warm H\u{00b2}*psi failed: {e}"); CHEM_EIG_CUDA_ERROR })?;
             }
             // Compute S·warm_psi → spsi (overwrite) and spsi_prev
             stream.memcpy_dtod(&psi_curr, &mut spsi.0).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
             unsafe {
-                crate::eigensolver::hamiltonian::apply_s_times(
-                    &psi_curr_pw, &mut spsi, &kd.vnl, n_bands_i32, n_pw_i32, blas, stream,
-                ).map_err(|e| { eprintln!("[chemrust] warm S*Hpsi failed: {e}"); CHEM_EIG_CUDA_ERROR })?;
+                crate::eigensolver::hamiltonian::apply_s_times()
+                    .psi_dev(&psi_curr_pw)
+                    .spsi_dev(&mut spsi)
+                    .vnl_data(&kd.vnl)
+                    .n_bands(n_bands_i32)
+                    .n_pw(n_pw_i32)
+                    .blas(blas)
+                    .stream(stream)
+                    .call()
+                    .map_err(|e| { eprintln!("[chemrust] warm S*Hpsi failed: {e}"); CHEM_EIG_CUDA_ERROR })?;
             }
             stream.memcpy_dtod(&*spsi, &mut spsi_prev.0).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
             // Return GPU pointers for RQ computation and recurrence
@@ -762,9 +802,15 @@ unsafe fn step_inner(
     unsafe {
         // k=1: psi_1 = (1/r)*(S^-1*H - c)*psi_0
         stream.memcpy_dtod(&*hpsi, &mut sm1hpsi.0).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
-        crate::eigensolver::hamiltonian::apply_s_inverse(
-            &mut sm1hpsi, &kd.vnl, n_bands_i32, n_pw_i32, blas, stream, solver,
-        ).map_err(|e| { eprintln!("[chemrust] S^-1 k=1 failed: {e}"); CHEM_EIG_CUDA_ERROR })?;
+        crate::eigensolver::hamiltonian::apply_s_inverse()
+            .hpsi_dev(&mut sm1hpsi)
+            .vnl_data(&kd.vnl)
+            .n_bands(n_bands_i32)
+            .n_pw(n_pw_i32)
+            .blas(blas)
+            .stream(stream)
+            .solver(solver)
+            .call().map_err(|e| { eprintln!("[chemrust] S^-1 k=1 failed: {e}"); CHEM_EIG_CUDA_ERROR })?;
 
         stream.memcpy_dtod(psi_input_slice, &mut psi_prev).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
         stream.memcpy_dtod(&*sm1hpsi, &mut psi_curr).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
@@ -803,16 +849,36 @@ unsafe fn step_inner(
         // k=2..ndeg
         for k in 2..=ndeg {
             let psi_curr_pw = PwCoefficients::new(psi_curr.clone());
-            crate::eigensolver::hamiltonian::apply_full_hamiltonian(
-                &psi_curr_pw, v_eff_gpu.as_device_slice(), &kinetic_dev, &fft_idx_dev,
-                n_pw, n_bands, gs, inv_ntotal, &fft_plan, &mut hpsi, &mut grid_buf,
-                &kd.vnl, blas, kernels, stream,
-            ).map_err(|e| { eprintln!("[chemrust] H*psi k={k} failed: {e}"); CHEM_EIG_CUDA_ERROR })?;
+            crate::eigensolver::hamiltonian::apply_full_hamiltonian()
+                .psi_dev(&psi_curr_pw)
+                .v_eff_dev(v_eff_gpu.as_device_slice())
+                .kinetic_dev(&kinetic_dev)
+                .fft_idx_dev(&fft_idx_dev)
+                .n_pw(n_pw)
+                .n_bands(n_bands)
+                .grid_size(gs)
+                .inv_ntotal(inv_ntotal)
+                .fft_plan(&fft_plan)
+                .hpsi_dev(&mut hpsi)
+                .grid_dev(&mut grid_buf)
+                .vnl_data(&kd.vnl)
+                .blas(blas)
+                .kernels(kernels)
+                .stream(stream)
+                .call()
+                .map_err(|e| { eprintln!("[chemrust] H*psi k={k} failed: {e}"); CHEM_EIG_CUDA_ERROR })?;
 
             stream.memcpy_dtod(&*hpsi, &mut sm1hpsi.0).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
-            crate::eigensolver::hamiltonian::apply_s_inverse(
-                &mut sm1hpsi, &kd.vnl, n_bands_i32, n_pw_i32, blas, stream, solver,
-            ).map_err(|e| { eprintln!("[chemrust] S^-1 k={k} failed: {e}"); CHEM_EIG_CUDA_ERROR })?;
+            crate::eigensolver::hamiltonian::apply_s_inverse()
+                .hpsi_dev(&mut sm1hpsi)
+                .vnl_data(&kd.vnl)
+                .n_bands(n_bands_i32)
+                .n_pw(n_pw_i32)
+                .blas(blas)
+                .stream(stream)
+                .solver(solver)
+                .call()
+                .map_err(|e| { eprintln!("[chemrust] S^-1 k={k} failed: {e}"); CHEM_EIG_CUDA_ERROR })?;
 
             cudarc::cublas::sys::cublasZscal_v2(
                 blas_raw, n_elem_i32, &two_inv_r_c as *const _ as *const _,
@@ -1064,11 +1130,24 @@ unsafe fn step_inner(
     // the subspace via the eigenvectors X.
     let psi_curr_pw = PwCoefficients::new(psi_curr.clone());
     unsafe {
-        crate::eigensolver::hamiltonian::apply_full_hamiltonian(
-            &psi_curr_pw, v_eff_gpu.as_device_slice(), &kinetic_dev, &fft_idx_dev,
-            n_pw, n_bands, gs, inv_ntotal, &fft_plan, &mut hpsi, &mut grid_buf,
-            &kd.vnl, blas, kernels, stream,
-        ).map_err(|e| { eprintln!("[chemrust] final H*psi failed: {e}"); CHEM_EIG_CUDA_ERROR })?;
+        crate::eigensolver::hamiltonian::apply_full_hamiltonian()
+            .psi_dev(&psi_curr_pw)
+            .v_eff_dev(v_eff_gpu.as_device_slice())
+            .kinetic_dev(&kinetic_dev)
+            .fft_idx_dev(&fft_idx_dev)
+            .n_pw(n_pw)
+            .n_bands(n_bands)
+            .grid_size(gs)
+            .inv_ntotal(inv_ntotal)
+            .fft_plan(&fft_plan)
+            .hpsi_dev(&mut hpsi)
+            .grid_dev(&mut grid_buf)
+            .vnl_data(&kd.vnl)
+            .blas(blas)
+            .kernels(kernels)
+            .stream(stream)
+            .call()
+            .map_err(|e| { eprintln!("[chemrust] final H*psi failed: {e}"); CHEM_EIG_CUDA_ERROR })?;
     }
 
     // ---- Rayleigh-Ritz and download ----
@@ -1128,10 +1207,16 @@ unsafe fn step_inner(
         let psi_col_pw = PwCoefficients::new(psi_col.as_device_slice().clone());
         stream.memcpy_dtod(psi_col.as_device_slice(), &mut spsi.0).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
         unsafe {
-            crate::eigensolver::hamiltonian::apply_s_times(
-                &psi_col_pw, &mut spsi, &kd.vnl,
-                n_bands_i32, n_pw_i32, blas, stream,
-            ).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
+            crate::eigensolver::hamiltonian::apply_s_times()
+                .psi_dev(&psi_col_pw)
+                .spsi_dev(&mut spsi)
+                .vnl_data(&kd.vnl)
+                .n_bands(n_bands_i32)
+                .n_pw(n_pw_i32)
+                .blas(blas)
+                .stream(stream)
+                .call()
+                .map_err(|_| CHEM_EIG_CUDA_ERROR)?;
         }
         // Download spsi and psi_col for CPU check
         let spsi_host: Vec<CudaComplex> = stream.clone_dtoh(&*spsi)
@@ -1179,9 +1264,16 @@ unsafe fn step_inner(
         {
             // spsi currently holds S·psi. Apply S⁻¹ to it, should get back psi.
             unsafe {
-                crate::eigensolver::hamiltonian::apply_s_inverse(
-                    &mut spsi, &kd.vnl, n_bands_i32, n_pw_i32, blas, stream, solver,
-                ).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
+                crate::eigensolver::hamiltonian::apply_s_inverse()
+                    .hpsi_dev(&mut spsi)
+                    .vnl_data(&kd.vnl)
+                    .n_bands(n_bands_i32)
+                    .n_pw(n_pw_i32)
+                    .blas(blas)
+                    .stream(stream)
+                    .solver(solver)
+                    .call()
+                    .map_err(|_| CHEM_EIG_CUDA_ERROR)?;
             }
             let sinv_s_host: Vec<CudaComplex> = stream.clone_dtoh(&*spsi)
                 .map_err(|_| CHEM_EIG_CUDA_ERROR)?;

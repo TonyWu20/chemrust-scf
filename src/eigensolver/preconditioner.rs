@@ -55,6 +55,7 @@ pub(crate) struct TpaPreconditioner {
     clamp_eps: f64,
 }
 
+#[bon::bon]
 impl TpaPreconditioner {
     /// Compile the TPA preconditioner CUDA kernel via NVRTC.
     ///
@@ -80,6 +81,7 @@ impl TpaPreconditioner {
     /// - `kinetic_dev` must have length ≥ `n_pw`.
     /// - No other kernel on the same stream may read/write `precond` or
     ///   `residual` concurrently.
+    #[builder]
     pub(crate) unsafe fn apply(
         &self,
         precond: &mut PwCoefficients,

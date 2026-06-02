@@ -26,6 +26,7 @@ use crate::eigensolver::davidson_types::{
 use crate::eigensolver::kernels::CudaKernelSet;
 use crate::eigensolver::vnl_data::VnlBatchData;
 use crate::types::Error;
+use bon::builder;
 
 // ---------------------------------------------------------------------------
 // Helper: call cuFFT C2C in-place (same buffer for input and output)
@@ -63,6 +64,7 @@ unsafe fn c2c_forward_inplace(
 /// 4. V_eff multiply (pointwise)
 /// 5. Batched C2C FFT
 /// 6. Gather + add to hpsi: hpsi += grid / N_total
+#[builder]
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn apply_v_loc_hamiltonian(
     psi_dev: &PwCoefficients,
@@ -158,6 +160,7 @@ pub(crate) unsafe fn apply_v_loc_hamiltonian(
 /// Apply the full Hamiltonian H|psi>. For Phase 2 this includes T + V_loc
 /// Apply the full Hamiltonian H|psi>. Includes T + V_loc (FFT-based)
 /// and V_NL (non-local pseudopotential via cuBLAS gemm).
+#[builder]
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn apply_full_hamiltonian(
     psi_dev: &PwCoefficients,
@@ -177,18 +180,31 @@ pub(crate) unsafe fn apply_full_hamiltonian(
     stream: &Arc<CudaStream>,
 ) -> Result<(), Error> {
     unsafe {
-        apply_v_loc_hamiltonian(
-            psi_dev, hpsi_dev, grid_dev,
-            kinetic_dev, fft_idx_dev, v_eff_dev,
-            n_pw as i32, n_bands as i32, grid_size as i32, inv_ntotal,
-            fft_plan, kernels, stream,
-        )?;
+        apply_v_loc_hamiltonian()
+            .psi_dev(psi_dev)
+            .hpsi_dev(hpsi_dev)
+            .grid_dev(grid_dev)
+            .kinetic_dev(kinetic_dev)
+            .fft_idx_dev(fft_idx_dev)
+            .v_eff_dev(v_eff_dev)
+            .n_pw(n_pw as i32)
+            .n_bands(n_bands as i32)
+            .grid_size(grid_size as i32)
+            .inv_ntotal(inv_ntotal)
+            .fft_plan(fft_plan)
+            .kernels(kernels)
+            .stream(stream)
+            .call()?;
 
-        apply_v_nl_hamiltonian(
-            psi_dev, hpsi_dev, vnl_data,
-            n_bands as i32, n_pw as i32,
-            blas, stream,
-        )?;
+        apply_v_nl_hamiltonian()
+            .psi_dev(psi_dev)
+            .hpsi_dev(hpsi_dev)
+            .vnl_data(vnl_data)
+            .n_bands(n_bands as i32)
+            .n_pw(n_pw as i32)
+            .blas(blas)
+            .stream(stream)
+            .call()?;
     }
     Ok(())
 }
@@ -203,6 +219,7 @@ pub(crate) unsafe fn apply_full_hamiltonian(
 ///   C_proj = beta^H . psi     (n_expanded x n_bands)
 ///   C_proj = D . C_proj       (n_expanded x n_bands)
 ///   hpsi   += beta . C_proj   (n_pw x n_bands, accumulated)
+#[builder]
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn apply_v_nl_hamiltonian(
     psi_dev: &PwCoefficients,
@@ -299,6 +316,7 @@ pub(crate) unsafe fn apply_v_nl_hamiltonian(
 /// Uses the global Woodbury formula (PHASE_PLAN.md):
 ///   S⁻¹·v = v − B · M⁻¹ · (B^H · v)
 ///   where M = Q⁻¹ + B^H·B (Cholesky-factored in VnlBatchData::precompute).
+#[builder]
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn apply_s_inverse(
     hpsi_dev: &mut PwCoefficients,
@@ -385,6 +403,7 @@ pub(crate) unsafe fn apply_s_inverse(
 ///
 /// The caller is responsible for copying `psi_dev` into `spsi_dev` first
 /// (the identity term) before calling this to accumulate the β·Q·β^H·ψ correction.
+#[builder]
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn apply_s_times(
     psi_dev: &PwCoefficients,     // input ψ (n_pw × n_bands, col-major)
@@ -542,9 +561,15 @@ pub fn check_s_inv_s_identity(
     // 2. Apply S⁻¹ to spsi, then D2H
     let mut spsi_pw = PwCoefficients(spsi_dev);
     unsafe {
-        apply_s_inverse(
-            &mut spsi_pw, vnl_data, 1, n, blas, stream, solver,
-        )?;
+        apply_s_inverse()
+            .hpsi_dev(&mut spsi_pw)
+            .vnl_data(vnl_data)
+            .n_bands(1)
+            .n_pw(n)
+            .blas(blas)
+            .stream(stream)
+            .solver(solver)
+            .call()?;
     }
     let result: Vec<CudaComplex> = stream.clone_dtoh(&*spsi_pw).map_err(Error::Cuda)?;
     let max_residual = psi_host.iter().zip(result.iter())

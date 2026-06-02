@@ -42,21 +42,21 @@ pub(crate) unsafe fn apply_h_tv(
     stream: &Arc<CudaStream>,
 ) -> Result<(), Error> {
     unsafe {
-        apply_v_loc_hamiltonian(
-            psi_dev,
-            hpsi_dev,
-            grid_dev,
-            kinetic_dev,
-            fft_idx_dev,
-            v_eff_dev,
-            n_pw,
-            n_bands,
-            grid_size,
-            inv_ntotal,
-            fft_plan,
-            kernels,
-            stream,
-        )
+        apply_v_loc_hamiltonian()
+            .psi_dev(psi_dev)
+            .hpsi_dev(hpsi_dev)
+            .grid_dev(grid_dev)
+            .kinetic_dev(kinetic_dev)
+            .fft_idx_dev(fft_idx_dev)
+            .v_eff_dev(v_eff_dev)
+            .n_pw(n_pw)
+            .n_bands(n_bands)
+            .grid_size(grid_size)
+            .inv_ntotal(inv_ntotal)
+            .fft_plan(fft_plan)
+            .kernels(kernels)
+            .stream(stream)
+            .call()
     }
 }
 

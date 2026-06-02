@@ -646,25 +646,25 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
             };
 
             let result = unsafe {
-                davidson_v1(
-                    &psi_pw,
-                    v_eff_slice,
-                    &kinetic_precond,
-                    &fft_idx_dev,
-                    &vnl_data,
-                    n_pw,
-                    n_bands,
-                    grid_size_usize,
-                    inv_ntotal,
-                    &fft_plan,
-                    lock_tol,
-                    &blas,
-                    &solver,
-                    &kernels,
-                    &stream,
-                    &ctx,
-                    &davidson_cfg,
-                )?
+                davidson_v1()
+                    .psi_init(&psi_pw)
+                    .v_eff_dev(v_eff_slice)
+                    .kinetic_dev(&kinetic_precond)
+                    .fft_idx_dev(&fft_idx_dev)
+                    .vnl_data(&vnl_data)
+                    .n_pw(n_pw)
+                    .n_bands(n_bands)
+                    .grid_size(grid_size_usize)
+                    .inv_ntotal(inv_ntotal)
+                    .fft_plan(&fft_plan)
+                    .lock_tol(lock_tol)
+                    .blas(&blas)
+                    .solver(&solver)
+                    .kernels(&kernels)
+                    .stream(&stream)
+                    .ctx(&ctx)
+                    .cfg(&davidson_cfg)
+                    .call()?
             };
 
             // Wrap psi_out CudaSlice into Gpu<WavefunctionSet<ColumnDistributed>>
