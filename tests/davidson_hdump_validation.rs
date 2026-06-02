@@ -36,7 +36,7 @@ use chemrust_hamiltonian_core::{
 };
 use chemrust_scf::{
     ColumnDistributed, Density, KPoint, ScfIteration, SmearingParams, SmearingScheme,
-    WaveGridArray, WavefunctionSet, pw_coords_to_fft_indices,
+    WaveGridArray, WavefunctionSet, downsample_array_to_wave_grid, pw_coords_to_fft_indices,
 };
 
 /// Path to CASTEP H_dump fixture directory.
@@ -234,9 +234,13 @@ fn davidson_hdump_validation() {
     let pw_coords = kpt.pw_grid_coord.clone();
     let pw_fft_indices = pw_coords_to_fft_indices(&pw_coords, &wave_grid);
 
-    // Density from .castep_bin (wave grid convention).
+    // Density from .check is stored on the FINE grid (check.rs:134).
+    // Downsample to wave grid for V_eff construction (same FFT-based method as V_eff).
+    let density_fine = fx.bin.density.charge.as_real_grid().as_real_array().clone();
+    let density_wave = downsample_array_to_wave_grid(&density_fine, &fine_grid, &wave_grid)
+        .expect("density downsampling failed");
     let density = Density::from_inner(WaveGridArray::from_inner(
-        fx.bin.density.charge.as_real_grid().as_real_array().clone(),
+        density_wave.as_fine_array().clone(),
     ));
 
     // Wavefunctions as column-distributed flat array.
