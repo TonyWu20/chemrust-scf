@@ -964,6 +964,39 @@ pub(crate) unsafe fn davidson_diagonalise(
                 let h_init_cpu: Vec<CudaComplex> = stream.clone_dtoh(&h_init).map_err(Error::Cuda)?;
                 eprintln!("[davidson]     initial H_sub diag[0..3]: [{:.6}, {:.6}, {:.6}]",
                     h_init_cpu[0 * k + 0].x, h_init_cpu[1 * k + 1].x, h_init_cpu[2 * k + 2].x);
+
+                // CPU dot-product cross-check: download just first column (n_pw elems)
+                // of super_wvfn and h_super_wvfn, compute ⟨psi|H·psi⟩ manually
+                {
+                    let sw_col0: Vec<CudaComplex> = {
+                        // Use cublasZcopy to extract first column into a temp buffer
+                        let (super_ptr, _) = super_wvfn.device_ptr(stream);
+                        let mut tmp = stream.alloc_zeros::<CudaComplex>(n_pw).map_err(Error::Cuda)?;
+                        cublasZcopy_v2(handle, n_pw_i32,
+                            super_ptr as *const _, 1,
+                            tmp.device_ptr_mut(stream).0 as *mut _, 1,
+                        ).result().map_err(Error::Blas)?;
+                        stream.clone_dtoh(&tmp).map_err(Error::Cuda)?
+                    };
+                    let hw_col0: Vec<CudaComplex> = {
+                        let (hsuper_ptr, _) = h_super_wvfn.device_ptr(stream);
+                        let mut tmp = stream.alloc_zeros::<CudaComplex>(n_pw).map_err(Error::Cuda)?;
+                        cublasZcopy_v2(handle, n_pw_i32,
+                            hsuper_ptr as *const _, 1,
+                            tmp.device_ptr_mut(stream).0 as *mut _, 1,
+                        ).result().map_err(Error::Blas)?;
+                        stream.clone_dtoh(&tmp).map_err(Error::Cuda)?
+                    };
+                    let (mut dot_re, mut dot_im) = (0.0f64, 0.0f64);
+                    for g in 0..n_pw {
+                        let psi_g = sw_col0[g];
+                        let hpsi_g = hw_col0[g];
+                        dot_re += psi_g.x * hpsi_g.x + psi_g.y * hpsi_g.y;
+                        dot_im += psi_g.x * hpsi_g.y - psi_g.y * hpsi_g.x;
+                    }
+                    eprintln!("[davidson]     CPU dot col0: re={:.6} im={:.6} (GEMM H_sub[0,0] re={:.6})",
+                        dot_re, dot_im, h_init_cpu[0].x);
+                }
                 for i in 0..k {
                     for j in 0..k {
                         super_hamiltonian[i * superspace_max_bands + j] = h_init_cpu[i * k + j];
