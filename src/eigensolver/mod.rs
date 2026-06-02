@@ -1,4 +1,5 @@
 pub(crate) mod chebyshev;
+pub(crate) mod davidson_types;
 pub(crate) mod hamiltonian;
 pub(crate) mod kernels;
 pub(crate) mod preconditioner;
