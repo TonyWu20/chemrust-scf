@@ -1,3 +1,4 @@
+#![cfg(feature = "chebyshev")]
 //! Per-step comparison tests against CASTEP reference data.
 //!
 //! Each test loads the Cu111_CO fixture, runs one SCF transition, and compares

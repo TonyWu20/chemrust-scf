@@ -1,3 +1,4 @@
+#![cfg(feature = "chebyshev")]
 //! Eigenvalue residual validation test.
 //!
 //! For each eigenvalue λ_i and corresponding eigenvector ψ_i, the residual is:

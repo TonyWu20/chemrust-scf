@@ -1,3 +1,4 @@
+#![cfg(feature = "chebyshev")]
 //! Hermiticity self-test for the production Hamiltonian apply path.
 //!
 //! For a Hermitian operator H, ⟨ψ_a|H|ψ_b⟩ = ⟨ψ_b|H|ψ_a⟩^* must hold for

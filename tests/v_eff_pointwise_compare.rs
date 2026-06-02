@@ -1,3 +1,4 @@
+#![cfg(feature = "chebyshev")]
 //! Pointwise comparison of iter-1 and iter-2 V_eff against CASTEP `.pot_fmt`.
 //!
 //! Drives one SCF iteration, dumps iter-1 V_eff and iter-2 V_eff to disk,

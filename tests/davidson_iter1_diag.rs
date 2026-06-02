@@ -1,3 +1,4 @@
+#![cfg(feature = "chebyshev")]
 //! Quick diagnostic: compare Davidson iter-1 eigenvalues and density split
 //! against CASTEP reference, without running full SCF.
 

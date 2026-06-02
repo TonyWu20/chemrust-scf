@@ -1,3 +1,4 @@
+#![cfg(feature = "chebyshev")]
 //! Synthetic locked-input construction helpers for Gate 3' Davidson
 //! identity-preservation tests.
 //!

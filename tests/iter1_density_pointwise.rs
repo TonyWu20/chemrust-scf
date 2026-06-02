@@ -1,3 +1,4 @@
+#![cfg(feature = "chebyshev")]
 //! Compare iter-1 output (ρ_PW upsampled + ρ_aug) vs CASTEP `.den_fmt` pointwise.
 //!
 //! This test localises whether the ρ_PW (smooth) or ρ_aug (augmentation)

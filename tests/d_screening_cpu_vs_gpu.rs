@@ -1,3 +1,4 @@
+#![cfg(feature = "chebyshev")]
 //! Discriminator test: CPU vs GPU D-screening on Cu111_CO fixture.
 //!
 //! Compares per-ion D matrices from the GPU path (`screen_d_gpu`) against

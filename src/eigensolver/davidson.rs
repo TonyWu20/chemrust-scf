@@ -730,6 +730,19 @@ pub fn check_inner_convergence(
 // Outer Davidson loop with subspace diagonalization (Phase 1B)
 // ======================================================================
 
+/// Conditionally emit diagnostic output inside `davidson_diagonalise`.
+///
+/// Expands to an `eprintln!` when `feature = "scf_diag"` is enabled; compiles
+/// to nothing otherwise.  `cfg!()` is a compile-time constant, so the dead
+/// branch is eliminated by the optimizer in release builds.
+macro_rules! davidson_diag {
+    ($($arg:tt)*) => {
+        if cfg!(feature = "scf_diag") {
+            eprintln!($($arg)*);
+        }
+    };
+}
+
 /// Run the outer Davidson loop with subspace diagonalization.
 ///
 /// Implements the outer loop structure from CASTEP's
@@ -820,7 +833,7 @@ pub(crate) unsafe fn davidson_diagonalise(
     // Initialized to 0.0; first inner step sets it to |prev_eig - new_eig|.
     let mut break_cond_tols = vec![0.0_f64; n_bands];
 
-    eprintln!("[davidson] start: n_bands={n_bands} n_pw={n_pw} tol_abs={tol_abs:.1e} max_outer={max_outer_iter}");
+    davidson_diag!("[davidson] start: n_bands={n_bands} n_pw={n_pw} tol_abs={tol_abs:.1e} max_outer={max_outer_iter}");
 
     // ------------------------------------------------------------------
     // Outer loop
@@ -828,17 +841,17 @@ pub(crate) unsafe fn davidson_diagonalise(
     #[allow(unused_assignments)]
     for iteration in 0..max_outer_iter {
         let n_conv = band_converged.iter().filter(|&&c| c).count();
-        eprintln!("[davidson] outer iter {iteration}: {n_conv}/{n_bands} converged");
+        davidson_diag!("[davidson] outer iter {iteration}: {n_conv}/{n_bands} converged");
 
         // Step a: exit if all bands converged
         if band_converged.iter().all(|&c| c) {
-            eprintln!("[davidson] all converged, exiting outer loop");
+            davidson_diag!("[davidson] all converged, exiting outer loop");
             break;
         }
 
         // Step b: compute H·ψ if needed
         if !h_correct {
-            eprintln!("[davidson] computing H·psi...");
+            davidson_diag!("[davidson] computing H·psi...");
             unsafe {
                 apply_full_hamiltonian()
                     .psi_dev(&psi_dev)
@@ -859,12 +872,12 @@ pub(crate) unsafe fn davidson_diagonalise(
                     .call()?;
             }
             h_correct = true;
-            eprintln!("[davidson] H·psi done");
+            davidson_diag!("[davidson] H·psi done");
         }
 
         // Step c: save previous eigenvalues
         let prev_eigenvalues = eigenvalues.clone();
-        eprintln!("[davidson] prev eigenvalues: [{:.6}, ..., {:.6}]",
+        davidson_diag!("[davidson] prev eigenvalues: [{:.6}, ..., {:.6}]",
                   prev_eigenvalues[0], prev_eigenvalues[n_bands-1]);
 
         // Compute TPA preconditioner R(G) vector (used by all blocks in this iter)
@@ -897,7 +910,7 @@ pub(crate) unsafe fn davidson_diagonalise(
             superspace_max_bands * superspace_max_bands
         ];
 
-        eprintln!("[davidson] block loop: nblock={nblock} superspace_size={superspace_size}");
+        davidson_diag!("[davidson] block loop: nblock={nblock} superspace_size={superspace_size}");
 
         for block_start in (0..n_bands).step_by(nblock) {
             let current_nblock = nblock.min(n_bands - block_start);
@@ -906,11 +919,11 @@ pub(crate) unsafe fn davidson_diagonalise(
             if (block_start..block_start + current_nblock)
                 .all(|b| band_converged[b])
             {
-                eprintln!("[davidson]   block {block_start}..{}: skipped (all converged)", block_start+current_nblock);
+                davidson_diag!("[davidson]   block {block_start}..{}: skipped (all converged)", block_start+current_nblock);
                 continue;
             }
 
-            eprintln!("[davidson]   block {block_start}..{}: current_nblock={current_nblock}", block_start+current_nblock);
+            davidson_diag!("[davidson]   block {block_start}..{}: current_nblock={current_nblock}", block_start+current_nblock);
 
             // Copy block eigenvectors -> super_wvfn (first current_nblock bands)
             // Copy block H.psi -> h_super_wvfn
@@ -970,7 +983,7 @@ pub(crate) unsafe fn davidson_diagonalise(
                 }
                 // D2H: copy into CPU super_hamiltonian
                 let h_init_cpu: Vec<CudaComplex> = stream.clone_dtoh(&h_init).map_err(Error::Cuda)?;
-                eprintln!("[davidson]     initial H_sub diag[0..3]: [{:.6}, {:.6}, {:.6}]",
+                davidson_diag!("[davidson]     initial H_sub diag[0..3]: [{:.6}, {:.6}, {:.6}]",
                     h_init_cpu[0].x, h_init_cpu[k + 1].x, h_init_cpu[2 * k + 2].x);
 
                 // CPU dot-product cross-check: download just first column (n_pw elems)
@@ -1002,7 +1015,7 @@ pub(crate) unsafe fn davidson_diagonalise(
                         dot_re += psi_g.x * hpsi_g.x + psi_g.y * hpsi_g.y;
                         dot_im += psi_g.x * hpsi_g.y - psi_g.y * hpsi_g.x;
                     }
-                    eprintln!("[davidson]     CPU dot col0: re={:.6} im={:.6} (GEMM H_sub[0,0] re={:.6})",
+                    davidson_diag!("[davidson]     CPU dot col0: re={:.6} im={:.6} (GEMM H_sub[0,0] re={:.6})",
                         dot_re, dot_im, h_init_cpu[0].x);
                 }
                 for i in 0..k {
@@ -1051,7 +1064,7 @@ pub(crate) unsafe fn davidson_diagonalise(
                 stream.alloc_zeros(n_pw).map_err(Error::Cuda)?);
 
             for _inner_iter in 0..max_inner_iter {
-                eprintln!("[davidson]     inner iter {_inner_iter}: superspace_index={superspace_index}");
+                davidson_diag!("[davidson]     inner iter {_inner_iter}: superspace_index={superspace_index}");
                 // (1) Save previous eigenvalues for convergence tracking
                 for b in 0..ncol {
                     previous_eigenvalues[b] = eigenvalues[block_start + b];
@@ -1201,7 +1214,7 @@ pub(crate) unsafe fn davidson_diagonalise(
             for i in 0..current_nblock {
                 eigenvalues[block_start + i] = super_eigenvalues[i];
             }
-            eprintln!("[davidson]     block eigenvalues: [{:.6}, ..., {:.6}]",
+            davidson_diag!("[davidson]     block eigenvalues: [{:.6}, ..., {:.6}]",
                       super_eigenvalues[0], super_eigenvalues[current_nblock-1]);
         }
 
@@ -1221,7 +1234,7 @@ pub(crate) unsafe fn davidson_diagonalise(
         }
 
         let n_conv = band_converged.iter().filter(|&&c| c).count();
-        eprintln!("[davidson] after convergence check: {n_conv}/{n_bands} converged, eigenvalues: [{:.6}, ..., {:.6}]",
+        davidson_diag!("[davidson] after convergence check: {n_conv}/{n_bands} converged, eigenvalues: [{:.6}, ..., {:.6}]",
                   eigenvalues[0], eigenvalues[n_bands-1]);
 
         // Step h: after rotation, H·ψ has been back-copied from the rotated super-space,
