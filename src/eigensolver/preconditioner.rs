@@ -414,7 +414,7 @@ pub fn assemble_q_rcq(
 ///   eigenvalues, and the R vector.
 /// - `apply_add`: adds a correction term (e.g. NL contribution) with the TPA
 ///   R-vector scaling.
-pub(crate) struct TpaPreconditioner {
+pub struct TpaPreconditioner {
     kernel_residual: CudaFunction,
     kernel_add: CudaFunction,
 }
@@ -511,6 +511,62 @@ impl TpaPreconditioner {
         }
         .map_err(Error::Cuda)
     }
+}
+
+// ---------------------------------------------------------------------------
+// apply_preconditioner — TPA preconditioner entry point
+// ---------------------------------------------------------------------------
+
+/// Apply the TPA preconditioner to the residual vector.
+///
+/// This is the norm-conserving pseudopotential (NCPP) path:
+///
+///   `precon[G,b] = (hpsi[G,b] - e[b] * psi[G,b]) * R(G)`
+///
+/// where `R(G) = tpa(pw_ek(G) / mean_ek)` is the TPA preconditioner vector
+/// (computed once per outer iteration by [`compute_r_vector`]).
+///
+/// For USPP, the NL correction `precon += Σ β · weight · R(G)` should be
+/// added after the TPA step (see CASTEP `nlpot_apply_precon_ES_slice`).
+/// That path is planned as a follow-up.
+///
+/// # Safety
+///
+/// - All input slices must have sufficient length:
+///   `psi`, `hpsi` >= `n_pw * n_bands`
+///   `eigenvalues` >= `n_bands`
+///   `r_vector` >= `n_pw`
+/// - No other kernel on the same stream may read/write these buffers
+///   concurrently.
+#[bon::builder]
+pub unsafe fn apply_preconditioner(
+    psi: &PwCoefficients,
+    hpsi: &PwCoefficients,
+    eigenvalues: &CudaSlice<f64>,
+    r_vector: &PreconditionerVector,
+    tpa_preconditioner: &TpaPreconditioner,
+    n_bands: usize,
+    n_pw: usize,
+    stream: &Arc<CudaStream>,
+) -> Result<PwCoefficients, Error> {
+    let total = n_pw * n_bands;
+    let out_dev: CudaSlice<CudaComplex> = stream.alloc_zeros(total).map_err(Error::Cuda)?;
+    let mut precon = PwCoefficients::new(out_dev);
+
+    unsafe {
+        tpa_preconditioner.apply_residual(
+            &mut precon,
+            psi,
+            hpsi,
+            eigenvalues,
+            r_vector,
+            n_pw,
+            n_bands,
+            stream,
+        )
+    }?;
+
+    Ok(precon)
 }
 
 // ---------------------------------------------------------------------------

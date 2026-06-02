@@ -4,7 +4,8 @@ pub mod scf;
 pub mod mixing;
 pub mod density;
 pub mod device;
-pub(crate) mod eigensolver;
+#[doc(hidden)]
+pub mod eigensolver;
 pub mod ffi;
 
 // Re-export test-only helpers for integration tests
@@ -24,6 +25,14 @@ pub use eigensolver::preconditioner::invert_q_matrix;
 pub use eigensolver::preconditioner::assemble_r_beta;
 #[doc(hidden)]
 pub use eigensolver::preconditioner::assemble_q_rcq;
+#[doc(hidden)]
+pub use eigensolver::preconditioner::apply_preconditioner;
+#[doc(hidden)]
+pub use eigensolver::preconditioner::TpaPreconditioner;
+#[doc(hidden)]
+pub use eigensolver::davidson_types::PwCoefficients;
+#[doc(hidden)]
+pub use eigensolver::davidson_types::PreconditionerVector;
 /// Rayleigh-Ritz test wrapper (returns subspace matrices for diagnostics).
 /// Gated behind `scf_diag` (default feature) or `test` cfg.
 #[cfg(any(test, feature = "scf_diag"))]
