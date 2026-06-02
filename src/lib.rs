@@ -14,6 +14,16 @@ pub use eigensolver::chebyshev::{
     chebyshev_filter_for_test_gpu, chebyshev_filter_iteration_gpu,
     compute_residual_norms_for_test, CudaKernelSet, FilterMode, HComponentsForTest,
 };
+#[doc(hidden)]
+pub use eigensolver::preconditioner::tpa;
+#[doc(hidden)]
+pub use eigensolver::preconditioner::compute_c_matrix;
+#[doc(hidden)]
+pub use eigensolver::preconditioner::invert_q_matrix;
+#[doc(hidden)]
+pub use eigensolver::preconditioner::assemble_r_beta;
+#[doc(hidden)]
+pub use eigensolver::preconditioner::assemble_q_rcq;
 /// Rayleigh-Ritz test wrapper (returns subspace matrices for diagnostics).
 /// Gated behind `scf_diag` (default feature) or `test` cfg.
 #[cfg(any(test, feature = "scf_diag"))]
