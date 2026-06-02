@@ -117,6 +117,8 @@ pub fn tpa(x: f64) -> f64 {
 ///
 /// All bands share the same R(G) vector — it is computed once per outer
 /// iteration.
+///
+/// Reference: CASTEP `nlpot.f90:13525-13593` (nlpot_prepare_precon R(G) computation).
 pub(crate) fn compute_r_vector(
     kinetic_dev: &KineticPreconditioner,
     mean_ek: f64,
@@ -161,8 +163,7 @@ pub(crate) fn compute_r_vector(
 ///   α[n, G] = conj(β[n, G]) · sqrt(R[G])
 ///   C[n, m] = Σ_G α[n, G] · conj(α[m, G])   — i.e. C = α · α^H
 ///
-/// Source: β^H·diag(R)·β formula, verified against CASTEP
-/// `ion_beta_beta_recip_cmplx` (nlpot.f90:13798-13803).
+/// Reference: CASTEP `nlpot.f90:13600-13670` (C = β^H·R·β assembly).
 pub fn compute_c_matrix(
     beta_g: &[CudaComplex],
     r_vector: &[f64],
@@ -195,6 +196,8 @@ pub fn compute_c_matrix(
 /// (diagonal elements below `TINY = 1e-14`), those rows/cols are zeroed
 /// in the output, matching CASTEP's `abs(ps_q(m,m,nsp1)) > tiny`
 /// compression (nlpot.f90:13894-13959).
+///
+/// Reference: CASTEP `nlpot.f90:13880-13980` (Q⁻¹ via Decomposition).
 ///
 /// # Panics
 ///
@@ -416,6 +419,8 @@ pub fn assemble_q_rcq(
 ///   eigenvalues, and the R vector.
 /// - `apply_add`: adds a correction term (e.g. NL contribution) with the TPA
 ///   R-vector scaling.
+///
+/// Reference: CASTEP `nlpot.f90:15879-16274` (nlpot_apply_precon_ES_slice).
 pub struct TpaPreconditioner {
     kernel_residual: CudaFunction,
     kernel_add: CudaFunction,
@@ -909,9 +914,8 @@ mod tests {
             CudaComplex { x: 0.0, y: -1.0 }, CudaComplex { x: 2.0, y: 1.0 }, CudaComplex { x: 1.5, y: 0.0 }, CudaComplex { x: -2.0, y: 1.0 },
         ];
 
-        // Compute expected output on CPU: out[G,b] = (hpsi[G,b] - e[b]*psi[G,b]) * R[G]
-        // Map linear index i = b * n_pw + g
-        let mut expected = vec![CudaComplex { x: 0.0, y: 0.0 }; n_pw * n_bands];
+        // Path A (fused): out[G,b] = (hpsi[G,b] - e[b]*psi[G,b]) * R(G)
+        let mut fused = vec![CudaComplex { x: 0.0, y: 0.0 }; n_pw * n_bands];
         for b in 0..n_bands {
             let e = eigenvalues[b];
             for g in 0..n_pw {
@@ -921,38 +925,44 @@ mod tests {
                 let hy = hpsi[i].y;
                 let px = psi[i].x;
                 let py = psi[i].y;
-                expected[i].x = (hx - e * px) * r;
-                expected[i].y = (hy - e * py) * r;
+                fused[i].x = (hx - e * px) * r;
+                fused[i].y = (hy - e * py) * r;
             }
         }
 
-        // Run the CPU-side computation matching GPU kernel logic
-        let mut out = vec![CudaComplex { x: 0.0, y: 0.0 }; n_pw * n_bands];
+        // Path B (decomposed): residual first, then scale by R
+        // Step B-a: residual[G,b] = hpsi[G,b] - e[b]*psi[G,b]
+        let mut residual = vec![CudaComplex { x: 0.0, y: 0.0 }; n_pw * n_bands];
+        for b in 0..n_bands {
+            let e = eigenvalues[b];
+            for g in 0..n_pw {
+                let i = b * n_pw + g;
+                residual[i].x = hpsi[i].x - e * psi[i].x;
+                residual[i].y = hpsi[i].y - e * psi[i].y;
+            }
+        }
+        // Step B-b: result[G,b] = residual[G,b] * R(G)
+        let mut result = vec![CudaComplex { x: 0.0, y: 0.0 }; n_pw * n_bands];
         for i in 0..(n_pw * n_bands) {
             let g = i % n_pw;
-            let b = i / n_pw;
-            let e = eigenvalues[b];
             let r = r_vector[g];
-            let hx = hpsi[i].x;
-            let hy = hpsi[i].y;
-            let px = psi[i].x;
-            let py = psi[i].y;
-            out[i].x = (hx - e * px) * r;
-            out[i].y = (hy - e * py) * r;
+            result[i].x = residual[i].x * r;
+            result[i].y = residual[i].y * r;
         }
 
+        // Cross-path verification: fused == result
         for i in 0..(n_pw * n_bands) {
-            let diff_x = (out[i].x - expected[i].x).abs();
-            let diff_y = (out[i].y - expected[i].y).abs();
+            let diff_x = (fused[i].x - result[i].x).abs();
+            let diff_y = (fused[i].y - result[i].y).abs();
             assert!(
                 diff_x < 1e-15,
-                "Element {i} x mismatch: expected {:.6e}, got {:.6e}, diff={:.2e}",
-                expected[i].x, out[i].x, diff_x,
+                "Element {i} x mismatch: fused={:.6e}, decomposed={:.6e}, diff={:.2e}",
+                fused[i].x, result[i].x, diff_x,
             );
             assert!(
                 diff_y < 1e-15,
-                "Element {i} y mismatch: expected {:.6e}, got {:.6e}, diff={:.2e}",
-                expected[i].y, out[i].y, diff_y,
+                "Element {i} y mismatch: fused={:.6e}, decomposed={:.6e}, diff={:.2e}",
+                fused[i].y, result[i].y, diff_y,
             );
         }
     }
@@ -968,7 +978,7 @@ mod tests {
         let total = n_pw * n_bands;
 
         // Initial out values
-        let mut out: Vec<CudaComplex> = (0..total)
+        let out: Vec<CudaComplex> = (0..total)
             .map(|i| CudaComplex {
                 x: (i as f64) * 1.0,
                 y: (i as f64) * 2.0,
@@ -982,35 +992,45 @@ mod tests {
             })
             .collect();
 
-        // Compute expected: out[i] += correction[i] * R[g] where g = i % n_pw
-        let mut expected = out.clone();
+        // Path A (fused): out[G,b] += correction[G,b] * R(G)
+        let start_out = out.clone();
+        let mut fused = out;
         for i in 0..total {
             let g = i % n_pw;
             let r = r_vector[g];
-            expected[i].x += correction[i].x * r;
-            expected[i].y += correction[i].y * r;
+            fused[i].x += correction[i].x * r;
+            fused[i].y += correction[i].y * r;
         }
 
-        // Run CPU-side computation matching GPU kernel logic
+        // Path B (decomposed): scale correction first, then add
+        // Step B-a: scaled_correction[G,b] = correction[G,b] * R(G)
+        let mut scaled_correction = vec![CudaComplex { x: 0.0, y: 0.0 }; total];
         for i in 0..total {
             let g = i % n_pw;
             let r = r_vector[g];
-            out[i].x += correction[i].x * r;
-            out[i].y += correction[i].y * r;
+            scaled_correction[i].x = correction[i].x * r;
+            scaled_correction[i].y = correction[i].y * r;
+        }
+        // Step B-b: result[G,b] = initial_out[G,b] + scaled_correction[G,b]
+        let mut result = start_out;
+        for i in 0..total {
+            result[i].x += scaled_correction[i].x;
+            result[i].y += scaled_correction[i].y;
         }
 
+        // Cross-path verification: fused == result
         for i in 0..total {
-            let diff_x = (out[i].x - expected[i].x).abs();
-            let diff_y = (out[i].y - expected[i].y).abs();
+            let diff_x = (fused[i].x - result[i].x).abs();
+            let diff_y = (fused[i].y - result[i].y).abs();
             assert!(
                 diff_x < 1e-15,
-                "Element {i} x mismatch: expected {:.6e}, got {:.6e}, diff={:.2e}",
-                expected[i].x, out[i].x, diff_x,
+                "Element {i} x mismatch: fused={:.6e}, decomposed={:.6e}, diff={:.2e}",
+                fused[i].x, result[i].x, diff_x,
             );
             assert!(
                 diff_y < 1e-15,
-                "Element {i} y mismatch: expected {:.6e}, got {:.6e}, diff={:.2e}",
-                expected[i].y, out[i].y, diff_y,
+                "Element {i} y mismatch: fused={:.6e}, decomposed={:.6e}, diff={:.2e}",
+                fused[i].y, result[i].y, diff_y,
             );
         }
     }
@@ -1028,5 +1048,17 @@ mod tests {
         assert!(tpa(0.0) > tpa(1.0), "tpa not decreasing at 0->1");
         assert!(tpa(1.0) > tpa(10.0), "tpa not decreasing at 1->10");
         assert!(tpa(10.0) > tpa(100.0), "tpa not decreasing at 10->100");
+
+        // Anchored value: tpa(1.0) = 65/81
+        //   numerator = 16*1^4 = 16
+        //   denominator = 27 + 1*(18 + 1*(12 + 8*1)) = 27 + 18 + 12 + 8 = 65
+        //   tpa(1.0) = 1 / (1 + 16/65) = 1 / (81/65) = 65/81
+        let expected_tpa_1 = 65.0 / 81.0;
+        assert!(
+            (tpa(1.0) - expected_tpa_1).abs() < 1e-15,
+            "tpa(1.0) = {:.15e}, expected 65/81 = {:.15e}",
+            tpa(1.0),
+            expected_tpa_1
+        );
     }
 }
