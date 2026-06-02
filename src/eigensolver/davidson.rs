@@ -669,12 +669,14 @@ pub(crate) unsafe fn davidson_diagonalise(
     tol_abs: f64,
     max_outer_iter: usize,
     blas: &BlasHandle,
-    solver: &SolverHandle,
+    _solver: &SolverHandle,
     kernels: &CudaKernelSet,
     stream: &Arc<CudaStream>,
     _ctx: &Arc<CudaContext>,
 ) -> Result<DavidsonResult, Error> {
     let n_elem = n_bands * n_pw;
+    let n_pw_i32 = n_pw as i32;
+    let handle = blas.raw_handle();
 
     // ------------------------------------------------------------------
     // Persistent GPU buffers
@@ -691,10 +693,10 @@ pub(crate) unsafe fn davidson_diagonalise(
     let mut grid_dev: CudaSlice<CudaComplex> =
         stream.alloc_zeros(grid_alloc).map_err(Error::Cuda)?;
 
-    // ZHEGVD GPU buffers (reused across iterations)
-    let mut eig_dev: CudaSlice<f64> =
+    // ZHEGVD GPU buffers (reused across iterations in E-3/E-4 block solve)
+    let _eig_dev: CudaSlice<f64> =
         stream.alloc_zeros(n_bands).map_err(Error::Cuda)?;
-    let mut info_dev: CudaSlice<i32> =
+    let _info_dev: CudaSlice<i32> =
         stream.alloc_zeros(1).map_err(Error::Cuda)?;
 
     // ------------------------------------------------------------------
@@ -743,30 +745,152 @@ pub(crate) unsafe fn davidson_diagonalise(
         // Step c: save previous eigenvalues
         let prev_eigenvalues = eigenvalues.clone();
 
-        // Steps d-e: subspace diagonalization (full n_bands)
-        // psi_rotated is temporary — we copy it back to psi_dev after rotation
-        let mut psi_rotated = PwCoefficients::new(
-            stream.alloc_zeros(n_elem).map_err(Error::Cuda)?);
+        // ------------------------------------------------------------------
+        // Block loop with superspace management (replaces full ZHEGVD)
+        //
+        // Implements the block-loop structure from CASTEP's
+        // hamiltonian.f90:1019-1063 with nblock-sized blocks.
+        // Each block copies eigenvectors into a superspace buffer and
+        // computes the initial super_hamiltonian. The inner loop (residual,
+        // precondition, expand, solve) is a TODO placeholder for TASKS E-3,
+        // E-4.
+        // ------------------------------------------------------------------
+        let nblock_base = (2.0 * (n_bands as f64).sqrt()).ceil() as usize;
+        let nblock = (nblock_base + 1) / 2 * 2; // round to next even
+        let superspace_size = 6;
+        let superspace_max_bands = superspace_size * nblock;
 
-        solve_block_zhegvd()
-            .psi_block(&psi_dev)
-            .hpsi_block(&hpsi_dev)
-            .vnl_data(vnl_data)
-            .k(n_bands)
-            .n_pw(n_pw)
-            .blas(blas)
-            .solver(solver)
-            .stream(stream)
-            .eigenvalues_out(&mut eigenvalues)
-            .eig_dev(&mut eig_dev)
-            .info_dev(&mut info_dev)
-            .psi_rotated(&mut psi_rotated)
-            .call()?;
+        // Allocate superspace buffers (reused across blocks)
+        let super_alloc = n_pw * superspace_max_bands;
+        let mut super_wvfn = PwCoefficients::new(
+            stream.alloc_zeros(super_alloc).map_err(Error::Cuda)?);
+        let mut h_super_wvfn = PwCoefficients::new(
+            stream.alloc_zeros(super_alloc).map_err(Error::Cuda)?);
 
-        // Copy rotated ψ back to psi_dev
-        stream
-            .memcpy_dtod(&*psi_rotated, &mut psi_dev.0)
-            .map_err(Error::Cuda)?;
+        // CPU-side dense Hermitian super_hamiltonian matrix (used in E-3/E-4)
+        let mut _super_hamiltonian = vec![
+            CudaComplex { x: 0.0, y: 0.0 };
+            superspace_max_bands * superspace_max_bands
+        ];
+
+        for block_start in (0..n_bands).step_by(nblock) {
+            let current_nblock = nblock.min(n_bands - block_start);
+
+            // Skip if all bands in this block are converged
+            if (block_start..block_start + current_nblock)
+                .all(|b| band_converged[b])
+            {
+                continue;
+            }
+
+            // Copy block eigenvectors -> super_wvfn (first current_nblock bands)
+            // Copy block H.psi -> h_super_wvfn
+            {
+                let (psi_ptr, _) = psi_dev.device_ptr(stream);
+                let (hpsi_ptr, _) = hpsi_dev.device_ptr(stream);
+                let (super_mut, _) = super_wvfn.device_ptr_mut(stream);
+                let (h_super_mut, _) = h_super_wvfn.device_ptr_mut(stream);
+
+                for i in 0..current_nblock {
+                    let src_off = (block_start + i) * n_pw;
+                    let dst_off = i * n_pw;
+                    cublasZcopy_v2(
+                        handle,
+                        n_pw_i32,
+                        (psi_ptr as *const CudaComplex).add(src_off) as *const _, 1,
+                        (super_mut as *mut CudaComplex).add(dst_off) as *mut _, 1,
+                    )
+                    .result()
+                    .map_err(Error::Blas)?;
+                    cublasZcopy_v2(
+                        handle,
+                        n_pw_i32,
+                        (hpsi_ptr as *const CudaComplex).add(src_off) as *const _, 1,
+                        (h_super_mut as *mut CudaComplex).add(dst_off) as *mut _, 1,
+                    )
+                    .result()
+                    .map_err(Error::Blas)?;
+                }
+            }
+
+            // _superspace_index is the next free row/col in _super_hamiltonian.
+            // After copying the block, the first current_nblock slots are filled.
+            let _superspace_index = current_nblock;
+
+            // Store initial eigenvalues for this block (used in E-3/E-4 inner loop)
+            let _block_initial_eigenvalues: Vec<f64> =
+                eigenvalues[block_start..block_start + current_nblock].to_vec();
+
+            // Compute initial super_hamiltonian:
+            //   H_super[0..c, 0..c] = super_wvfn[:,0..c]^H . h_super_wvfn[:,0..c]
+            // where c = current_nblock.
+            let mut h_init_sub: CudaSlice<CudaComplex> = stream
+                .alloc_zeros(current_nblock * current_nblock)
+                .map_err(Error::Cuda)?;
+            unsafe {
+                blas.gemm_c64(
+                    ZgemmConfig {
+                        transa: op::C,
+                        transb: op::N,
+                        m: current_nblock as i32,
+                        n: current_nblock as i32,
+                        k: n_pw_i32,
+                        alpha: CudaComplex { x: 1.0, y: 0.0 },
+                        lda: n_pw_i32,
+                        ldb: n_pw_i32,
+                        beta: CudaComplex { x: 0.0, y: 0.0 },
+                        ldc: current_nblock as i32,
+                    },
+                    &*super_wvfn,
+                    &*h_super_wvfn,
+                    &mut h_init_sub,
+                )?;
+            }
+
+            // D2H: copy computed block into the CPU _super_hamiltonian
+            {
+                let h_init_cpu: Vec<CudaComplex> = stream
+                    .clone_dtoh(&h_init_sub)
+                    .map_err(Error::Cuda)?;
+                for i in 0..current_nblock {
+                    for j in 0..current_nblock {
+                        _super_hamiltonian
+                            [i * superspace_max_bands + j] =
+                            h_init_cpu[i * current_nblock + j];
+                    }
+                }
+            }
+
+            // ============================================================
+            // TODO(TASKS E-3, E-4): Inner loop -- residual, precondition,
+            //                       expand superspace, solve in superspace
+            //
+            // After the inner solve, the first current_nblock bands of
+            // super_wvfn contain the rotated eigenvectors, and eigenvalues
+            // for this block are updated.
+            // ============================================================
+
+            // Copy rotated eigenvectors from super_wvfn back to psi_dev
+            // (placeholder: no inner loop yet, so this copies back the
+            //  original block unchanged -- real rotation comes in E-3/E-4).
+            {
+                let (psi_mut, _) = psi_dev.device_ptr_mut(stream);
+                let (super_ptr, _) = super_wvfn.device_ptr(stream);
+
+                for i in 0..current_nblock {
+                    let dst_off = (block_start + i) * n_pw;
+                    let src_off = i * n_pw;
+                    cublasZcopy_v2(
+                        handle,
+                        n_pw_i32,
+                        (super_ptr as *const CudaComplex).add(src_off) as *const _, 1,
+                        (psi_mut as *mut CudaComplex).add(dst_off) as *mut _, 1,
+                    )
+                    .result()
+                    .map_err(Error::Blas)?;
+                }
+            }
+        }
 
         // Step f-g: convergence check
         for b in 0..n_bands {
