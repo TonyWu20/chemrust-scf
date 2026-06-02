@@ -934,6 +934,53 @@ pub(crate) unsafe fn davidson_diagonalise(
                 }
             }
 
+            // Compute initial super_hamiltonian: H_sub = super_wvfn^H · h_super_wvfn
+            // for the first current_nblock columns (k × k, where k = current_nblock).
+            // Reference: hamiltonian.f90:1059 — wave_dot_all(super_wvfn, H_super_wvfn, super_hamiltonian)
+            {
+                let k = current_nblock;
+                let mut h_init: CudaSlice<CudaComplex> =
+                    stream.alloc_zeros(k * k).map_err(Error::Cuda)?;
+                unsafe {
+                    blas.gemm_c64(
+                        ZgemmConfig {
+                            transa: op::C,
+                            transb: op::N,
+                            m: k as i32,
+                            n: k as i32,
+                            k: n_pw_i32,
+                            alpha: CudaComplex { x: 1.0, y: 0.0 },
+                            lda: n_pw_i32,
+                            ldb: n_pw_i32,
+                            beta: CudaComplex { x: 0.0, y: 0.0 },
+                            ldc: k as i32,
+                        },
+                        &super_wvfn,
+                        &h_super_wvfn,
+                        &mut h_init,
+                    )?;
+                }
+                // D2H: copy into CPU super_hamiltonian
+                let h_init_cpu: Vec<CudaComplex> = stream.clone_dtoh(&h_init).map_err(Error::Cuda)?;
+                eprintln!("[davidson]     initial H_sub diag[0..3]: [{:.6}, {:.6}, {:.6}]",
+                    h_init_cpu[0 * k + 0].x, h_init_cpu[1 * k + 1].x, h_init_cpu[2 * k + 2].x);
+                for i in 0..k {
+                    for j in 0..k {
+                        super_hamiltonian[i * superspace_max_bands + j] = h_init_cpu[i * k + j];
+                    }
+                }
+                // Fill lower triangle via Hermitian conjugate
+                for i in 0..k {
+                    for j in 0..i {
+                        let val = super_hamiltonian[j * superspace_max_bands + i];
+                        super_hamiltonian[i * superspace_max_bands + j] = CudaComplex {
+                            x: val.x,
+                            y: -val.y,
+                        };
+                    }
+                }
+            }
+
             // ------------------------------------------------------------------
             // Inner Davidson loop: build search directions, expand superspace
             // ------------------------------------------------------------------
