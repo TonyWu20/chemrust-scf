@@ -9,6 +9,7 @@ use ndarray::Array2;
 use num_complex::Complex64;
 
 use crate::device::CudaComplex;
+use crate::types::KineticEnergies;
 
 // ---------------------------------------------------------------------------
 // Newtype structs for the Chebyshev–Davidson solver
@@ -230,4 +231,28 @@ impl DerefMut for BlockIndex {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
     }
+}
+
+/// Compute kinetic energy ½|G|² for each plane-wave from Miller indices.
+///
+/// Reference: CASTEP pw_ek_data = 0.5*|G+k|² in kinetic.F90.
+/// Used for KE diagnostic in the FFI step function.
+pub(crate) fn compute_kinetic_energies(
+    pw_coords: &[[i32; 3]],
+    recip_lattice: &chemrust_hamiltonian_core::RecipLattice,
+) -> KineticEnergies {
+    let r = recip_lattice.as_array();
+    let ke: Vec<f64> = pw_coords
+        .iter()
+        .map(|&[h, k, l]| {
+            let hf = h as f64;
+            let kf = k as f64;
+            let lf = l as f64;
+            let gx = hf * r[0][0] + kf * r[1][0] + lf * r[2][0];
+            let gy = hf * r[0][1] + kf * r[1][1] + lf * r[2][1];
+            let gz = hf * r[0][2] + kf * r[1][2] + lf * r[2][2];
+            0.5 * (gx * gx + gy * gy + gz * gz)
+        })
+        .collect();
+    KineticEnergies(ke)
 }

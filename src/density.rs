@@ -26,7 +26,7 @@ use crate::device::blas::{BlasHandle, op};
 use crate::device::fft::{BatchedFftPlan3d, FftPlan3d};
 use crate::device::{complex_slice_to_cuda, CudaComplex};
 use crate::device::pcie::PcieAccount;
-use crate::eigensolver::chebyshev::CudaKernelSet;
+use crate::eigensolver::kernels::CudaKernelSet;
 use crate::types::{ChemicalPotential, Density, Error, Occupations, SmearingParams, SmearingScheme, WaveGridArray};
 
 // ---------------------------------------------------------------------------
@@ -593,7 +593,9 @@ pub mod test_api {
         save_q_sf_cache_to_disk,
         load_q_sf_cache_from_disk,
     };
-    pub use crate::eigensolver::chebyshev::{check_s_inv_s_identity, CudaKernelSet, FilterMode};
+    pub use crate::eigensolver::kernels::CudaKernelSet;
+    #[cfg(feature = "chebyshev")]
+    pub use crate::eigensolver::chebyshev::{check_s_inv_s_identity, FilterMode};
     pub use crate::eigensolver::vnl_data::{VnlBatchData, VnlIonData};
     #[cfg(any(test, feature = "scf_diag"))]
     pub use crate::eigensolver::rayleigh_ritz::rayleigh_ritz_with_matrices;

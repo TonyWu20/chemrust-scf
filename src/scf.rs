@@ -14,13 +14,17 @@ use crate::device::fft::BatchedFftPlan3d;
 use crate::device::solver::SolverHandle;
 use crate::device::pcie::PcieAccount;
 use crate::device::{CudaComplex, Gpu};
-use crate::eigensolver::chebyshev::{compute_kinetic_energies, FilterMode, chebyshev_filter, CudaKernelSet};
+use crate::eigensolver::davidson_types::compute_kinetic_energies;
+use crate::eigensolver::kernels::CudaKernelSet;
+#[cfg(feature = "chebyshev")]
+use crate::eigensolver::chebyshev::{FilterMode, chebyshev_filter};
 use crate::eigensolver::davidson::{davidson_v1, DavidsonConfig, lock_tol_for_iter};
 use crate::eigensolver::davidson_types::{KineticPreconditioner, PwCoefficients};
 #[cfg(any(test, feature = "scf_diag"))]
 use crate::eigensolver::davidson::{DavidsonDiagnostic, DAVIDSON_LAST_DIAG};
+#[cfg(feature = "chebyshev")]
 use crate::eigensolver::rayleigh_ritz::rayleigh_ritz;
-#[cfg(any(test, feature = "scf_diag"))]
+#[cfg(all(any(test, feature = "scf_diag"), feature = "chebyshev"))]
 use crate::eigensolver::rayleigh_ritz::rayleigh_ritz_with_matrices;
 use crate::eigensolver::vnl_data::VnlBatchData;
 use crate::layout::{ColumnDistributed, Cpu, WavefunctionSet};
@@ -464,10 +468,14 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
         ndeg: usize,
         occupations: Option<&[f64]>,
     ) -> Result<ScfIteration<S, WavefunctionsUpdated, MixingOff>, Error> {
-        self.diagonalize_with_mode(ndeg, occupations, FilterMode::SinvHKeepHEig)
+        #[cfg(feature = "chebyshev")]
+        { self.diagonalize_with_mode(ndeg, occupations, FilterMode::SinvHKeepHEig) }
+        #[cfg(not(feature = "chebyshev"))]
+        { self.diagonalize_inner(ndeg, occupations, None) }
     }
 
     /// Like `diagonalize` but with an explicit `FilterMode` for the A/B/C diagnostic sweep.
+    #[cfg(feature = "chebyshev")]
     pub fn diagonalize_with_mode(
         self,
         ndeg: usize,
@@ -485,6 +493,7 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
     /// Used by the T-prime discriminator test
     /// (`iter2_band0_with_castep_d_injection`) to determine whether the SCF
     /// cascade is D-driven or eigensolver-rotation-driven.
+    #[cfg(feature = "chebyshev")]
     #[doc(hidden)]
     pub fn diagonalize_with_d_override(
         self,
@@ -501,9 +510,9 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
 
     fn diagonalize_inner(
         self,
-        ndeg: usize,
+        _ndeg: usize,
         occupations: Option<&[f64]>,
-        filter_mode: FilterMode,
+        #[cfg(feature = "chebyshev")] filter_mode: FilterMode,
         d_override_per_ion: Option<&[Option<Vec<f64>>]>,
     ) -> Result<ScfIteration<S, WavefunctionsUpdated, MixingOff>, Error> {
         let ctx = Arc::new(CudaContext::new(0)?);
@@ -570,7 +579,7 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
 
         // Save the input ψ for Procrustes pinning (prev_psi_dev)
         // This is the basis we hand to Chebyshev before filter/GS produce ψ_after_GS.
-        let prev_psi_dev = psi_gpu.as_device_slice();
+        let _prev_psi_dev = psi_gpu.as_device_slice();
 
         // V_NL precomputation (CPU, uses chemrust-hamiltonian, one-time cost)
         // Pass the downsampled V_eff for D-matrix screening (D = D0 + ∫ Q·V_eff).
@@ -592,7 +601,7 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
         // epsilon). Per-band eigenvalue machinery is provably redundant and
         // introduces numerical weak points from stale eigenvalue labels when
         // V_eff drifts between SCF iterations.
-        let eig: Option<&[f64]> = None;
+        let _eig: Option<&[f64]> = None;
 
         // Upload PW-to-FFT index map to GPU
         let fft_idx_dev: CudaSlice<i32> = stream
@@ -719,6 +728,8 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
         }
         // ---- End davidson dispatch ----
 
+        #[cfg(feature = "chebyshev")]
+        {
         // Chebyshev filter (pipeline: T+V_loc via FFT, V_NL via gemm)
         let (psi_filtered_row, hpsi_row) = chebyshev_filter(
             &psi_gpu, &v_eff_gpu, &self.pots,
@@ -796,14 +807,20 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
         next.psi = psi_new;
         next.eigenvalues = eigenvalues;
         next.beta_psi_per_ion = Some(beta_psi_gpu);
-        Ok(next)
+        return Ok(next);
+        }
+
+        // Chebyshev feature disabled and non-Davidson solver requested.
+        Err(Error::Cuda(cudarc::driver::result::DriverError(
+            cudarc::driver::sys::CUresult::CUDA_ERROR_INVALID_VALUE,
+        )))
     }
 
     /// Test-only: run Chebyshev + Rayleigh-Ritz and return the internal subspace matrices
     /// H_sub, S_sub, X alongside the normal RR outputs.
     ///
     /// Returns: `(eigenvalues, H_sub_cpu, S_sub_cpu, X_cpu)` — all col-major (n_bands × n_bands).
-    #[cfg(any(test, feature = "scf_diag"))]
+    #[cfg(all(any(test, feature = "scf_diag"), feature = "chebyshev"))]
     #[doc(hidden)]
     #[allow(clippy::type_complexity)]
     pub fn diagonalize_with_rr_matrices(
@@ -883,6 +900,7 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
     ///
     /// Returns `(hpsi_t, hpsi_tv, hpsi_full)` in column-major (n_bands × n_pw)
     /// layout matching `psi.data`.
+    #[cfg(feature = "chebyshev")]
     #[doc(hidden)]
     pub fn apply_h_components_for_test(
         &self,
@@ -934,6 +952,7 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
     ///
     /// `psi_input` must be column-major `[band * n_pw + g]`; output is the
     /// same layout. `n_pw` is read from `self.psi.n_pw`.
+    #[cfg(feature = "chebyshev")]
     #[doc(hidden)]
     pub fn apply_s_for_test(
         &self,

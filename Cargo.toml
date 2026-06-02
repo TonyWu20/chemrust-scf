@@ -19,6 +19,7 @@ faer = "0.24"
 [features]
 default = ["scf_diag"]
 scf_diag = []
+chebyshev = []
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt"] }

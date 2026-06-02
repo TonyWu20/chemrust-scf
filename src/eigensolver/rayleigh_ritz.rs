@@ -20,7 +20,7 @@ use crate::device::blas::BlasHandle;
 use crate::device::pcie::PcieAccount;
 use crate::device::solver::SolverHandle;
 use crate::device::{CudaComplex, Gpu};
-use crate::eigensolver::chebyshev::CudaKernelSet;
+use crate::eigensolver::kernels::CudaKernelSet;
 use crate::eigensolver::vnl_data::VnlBatchData;
 use crate::layout::{ColumnDistributed, Cpu, RowDistributed, WavefunctionSet};
 use crate::types::Error;

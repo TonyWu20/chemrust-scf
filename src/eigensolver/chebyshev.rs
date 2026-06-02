@@ -35,7 +35,8 @@ pub use super::hamiltonian::check_s_inv_s_identity;
 pub use super::kernels::CudaKernelSet;
 
 use crate::layout::{ColumnDistributed, RowDistributed, WavefunctionSet};
-use crate::types::{Error, KineticEnergies, KPoint};
+use crate::eigensolver::davidson_types::compute_kinetic_energies;
+use crate::types::{Error, KPoint};
 
 // ---------------------------------------------------------------------------
 // Type alias for the complex Chebyshev return type
@@ -366,34 +367,6 @@ unsafe fn lanczos_upper_bound(
 // ---------------------------------------------------------------------------
 // Precomputed FFT metadata (uploaded to GPU)
 // ---------------------------------------------------------------------------
-
-/// Kinetic energy ½|G|² for each plane-wave (Hartree atomic units).
-///
-/// Computed directly from the fractional G-vectors (from `pw_coords`) rather than
-/// from the full grid `g2()`, because the kernel `init_kinetic` indexes by
-/// plane-wave index (0..n_pw), not by grid position.
-///
-/// pw_coords are integer reciprocal-space grid coordinates (nx_coord, ny_coord,
-/// nz_coord), where G = nx_coord·b1 + ny_coord·b2 + nz_coord·b3.
-pub(crate) fn compute_kinetic_energies(
-    pw_coords: &[[i32; 3]],
-    recip_lattice: &chemrust_hamiltonian_core::RecipLattice,
-) -> KineticEnergies {
-    let r = recip_lattice.as_array();
-    let ke: Vec<f64> = pw_coords
-        .iter()
-        .map(|&[h, k, l]| {
-            let hf = h as f64;
-            let kf = k as f64;
-            let lf = l as f64;
-            let gx = hf * r[0][0] + kf * r[1][0] + lf * r[2][0];
-            let gy = hf * r[0][1] + kf * r[1][1] + lf * r[2][1];
-            let gz = hf * r[0][2] + kf * r[1][2] + lf * r[2][2];
-            0.5 * (gx * gx + gy * gy + gz * gz)
-        })
-        .collect();
-    KineticEnergies(ke)
-}
 
 // ---------------------------------------------------------------------------
 // Scaled Hamiltonian

@@ -5,7 +5,7 @@ use chemrust_hamiltonian_core::augment::beta_phi::{
 };
 use chemrust_hamiltonian_core::nlpot::build_d0_expanded;
 use crate::eigensolver::d_screening::{build_wave_screening_cache, screen_d_gpu, WaveScreeningCache};
-use crate::eigensolver::chebyshev::CudaKernelSet;
+use crate::eigensolver::kernels::CudaKernelSet;
 use chemrust_hamiltonian_core::pseudopotential::HasAugmentationData;
 use chemrust_hamiltonian_core::Pseudopotential;
 use cudarc::driver::{CudaSlice, CudaStream};

@@ -22,7 +22,7 @@ use cudarc::driver::{CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
 use ndarray::Array2;
 
 use crate::device::{blas::{BlasHandle, op}, CudaComplex, pcie::PcieAccount};
-use crate::eigensolver::chebyshev::CudaKernelSet;
+use crate::eigensolver::kernels::CudaKernelSet;
 use crate::types::Error;
 
 // ---------------------------------------------------------------------------
