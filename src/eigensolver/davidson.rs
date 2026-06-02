@@ -41,6 +41,7 @@ use crate::device::CudaComplex;
 use crate::eigensolver::davidson_types::*;
 use crate::eigensolver::hamiltonian::{apply_full_hamiltonian, apply_s_inverse, apply_s_times};
 use crate::eigensolver::kernels::CudaKernelSet;
+use crate::eigensolver::preconditioner::{apply_preconditioner, compute_r_vector, TpaPreconditioner};
 use crate::eigensolver::vnl_data::VnlBatchData;
 use crate::types::Error;
 use bon::builder;
@@ -768,6 +769,7 @@ pub(crate) unsafe fn davidson_diagonalise(
     blas: &BlasHandle,
     solver: &SolverHandle,
     kernels: &CudaKernelSet,
+    tpa_preconditioner: &TpaPreconditioner,
     stream: &Arc<CudaStream>,
     _ctx: &Arc<CudaContext>,
 ) -> Result<DavidsonResult, Error> {
@@ -845,6 +847,11 @@ pub(crate) unsafe fn davidson_diagonalise(
 
         // Step c: save previous eigenvalues
         let prev_eigenvalues = eigenvalues.clone();
+
+        // Compute TPA preconditioner R(G) vector (used by all blocks in this iter)
+        let kinetic_host: Vec<f64> = stream.clone_dtoh(&**kinetic_dev).map_err(Error::Cuda)?;
+        let mean_ek = kinetic_host.iter().sum::<f64>() / kinetic_host.len() as f64;
+        let r_vector = compute_r_vector(kinetic_dev, mean_ek, n_pw, stream)?;
 
         // ------------------------------------------------------------------
         // Block loop with superspace management (replaces full ZHEGVD)
@@ -928,39 +935,69 @@ pub(crate) unsafe fn davidson_diagonalise(
             let mut hsearch_dev = PwCoefficients::new(
                 stream.alloc_zeros(n_pw * ncol).map_err(Error::Cuda)?);
 
+            // Block-level temp buffers for TPA preconditioner (Gap 2)
+            let mut block_psi_temp = PwCoefficients::new(
+                stream.alloc_zeros(n_pw * ncol).map_err(Error::Cuda)?);
+            let mut block_hpsi_temp = PwCoefficients::new(
+                stream.alloc_zeros(n_pw * ncol).map_err(Error::Cuda)?);
+            let mut eig_block_dev: CudaSlice<f64> =
+                stream.alloc_zeros(ncol).map_err(Error::Cuda)?;
+
+            // Single-column temp buffers for S-orthogonalization (Gap 3)
+            let mut s_orth_in = PwCoefficients::new(
+                stream.alloc_zeros(n_pw).map_err(Error::Cuda)?);
+            let mut s_orth_out = PwCoefficients::new(
+                stream.alloc_zeros(n_pw).map_err(Error::Cuda)?);
+
             for _inner_iter in 0..max_inner_iter {
                 // (1) Save previous eigenvalues for convergence tracking
                 for b in 0..ncol {
                     previous_eigenvalues[b] = eigenvalues[block_start + b];
                 }
 
-                // (2) Build search direction: residual r_b = Hψ_b − λ_b · ψ_b
+                // (2) Build preconditioned search direction via TPA
                 {
                     let (psi_ptr, _) = psi_dev.device_ptr(stream);
                     let (hpsi_ptr, _) = hpsi_dev.device_ptr(stream);
-                    let (search_mut, _) = search_dev.device_ptr_mut(stream);
+                    let (block_psi_mut, _) = block_psi_temp.device_ptr_mut(stream);
+                    let (block_hpsi_mut, _) = block_hpsi_temp.device_ptr_mut(stream);
 
                     for i in 0..ncol {
                         let b = block_start + i;
-                        let lambda = eigenvalues[b];
-                        let psi_col = (psi_ptr as *const CudaComplex).add(b * n_pw);
-                        let hpsi_col = (hpsi_ptr as *const CudaComplex).add(b * n_pw);
-                        let search_col = (search_mut as *mut CudaComplex).add(i * n_pw);
-
-                        // Copy hpsi_b → search_col
                         cublasZcopy_v2(handle, n_pw_i32,
-                            hpsi_col as *const _, 1,
-                            search_col as *mut _, 1,
+                            (psi_ptr as *const CudaComplex).add(b * n_pw) as *const _, 1,
+                            (block_psi_mut as *mut CudaComplex).add(i * n_pw) as *mut _, 1,
                         ).result().map_err(Error::Blas)?;
-
-                        // search_col -= λ_b · ψ_b
-                        let neg_lambda = CudaComplex { x: -lambda, y: 0.0 };
-                        cublasZaxpy_v2(handle, n_pw_i32,
-                            &neg_lambda as *const _ as *const _,
-                            psi_col as *const _, 1,
-                            search_col as *mut _, 1,
+                        cublasZcopy_v2(handle, n_pw_i32,
+                            (hpsi_ptr as *const CudaComplex).add(b * n_pw) as *const _, 1,
+                            (block_hpsi_mut as *mut CudaComplex).add(i * n_pw) as *mut _, 1,
                         ).result().map_err(Error::Blas)?;
                     }
+
+                    // Upload block eigenvalues to GPU
+                    let eig_block_cpu: Vec<f64> = (0..ncol)
+                        .map(|i| eigenvalues[block_start + i])
+                        .collect();
+                    stream.memcpy_htod(&eig_block_cpu, &mut eig_block_dev)
+                        .map_err(Error::Cuda)?;
+
+                    // Apply TPA preconditioner: search = (hpsi - lambda·psi) * R(G)
+                    let precon_result = unsafe {
+                        apply_preconditioner()
+                            .psi(&block_psi_temp)
+                            .hpsi(&block_hpsi_temp)
+                            .eigenvalues(&eig_block_dev)
+                            .r_vector(&r_vector)
+                            .tpa_preconditioner(tpa_preconditioner)
+                            .n_bands(ncol)
+                            .n_pw(n_pw)
+                            .stream(stream)
+                            .call()?
+                    };
+
+                    // Copy result to search_dev
+                    stream.memcpy_dtod(&*precon_result, &mut search_dev.0)
+                        .map_err(Error::Cuda)?;
                 }
 
                 // (3) Check superspace bounds: reset if full
@@ -968,8 +1005,7 @@ pub(crate) unsafe fn davidson_diagonalise(
                     superspace_index = ncol;
                 }
 
-                // (4) Orthogonalize search directions against lower superspace
-                //     plain L2 Gram-Schmidt (no S-operator for MVP)
+                // (4) S-orthogonalize search directions against lower superspace
                 {
                     let (search_mut, _) = search_dev.device_ptr_mut(stream);
                     let (super_ptr, _) = super_wvfn.device_ptr(stream);
@@ -978,13 +1014,44 @@ pub(crate) unsafe fn davidson_diagonalise(
                         let search_j = (search_mut as *mut CudaComplex).add(j * n_pw);
                         for si in 0..superspace_index {
                             let super_si = (super_ptr as *const CudaComplex).add(si * n_pw);
+
+                            // Copy super_si -> s_orth_in (input to apply_s_times)
+                            let (s_in_mut, _) = s_orth_in.device_ptr_mut(stream);
+                            cublasZcopy_v2(handle, n_pw_i32,
+                                super_si as *const _, 1,
+                                s_in_mut as *mut _, 1,
+                            ).result().map_err(Error::Blas)?;
+
+                            // s_orth_out = super_si (identity pre-copy)
+                            let (s_out_mut, _) = s_orth_out.device_ptr_mut(stream);
+                            cublasZcopy_v2(handle, n_pw_i32,
+                                super_si as *const _, 1,
+                                s_out_mut as *mut _, 1,
+                            ).result().map_err(Error::Blas)?;
+
+                            // s_orth_out = S * super_si
+                            unsafe {
+                                apply_s_times()
+                                    .psi_dev(&s_orth_in)
+                                    .spsi_dev(&mut s_orth_out)
+                                    .vnl_data(vnl_data)
+                                    .n_bands(1_i32)
+                                    .n_pw(n_pw_i32)
+                                    .blas(blas)
+                                    .stream(stream)
+                                    .call()?;
+                            }
+
+                            // dot = <S*super_si | search_j>
+                            let (s_out_ptr, _) = s_orth_out.device_ptr(stream);
                             let mut dot = CudaComplex { x: 0.0, y: 0.0 };
                             cublasZdotc_v2(handle, n_pw_i32,
-                                super_si as *const _, 1,
+                                s_out_ptr as *const _, 1,
                                 search_j as *const _, 1,
                                 &mut dot as *mut _ as *mut _,
                             ).result().map_err(Error::Blas)?;
 
+                            // search_j -= dot * super_si
                             let neg_dot = CudaComplex { x: -dot.x, y: -dot.y };
                             cublasZaxpy_v2(handle, n_pw_i32,
                                 &neg_dot as *const _ as *const _,
