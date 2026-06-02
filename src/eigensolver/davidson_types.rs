@@ -237,7 +237,7 @@ impl DerefMut for BlockIndex {
 ///
 /// Reference: CASTEP pw_ek_data = 0.5*|G+k|² in kinetic.F90.
 /// Used for KE diagnostic in the FFI step function.
-pub(crate) fn compute_kinetic_energies(
+pub fn compute_kinetic_energies(
     pw_coords: &[[i32; 3]],
     recip_lattice: &chemrust_hamiltonian_core::RecipLattice,
 ) -> KineticEnergies {

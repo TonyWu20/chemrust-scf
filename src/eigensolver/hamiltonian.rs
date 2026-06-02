@@ -162,7 +162,7 @@ pub(crate) unsafe fn apply_v_loc_hamiltonian(
 /// and V_NL (non-local pseudopotential via cuBLAS gemm).
 #[builder]
 #[allow(clippy::too_many_arguments)]
-pub(crate) unsafe fn apply_full_hamiltonian(
+pub unsafe fn apply_full_hamiltonian(
     psi_dev: &PwCoefficients,
     v_eff_dev: &CudaSlice<f64>,
     kinetic_dev: &KineticPreconditioner,
@@ -405,7 +405,7 @@ pub(crate) unsafe fn apply_s_inverse(
 /// (the identity term) before calling this to accumulate the β·Q·β^H·ψ correction.
 #[builder]
 #[allow(clippy::too_many_arguments)]
-pub(crate) unsafe fn apply_s_times(
+pub unsafe fn apply_s_times(
     psi_dev: &PwCoefficients,     // input ψ (n_pw × n_bands, col-major)
     spsi_dev: &mut PwCoefficients, // output S·ψ (caller pre-copies psi into this)
     vnl_data: &VnlBatchData,

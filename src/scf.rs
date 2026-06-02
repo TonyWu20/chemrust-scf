@@ -18,7 +18,8 @@ use crate::eigensolver::davidson_types::compute_kinetic_energies;
 use crate::eigensolver::kernels::CudaKernelSet;
 #[cfg(feature = "chebyshev")]
 use crate::eigensolver::chebyshev::{FilterMode, chebyshev_filter};
-use crate::eigensolver::davidson::{davidson_v1, DavidsonConfig, lock_tol_for_iter};
+use crate::eigensolver::davidson::davidson_diagonalise;
+use crate::eigensolver::preconditioner::TpaPreconditioner;
 use crate::eigensolver::davidson_types::{KineticPreconditioner, PwCoefficients};
 #[cfg(any(test, feature = "scf_diag"))]
 use crate::eigensolver::davidson::{DavidsonDiagnostic, DAVIDSON_LAST_DIAG};
@@ -635,27 +636,15 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
                 stream.clone(),
             ).map_err(Error::Fft)?;
 
-            // Lock tolerance from env-var override or ratchet schedule.
-            // Target 0.05 Ha is the empirical stability floor for Cu111+CO —
-            // below this the ratchet unlocks enough bands that ZHEGVD rotation
-            // perturbs the density, triggering an SCF cascade.
-            let lock_tol = std::env::var("CHEMRUST_DAVIDSON_LOCK_TOL")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or_else(|| lock_tol_for_iter(self.scf_iter, 0.05));
-
             let psi_in = psi_gpu.as_device_slice();
             let psi_pw = PwCoefficients::new(psi_in.clone());
             let v_eff_slice = v_eff_gpu.as_device_slice();
 
-            // Davidson configuration
-            let davidson_cfg = DavidsonConfig {
-                max_outer_iter: 30,
-                block_eps_degen: 0.01,
-            };
+            // Compile TPA preconditioner CUDA kernels via NVRTC
+            let tpa_precond = TpaPreconditioner::new(&ctx)?;
 
             let result = unsafe {
-                davidson_v1()
+                davidson_diagonalise()
                     .psi_init(&psi_pw)
                     .v_eff_dev(v_eff_slice)
                     .kinetic_dev(&kinetic_precond)
@@ -666,13 +655,14 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
                     .grid_size(grid_size_usize)
                     .inv_ntotal(inv_ntotal)
                     .fft_plan(&fft_plan)
-                    .lock_tol(lock_tol)
+                    .tol_abs(1e-5)
+                    .max_outer_iter(30)
                     .blas(&blas)
                     .solver(&solver)
                     .kernels(&kernels)
+                    .tpa_preconditioner(&tpa_precond)
                     .stream(&stream)
                     .ctx(&ctx)
-                    .cfg(&davidson_cfg)
                     .call()?
             };
 

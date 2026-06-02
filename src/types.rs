@@ -239,7 +239,7 @@ pub struct FinalResult {
 
 /// Kinetic energies ½|G|² per plane-wave (Hartree), indexed by PW index.
 #[derive(Debug, Clone)]
-pub struct KineticEnergies(pub(crate) Vec<f64>);
+pub struct KineticEnergies(pub Vec<f64>);
 
 /// Occupation numbers per band (dimensionless, 0–2 per band for spin-degenerate).
 #[derive(Debug, Clone)]

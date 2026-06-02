@@ -33,9 +33,15 @@ pub use eigensolver::preconditioner::apply_preconditioner;
 #[doc(hidden)]
 pub use eigensolver::preconditioner::TpaPreconditioner;
 #[doc(hidden)]
+pub use eigensolver::hamiltonian::{apply_full_hamiltonian, apply_s_times};
+#[doc(hidden)]
 pub use eigensolver::davidson_types::PwCoefficients;
 #[doc(hidden)]
 pub use eigensolver::davidson_types::PreconditionerVector;
+#[doc(hidden)]
+pub use eigensolver::davidson_types::KineticPreconditioner;
+#[doc(hidden)]
+pub use eigensolver::davidson_types::compute_kinetic_energies;
 #[doc(hidden)]
 pub use eigensolver::davidson::{check_inner_convergence, BandConvStatus};
 /// Rayleigh-Ritz test wrapper (returns subspace matrices for diagnostics).

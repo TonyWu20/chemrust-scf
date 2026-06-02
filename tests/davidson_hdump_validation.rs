@@ -32,8 +32,7 @@
 use std::sync::Once;
 
 use chemrust_hamiltonian_core::{
-    CastepBinFile, CheckFile, GVectorGrid,
-    PseudopotentialSet,
+    CheckFile, GVectorGrid, PseudopotentialSet,
 };
 use chemrust_scf::{
     ColumnDistributed, Density, KPoint, ScfIteration, SmearingParams, SmearingScheme,
@@ -94,8 +93,6 @@ fn gpu_available() -> bool {
 /// Pre-loaded H_dump fixture data for a single test invocation.
 struct HDumpFixture {
     bin: chemrust_hamiltonian_core::CastepBin,
-    check: chemrust_hamiltonian_core::CastepBin,
-    pot_fmt: ndarray::Array3<f64>,
     bands_eigenvalues: Vec<f64>,
     pots: PseudopotentialSet,
     h_sub_ref: Vec<Vec<f64>>,
@@ -138,34 +135,24 @@ fn load_hdump_fixture() -> Result<HDumpFixture, Box<dyn std::error::Error>> {
     let potential_dir =
         std::env::var("CASTEP_POTENTIAL_DIR").unwrap_or_else(|_| POTENTIAL_DIR.to_string());
 
-    // 1. .castep_bin (cell, density on wave grid, eigenvalues)
-    let bin_path = format!("{fixture_dir}/Cu111_CO.castep_bin");
-    let bin_file = std::fs::File::open(&bin_path)?;
-    let bin_reader = std::io::BufReader::new(bin_file);
-    let bin = CastepBinFile::read(bin_reader)?;
-
-    // 2. .check (wavefunction + fine_grid)
+    // .check file has everything: cell, density (fine grid), wavefunctions.
+    // Single source of truth — no .castep_bin or .pot_fmt needed.
     let check_path = format!("{fixture_dir}/Cu111_CO.check");
     let check_file = std::fs::File::open(&check_path)?;
     let check_reader = std::io::BufReader::new(check_file);
-    let check = CheckFile::read(check_reader)?;
+    let bin = CheckFile::read(check_reader)?;
 
-    // 3. .pot_fmt (reference V_eff on wave grid)
-    let pot_path = format!("{fixture_dir}/Cu111_CO.pot_fmt");
-    let pot_text = std::fs::read_to_string(&pot_path)?;
-    let (_pot_grid, pot_arr) = chemrust_hamiltonian_core::formatted::parse_pot_fmt(&pot_text)?;
-
-    // 4. .bands (reference eigenvalues)
+    // .bands (reference eigenvalues)
     let bands_path = format!("{fixture_dir}/Cu111_CO.bands");
     let bands_text = std::fs::read_to_string(&bands_path)?;
     let bands_eigenvalues = parse_bands_file(&bands_text);
 
-    // 5. H_sub_debug.dat
+    // H_sub_debug.dat
     let dat_path = format!("{fixture_dir}/Cu111_CO.H_sub_debug.dat");
     let dat_text = std::fs::read_to_string(&dat_path)?;
     let (_n_bands_ref, h_sub_ref) = parse_hsub_debug(&dat_text);
 
-    // 6. Pseudopotentials
+    // Pseudopotentials
     let pots = PseudopotentialSet::from_dir(
         potential_dir,
         &bin.cell.species_symbols,
@@ -174,8 +161,6 @@ fn load_hdump_fixture() -> Result<HDumpFixture, Box<dyn std::error::Error>> {
 
     Ok(HDumpFixture {
         bin,
-        check,
-        pot_fmt: pot_arr,
         bands_eigenvalues,
         pots,
         h_sub_ref,
@@ -209,7 +194,7 @@ fn davidson_hdump_validation() {
     let fx = load_hdump_fixture().expect("failed to load H_dump fixture");
 
     let wfc = fx
-        .check
+        .bin
         .wavefunction
         .as_ref()
         .expect(".check must have wavefunction section");
@@ -242,7 +227,7 @@ fn davidson_hdump_validation() {
     let wave_grid = GVectorGrid::new(ngx, ngy, ngz, cell.recip_lattice);
 
     // Fine grid from .check file.
-    let fine_grid_dims = fx.check.fine_grid.expect(".check must have fine_grid");
+    let fine_grid_dims = fx.bin.fine_grid.expect(".check must have fine_grid");
     let [fgx, fgy, fgz] = fine_grid_dims;
     let fine_grid = GVectorGrid::new(fgx, fgy, fgz, cell.recip_lattice);
 
@@ -286,16 +271,10 @@ fn davidson_hdump_validation() {
         .max_history(8)
         .build();
 
-    // Build V_eff (uses our density + potentials), then pin CASTEP's V_eff
-    // from .pot_fmt to isolate the eigensolver fidelity from V_eff accuracy.
-    let mut veff_state = state
+    // Build V_eff self-consistently from .check density + pseudopotentials
+    let veff_state = state
         .build_v_eff_with_energy()
         .expect("build_v_eff_with_energy failed");
-
-    let castep_veff = chemrust_hamiltonian_core::EffectivePotential::from_inner(
-        chemrust_hamiltonian_core::fft::RealGrid::from_inner(fx.pot_fmt.clone()),
-    );
-    veff_state.set_v_eff(castep_veff);
 
     // -----------------------------------------------------------------------
     // Run Davidson diagonalize

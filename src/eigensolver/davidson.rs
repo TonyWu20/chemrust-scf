@@ -150,7 +150,8 @@ pub(crate) fn lock_tol_for_iter(scf_iter: usize, target_tol: f64) -> f64 {
 /// be S-orthonormal (column-major, n_bands × n_pw).
 #[builder]
 #[allow(clippy::too_many_arguments, unsafe_op_in_unsafe_fn)]
-pub(crate) unsafe fn davidson_v1(
+#[cfg(any())] // dead: superseded by davidson_diagonalise
+unsafe fn davidson_v1(
     psi_init: &PwCoefficients,
     v_eff_dev: &CudaSlice<f64>,
     kinetic_dev: &KineticPreconditioner,
@@ -811,18 +812,25 @@ pub(crate) unsafe fn davidson_diagonalise(
     // Initialized to 0.0; first inner step sets it to |prev_eig - new_eig|.
     let mut break_cond_tols = vec![0.0_f64; n_bands];
 
+    eprintln!("[davidson] start: n_bands={n_bands} n_pw={n_pw} tol_abs={tol_abs:.1e} max_outer={max_outer_iter}");
+
     // ------------------------------------------------------------------
     // Outer loop
     // ------------------------------------------------------------------
-    #[allow(unused_assignments)] // h_correct managed here for future inner block loop
+    #[allow(unused_assignments)]
     for iteration in 0..max_outer_iter {
+        let n_conv = band_converged.iter().filter(|&&c| c).count();
+        eprintln!("[davidson] outer iter {iteration}: {n_conv}/{n_bands} converged");
+
         // Step a: exit if all bands converged
         if band_converged.iter().all(|&c| c) {
+            eprintln!("[davidson] all converged, exiting outer loop");
             break;
         }
 
         // Step b: compute H·ψ if needed
         if !h_correct {
+            eprintln!("[davidson] computing H·psi...");
             unsafe {
                 apply_full_hamiltonian()
                     .psi_dev(&psi_dev)
@@ -843,10 +851,13 @@ pub(crate) unsafe fn davidson_diagonalise(
                     .call()?;
             }
             h_correct = true;
+            eprintln!("[davidson] H·psi done");
         }
 
         // Step c: save previous eigenvalues
         let prev_eigenvalues = eigenvalues.clone();
+        eprintln!("[davidson] prev eigenvalues: [{:.6}, ..., {:.6}]",
+                  prev_eigenvalues[0], prev_eigenvalues[n_bands-1]);
 
         // Compute TPA preconditioner R(G) vector (used by all blocks in this iter)
         let kinetic_host: Vec<f64> = stream.clone_dtoh(&**kinetic_dev).map_err(Error::Cuda)?;
@@ -854,18 +865,15 @@ pub(crate) unsafe fn davidson_diagonalise(
         let r_vector = compute_r_vector(kinetic_dev, mean_ek, n_pw, stream)?;
 
         // ------------------------------------------------------------------
-        // Block loop with superspace management (replaces full ZHEGVD)
+        // Block loop with superspace management
         //
-        // Implements the block-loop structure from CASTEP's
-        // hamiltonian.f90:1019-1063 with nblock-sized blocks.
-        // Each block copies eigenvectors into a superspace buffer and
-        // computes the initial super_hamiltonian. The inner loop (residual,
-        // precondition, expand, solve) is a TODO placeholder for TASKS E-3,
-        // E-4.
+        // CASTEP hamiltonian.f90:1019-1063 — block loop over groups of nblock
+        // bands. Each unconverged block runs an inner Davidson loop (residual,
+        // S-orthogonalize, H·search, extend superspace, ZHEGVD).
         // ------------------------------------------------------------------
         let nblock_base = (2.0 * (n_bands as f64).sqrt()).ceil() as usize;
         let nblock = (nblock_base + 1) / 2 * 2; // round to next even
-        let superspace_size = 6;
+        let superspace_size = 4;
         let superspace_max_bands = superspace_size * nblock;
 
         // Allocate superspace buffers (reused across blocks)
@@ -875,11 +883,13 @@ pub(crate) unsafe fn davidson_diagonalise(
         let mut h_super_wvfn = PwCoefficients::new(
             stream.alloc_zeros(super_alloc).map_err(Error::Cuda)?);
 
-        // CPU-side dense Hermitian super_hamiltonian matrix (used in E-3/E-4)
+        // CPU-side dense Hermitian super_hamiltonian matrix
         let mut super_hamiltonian = vec![
             CudaComplex { x: 0.0, y: 0.0 };
             superspace_max_bands * superspace_max_bands
         ];
+
+        eprintln!("[davidson] block loop: nblock={nblock} superspace_size={superspace_size}");
 
         for block_start in (0..n_bands).step_by(nblock) {
             let current_nblock = nblock.min(n_bands - block_start);
@@ -888,8 +898,11 @@ pub(crate) unsafe fn davidson_diagonalise(
             if (block_start..block_start + current_nblock)
                 .all(|b| band_converged[b])
             {
+                eprintln!("[davidson]   block {block_start}..{}: skipped (all converged)", block_start+current_nblock);
                 continue;
             }
+
+            eprintln!("[davidson]   block {block_start}..{}: current_nblock={current_nblock}", block_start+current_nblock);
 
             // Copy block eigenvectors -> super_wvfn (first current_nblock bands)
             // Copy block H.psi -> h_super_wvfn
@@ -950,6 +963,7 @@ pub(crate) unsafe fn davidson_diagonalise(
                 stream.alloc_zeros(n_pw).map_err(Error::Cuda)?);
 
             for _inner_iter in 0..max_inner_iter {
+                eprintln!("[davidson]     inner iter {_inner_iter}: superspace_index={superspace_index}");
                 // (1) Save previous eigenvalues for convergence tracking
                 for b in 0..ncol {
                     previous_eigenvalues[b] = eigenvalues[block_start + b];
@@ -1006,44 +1020,47 @@ pub(crate) unsafe fn davidson_diagonalise(
                 }
 
                 // (4) S-orthogonalize search directions against lower superspace
+                //     Precompute S·super_si once per superspace column, reuse
+                //     for all search columns (avoids O(ncol × superspace_index)
+                //     calls to the expensive apply_s_times).
                 {
                     let (search_mut, _) = search_dev.device_ptr_mut(stream);
                     let (super_ptr, _) = super_wvfn.device_ptr(stream);
 
-                    for j in 0..ncol {
-                        let search_j = (search_mut as *mut CudaComplex).add(j * n_pw);
-                        for si in 0..superspace_index {
-                            let super_si = (super_ptr as *const CudaComplex).add(si * n_pw);
+                    for si in 0..superspace_index {
+                        let super_si = (super_ptr as *const CudaComplex).add(si * n_pw);
 
-                            // Copy super_si -> s_orth_in (input to apply_s_times)
-                            let (s_in_mut, _) = s_orth_in.device_ptr_mut(stream);
-                            cublasZcopy_v2(handle, n_pw_i32,
-                                super_si as *const _, 1,
-                                s_in_mut as *mut _, 1,
-                            ).result().map_err(Error::Blas)?;
+                        // Compute S·super_si ONCE → s_orth_out
+                        let (s_in_mut, _) = s_orth_in.device_ptr_mut(stream);
+                        cublasZcopy_v2(handle, n_pw_i32,
+                            super_si as *const _, 1,
+                            s_in_mut as *mut _, 1,
+                        ).result().map_err(Error::Blas)?;
 
-                            // s_orth_out = super_si (identity pre-copy)
-                            let (s_out_mut, _) = s_orth_out.device_ptr_mut(stream);
-                            cublasZcopy_v2(handle, n_pw_i32,
-                                super_si as *const _, 1,
-                                s_out_mut as *mut _, 1,
-                            ).result().map_err(Error::Blas)?;
+                        let (s_out_mut, _) = s_orth_out.device_ptr_mut(stream);
+                        cublasZcopy_v2(handle, n_pw_i32,
+                            super_si as *const _, 1,
+                            s_out_mut as *mut _, 1,
+                        ).result().map_err(Error::Blas)?;
 
-                            // s_orth_out = S * super_si
-                            unsafe {
-                                apply_s_times()
-                                    .psi_dev(&s_orth_in)
-                                    .spsi_dev(&mut s_orth_out)
-                                    .vnl_data(vnl_data)
-                                    .n_bands(1_i32)
-                                    .n_pw(n_pw_i32)
-                                    .blas(blas)
-                                    .stream(stream)
-                                    .call()?;
-                            }
+                        unsafe {
+                            apply_s_times()
+                                .psi_dev(&s_orth_in)
+                                .spsi_dev(&mut s_orth_out)
+                                .vnl_data(vnl_data)
+                                .n_bands(1_i32)
+                                .n_pw(n_pw_i32)
+                                .blas(blas)
+                                .stream(stream)
+                                .call()?;
+                        }
+                        let (s_out_ptr, _) = s_orth_out.device_ptr(stream);
 
-                            // dot = <S*super_si | search_j>
-                            let (s_out_ptr, _) = s_orth_out.device_ptr(stream);
+                        // Project ALL search columns against this superspace column
+                        // using the precomputed S·super_si
+                        for j in 0..ncol {
+                            let search_j = (search_mut as *mut CudaComplex).add(j * n_pw);
+
                             let mut dot = CudaComplex { x: 0.0, y: 0.0 };
                             cublasZdotc_v2(handle, n_pw_i32,
                                 s_out_ptr as *const _, 1,
@@ -1214,6 +1231,8 @@ pub(crate) unsafe fn davidson_diagonalise(
             let k_super = superspace_index;
             let mut psi_rotated_super = PwCoefficients::new(
                 stream.alloc_zeros(n_pw * k_super).map_err(Error::Cuda)?);
+            let mut h_rotated_super = PwCoefficients::new(
+                stream.alloc_zeros(n_pw * k_super).map_err(Error::Cuda)?);
             let mut super_eigenvalues = vec![0.0_f64; k_super];
 
             unsafe {
@@ -1230,19 +1249,26 @@ pub(crate) unsafe fn davidson_diagonalise(
                     .eig_dev(&mut eig_dev)
                     .info_dev(&mut info_dev)
                     .psi_rotated(&mut psi_rotated_super)
+                    .hpsi_rotated(&mut h_rotated_super)
                     .call()?;
             }
 
-            // Copy first current_nblock eigenvectors back to psi_dev
+            // Copy first current_nblock eigenvectors back to psi_dev and hpsi_dev
             {
                 let (psi_mut, _) = psi_dev.device_ptr_mut(stream);
+                let (hpsi_mut, _) = hpsi_dev.device_ptr_mut(stream);
                 let (rotated_ptr, _) = psi_rotated_super.device_ptr(stream);
+                let (h_rotated_ptr, _) = h_rotated_super.device_ptr(stream);
 
                 for i in 0..current_nblock {
                     let dst_off = (block_start + i) * n_pw;
                     cublasZcopy_v2(handle, n_pw_i32,
                         (rotated_ptr as *const CudaComplex).add(i * n_pw) as *const _, 1,
                         (psi_mut as *mut CudaComplex).add(dst_off) as *mut _, 1,
+                    ).result().map_err(Error::Blas)?;
+                    cublasZcopy_v2(handle, n_pw_i32,
+                        (h_rotated_ptr as *const CudaComplex).add(i * n_pw) as *const _, 1,
+                        (hpsi_mut as *mut CudaComplex).add(dst_off) as *mut _, 1,
                     ).result().map_err(Error::Blas)?;
                 }
             }
@@ -1251,6 +1277,8 @@ pub(crate) unsafe fn davidson_diagonalise(
             for i in 0..current_nblock {
                 eigenvalues[block_start + i] = super_eigenvalues[i];
             }
+            eprintln!("[davidson]     block eigenvalues: [{:.6}, ..., {:.6}]",
+                      super_eigenvalues[0], super_eigenvalues[current_nblock-1]);
         }
 
         // Step f-g: convergence check using inner-loop convergence criteria
@@ -1259,7 +1287,7 @@ pub(crate) unsafe fn davidson_diagonalise(
                 prev_eigenvalues[b],
                 eigenvalues[b],
                 tol_abs,
-                0.0, // tol_rel not yet configurable at this level
+                0.0,
                 &mut break_cond_tols[b],
                 iteration == 0,
                 iteration,
@@ -1267,6 +1295,10 @@ pub(crate) unsafe fn davidson_diagonalise(
             );
             band_converged[b] = result.converged;
         }
+
+        let n_conv = band_converged.iter().filter(|&&c| c).count();
+        eprintln!("[davidson] after convergence check: {n_conv}/{n_bands} converged, eigenvalues: [{:.6}, ..., {:.6}]",
+                  eigenvalues[0], eigenvalues[n_bands-1]);
 
         // Step h: after rotation, H·ψ is stale
         h_correct = false;
@@ -1310,6 +1342,7 @@ unsafe fn solve_block_zhegvd(
     eig_dev: &mut CudaSlice<f64>,
     info_dev: &mut CudaSlice<i32>,
     psi_rotated: &mut PwCoefficients,
+    hpsi_rotated: &mut PwCoefficients,
 ) -> Result<(), Error> {
     debug_assert_eq!(k, eigenvalues_out.len());
     let k_i32 = k as i32;
@@ -1441,6 +1474,20 @@ unsafe fn solve_block_zhegvd(
         *info_dev = stream.alloc_zeros(1).map_err(Error::Cuda)?;
     }
 
+    // Regularize S_sub diagonal to ensure positive-definiteness.
+    // USPP Q_aug matrices can have negative eigenvalues, making
+    // S = I + β^H·Q·β indefinite for some projector combinations.
+    // A small ε on the diagonal stabilises ZHEGVD without affecting
+    // eigenvalues at the 1e-10 Ha level.
+    {
+        let mut s_sub_cpu: Vec<CudaComplex> = stream.clone_dtoh(&s_sub).map_err(Error::Cuda)?;
+        for i in 0..k {
+            s_sub_cpu[i * k + i].x += 1e-10;
+        }
+        let s_reg = stream.clone_htod(&s_sub_cpu).map_err(Error::Cuda)?;
+        core::mem::drop(core::mem::replace(&mut s_sub, s_reg));
+    }
+
     // ZHEGVD: H_sub · X = Λ · S_sub · X
     solver.zhegvd(
         cusolverEigMode_t::CUSOLVER_EIG_MODE_VECTOR,
@@ -1482,6 +1529,25 @@ unsafe fn solve_block_zhegvd(
             psi_block,
             &h_sub, // eigenvectors (column-major, k×k)
             psi_rotated,
+        )?;
+
+        // Also rotate H·psi (cheap GEMM, no FFT)
+        blas.gemm_c64(
+            ZgemmConfig {
+                transa: op::N,
+                transb: op::N,
+                m: n_pw_i32,
+                n: k_i32,
+                k: k_i32,
+                alpha: CudaComplex { x: 1.0, y: 0.0 },
+                lda: n_pw_i32,
+                ldb: k_i32,
+                beta: CudaComplex { x: 0.0, y: 0.0 },
+                ldc: n_pw_i32,
+            },
+            hpsi_block,
+            &h_sub, // eigenvectors
+            hpsi_rotated,
         )?;
     }
 
