@@ -9,6 +9,8 @@
 //! - Layer 2 (Tests 3-4): ZHEGVD solution quality
 //! - Layer 3 (Tests 5-6): Full pipeline output vs CASTEP reference
 
+#![cfg(feature = "chebyshev")]
+
 mod fixtures;
 
 use chemrust_scf::device::CudaComplex;

@@ -11,6 +11,8 @@
 //! atomic superposition is not implemented in chemrust-hamiltonian).  The
 //! perturbation-recovery test is the practical workaround.
 
+#![cfg(feature = "chebyshev")]
+
 mod fixtures;
 
 /// True per-ion Woodbury baseline after m_inv→s_inv typo fix.

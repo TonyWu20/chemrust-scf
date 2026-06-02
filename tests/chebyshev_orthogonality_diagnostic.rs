@@ -22,6 +22,8 @@
 //!
 //! **Reference**: PARSEC paper Algorithm 2 (Cholesky QR), ANALYSIS.md § 4.1
 
+#![cfg(feature = "chebyshev")]
+
 mod fixtures;
 
 use ndarray::Array2;

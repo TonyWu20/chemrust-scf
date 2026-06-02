@@ -11,6 +11,8 @@
 //! Run with `cargo test --test davidson_v1_validation --release -- --ignored`
 //! on a GPU-equipped machine with CASTEP fixture data.
 
+#![cfg(feature = "chebyshev")]
+
 mod fixtures;
 
 use std::sync::Once;
