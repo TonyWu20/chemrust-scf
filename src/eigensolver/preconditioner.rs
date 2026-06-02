@@ -778,9 +778,6 @@ pub struct PreconditionerPrepResult {
     pub q_rcq: Array2<Complex64>,
 }
 
-// TODO(FIX-6.1): wire into scf.rs — call before davidson_diagonalise,
-// pass PreconditionerPrepResult.{r_beta_per_ion, q_rcq} via the builder.
-// Deferred: requires D2H of beta_g and q_matrix from VnlBatchData (GPU→CPU).
 /// Prepare the USPP preconditioner matrices.
 ///
 /// This orchestrates the preconditioner setup for a Davidson outer iteration:

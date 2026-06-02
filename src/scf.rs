@@ -6,7 +6,7 @@ use chemrust_hamiltonian_core::{
     CellGeometry, GVectorGrid, NonSpin, PseudopotentialSet, SpinCollinear, SpinPolicy, VEffBuilder,
 };
 use cudarc::driver::{CudaContext, CudaSlice};
-use ndarray::{Array3, ShapeBuilder};
+use ndarray::{Array2, Array3, ShapeBuilder};
 use num_complex::Complex64;
 
 use crate::device::blas::{op, BlasHandle, ZgemmConfig};
@@ -19,7 +19,7 @@ use crate::eigensolver::kernels::CudaKernelSet;
 #[cfg(feature = "chebyshev")]
 use crate::eigensolver::chebyshev::{FilterMode, chebyshev_filter};
 use crate::eigensolver::davidson::davidson_diagonalise;
-use crate::eigensolver::preconditioner::TpaPreconditioner;
+use crate::eigensolver::preconditioner::{TpaPreconditioner, prepare_preconditioner};
 use crate::eigensolver::davidson_types::{KineticPreconditioner, PwCoefficients};
 #[cfg(any(test, feature = "scf_diag"))]
 use crate::eigensolver::davidson::{DavidsonDiagnostic, DAVIDSON_LAST_DIAG};
@@ -643,6 +643,50 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
             // Compile TPA preconditioner CUDA kernels via NVRTC
             let tpa_precond = TpaPreconditioner::new(&ctx)?;
 
+            // --- USPP preconditioner preparation ---
+            // Compute r_beta_per_ion and q_rcq from vnl_data for the Davidson
+            // preconditioner's NL correction step.  For NCPP-only systems this
+            // produces empty matrices and the apply step returns early.
+            let mean_ek = kinetic_cpu.0.iter().sum::<f64>() / kinetic_cpu.0.len() as f64;
+            let ion_n_expanded: Vec<usize> = vnl_data.entries.iter()
+                .map(|e| e.n_expanded as usize)
+                .collect();
+            let mixture_weights: Vec<f64> = vec![1.0; vnl_data.entries.len()];
+
+            // D2H: beta_g and q_matrix for each ion (tiny: O(n_expanded × n_pw) per ion)
+            let mut beta_g_per_ion: Vec<Array2<Complex64>> = Vec::with_capacity(vnl_data.entries.len());
+            let mut q_matrices: Vec<Vec<f64>> = Vec::with_capacity(vnl_data.entries.len());
+            for entry in &vnl_data.entries {
+                let ne = entry.n_expanded as usize;
+                if ne > 0 {
+                    let beta_host: Vec<CudaComplex> = stream.clone_dtoh(&entry.beta_g)
+                        .map_err(Error::Cuda)?;
+                    beta_g_per_ion.push(
+                        Array2::from_shape_vec((n_pw, ne),
+                            beta_host.iter().map(|c| Complex64::new(c.x, c.y)).collect()
+                        ).expect("beta_g shape (n_pw, ne) mismatch")
+                    );
+                    let q_host: Vec<CudaComplex> = stream.clone_dtoh(&entry.q_matrix)
+                        .map_err(Error::Cuda)?;
+                    q_matrices.push(q_host.iter().map(|c| c.x).collect());
+                } else {
+                    // NCPP ion: empty β (n_pw × 0) and Q (0 × 0)
+                    beta_g_per_ion.push(Array2::zeros((n_pw, 0)));
+                    q_matrices.push(Vec::new());
+                }
+            }
+
+            // Assemble USPP preconditioner matrices on CPU
+            let precon_prep = prepare_preconditioner()
+                .pw_ek(&kinetic_cpu.0)
+                .mean_ek(mean_ek)
+                .n_pw(n_pw)
+                .beta_g_per_ion(&beta_g_per_ion)
+                .q_matrices(&q_matrices)
+                .ion_n_expanded(&ion_n_expanded)
+                .mixture_weights(&mixture_weights)
+                .call()?;
+
             let result = unsafe {
                 davidson_diagonalise()
                     .psi_init(&psi_pw)
@@ -663,6 +707,8 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
                     .tpa_preconditioner(&tpa_precond)
                     .stream(&stream)
                     .ctx(&ctx)
+                    .r_beta_per_ion(&precon_prep.r_beta_per_ion)
+                    .q_rcq(&precon_prep.q_rcq)
                     .call()?
             };
 
