@@ -17,6 +17,7 @@ const DIR: &str = "/export/public_castep_jobs/tony/Cu111_CO_H_dump";
 const PDIR: &str = "/export/Potentials";
 
 #[test]
+#[ignore = "requires Cu111_CO_H_dump fixture at /export/public_castep_jobs/tony/Cu111_CO_H_dump"]
 fn debug_rayleigh() {
     let bin = CastepBinFile::read(std::io::BufReader::new(
         std::fs::File::open(format!("{DIR}/Cu111_CO.castep_bin")).unwrap())).unwrap();
