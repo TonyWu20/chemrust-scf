@@ -78,6 +78,8 @@ pub(crate) struct DavidsonResult {
     pub n_locked: usize,
     /// S⁻¹-weighted residual norms for all bands.
     pub residual_norms_sinv: ResidualSInvNorm,
+    /// Number of outer iterations completed (0 for single-sweep v1).
+    pub n_outer_iterations: usize,
 }
 
 /// Snapshot of Davidson diagnostics after the most recent solve.
@@ -383,6 +385,7 @@ pub(crate) unsafe fn davidson_v1(
             eigenvalues,
             n_locked,
             residual_norms_sinv: ResidualSInvNorm::new(residual_norms_sinv),
+            n_outer_iterations: 0,
         });
     }
 
@@ -592,6 +595,203 @@ pub(crate) unsafe fn davidson_v1(
         eigenvalues,
         n_locked,
         residual_norms_sinv: ResidualSInvNorm::new(residual_norms_sinv),
+        n_outer_iterations: 0,
+    })
+}
+
+// ======================================================================
+// Outer-loop convergence check
+// ======================================================================
+
+/// Check whether a band has converged based on eigenvalue stability.
+///
+/// A band is converged if the eigenvalue change after subspace rotation
+/// is below the threshold: `|prev - new| < max(tol_abs, 2*|new|*EPS)`.
+///
+/// The EPS guard prevents near-zero tol_abs from demanding convergence
+/// beyond machine precision for large eigenvalues.
+///
+/// # Arguments
+/// - `prev`: eigenvalue before subspace rotation
+/// - `new`: eigenvalue after subspace rotation
+/// - `tol_abs`: absolute convergence tolerance (Hartree)
+///
+/// Returns `true` if the band is converged.
+pub(crate) fn check_band_converged(prev: f64, new: f64, tol_abs: f64) -> bool {
+    let diff = (prev - new).abs();
+    let threshold = tol_abs.max(2.0 * new.abs() * f64::EPSILON);
+    diff < threshold
+}
+
+// ======================================================================
+// Outer Davidson loop with subspace diagonalization (Phase 1B)
+// ======================================================================
+
+/// Run the outer Davidson loop with subspace diagonalization.
+///
+/// Implements the outer loop structure from CASTEP's
+/// `hamiltonian_diagonalise_ks` (hamiltonian.f90:947-1018):
+///
+/// 1. Copy psi_init → eigenvectors buffer
+/// 2. Set H_correct = false
+/// 3. `for iteration in 0..max_outer_iter`:
+///    a. If all bands converged: break
+///    b. If !H_correct: compute H·ψ via `apply_full_hamiltonian`
+///    c. Save previous eigenvalues
+///    d. Subspace diagonalization via `solve_block_zhegvd` (full n_bands)
+///    e. Rotate ψ via ZHEGVD eigenvector matrix
+///    f. Convergence check: |prev_eig - new_eig| < max(tol_abs, 2*|new_eig|*EPS)
+///    g. Set H_correct = true (H·ψ was just computed)
+///    h. After rotation, H·ψ is stale → H_correct = false
+///
+/// # Notes
+/// - The preconditioner call and inner block loop are NOT implemented yet
+///   (TODO for future tasks).
+/// - Uses the existing `solve_block_zhegvd` for the full n_bands × n_bands
+///   subspace (not block-by-block).
+///
+/// # Safety
+/// All device pointers must be valid and of sufficient size. `psi_init` must
+/// be S-orthonormal (column-major, n_bands × n_pw).
+#[builder]
+#[allow(clippy::too_many_arguments, unsafe_op_in_unsafe_fn)]
+pub(crate) unsafe fn davidson_diagonalise(
+    psi_init: &PwCoefficients,
+    v_eff_dev: &CudaSlice<f64>,
+    kinetic_dev: &KineticPreconditioner,
+    fft_idx_dev: &CudaSlice<i32>,
+    vnl_data: &VnlBatchData,
+    n_pw: usize,
+    n_bands: usize,
+    grid_size: usize,
+    inv_ntotal: f64,
+    fft_plan: &BatchedFftPlan3d,
+    tol_abs: f64,
+    max_outer_iter: usize,
+    blas: &BlasHandle,
+    solver: &SolverHandle,
+    kernels: &CudaKernelSet,
+    stream: &Arc<CudaStream>,
+    _ctx: &Arc<CudaContext>,
+) -> Result<DavidsonResult, Error> {
+    let n_elem = n_bands * n_pw;
+
+    // ------------------------------------------------------------------
+    // Persistent GPU buffers
+    // ------------------------------------------------------------------
+    let mut psi_dev = PwCoefficients::new(
+        stream.alloc_zeros(n_elem).map_err(Error::Cuda)?);
+    stream
+        .memcpy_dtod(&**psi_init, &mut psi_dev.0)
+        .map_err(Error::Cuda)?;
+
+    let mut hpsi_dev = PwCoefficients::new(
+        stream.alloc_zeros(n_elem).map_err(Error::Cuda)?);
+    let grid_alloc = n_bands * grid_size;
+    let mut grid_dev: CudaSlice<CudaComplex> =
+        stream.alloc_zeros(grid_alloc).map_err(Error::Cuda)?;
+
+    // ZHEGVD GPU buffers (reused across iterations)
+    let mut eig_dev: CudaSlice<f64> =
+        stream.alloc_zeros(n_bands).map_err(Error::Cuda)?;
+    let mut info_dev: CudaSlice<i32> =
+        stream.alloc_zeros(1).map_err(Error::Cuda)?;
+
+    // ------------------------------------------------------------------
+    // State
+    // ------------------------------------------------------------------
+    let mut eigenvalues = vec![0.0_f64; n_bands];
+    let mut band_converged = vec![false; n_bands];
+    let mut h_correct = false;
+
+    let mut n_outer_completed: usize = 0;
+
+    // ------------------------------------------------------------------
+    // Outer loop
+    // ------------------------------------------------------------------
+    #[allow(unused_assignments)] // h_correct managed here for future inner block loop
+    for iteration in 0..max_outer_iter {
+        // Step a: exit if all bands converged
+        if band_converged.iter().all(|&c| c) {
+            break;
+        }
+
+        // Step b: compute H·ψ if needed
+        if !h_correct {
+            unsafe {
+                apply_full_hamiltonian()
+                    .psi_dev(&psi_dev)
+                    .v_eff_dev(v_eff_dev)
+                    .kinetic_dev(kinetic_dev)
+                    .fft_idx_dev(fft_idx_dev)
+                    .n_pw(n_pw)
+                    .n_bands(n_bands)
+                    .grid_size(grid_size)
+                    .inv_ntotal(inv_ntotal)
+                    .fft_plan(fft_plan)
+                    .hpsi_dev(&mut hpsi_dev)
+                    .grid_dev(&mut grid_dev)
+                    .vnl_data(vnl_data)
+                    .blas(blas)
+                    .kernels(kernels)
+                    .stream(stream)
+                    .call()?;
+            }
+            h_correct = true;
+        }
+
+        // Step c: save previous eigenvalues
+        let prev_eigenvalues = eigenvalues.clone();
+
+        // Steps d-e: subspace diagonalization (full n_bands)
+        // psi_rotated is temporary — we copy it back to psi_dev after rotation
+        let mut psi_rotated = PwCoefficients::new(
+            stream.alloc_zeros(n_elem).map_err(Error::Cuda)?);
+
+        solve_block_zhegvd()
+            .psi_block(&psi_dev)
+            .hpsi_block(&hpsi_dev)
+            .vnl_data(vnl_data)
+            .k(n_bands)
+            .n_pw(n_pw)
+            .blas(blas)
+            .solver(solver)
+            .stream(stream)
+            .eigenvalues_out(&mut eigenvalues)
+            .eig_dev(&mut eig_dev)
+            .info_dev(&mut info_dev)
+            .psi_rotated(&mut psi_rotated)
+            .call()?;
+
+        // Copy rotated ψ back to psi_dev
+        stream
+            .memcpy_dtod(&*psi_rotated, &mut psi_dev.0)
+            .map_err(Error::Cuda)?;
+
+        // Step f-g: convergence check
+        for b in 0..n_bands {
+            if check_band_converged(prev_eigenvalues[b], eigenvalues[b], tol_abs) {
+                band_converged[b] = true;
+            } else {
+                band_converged[b] = false;
+            }
+        }
+
+        // Step h: after rotation, H·ψ is stale
+        h_correct = false;
+
+        n_outer_completed = iteration + 1;
+    }
+
+    // ------------------------------------------------------------------
+    // Result
+    // ------------------------------------------------------------------
+    Ok(DavidsonResult {
+        psi_out: psi_dev.0,
+        eigenvalues,
+        n_locked: band_converged.iter().filter(|&&c| c).count(),
+        residual_norms_sinv: ResidualSInvNorm::new(vec![0.0_f64; n_bands]),
+        n_outer_iterations: n_outer_completed,
     })
 }
 
@@ -803,7 +1003,11 @@ unsafe fn solve_block_zhegvd(
 
 #[cfg(test)]
 mod tests {
-    use super::lock_tol_for_iter;
+    use super::{lock_tol_for_iter, check_band_converged};
+
+    // -----------------------------------------------------------------------
+    // lock_tol_for_iter tests (existing)
+    // -----------------------------------------------------------------------
 
     #[test]
     fn lock_tol_for_iter_baseline() {
@@ -862,5 +1066,90 @@ mod tests {
             tol < 1e-10,
             "iter 100 with target 0.0: lock_tol = {tol}, expected near 0"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // check_band_converged tests (outer-loop convergence)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn check_band_converged_small_diff_below_tol_abs() {
+        // diff < tol_abs → converged
+        assert!(check_band_converged(1.0, 1.0 + 1e-10, 1e-8));
+    }
+
+    #[test]
+    fn check_band_converged_large_diff_above_tol_abs() {
+        // diff > tol_abs → not converged
+        assert!(!check_band_converged(1.0, 1.1, 1e-8));
+    }
+
+    #[test]
+    fn check_band_converged_exact_zero_diff() {
+        // zero diff → converged
+        assert!(check_band_converged(1.0, 1.0, 1e-8));
+    }
+
+    #[test]
+    fn check_band_converged_eps_guard_below_threshold() {
+        // For large eigenvalues, the EPS term dominates tol_abs.
+        // threshold ≈ 2*|1e10|*EPS ≈ 4.44e-6
+        // diff = threshold * 0.5 < threshold → converged
+        let eig = 1e10_f64;
+        let threshold = 2.0 * eig.abs() * f64::EPSILON;
+        assert!(check_band_converged(eig, eig + threshold * 0.5, 1e-8));
+    }
+
+    #[test]
+    fn check_band_converged_eps_guard_above_threshold() {
+        // diff = threshold * 5.0 > threshold → not converged
+        // (Large margin avoids f64 rounding at 1e10 scale)
+        let eig = 1e10_f64;
+        let threshold = 2.0 * eig.abs() * f64::EPSILON;
+        assert!(!check_band_converged(eig, eig + threshold * 5.0, 1e-8));
+    }
+
+    #[test]
+    fn check_band_converged_tol_abs_dominates_for_small_eig() {
+        // For small eigenvalues, tol_abs dominates.
+        // threshold = max(1e-6, 2*|1.0|*EPS) = 1e-6 (tol_abs is larger)
+        // diff = 5e-7 < 1e-6 → converged
+        assert!(check_band_converged(1.0, 1.0 + 5e-7, 1e-6));
+
+        // diff = 2e-6 > 1e-6 → not converged
+        assert!(!check_band_converged(1.0, 1.0 + 2e-6, 1e-6));
+    }
+
+    #[test]
+    fn check_band_converged_negative_eigenvalues() {
+        // Negative eigenvalues should be handled correctly
+        // |(-10.0 - (-10.0 + 1e-9))| = 1e-9 < 1e-8 → converged
+        assert!(check_band_converged(-10.0, -10.0 + 1e-9, 1e-8));
+
+        // |(-10.0 - (-11.0))| = 1.0 > 1e-8 → not converged
+        assert!(!check_band_converged(-10.0, -11.0, 1e-8));
+    }
+
+    #[test]
+    fn check_band_converged_zero_tol_abs() {
+        // With zero tol_abs, only EPS guard protects
+        // diff = 1e-8, threshold = max(0.0, 2*|1.0|*EPS) ≈ 4.4e-16
+        // diff > threshold → not converged
+        assert!(!check_band_converged(1.0, 1.0 + 1e-8, 0.0));
+
+        // diff = 0.0 < threshold → converged
+        assert!(check_band_converged(1.0, 1.0, 0.0));
+    }
+
+    #[test]
+    fn check_band_converged_very_large_eigenvalue() {
+        // For extremely large eigenvalues, EPS guard dominates
+        // threshold ≈ 2 * |1e15| * EPS ≈ 4.4e-1
+        let eig = 1e15_f64;
+        let threshold = 2.0 * eig.abs() * f64::EPSILON;
+        // diff just below threshold → converged
+        assert!(check_band_converged(eig, eig + threshold * 0.5, 1e-8));
+        // diff just above threshold → not converged
+        assert!(!check_band_converged(eig, eig + threshold * 2.0, 1e-8));
     }
 }
