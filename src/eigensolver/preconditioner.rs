@@ -7,11 +7,11 @@
 use std::sync::Arc;
 
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
+    CudaContext, CudaFunction, CudaModule, CudaStream, LaunchConfig, PushKernelArg,
 };
 use cudarc::nvrtc::compile_ptx;
 
-use crate::device::CudaComplex;
+use crate::eigensolver::davidson_types::{KineticPreconditioner, PwCoefficients};
 use crate::types::Error;
 
 // ---------------------------------------------------------------------------
@@ -82,9 +82,9 @@ impl TpaPreconditioner {
     ///   `residual` concurrently.
     pub(crate) unsafe fn apply(
         &self,
-        precond: &mut CudaSlice<CudaComplex>,
-        residual: &CudaSlice<CudaComplex>,
-        kinetic_dev: &CudaSlice<f64>,
+        precond: &mut PwCoefficients,
+        residual: &PwCoefficients,
+        kinetic_dev: &KineticPreconditioner,
         lambda: f64,
         n_pw: usize,
         stream: &Arc<CudaStream>,
@@ -93,9 +93,9 @@ impl TpaPreconditioner {
         unsafe {
             stream
                 .launch_builder(&self.kernel)
-                .arg(&mut *precond)
-                .arg(residual)
-                .arg(kinetic_dev)
+                .arg(&mut **precond)
+                .arg(&**residual)
+                .arg(&**kinetic_dev)
                 .arg(&lambda)
                 .arg(&self.clamp_eps)
                 .arg(&n_pw_i32)

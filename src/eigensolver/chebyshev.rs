@@ -19,6 +19,7 @@ use cudarc::driver::{
 };
 
 use crate::device::blas::BlasHandle;
+use crate::eigensolver::davidson_types::{KineticPreconditioner, PwCoefficients};
 use crate::device::fft::BatchedFftPlan3d;
 use crate::device::pcie::PcieAccount;
 use crate::device::solver::SolverHandle;
@@ -192,7 +193,7 @@ pub(crate) fn compute_spectral_bounds(
 #[allow(clippy::too_many_arguments)]
 unsafe fn lanczos_upper_bound(
     v_eff_dev: &CudaSlice<f64>,
-    kinetic_dev: &CudaSlice<f64>,
+    kinetic_dev: &KineticPreconditioner,
     fft_idx_dev: &CudaSlice<i32>,
     n_pw: usize,
     grid_size: usize,
@@ -213,9 +214,9 @@ unsafe fn lanczos_upper_bound(
     )?;
 
     // Working buffers: v (current), v_prev (previous), Hv
-    let mut v_cur: CudaSlice<CudaComplex> = stream.alloc_zeros(n_pw).map_err(Error::Cuda)?;
-    let mut v_prev: CudaSlice<CudaComplex> = stream.alloc_zeros(n_pw).map_err(Error::Cuda)?;
-    let mut hv: CudaSlice<CudaComplex> = stream.alloc_zeros(n_pw).map_err(Error::Cuda)?;
+    let mut v_cur = PwCoefficients::new(stream.alloc_zeros(n_pw).map_err(Error::Cuda)?);
+    let mut v_prev = PwCoefficients::new(stream.alloc_zeros(n_pw).map_err(Error::Cuda)?);
+    let mut hv = PwCoefficients::new(stream.alloc_zeros(n_pw).map_err(Error::Cuda)?);
     let mut grid1: CudaSlice<CudaComplex> = stream.alloc_zeros(grid_size).map_err(Error::Cuda)?;
     // Use a deterministic pseudo-random starting vector so Lanczos explores
     // the full spectrum. Using the first band (lowest eigenstate) as start
@@ -228,7 +229,7 @@ unsafe fn lanczos_upper_bound(
             })
             .collect();
         let rand_dev = stream.clone_htod(&rand_cpu).map_err(Error::Cuda)?;
-        stream.memcpy_dtod(&rand_dev, &mut v_cur).map_err(Error::Cuda)?;
+        stream.memcpy_dtod(&rand_dev, &mut v_cur.0).map_err(Error::Cuda)?;
     }
 
     // Normalise v_cur
@@ -305,9 +306,9 @@ unsafe fn lanczos_upper_bound(
         }
 
         // v_prev = v_cur;  v_cur = Hv / beta[j+1]
-        stream.memcpy_dtod(&v_cur, &mut v_prev).map_err(Error::Cuda)?;
+        stream.memcpy_dtod(&*v_cur, &mut v_prev.0).map_err(Error::Cuda)?;
         let inv_b = CudaComplex { x: 1.0 / beta[j + 1], y: 0.0 };
-        stream.memcpy_dtod(&hv, &mut v_cur).map_err(Error::Cuda)?;
+        stream.memcpy_dtod(&*hv, &mut v_cur.0).map_err(Error::Cuda)?;
         unsafe {
             let (ptr, _) = v_cur.device_ptr_mut(stream);
             cudarc::cublas::sys::cublasZscal_v2(blas.raw_handle(), n, &inv_b as *const _ as *const _, ptr as *mut _, 1)
@@ -588,8 +589,9 @@ pub(crate) fn chebyshev_filter(
         Some(ke) => ke.to_vec(),
         None => compute_kinetic_energies(pw_coords, wave_grid.recip_lattice()).0,
     };
-    let kinetic_dev: CudaSlice<f64> =
+    let kinetic_dev_values: CudaSlice<f64> =
         stream.clone_htod(&kinetic_data).map_err(Error::Cuda)?;
+    let kinetic_dev = KineticPreconditioner::new(kinetic_dev_values);
     pcie.h2d_bytes += kinetic_data.len() * std::mem::size_of::<f64>();
 
     // ---- FFT plan (batched C2C) ----
@@ -606,28 +608,27 @@ pub(crate) fn chebyshev_filter(
 
     // ---- GPU workspace buffers ----
     let v_eff_dev = v_eff_gpu.as_device_slice();
-    let psi_input = psi_gpu.as_device_slice().clone();
+    let psi_input = PwCoefficients::new(psi_gpu.as_device_slice().clone());
 
     // R-ChFSI buffers (Algorithm 3):
     // buf_y = Y = H·X − S·X·Λ, buf_sx = S·X for residual, buf_rx = R_X, buf_ry = R_Y
     // buf_c: reused for R_new computation then swap with buf_ry
     // buf_a: reused for X_new reconstruction at Step 4
-    let mut buf_y: CudaSlice<CudaComplex> = stream.alloc_zeros(n_elem).map_err(Error::Cuda)?;
-    let mut buf_sx: CudaSlice<CudaComplex> = stream.alloc_zeros(n_elem).map_err(Error::Cuda)?;
-    let mut buf_rx: CudaSlice<CudaComplex> = stream.alloc_zeros(n_elem).map_err(Error::Cuda)?;
-    let mut buf_ry: CudaSlice<CudaComplex> = stream.alloc_zeros(n_elem).map_err(Error::Cuda)?;
-    let mut buf_c: CudaSlice<CudaComplex> = stream.alloc_zeros(n_elem).map_err(Error::Cuda)?;
-    let mut buf_a: CudaSlice<CudaComplex> = stream.alloc_zeros(n_elem).map_err(Error::Cuda)?;
+    let mut buf_y = PwCoefficients::new(stream.alloc_zeros(n_elem).map_err(Error::Cuda)?);
+    let mut buf_sx = PwCoefficients::new(stream.alloc_zeros(n_elem).map_err(Error::Cuda)?);
+    let mut buf_rx = PwCoefficients::new(stream.alloc_zeros(n_elem).map_err(Error::Cuda)?);
+    let mut buf_ry = PwCoefficients::new(stream.alloc_zeros(n_elem).map_err(Error::Cuda)?);
+    let mut buf_c = PwCoefficients::new(stream.alloc_zeros(n_elem).map_err(Error::Cuda)?);
+    let mut buf_a = PwCoefficients::new(stream.alloc_zeros(n_elem).map_err(Error::Cuda)?);
 
     // Hamiltonian workspace
-    let mut hpsi_dev: CudaSlice<CudaComplex> = stream.alloc_zeros(n_elem).map_err(Error::Cuda)?;
+    let mut hpsi_dev = PwCoefficients::new(stream.alloc_zeros(n_elem).map_err(Error::Cuda)?);
     let mut grid_dev: CudaSlice<CudaComplex> =
         stream.alloc_zeros(grid_alloc).map_err(Error::Cuda)?;
 
     // Output RowDistributed buffers
-    let mut psi_row_dev: CudaSlice<CudaComplex> = stream.alloc_zeros(n_elem).map_err(Error::Cuda)?;
-    let mut hpsi_row_dev: CudaSlice<CudaComplex> =
-        stream.alloc_zeros(n_elem).map_err(Error::Cuda)?;
+    let mut psi_row_dev = PwCoefficients::new(stream.alloc_zeros(n_elem).map_err(Error::Cuda)?);
+    let mut hpsi_row_dev = PwCoefficients::new(stream.alloc_zeros(n_elem).map_err(Error::Cuda)?);
 
     // ---- Spectral bounds ----
     // Per Zhou (2014) Algorithm 4.1 §7.1-7.2:
@@ -743,11 +744,11 @@ pub(crate) fn chebyshev_filter(
     // Pre-allocate lam_y_dev (updated each step, no re-allocation)
     let mut lam_y_dev: CudaSlice<f64> = stream.alloc_zeros(n_bands).map_err(Error::Cuda)?;
 
-    let final_psi_buf: &mut CudaSlice<CudaComplex>;
+    let final_psi_buf: &mut PwCoefficients;
 
     if ndeg == 0 {
         // No filtering: use input wavefunctions as-is
-        stream.memcpy_dtod(&psi_input, &mut buf_a).map_err(Error::Cuda)?;
+        stream.memcpy_dtod(&*psi_input, &mut buf_a.0).map_err(Error::Cuda)?;
         final_psi_buf = &mut buf_a;
     } else {
         // ------------------------------------------------------------
@@ -763,12 +764,11 @@ pub(crate) fn chebyshev_filter(
         }
 
         // buf_y = hpsi_dev (copy, keeping hpsi_dev intact for diagnostics)
-        stream.memcpy_dtod(&hpsi_dev, &mut buf_y).map_err(Error::Cuda)?;
+        stream.memcpy_dtod(&*hpsi_dev, &mut buf_y.0).map_err(Error::Cuda)?;
 
         if let Some(eig) = eigenvalues {
             // buf_sx = S·psi_input
-            stream.memcpy_dtod(&psi_input, &mut buf_sx).map_err(Error::Cuda)?;
-            unsafe {
+            stream.memcpy_dtod(&*psi_input, &mut buf_sx.0).map_err(Error::Cuda)?;            unsafe {
                 apply_s_times(&psi_input, &mut buf_sx, vnl_data, n_bands_i32, n_pw_i32, blas, stream)?;
             }
             // Upload eigenvalues to GPU
@@ -834,7 +834,7 @@ pub(crate) fn chebyshev_filter(
         // buf_rx = 0  (already zero-allocated)
         // buf_ry = (σ₁/e) · Y
         let sigma1_over_e = sigma1 / e;
-        stream.memcpy_dtod(&buf_y, &mut buf_ry).map_err(Error::Cuda)?;
+        stream.memcpy_dtod(&*buf_y, &mut buf_ry.0).map_err(Error::Cuda)?;
         unsafe {
             let alpha_s1 = CudaComplex { x: sigma1_over_e, y: 0.0 };
             let (ptr, _) = buf_ry.device_ptr_mut(stream);
@@ -902,11 +902,11 @@ pub(crate) fn chebyshev_filter(
 
             // R_new = (2σ₂/e)·H·R_Y − (2σ₂/e)·c·R_Y − σ·σ₂·R_X + (2σ₂/e)·Y·Λ_Y
             // First: buf_c = coeff * H·R_Y
-            stream.memcpy_dtod(&hpsi_dev, &mut buf_c).map_err(Error::Cuda)?;
+            stream.memcpy_dtod(&*hpsi_dev, &mut buf_c.0).map_err(Error::Cuda)?;
             {
                 let alpha_cf = CudaComplex { x: coeff, y: 0.0 };
                 unsafe {
-                    let (ptr, _) = buf_c.device_ptr_mut(stream);
+                    let (ptr, _) = buf_c.0.device_ptr_mut(stream);
                     cudarc::cublas::sys::cublasZscal_v2(
                         blas.raw_handle(),
                         n_elem_i32,
@@ -972,7 +972,7 @@ pub(crate) fn chebyshev_filter(
         //   Modes A/B: X_new = R_Y + X·Λ_Y  (no S⁻¹)
         //   Mode C:    X_new = S⁻¹·R_Y + X·Λ_Y  (Das Alg 3 line 607)
         // ------------------------------------------------------------
-        stream.memcpy_dtod(&buf_ry, &mut buf_a).map_err(Error::Cuda)?;
+        stream.memcpy_dtod(&*buf_ry, &mut buf_a.0).map_err(Error::Cuda)?;
         if matches!(filter_mode, FilterMode::SinvHFullDas) {
             unsafe {
                 apply_s_inverse(&mut buf_a, vnl_data, n_bands_i32, n_pw_i32, blas, stream, solver)?;
@@ -998,11 +998,11 @@ pub(crate) fn chebyshev_filter(
     //   4. col_b /= √(‖col_b_new‖²_S)
     //
     // Scratch: gs_col holds col_b(initial); gs_s_col holds S·col_b(initial).
-    let mut gs_col: CudaSlice<CudaComplex> = stream.alloc_zeros(n_pw).map_err(Error::Cuda)?;
-    let mut gs_s_col: CudaSlice<CudaComplex> = stream.alloc_zeros(n_pw).map_err(Error::Cuda)?;
+    let mut gs_col = PwCoefficients::new(stream.alloc_zeros(n_pw).map_err(Error::Cuda)?);
+    let mut gs_s_col = PwCoefficients::new(stream.alloc_zeros(n_pw).map_err(Error::Cuda)?);
     unsafe {
-        let (psi_ptr, _) = final_psi_buf.device_ptr_mut(stream);
-        let (gs_col_ptr, _) = gs_col.device_ptr_mut(stream);
+        let (psi_ptr, _) = final_psi_buf.0.device_ptr_mut(stream);
+        let (gs_col_ptr, _) = gs_col.0.device_ptr_mut(stream);
         for _pass in 0..2 {
             for b in 0..n_bands {
                 let col_b = (psi_ptr as *mut CudaComplex).add(b * n_pw);
@@ -1013,10 +1013,10 @@ pub(crate) fn chebyshev_filter(
                     gs_col_ptr as *mut _, 1,
                 ).result().map_err(Error::Blas)?;
                 // gs_s_col = S · gs_col
-                stream.memcpy_dtod(&gs_col, &mut gs_s_col).map_err(Error::Cuda)?;
+                stream.memcpy_dtod(&*gs_col, &mut gs_s_col.0).map_err(Error::Cuda)?;
                 apply_s_times(&gs_col, &mut gs_s_col, vnl_data, 1, n_pw_i32, blas, stream)?;
                 // Get device pointer from gs_s_col after mutable ops complete
-                let (gs_s_col_ptr, _) = gs_s_col.device_ptr_mut(stream);
+                let (gs_s_col_ptr, _) = gs_s_col.0.device_ptr_mut(stream);
                 // ‖col_b‖²_S = ⟨col_b, S·col_b⟩  (real part; S is Hermitian)
                 // cublasZdotc computes Σ_i conj(x[i])·y[i], a dimensionless grid sum.
                 // For continuous normalization ∫ψ*(r)·(S·ψ)(r) d³r = 1, the discrete
@@ -1100,8 +1100,8 @@ pub(crate) fn chebyshev_filter(
     // (n_bands, n_pw) [flat[g*n_bands + b] = psi[b, g]] which gemm with
     // lda = n_pw mis-read, scrambling H_sub and S_sub. Found via the
     // RR_DUMP_HS diagnostic in `rayleigh_ritz.rs`.
-    stream.memcpy_dtod(final_psi_buf, &mut psi_row_dev).map_err(Error::Cuda)?;
-    stream.memcpy_dtod(&hpsi_dev, &mut hpsi_row_dev).map_err(Error::Cuda)?;
+    stream.memcpy_dtod(&**final_psi_buf, &mut psi_row_dev.0).map_err(Error::Cuda)?;
+    stream.memcpy_dtod(&*hpsi_dev, &mut hpsi_row_dev.0).map_err(Error::Cuda)?;
 
     // The Gram-Schmidt step above already orthonormalized the bands, so
     // S_sub = ψ†ψ ≈ I and ZHEGVD is well-conditioned. No further per-band
@@ -1109,13 +1109,13 @@ pub(crate) fn chebyshev_filter(
 
     // Wrap into Gpu<WavefunctionSet<L>>
     let psi_row = Gpu::<WavefunctionSet<RowDistributed>> {
-        slice: psi_row_dev,
+        slice: psi_row_dev.0,
         shape: vec![n_bands, n_pw],
         ctx: ctx.clone(),
         _marker: PhantomData,
     };
     let hpsi_row = Gpu::<WavefunctionSet<RowDistributed>> {
-        slice: hpsi_row_dev,
+        slice: hpsi_row_dev.0,
         shape: vec![n_bands, n_pw],
         ctx: ctx.clone(),
         _marker: PhantomData,
@@ -1157,7 +1157,8 @@ pub fn apply_h_components_for_test(
     let grid_alloc = n_bands * grid_size;
 
     let kinetic_cpu = compute_kinetic_energies(pw_coords, wave_grid.recip_lattice());
-    let kinetic_dev: CudaSlice<f64> = stream.clone_htod(&kinetic_cpu.0).map_err(Error::Cuda)?;
+    let kinetic_raw: CudaSlice<f64> = stream.clone_htod(&kinetic_cpu.0).map_err(Error::Cuda)?;
+    let kinetic_dev = KineticPreconditioner::new(kinetic_raw);
 
     // Plan with the cuFFT-correct dim ordering (matches chebyshev_filter at line 844).
     let fft_plan = BatchedFftPlan3d::plan_batched_c2c(
@@ -1176,7 +1177,7 @@ pub fn apply_h_components_for_test(
             .launch_builder(&kernels.init_kinetic)
             .arg(&mut hpsi_t)
             .arg(psi_input)
-            .arg(&kinetic_dev)
+            .arg(&*kinetic_dev)
             .arg(&n_pw_i32)
             .arg(&n_bands_i32)
             .launch(LaunchConfig::for_num_elems((n_bands_i32 * n_pw_i32) as u32))
@@ -1184,10 +1185,11 @@ pub fn apply_h_components_for_test(
     .map_err(Error::Cuda)?;
 
     // Component 2: kinetic + V_loc (full apply_v_loc_hamiltonian).
-    let mut hpsi_tv: CudaSlice<CudaComplex> = stream.alloc_zeros(n_elem).map_err(Error::Cuda)?;
+    let mut hpsi_tv = PwCoefficients::new(stream.alloc_zeros(n_elem).map_err(Error::Cuda)?);
+    let psi_pw = PwCoefficients::new(psi_input.clone());
     unsafe {
         apply_v_loc_hamiltonian(
-            psi_input, &mut hpsi_tv, &mut grid_dev,
+            &psi_pw, &mut hpsi_tv, &mut grid_dev,
             &kinetic_dev, fft_idx_dev, v_eff_dev,
             n_pw_i32, n_bands_i32, grid_size as i32, inv_ntotal,
             &fft_plan, kernels, stream,
@@ -1195,16 +1197,16 @@ pub fn apply_h_components_for_test(
     }
 
     // Component 3: kinetic + V_loc + V_NL (full apply_full_hamiltonian).
-    let mut hpsi_full: CudaSlice<CudaComplex> = stream.alloc_zeros(n_elem).map_err(Error::Cuda)?;
+    let mut hpsi_full = PwCoefficients::new(stream.alloc_zeros(n_elem).map_err(Error::Cuda)?);
     unsafe {
         apply_v_loc_hamiltonian(
-            psi_input, &mut hpsi_full, &mut grid_dev,
+            &psi_pw, &mut hpsi_full, &mut grid_dev,
             &kinetic_dev, fft_idx_dev, v_eff_dev,
             n_pw_i32, n_bands_i32, grid_size as i32, inv_ntotal,
             &fft_plan, kernels, stream,
         )?;
         apply_v_nl_hamiltonian(
-            psi_input, &mut hpsi_full, vnl_data,
+            &psi_pw, &mut hpsi_full, vnl_data,
             n_bands_i32, n_pw_i32, blas, stream,
         )?;
     }
@@ -1219,8 +1221,8 @@ pub fn apply_h_components_for_test(
     };
     Ok(HComponentsForTest {
         hpsi_t: to_complex(stream.clone_dtoh(&hpsi_t).map_err(Error::Cuda)?),
-        hpsi_tv: to_complex(stream.clone_dtoh(&hpsi_tv).map_err(Error::Cuda)?),
-        hpsi_full: to_complex(stream.clone_dtoh(&hpsi_full).map_err(Error::Cuda)?),
+        hpsi_tv: to_complex(stream.clone_dtoh(&*hpsi_tv).map_err(Error::Cuda)?),
+        hpsi_full: to_complex(stream.clone_dtoh(&*hpsi_full).map_err(Error::Cuda)?),
         n_bands,
         n_pw,
     })
@@ -1263,10 +1265,12 @@ pub fn apply_s_for_test(
     let mut spsi_dev: CudaSlice<CudaComplex> = stream.alloc_zeros(n_elem).map_err(Error::Cuda)?;
     stream.memcpy_dtod(&psi_dev, &mut spsi_dev).map_err(Error::Cuda)?;
 
+    let psi_pw = PwCoefficients(psi_dev);
+    let mut spsi_pw = PwCoefficients(spsi_dev);
     unsafe {
         apply_s_times(
-            &psi_dev,
-            &mut spsi_dev,
+            &psi_pw,
+            &mut spsi_pw,
             vnl_data,
             n_bands as i32,
             n_pw as i32,
@@ -1275,7 +1279,7 @@ pub fn apply_s_for_test(
         )?;
     }
     stream.synchronize()?;
-    let spsi_raw = stream.clone_dtoh(&spsi_dev).map_err(Error::Cuda)?;
+    let spsi_raw = stream.clone_dtoh(&*spsi_pw).map_err(Error::Cuda)?;
     Ok(spsi_raw
         .into_iter()
         .map(|c| num_complex::Complex64::new(c.x, c.y))
@@ -1290,14 +1294,14 @@ pub(crate) fn gram_schmidt_s(
     psi: &mut CudaSlice<CudaComplex>,
     vnl_data: &VnlBatchData,
     n_pw: usize, n_bands: usize,
-    blas: &BlasHandle, stream: &Arc<CudaStream>, solver: &SolverHandle,
+    blas: &BlasHandle, stream: &Arc<CudaStream>, _solver: &SolverHandle,
 ) -> Result<(), Error> {
     let n_pw_i32 = n_pw as i32;
-    let mut gs_col: CudaSlice<CudaComplex> = stream.alloc_zeros(n_pw)?;
-    let mut gs_s_col: CudaSlice<CudaComplex> = stream.alloc_zeros(n_pw)?;
+    let mut gs_col = PwCoefficients::new(stream.alloc_zeros(n_pw)?);
+    let mut gs_s_col = PwCoefficients::new(stream.alloc_zeros(n_pw)?);
     unsafe {
         let (psi_ptr, _) = psi.device_ptr_mut(stream);
-        let (gs_col_ptr, _) = gs_col.device_ptr_mut(stream);
+        let (gs_col_ptr, _) = gs_col.0.device_ptr_mut(stream);
         for _pass in 0..2 {
             for b in 0..n_bands {
                 let col_b = (psi_ptr as *mut CudaComplex).add(b * n_pw);
@@ -1305,9 +1309,9 @@ pub(crate) fn gram_schmidt_s(
                     blas.raw_handle(), n_pw_i32,
                     col_b as *const _, 1, gs_col_ptr as *mut _, 1,
                 ).result().map_err(Error::Blas)?;
-                stream.memcpy_dtod(&gs_col, &mut gs_s_col)?;
+                stream.memcpy_dtod(&*gs_col, &mut gs_s_col.0)?;
                 apply_s_times(&gs_col, &mut gs_s_col, vnl_data, 1, n_pw_i32, blas, stream)?;
-                let (gs_s_col_ptr, _) = gs_s_col.device_ptr_mut(stream);
+                let (gs_s_col_ptr, _) = gs_s_col.0.device_ptr_mut(stream);
                 let mut norm_sq_s = CudaComplex { x: 0.0, y: 0.0 };
                 cudarc::cublas::sys::cublasZdotc_v2(
                     blas.raw_handle(), n_pw_i32,
@@ -1654,7 +1658,7 @@ pub fn compute_residual_norms_for_test(
     // === 2. Allocate working buffers ===
     let mut hpsi_new_dev: CudaSlice<CudaComplex> =
         stream.alloc_zeros(n_elem).map_err(Error::Cuda)?;
-    let mut spsi_new_dev: CudaSlice<CudaComplex> =
+    let spsi_new_dev: CudaSlice<CudaComplex> =
         stream.alloc_zeros(n_elem).map_err(Error::Cuda)?;
     let mut residual_dev: CudaSlice<CudaComplex> =
         stream.alloc_zeros(n_elem).map_err(Error::Cuda)?;
@@ -1683,13 +1687,15 @@ pub fn compute_residual_norms_for_test(
 
     // === 4. spsi_new = S · psi_new (USPP overlap) ===
     // Pre-copy psi_new → spsi_new (identity term), then accumulate β·Q·β^H
+    let psi_new_pw = PwCoefficients::new(psi_new_gpu.as_device_slice().clone());
+    let mut spsi_new_pw = PwCoefficients::new(spsi_new_dev);
     stream
-        .memcpy_dtod(psi_new_gpu.as_device_slice(), &mut spsi_new_dev)
+        .memcpy_dtod(&*psi_new_pw, &mut spsi_new_pw.0)
         .map_err(Error::Cuda)?;
     unsafe {
         apply_s_times(
-            psi_new_gpu.as_device_slice(),
-            &mut spsi_new_dev,
+            &psi_new_pw,
+            &mut spsi_new_pw,
             vnl_data,
             n,
             k,
@@ -1701,7 +1707,7 @@ pub fn compute_residual_norms_for_test(
     // === 5. Per-band residual: r_b = hpsi_new_b − λ_b · spsi_new_b ===
     unsafe {
         let (hpsi_ptr, _) = hpsi_new_dev.device_ptr_mut(stream);
-        let (spsi_ptr, _) = spsi_new_dev.device_ptr_mut(stream);
+        let (spsi_ptr, _) = spsi_new_pw.0.device_ptr_mut(stream);
         let (residual_mut, _) = residual_dev.device_ptr_mut(stream);
 
         for b in 0..n_bands {
@@ -1751,14 +1757,14 @@ pub fn compute_residual_norms_for_test(
     }
 
     // === 7. S⁻¹ · residual_dev  (batch Woodbury, in-place on a copy) ===
-    let mut sinv_r_dev: CudaSlice<CudaComplex> =
-        stream.alloc_zeros(n_elem).map_err(Error::Cuda)?;
+    let mut sinv_r_pw = PwCoefficients::new(
+        stream.alloc_zeros(n_elem).map_err(Error::Cuda)?);
     stream
-        .memcpy_dtod(&residual_dev, &mut sinv_r_dev)
+        .memcpy_dtod(&residual_dev, &mut sinv_r_pw.0)
         .map_err(Error::Cuda)?;
     unsafe {
         apply_s_inverse(
-            &mut sinv_r_dev,
+            &mut sinv_r_pw,
             vnl_data,
             n,
             k,
@@ -1772,7 +1778,7 @@ pub fn compute_residual_norms_for_test(
     let mut sinv_norms = vec![0.0_f64; n_bands];
     unsafe {
         let (res_ptr, _) = residual_dev.device_ptr_mut(stream);
-        let (sinv_ptr, _) = sinv_r_dev.device_ptr_mut(stream);
+        let (sinv_ptr, _) = sinv_r_pw.0.device_ptr_mut(stream);
         for b in 0..n_bands {
             let r_b = (res_ptr as *const CudaComplex).add(b * n_pw);
             let sinv_b = (sinv_ptr as *const CudaComplex).add(b * n_pw);

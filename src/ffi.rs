@@ -14,13 +14,13 @@ use crate::device::blas::{BlasHandle, ZgemmConfig};
 use crate::device::fft::BatchedFftPlan3d;
 use crate::device::pcie::PcieAccount;
 use crate::device::solver::SolverHandle;
-use crate::device::{CudaComplex, DeviceMapped, Gpu};
-use crate::eigensolver::chebyshev::{chebyshev_filter, FilterMode};
+use crate::device::{CudaComplex, Gpu};
+use crate::eigensolver::davidson_types::{KineticPreconditioner, PwCoefficients};
 use crate::eigensolver::kernels::CudaKernelSet;
 use crate::eigensolver::rayleigh_ritz::rayleigh_ritz_with_matrices;
 use crate::eigensolver::vnl_data::VnlBatchData;
 use crate::layout::{ColumnDistributed, WavefunctionSet};
-use crate::types::{EffectivePotential, Error, FineGridArray, KPoint};
+use crate::types::{EffectivePotential, FineGridArray, KPoint};
 
 pub const CHEM_EIG_OK: c_int = 0;
 pub const CHEM_EIG_CUDA_ERROR: c_int = 3;
@@ -299,7 +299,7 @@ unsafe fn step_inner(
     let gs = (h.ngx * h.ngy * h.ngz) as usize;
     let n_pw_i32 = n_pw as i32;
     let n_bands_i32 = n_bands as i32;
-    let n_elem_i32 = (n_pw * n_bands) as i32;
+    let _n_elem_i32 = (n_pw * n_bands) as i32;
     let inv_ntotal = 1.0 / gs as f64;
     let kd = &mut h.kpts[ik];
 
@@ -422,7 +422,8 @@ unsafe fn step_inner(
     let mut pcie_step = PcieAccount::default();
     let n_elem = n_pw * n_bands;
     let n_elem_i32 = n_elem as i32;
-    let kinetic_dev: CudaSlice<f64> = stream.clone_htod(&ke_castep).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
+    let kinetic_raw: CudaSlice<f64> = stream.clone_htod(&ke_castep).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
+    let kinetic_dev = KineticPreconditioner::new(kinetic_raw);
 
     let fft_plan = BatchedFftPlan3d::plan_batched_c2c(
         h.ngx, h.ngy, h.ngz, n_bands_i32, stream.clone(),
@@ -431,10 +432,10 @@ unsafe fn step_inner(
     // Allocate GPU work buffers
     let mut psi_prev: CudaSlice<CudaComplex> = stream.alloc_zeros(n_elem).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
     let mut psi_curr: CudaSlice<CudaComplex> = stream.alloc_zeros(n_elem).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
-    let mut hpsi: CudaSlice<CudaComplex> = stream.alloc_zeros(n_elem).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
-    let mut spsi: CudaSlice<CudaComplex> = stream.alloc_zeros(n_elem).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
-    let mut spsi_prev: CudaSlice<CudaComplex> = stream.alloc_zeros(n_elem).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
-    let mut sm1hpsi: CudaSlice<CudaComplex> = stream.alloc_zeros(n_elem).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
+    let mut hpsi = PwCoefficients::new(stream.alloc_zeros(n_elem).map_err(|_| CHEM_EIG_CUDA_ERROR)?);
+    let mut spsi = PwCoefficients::new(stream.alloc_zeros(n_elem).map_err(|_| CHEM_EIG_CUDA_ERROR)?);
+    let mut spsi_prev = PwCoefficients::new(stream.alloc_zeros(n_elem).map_err(|_| CHEM_EIG_CUDA_ERROR)?);
+    let mut sm1hpsi = PwCoefficients::new(stream.alloc_zeros(n_elem).map_err(|_| CHEM_EIG_CUDA_ERROR)?);
     let mut grid_buf: CudaSlice<CudaComplex> = stream.alloc_zeros(n_bands * gs).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
 
     // Cold-start inner loop: repeat filter+RR with b_low from RR eigenvalues.
@@ -453,19 +454,20 @@ unsafe fn step_inner(
         };
 
         // Compute H*psi and S*psi for current psi_input
+        let psi_pw = PwCoefficients::new(psi_input_slice.clone());
         unsafe {
             crate::eigensolver::hamiltonian::apply_full_hamiltonian(
-                psi_input_slice, v_eff_gpu.as_device_slice(), &kinetic_dev, &fft_idx_dev,
+                &psi_pw, v_eff_gpu.as_device_slice(), &kinetic_dev, &fft_idx_dev,
                 n_pw, n_bands, gs, inv_ntotal, &fft_plan, &mut hpsi, &mut grid_buf,
                 &kd.vnl, blas, kernels, stream,
             ).map_err(|e| { eprintln!("[chemrust] H*psi iter={i_iter} failed: {e}"); CHEM_EIG_CUDA_ERROR })?;
             // S·psi: identity + augmentation
-            stream.memcpy_dtod(psi_input_slice, &mut spsi).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
+            stream.memcpy_dtod(&*psi_pw, &mut spsi.0).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
             crate::eigensolver::hamiltonian::apply_s_times(
-                psi_input_slice, &mut spsi, &kd.vnl, n_bands_i32, n_pw_i32, blas, stream,
+                &psi_pw, &mut spsi, &kd.vnl, n_bands_i32, n_pw_i32, blas, stream,
             ).map_err(|e| { eprintln!("[chemrust] S*psi iter={i_iter} failed: {e}"); CHEM_EIG_CUDA_ERROR })?;
             // ABINIT: also save S·psi₀ for the Chebyshev recurrence of gsc
-            stream.memcpy_dtod(&spsi, &mut spsi_prev).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
+            stream.memcpy_dtod(&*spsi, &mut spsi_prev.0).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
         }
 
         // Diagnostic: compare <psi|H_ours|psi> against CASTEP eigenvalues.
@@ -478,9 +480,9 @@ unsafe fn step_inner(
             };
             let psi_diag: Vec<CudaComplex> = stream.clone_dtoh(psi_input_slice)
                 .map_err(|_| CHEM_EIG_CUDA_ERROR)?;
-            let hpsi_diag: Vec<CudaComplex> = stream.clone_dtoh(&hpsi)
+            let hpsi_diag: Vec<CudaComplex> = stream.clone_dtoh(&*hpsi)
                 .map_err(|_| CHEM_EIG_CUDA_ERROR)?;
-            let spsi_diag: Vec<CudaComplex> = stream.clone_dtoh(&spsi)
+            let spsi_diag: Vec<CudaComplex> = stream.clone_dtoh(&*spsi)
                 .map_err(|_| CHEM_EIG_CUDA_ERROR)?;
             let mut e_h = vec![0.0f64; n_bands];
             let mut e_hs = vec![0.0f64; n_bands];
@@ -596,23 +598,24 @@ unsafe fn step_inner(
         // atomic projector overlap that the S-operator requires.
         let (warm_psi_ptr, warm_hpsi_ptr, warm_spsi_ptr) = if i_iter > 0 { // warm start enabled for inner iterations > 0
             // Save H·psi → psi_curr (warm_psi = H·psi₀)
-            stream.memcpy_dtod(&hpsi, &mut psi_curr).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
+            stream.memcpy_dtod(&*hpsi, &mut psi_curr).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
+            let psi_curr_pw = PwCoefficients::new(psi_curr.clone());
             // Compute H·(H·psi₀) → hpsi (overwrite; warm_hpsi)
             unsafe {
                 crate::eigensolver::hamiltonian::apply_full_hamiltonian(
-                    &psi_curr, v_eff_gpu.as_device_slice(), &kinetic_dev, &fft_idx_dev,
+                    &psi_curr_pw, v_eff_gpu.as_device_slice(), &kinetic_dev, &fft_idx_dev,
                     n_pw, n_bands, gs, inv_ntotal, &fft_plan, &mut hpsi, &mut grid_buf,
                     &kd.vnl, blas, kernels, stream,
                 ).map_err(|e| { eprintln!("[chemrust] warm H²*psi failed: {e}"); CHEM_EIG_CUDA_ERROR })?;
             }
             // Compute S·warm_psi → spsi (overwrite) and spsi_prev
-            stream.memcpy_dtod(&psi_curr, &mut spsi).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
+            stream.memcpy_dtod(&psi_curr, &mut spsi.0).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
             unsafe {
                 crate::eigensolver::hamiltonian::apply_s_times(
-                    &psi_curr, &mut spsi, &kd.vnl, n_bands_i32, n_pw_i32, blas, stream,
+                    &psi_curr_pw, &mut spsi, &kd.vnl, n_bands_i32, n_pw_i32, blas, stream,
                 ).map_err(|e| { eprintln!("[chemrust] warm S*Hpsi failed: {e}"); CHEM_EIG_CUDA_ERROR })?;
             }
-            stream.memcpy_dtod(&spsi, &mut spsi_prev).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
+            stream.memcpy_dtod(&*spsi, &mut spsi_prev.0).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
             // Return GPU pointers for RQ computation and recurrence
             let warm_ptr = psi_curr.device_ptr(stream).0;
             let warm_hptr = hpsi.device_ptr(stream).0;
@@ -758,13 +761,13 @@ unsafe fn step_inner(
 
     unsafe {
         // k=1: psi_1 = (1/r)*(S^-1*H - c)*psi_0
-        stream.memcpy_dtod(&hpsi, &mut sm1hpsi).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
+        stream.memcpy_dtod(&*hpsi, &mut sm1hpsi.0).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
         crate::eigensolver::hamiltonian::apply_s_inverse(
             &mut sm1hpsi, &kd.vnl, n_bands_i32, n_pw_i32, blas, stream, solver,
         ).map_err(|e| { eprintln!("[chemrust] S^-1 k=1 failed: {e}"); CHEM_EIG_CUDA_ERROR })?;
 
         stream.memcpy_dtod(psi_input_slice, &mut psi_prev).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
-        stream.memcpy_dtod(&sm1hpsi, &mut psi_curr).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
+        stream.memcpy_dtod(&*sm1hpsi, &mut psi_curr).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
 
         let blas_raw = blas.raw_handle();
         cudarc::cublas::sys::cublasZaxpy_v2(
@@ -783,29 +786,30 @@ unsafe fn step_inner(
         // Reuse sm1hpsi as temp (will be overwritten in k=2 step anyway)
         // sm1hpsi already contains S⁻¹·H·psi_0 from above, need hpsi = H·psi_0
         // hpsi still holds H·psi_0 at this point (not yet overwritten)
-        stream.memcpy_dtod(&hpsi, &mut sm1hpsi).map_err(|_| CHEM_EIG_CUDA_ERROR)?; // sm1hpsi = H·psi_0
+        stream.memcpy_dtod(&*hpsi, &mut sm1hpsi.0).map_err(|_| CHEM_EIG_CUDA_ERROR)?; // sm1hpsi = H·psi_0
         cudarc::cublas::sys::cublasZaxpy_v2(
             blas_raw, n_elem_i32, &neg_c as *const _ as *const _,
-            spsi_prev.device_ptr(stream).0 as *const _, 1,
-            sm1hpsi.device_ptr_mut(stream).0 as *mut _, 1,
+            spsi_prev.0.device_ptr(stream).0 as *const _, 1,
+            sm1hpsi.0.device_ptr_mut(stream).0 as *mut _, 1,
         ).result().map_err(|_| CHEM_EIG_CUDA_ERROR)?; // sm1hpsi = H·psi_0 - c*S·psi_0
         cudarc::cublas::sys::cublasZscal_v2(
             blas_raw, n_elem_i32, &inv_r_c as *const _ as *const _,
-            sm1hpsi.device_ptr_mut(stream).0 as *mut _, 1,
+            sm1hpsi.0.device_ptr_mut(stream).0 as *mut _, 1,
         ).result().map_err(|_| CHEM_EIG_CUDA_ERROR)?; // sm1hpsi = spsi_1
         // Update spsi buffers: spsi_prev stays as S·psi_0, spsi becomes S·psi_1
-        stream.memcpy_dtod(&spsi, &mut spsi_prev).map_err(|_| CHEM_EIG_CUDA_ERROR)?; // spsi_prev = S·psi_0
-        stream.memcpy_dtod(&sm1hpsi, &mut spsi).map_err(|_| CHEM_EIG_CUDA_ERROR)?;   // spsi = S·psi_1
+        stream.memcpy_dtod(&*spsi, &mut spsi_prev.0).map_err(|_| CHEM_EIG_CUDA_ERROR)?; // spsi_prev = S·psi_0
+        stream.memcpy_dtod(&*sm1hpsi, &mut spsi.0).map_err(|_| CHEM_EIG_CUDA_ERROR)?;   // spsi = S·psi_1
 
         // k=2..ndeg
         for k in 2..=ndeg {
+            let psi_curr_pw = PwCoefficients::new(psi_curr.clone());
             crate::eigensolver::hamiltonian::apply_full_hamiltonian(
-                &psi_curr, v_eff_gpu.as_device_slice(), &kinetic_dev, &fft_idx_dev,
+                &psi_curr_pw, v_eff_gpu.as_device_slice(), &kinetic_dev, &fft_idx_dev,
                 n_pw, n_bands, gs, inv_ntotal, &fft_plan, &mut hpsi, &mut grid_buf,
                 &kd.vnl, blas, kernels, stream,
             ).map_err(|e| { eprintln!("[chemrust] H*psi k={k} failed: {e}"); CHEM_EIG_CUDA_ERROR })?;
 
-            stream.memcpy_dtod(&hpsi, &mut sm1hpsi).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
+            stream.memcpy_dtod(&*hpsi, &mut sm1hpsi.0).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
             crate::eigensolver::hamiltonian::apply_s_inverse(
                 &mut sm1hpsi, &kd.vnl, n_bands_i32, n_pw_i32, blas, stream, solver,
             ).map_err(|e| { eprintln!("[chemrust] S^-1 k={k} failed: {e}"); CHEM_EIG_CUDA_ERROR })?;
@@ -834,25 +838,25 @@ unsafe fn step_inner(
             //        = (2/r)*hpsi + (-2c/r)*spsi + (-1)*spsi_prev
             // Reuse sm1hpsi as temp (it now holds stale psi_{k-1}, will be
             // overwritten at start of next iteration by memcpy from hpsi).
-            stream.memcpy_dtod(&hpsi, &mut sm1hpsi).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
+            stream.memcpy_dtod(&*hpsi, &mut sm1hpsi.0).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
             cudarc::cublas::sys::cublasZscal_v2(
                 blas_raw, n_elem_i32, &two_inv_r_c as *const _ as *const _,
-                sm1hpsi.device_ptr_mut(stream).0 as *mut _, 1,
+                sm1hpsi.0.device_ptr_mut(stream).0 as *mut _, 1,
             ).result().map_err(|_| CHEM_EIG_CUDA_ERROR)?;
             cudarc::cublas::sys::cublasZaxpy_v2(
                 blas_raw, n_elem_i32, &neg_two_c_r_c as *const _ as *const _,
-                spsi.device_ptr(stream).0 as *const _, 1,
-                sm1hpsi.device_ptr_mut(stream).0 as *mut _, 1,
+                spsi.0.device_ptr(stream).0 as *const _, 1,
+                sm1hpsi.0.device_ptr_mut(stream).0 as *mut _, 1,
             ).result().map_err(|_| CHEM_EIG_CUDA_ERROR)?;
             cudarc::cublas::sys::cublasZaxpy_v2(
                 blas_raw, n_elem_i32, &minus_one as *const _ as *const _,
-                spsi_prev.device_ptr(stream).0 as *const _, 1,
-                sm1hpsi.device_ptr_mut(stream).0 as *mut _, 1,
+                spsi_prev.0.device_ptr(stream).0 as *const _, 1,
+                sm1hpsi.0.device_ptr_mut(stream).0 as *mut _, 1,
             ).result().map_err(|_| CHEM_EIG_CUDA_ERROR)?;
 
             // Swap spsi buffers: spsi_prev ← spsi, spsi ← sm1hpsi (now holds spsi_k)
-            stream.memcpy_dtod(&spsi, &mut spsi_prev).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
-            stream.memcpy_dtod(&sm1hpsi, &mut spsi).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
+            stream.memcpy_dtod(&*spsi, &mut spsi_prev.0).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
+            stream.memcpy_dtod(&*sm1hpsi, &mut spsi.0).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
         }
     }
 
@@ -1058,9 +1062,10 @@ unsafe fn step_inner(
     // ABINIT goes filter → normalize(T_n) → H*psi → RR.
     // The RR solves H_sub·X = λ·S_sub·X which implicitly S-orthonormalizes
     // the subspace via the eigenvectors X.
+    let psi_curr_pw = PwCoefficients::new(psi_curr.clone());
     unsafe {
         crate::eigensolver::hamiltonian::apply_full_hamiltonian(
-            &psi_curr, v_eff_gpu.as_device_slice(), &kinetic_dev, &fft_idx_dev,
+            &psi_curr_pw, v_eff_gpu.as_device_slice(), &kinetic_dev, &fft_idx_dev,
             n_pw, n_bands, gs, inv_ntotal, &fft_plan, &mut hpsi, &mut grid_buf,
             &kd.vnl, blas, kernels, stream,
         ).map_err(|e| { eprintln!("[chemrust] final H*psi failed: {e}"); CHEM_EIG_CUDA_ERROR })?;
@@ -1072,7 +1077,7 @@ unsafe fn step_inner(
         v.into_iter().map(|c| num_complex::Complex64::new(c.x, c.y)).collect()
     };
     let hpsi_host_rr: Vec<num_complex::Complex64> = {
-        let v = stream.clone_dtoh(&hpsi).map_err(|_| { eprintln!("[chemrust] clone_dtoh hpsi failed ik={}", ik); CHEM_EIG_CUDA_ERROR })?;
+        let v = stream.clone_dtoh(&*hpsi).map_err(|_| { eprintln!("[chemrust] clone_dtoh hpsi failed ik={}", ik); CHEM_EIG_CUDA_ERROR })?;
         v.into_iter().map(|c| num_complex::Complex64::new(c.x, c.y)).collect()
     };
     let psi_wfn = WavefunctionSet::<crate::layout::RowDistributed>::new(psi_host, n_bands, n_pw);
@@ -1120,15 +1125,16 @@ unsafe fn step_inner(
     // Compute S·psi_new on GPU and check psi_new^H·(S·psi_new) ≈ I
     {
         // Re-use spsi buffer for S·psi_new
-        stream.memcpy_dtod(psi_col.as_device_slice(), &mut spsi).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
+        let psi_col_pw = PwCoefficients::new(psi_col.as_device_slice().clone());
+        stream.memcpy_dtod(psi_col.as_device_slice(), &mut spsi.0).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
         unsafe {
             crate::eigensolver::hamiltonian::apply_s_times(
-                psi_col.as_device_slice(), &mut spsi, &kd.vnl,
+                &psi_col_pw, &mut spsi, &kd.vnl,
                 n_bands_i32, n_pw_i32, blas, stream,
             ).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
         }
         // Download spsi and psi_col for CPU check
-        let spsi_host: Vec<CudaComplex> = stream.clone_dtoh(&spsi)
+        let spsi_host: Vec<CudaComplex> = stream.clone_dtoh(&*spsi)
             .map_err(|_| CHEM_EIG_CUDA_ERROR)?;
         let psi_out_host: Vec<CudaComplex> = stream.clone_dtoh(psi_col.as_device_slice())
             .map_err(|_| CHEM_EIG_CUDA_ERROR)?;
@@ -1177,7 +1183,7 @@ unsafe fn step_inner(
                     &mut spsi, &kd.vnl, n_bands_i32, n_pw_i32, blas, stream, solver,
                 ).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
             }
-            let sinv_s_host: Vec<CudaComplex> = stream.clone_dtoh(&spsi)
+            let sinv_s_host: Vec<CudaComplex> = stream.clone_dtoh(&*spsi)
                 .map_err(|_| CHEM_EIG_CUDA_ERROR)?;
 
             let mut max_sinv_err = 0.0f64;

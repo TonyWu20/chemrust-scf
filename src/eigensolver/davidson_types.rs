@@ -1,3 +1,7 @@
+// Allow dead code for newtypes not yet used by current tasks
+// but declared for forward-looking type-safety refactoring.
+#![allow(dead_code)]
+
 use std::ops::{Deref, DerefMut};
 
 use cudarc::driver::CudaSlice;

@@ -38,6 +38,7 @@ use crate::device::blas::{op, BlasHandle, ZgemmConfig};
 use crate::device::fft::BatchedFftPlan3d;
 use crate::device::solver::SolverHandle;
 use crate::device::CudaComplex;
+use crate::eigensolver::davidson_types::*;
 use crate::eigensolver::hamiltonian::{apply_full_hamiltonian, apply_s_inverse, apply_s_times};
 use crate::eigensolver::kernels::CudaKernelSet;
 use crate::eigensolver::vnl_data::VnlBatchData;
@@ -75,7 +76,7 @@ pub(crate) struct DavidsonResult {
     /// Number of locked bands on exit.
     pub n_locked: usize,
     /// S⁻¹-weighted residual norms for all bands.
-    pub residual_norms_sinv: Vec<f64>,
+    pub residual_norms_sinv: ResidualSInvNorm,
 }
 
 /// Snapshot of Davidson diagnostics after the most recent solve.
@@ -85,7 +86,7 @@ pub struct DavidsonDiagnostic {
     pub n_unconverged: usize,
     pub locked_indices: Vec<usize>,
     pub unconv_indices: Vec<usize>,
-    pub residual_norms_sinv: Vec<f64>,
+    pub residual_norms_sinv: ResidualSInvNorm,
     pub max_residual_sinv: f64,
     pub lock_tol: f64,
     pub eigenvalue_deltas: Vec<f64>,
@@ -145,9 +146,9 @@ pub(crate) fn lock_tol_for_iter(scf_iter: usize, target_tol: f64) -> f64 {
 /// be S-orthonormal (column-major, n_bands × n_pw).
 #[allow(clippy::too_many_arguments, unsafe_op_in_unsafe_fn)]
 pub(crate) unsafe fn davidson_v1(
-    psi_init: &CudaSlice<CudaComplex>,
+    psi_init: &PwCoefficients,
     v_eff_dev: &CudaSlice<f64>,
-    kinetic_dev: &CudaSlice<f64>,
+    kinetic_dev: &KineticPreconditioner,
     fft_idx_dev: &CudaSlice<i32>,
     vnl_data: &VnlBatchData,
     n_pw: usize,
@@ -171,18 +172,18 @@ pub(crate) unsafe fn davidson_v1(
     // ------------------------------------------------------------------
     // Persistent buffers
     // ------------------------------------------------------------------
-    let mut psi_dev: CudaSlice<CudaComplex> =
-        stream.alloc_zeros(n_elem).map_err(Error::Cuda)?;
+    let mut psi_dev = PwCoefficients::new(
+        stream.alloc_zeros(n_elem).map_err(Error::Cuda)?);
     stream
-        .memcpy_dtod(psi_init, &mut psi_dev)
+        .memcpy_dtod(&**psi_init, &mut psi_dev.0)
         .map_err(Error::Cuda)?;
 
-    let mut hpsi_dev: CudaSlice<CudaComplex> =
-        stream.alloc_zeros(n_elem).map_err(Error::Cuda)?;
-    let mut spsi_dev: CudaSlice<CudaComplex> =
-        stream.alloc_zeros(n_elem).map_err(Error::Cuda)?;
-    let mut residual_dev: CudaSlice<CudaComplex> =
-        stream.alloc_zeros(n_elem).map_err(Error::Cuda)?;
+    let mut hpsi_dev = PwCoefficients::new(
+        stream.alloc_zeros(n_elem).map_err(Error::Cuda)?);
+    let mut spsi_dev = PwCoefficients::new(
+        stream.alloc_zeros(n_elem).map_err(Error::Cuda)?);
+    let mut residual_dev = PwCoefficients::new(
+        stream.alloc_zeros(n_elem).map_err(Error::Cuda)?);
     let grid_alloc = n_bands * grid_size;
     let mut grid_dev: CudaSlice<CudaComplex> =
         stream.alloc_zeros(grid_alloc).map_err(Error::Cuda)?;
@@ -212,7 +213,7 @@ pub(crate) unsafe fn davidson_v1(
 
     // Sψ: pre-copy ψ → spsi (identity term), then accumulate β·Q·β^H
     stream
-        .memcpy_dtod(&psi_dev, &mut spsi_dev)
+        .memcpy_dtod(&*psi_dev, &mut spsi_dev.0)
         .map_err(Error::Cuda)?;
     unsafe {
         apply_s_times(
@@ -299,10 +300,10 @@ pub(crate) unsafe fn davidson_v1(
     // Step 5: S⁻¹-weighted residual norm (batch Woodbury)
     // ------------------------------------------------------------------
     // residual_dev ← S⁻¹ · residual_dev  (in-place)
-    let mut sinv_r_dev: CudaSlice<CudaComplex> =
-        stream.alloc_zeros(n_elem).map_err(Error::Cuda)?;
+    let mut sinv_r_dev = PwCoefficients::new(
+        stream.alloc_zeros(n_elem).map_err(Error::Cuda)?);
     stream
-        .memcpy_dtod(&residual_dev, &mut sinv_r_dev)
+        .memcpy_dtod(&*residual_dev, &mut sinv_r_dev.0)
         .map_err(Error::Cuda)?;
     unsafe {
         apply_s_inverse(
@@ -369,17 +370,17 @@ pub(crate) unsafe fn davidson_v1(
             n_unconverged: 0,
             locked_indices: locked_idx,
             unconv_indices: vec![],
-            residual_norms_sinv: residual_norms_sinv.clone(),
+            residual_norms_sinv: ResidualSInvNorm::new(residual_norms_sinv.clone()),
             max_residual_sinv: max_res,
             lock_tol,
             eigenvalue_deltas: vec![0.0_f64; n_bands],
         });
 
         return Ok(DavidsonResult {
-            psi_out: psi_dev, // ψ unchanged
+            psi_out: psi_dev.0, // ψ unchanged
             eigenvalues,
             n_locked,
-            residual_norms_sinv,
+            residual_norms_sinv: ResidualSInvNorm::new(residual_norms_sinv),
         });
     }
 
@@ -387,10 +388,10 @@ pub(crate) unsafe fn davidson_v1(
     // Step 8: Gather unconverged ψ and Hψ columns → contiguous buffers
     // ------------------------------------------------------------------
     let k = n_unconv;
-    let mut psi_unconv_dev: CudaSlice<CudaComplex> =
-        stream.alloc_zeros(n_pw * k).map_err(Error::Cuda)?;
-    let mut hpsi_unconv_dev: CudaSlice<CudaComplex> =
-        stream.alloc_zeros(n_pw * k).map_err(Error::Cuda)?;
+    let mut psi_unconv_dev = PwCoefficients::new(
+        stream.alloc_zeros(n_pw * k).map_err(Error::Cuda)?);
+    let mut hpsi_unconv_dev = PwCoefficients::new(
+        stream.alloc_zeros(n_pw * k).map_err(Error::Cuda)?);
 
     {
         let (psi_ptr, _) = psi_dev.device_ptr(stream);
@@ -419,8 +420,8 @@ pub(crate) unsafe fn davidson_v1(
     // ------------------------------------------------------------------
     // Steps 9–10: Unified k×k ZHEGVD + rotation
     // ------------------------------------------------------------------
-    let mut psi_unconv_new: CudaSlice<CudaComplex> =
-        stream.alloc_zeros(n_pw * k).map_err(Error::Cuda)?;
+    let mut psi_unconv_new = PwCoefficients::new(
+        stream.alloc_zeros(n_pw * k).map_err(Error::Cuda)?);
     let mut eig_dev: CudaSlice<f64> = stream.alloc_zeros(k).map_err(Error::Cuda)?;
     let mut info_dev: CudaSlice<i32> = stream.alloc_zeros(1).map_err(Error::Cuda)?;
     let mut eigenvalues_k = vec![0.0_f64; k];
@@ -450,10 +451,10 @@ pub(crate) unsafe fn davidson_v1(
     // ------------------------------------------------------------------
     if n_locked > 0 {
         // Single-column temporaries for S-orth (S·ψ_locked computation)
-        let mut s_psi_in: CudaSlice<CudaComplex> =
-            stream.alloc_zeros(n_pw).map_err(Error::Cuda)?;
-        let mut s_psi_out: CudaSlice<CudaComplex> =
-            stream.alloc_zeros(n_pw).map_err(Error::Cuda)?;
+        let mut s_psi_in = PwCoefficients::new(
+            stream.alloc_zeros(n_pw).map_err(Error::Cuda)?);
+        let mut s_psi_out = PwCoefficients::new(
+            stream.alloc_zeros(n_pw).map_err(Error::Cuda)?);
 
         for u in 0..k {
             let (psi_unconv_ptr, _) = psi_unconv_new.device_ptr(stream);
@@ -578,7 +579,7 @@ pub(crate) unsafe fn davidson_v1(
         n_unconverged: n_unconv,
         locked_indices: locked_idx,
         unconv_indices: unconv_idx,
-        residual_norms_sinv: residual_norms_sinv.clone(),
+        residual_norms_sinv: ResidualSInvNorm::new(residual_norms_sinv.clone()),
         max_residual_sinv: max_res,
         lock_tol,
         eigenvalue_deltas: vec![0.0_f64; n_bands],
@@ -588,7 +589,7 @@ pub(crate) unsafe fn davidson_v1(
         psi_out,
         eigenvalues,
         n_locked,
-        residual_norms_sinv,
+        residual_norms_sinv: ResidualSInvNorm::new(residual_norms_sinv),
     })
 }
 
@@ -603,8 +604,8 @@ pub(crate) unsafe fn davidson_v1(
 /// On return, `psi_rotated` holds the rotated eigenbasis.
 #[allow(clippy::too_many_arguments)]
 unsafe fn solve_block_zhegvd(
-    psi_block: &CudaSlice<CudaComplex>,
-    hpsi_block: &CudaSlice<CudaComplex>,
+    psi_block: &PwCoefficients,
+    hpsi_block: &PwCoefficients,
     vnl_data: &VnlBatchData,
     k: usize,
     n_pw: usize,
@@ -614,7 +615,7 @@ unsafe fn solve_block_zhegvd(
     eigenvalues_out: &mut [f64],
     eig_dev: &mut CudaSlice<f64>,
     info_dev: &mut CudaSlice<i32>,
-    psi_rotated: &mut CudaSlice<CudaComplex>,
+    psi_rotated: &mut PwCoefficients,
 ) -> Result<(), Error> {
     debug_assert_eq!(k, eigenvalues_out.len());
     let k_i32 = k as i32;

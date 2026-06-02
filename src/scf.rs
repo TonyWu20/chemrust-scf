@@ -16,6 +16,7 @@ use crate::device::pcie::PcieAccount;
 use crate::device::{CudaComplex, Gpu};
 use crate::eigensolver::chebyshev::{compute_kinetic_energies, FilterMode, chebyshev_filter, CudaKernelSet};
 use crate::eigensolver::davidson::{davidson_v1, DavidsonConfig, lock_tol_for_iter};
+use crate::eigensolver::davidson_types::{KineticPreconditioner, PwCoefficients};
 #[cfg(any(test, feature = "scf_diag"))]
 use crate::eigensolver::davidson::{DavidsonDiagnostic, DAVIDSON_LAST_DIAG};
 use crate::eigensolver::rayleigh_ritz::rayleigh_ritz;
@@ -616,6 +617,7 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
             let kinetic_dev: CudaSlice<f64> = stream
                 .clone_htod(&kinetic_cpu.0)
                 .map_err(Error::Cuda)?;
+            let kinetic_precond = KineticPreconditioner::new(kinetic_dev);
             pcie.h2d_bytes += kinetic_cpu.0.len() * std::mem::size_of::<f64>();
 
             // FFT plan (batched C2C) — same as chebyshev_filter creates
@@ -634,6 +636,7 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
                 .unwrap_or_else(|| lock_tol_for_iter(self.scf_iter, 0.05));
 
             let psi_in = psi_gpu.as_device_slice();
+            let psi_pw = PwCoefficients::new(psi_in.clone());
             let v_eff_slice = v_eff_gpu.as_device_slice();
 
             // Davidson configuration
@@ -644,9 +647,9 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
 
             let result = unsafe {
                 davidson_v1(
-                    psi_in,
+                    &psi_pw,
                     v_eff_slice,
-                    &kinetic_dev,
+                    &kinetic_precond,
                     &fft_idx_dev,
                     &vnl_data,
                     n_pw,
@@ -2051,7 +2054,7 @@ impl<S: SpinPolicy, M: MixingPhase> ScfIteration<S, WavefunctionsUpdated, M> {
     pub fn davidson_residual_norms_sinv(&self) -> Option<Vec<f64>> {
         self.last_davidson_diagnostics
             .as_ref()
-            .map(|d| d.residual_norms_sinv.clone())
+            .map(|d| d.residual_norms_sinv.0.clone())
     }
 
     /// Davidson eigenvalue deltas from the most recent solve.

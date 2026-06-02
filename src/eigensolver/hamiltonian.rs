@@ -20,6 +20,9 @@ use crate::device::blas::{self, BlasHandle, ZgemmConfig};
 use crate::device::fft::BatchedFftPlan3d;
 use crate::device::solver::SolverHandle;
 use crate::device::CudaComplex;
+use crate::eigensolver::davidson_types::{
+    KineticPreconditioner, PwCoefficients,
+};
 use crate::eigensolver::kernels::CudaKernelSet;
 use crate::eigensolver::vnl_data::VnlBatchData;
 use crate::types::Error;
@@ -62,10 +65,10 @@ unsafe fn c2c_forward_inplace(
 /// 6. Gather + add to hpsi: hpsi += grid / N_total
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn apply_v_loc_hamiltonian(
-    psi_dev: &CudaSlice<CudaComplex>,
-    hpsi_dev: &mut CudaSlice<CudaComplex>,
+    psi_dev: &PwCoefficients,
+    hpsi_dev: &mut PwCoefficients,
     grid_dev: &mut CudaSlice<CudaComplex>,
-    kinetic_dev: &CudaSlice<f64>,
+    kinetic_dev: &KineticPreconditioner,
     fft_idx_dev: &CudaSlice<i32>,
     v_eff_dev: &CudaSlice<f64>,
     n_pw: i32,
@@ -80,9 +83,9 @@ pub(crate) unsafe fn apply_v_loc_hamiltonian(
     unsafe {
         stream
             .launch_builder(&kernels.init_kinetic)
-            .arg(&mut *hpsi_dev)
-            .arg(psi_dev)
-            .arg(kinetic_dev)
+            .arg(&mut **hpsi_dev)
+            .arg(&**psi_dev)
+            .arg(&**kinetic_dev)
             .arg(&n_pw)
             .arg(&n_bands)
             .launch(LaunchConfig::for_num_elems((n_bands * n_pw) as u32))
@@ -106,7 +109,7 @@ pub(crate) unsafe fn apply_v_loc_hamiltonian(
     unsafe {
         stream
             .launch_builder(&kernels.scatter_pw_to_grid)
-            .arg(psi_dev)
+            .arg(&**psi_dev)
             .arg(fft_idx_dev)
             .arg(&mut *grid_dev)
             .arg(&n_pw)
@@ -141,7 +144,7 @@ pub(crate) unsafe fn apply_v_loc_hamiltonian(
             .launch_builder(&kernels.gather_add_kinetic)
             .arg(&*grid_dev)
             .arg(fft_idx_dev)
-            .arg(&mut *hpsi_dev)
+            .arg(&mut **hpsi_dev)
             .arg(&n_pw)
             .arg(&n_bands)
             .arg(&grid_size)
@@ -157,16 +160,16 @@ pub(crate) unsafe fn apply_v_loc_hamiltonian(
 /// and V_NL (non-local pseudopotential via cuBLAS gemm).
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn apply_full_hamiltonian(
-    psi_dev: &CudaSlice<CudaComplex>,
+    psi_dev: &PwCoefficients,
     v_eff_dev: &CudaSlice<f64>,
-    kinetic_dev: &CudaSlice<f64>,
+    kinetic_dev: &KineticPreconditioner,
     fft_idx_dev: &CudaSlice<i32>,
     n_pw: usize,
     n_bands: usize,
     grid_size: usize,
     inv_ntotal: f64,
     fft_plan: &BatchedFftPlan3d,
-    hpsi_dev: &mut CudaSlice<CudaComplex>,
+    hpsi_dev: &mut PwCoefficients,
     grid_dev: &mut CudaSlice<CudaComplex>,
     vnl_data: &VnlBatchData,
     blas: &BlasHandle,
@@ -202,8 +205,8 @@ pub(crate) unsafe fn apply_full_hamiltonian(
 ///   hpsi   += beta . C_proj   (n_pw x n_bands, accumulated)
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn apply_v_nl_hamiltonian(
-    psi_dev: &CudaSlice<CudaComplex>,
-    hpsi_dev: &mut CudaSlice<CudaComplex>,
+    psi_dev: &PwCoefficients,
+    hpsi_dev: &mut PwCoefficients,
     vnl_data: &VnlBatchData,
     n_bands: i32,
     n_pw: i32,
@@ -298,7 +301,7 @@ pub(crate) unsafe fn apply_v_nl_hamiltonian(
 ///   where M = Q⁻¹ + B^H·B (Cholesky-factored in VnlBatchData::precompute).
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn apply_s_inverse(
-    hpsi_dev: &mut CudaSlice<CudaComplex>,
+    hpsi_dev: &mut PwCoefficients,
     vnl_data: &VnlBatchData,
     n_bands: i32,
     n_pw: i32,
@@ -384,8 +387,8 @@ pub(crate) unsafe fn apply_s_inverse(
 /// (the identity term) before calling this to accumulate the β·Q·β^H·ψ correction.
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn apply_s_times(
-    psi_dev: &CudaSlice<CudaComplex>,     // input ψ (n_pw × n_bands, col-major)
-    spsi_dev: &mut CudaSlice<CudaComplex>, // output S·ψ (caller pre-copies psi into this)
+    psi_dev: &PwCoefficients,     // input ψ (n_pw × n_bands, col-major)
+    spsi_dev: &mut PwCoefficients, // output S·ψ (caller pre-copies psi into this)
     vnl_data: &VnlBatchData,
     n_bands: i32,
     n_pw: i32,
@@ -536,15 +539,14 @@ pub fn check_s_inv_s_identity(
         }
     }
 
-    // 2. Apply S⁻¹ to spsi
+    // 2. Apply S⁻¹ to spsi, then D2H
+    let mut spsi_pw = PwCoefficients(spsi_dev);
     unsafe {
         apply_s_inverse(
-            &mut spsi_dev, vnl_data, 1, n, blas, stream, solver,
+            &mut spsi_pw, vnl_data, 1, n, blas, stream, solver,
         )?;
     }
-
-    // 3. D2H and compute max residual ‖spsi − psi‖_∞
-    let result: Vec<CudaComplex> = stream.clone_dtoh(&spsi_dev).map_err(Error::Cuda)?;
+    let result: Vec<CudaComplex> = stream.clone_dtoh(&*spsi_pw).map_err(Error::Cuda)?;
     let max_residual = psi_host.iter().zip(result.iter())
         .map(|(&p, &r)| {
             let dr = r.x - p.re;

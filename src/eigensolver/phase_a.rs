@@ -13,10 +13,11 @@ use cudarc::cublas::sys::cublasOperation_t;
 use cudarc::driver::{DevicePtr, DevicePtrMut, LaunchConfig, PushKernelArg};
 use cudarc::driver::{CudaSlice, CudaStream};
 
-use crate::device::blas::{op, BlasHandle, ZgemmConfig};
+use crate::device::blas::{BlasHandle, ZgemmConfig};
 use crate::device::fft::BatchedFftPlan3d;
 use crate::device::solver::SolverHandle;
 use crate::device::CudaComplex;
+use crate::eigensolver::davidson_types::{KineticPreconditioner, PwCoefficients};
 use crate::eigensolver::hamiltonian::apply_v_loc_hamiltonian;
 use crate::eigensolver::kernels::CudaKernelSet;
 use crate::types::Error;
@@ -26,10 +27,10 @@ use crate::types::Error;
 // ---------------------------------------------------------------------------
 
 pub(crate) unsafe fn apply_h_tv(
-    psi_dev: &CudaSlice<CudaComplex>,
-    hpsi_dev: &mut CudaSlice<CudaComplex>,
+    psi_dev: &PwCoefficients,
+    hpsi_dev: &mut PwCoefficients,
     grid_dev: &mut CudaSlice<CudaComplex>,
-    kinetic_dev: &CudaSlice<f64>,
+    kinetic_dev: &KineticPreconditioner,
     fft_idx_dev: &CudaSlice<i32>,
     v_eff_dev: &CudaSlice<f64>,
     n_pw: i32,
@@ -64,8 +65,8 @@ pub(crate) unsafe fn apply_h_tv(
 // ---------------------------------------------------------------------------
 
 pub(crate) unsafe fn apply_scaled_hamiltonian_inplace(
-    hpsi_dev: &mut CudaSlice<CudaComplex>,
-    psi_dev: &CudaSlice<CudaComplex>,
+    hpsi_dev: &mut PwCoefficients,
+    psi_dev: &PwCoefficients,
     n_pw: i32,
     n_bands: i32,
     center: f64,
@@ -104,9 +105,9 @@ pub(crate) unsafe fn apply_scaled_hamiltonian_inplace(
 // ---------------------------------------------------------------------------
 
 pub(crate) unsafe fn chebyshev_combine(
-    psi_next: &mut CudaSlice<CudaComplex>,
-    hpsi: &CudaSlice<CudaComplex>,
-    psi_prev: &CudaSlice<CudaComplex>,
+    psi_next: &mut PwCoefficients,
+    hpsi: &PwCoefficients,
+    psi_prev: &PwCoefficients,
     n_pw: usize,
     n_bands: usize,
     kernels: &CudaKernelSet,
@@ -126,7 +127,7 @@ pub(crate) unsafe fn chebyshev_combine(
     unsafe {
         stream
             .launch_builder(&kernels.zero_buffer)
-            .arg(&mut *psi_next)
+            .arg(&mut **psi_next)
             .arg(&total)
             .launch(LaunchConfig::for_num_elems(n))
     }
@@ -136,8 +137,8 @@ pub(crate) unsafe fn chebyshev_combine(
     unsafe {
         stream
             .launch_builder(&kernels.band_scale_axpy)
-            .arg(&mut *psi_next)
-            .arg(hpsi)
+            .arg(&mut **psi_next)
+            .arg(&**hpsi)
             .arg(&scale_dev)
             .arg(&1.0f64)
             .arg(&n_pw_i32)
@@ -155,8 +156,8 @@ pub(crate) unsafe fn chebyshev_combine(
     unsafe {
         stream
             .launch_builder(&kernels.band_scale_axpy)
-            .arg(&mut *psi_next)
-            .arg(psi_prev)
+            .arg(&mut **psi_next)
+            .arg(&**psi_prev)
             .arg(&scale_dev)
             .arg(&-1.0f64)
             .arg(&n_pw_i32)
@@ -173,7 +174,7 @@ pub(crate) unsafe fn chebyshev_combine(
 // ---------------------------------------------------------------------------
 
 pub(crate) unsafe fn gram_schmidt(
-    psi: &mut CudaSlice<CudaComplex>,
+    psi: &mut PwCoefficients,
     n_pw: usize,
     n_bands: usize,
     blas: &BlasHandle,
@@ -267,8 +268,8 @@ pub(crate) unsafe fn gram_schmidt(
 // ---------------------------------------------------------------------------
 
 pub(crate) unsafe fn build_subspace_matrices(
-    psi: &CudaSlice<CudaComplex>,
-    hpsi: &CudaSlice<CudaComplex>,
+    psi: &PwCoefficients,
+    hpsi: &PwCoefficients,
     h_sub: &mut CudaSlice<CudaComplex>,
     s_sub: &mut CudaSlice<CudaComplex>,
     n_pw: i32,
@@ -341,17 +342,15 @@ pub(crate) unsafe fn solve_generalized(
     use cudarc::cusolver::sys::{
         cublasFillMode_t, cusolverEigMode_t,
     };
-    unsafe {
-        solver.zhegvd(
-            cusolverEigMode_t::CUSOLVER_EIG_MODE_VECTOR,
-            cublasFillMode_t::CUBLAS_FILL_MODE_LOWER,
-            n_bands,
-            x,
-            s,
-            eigenvalues,
-            info,
-        )?;
-    }
+    solver.zhegvd(
+        cusolverEigMode_t::CUSOLVER_EIG_MODE_VECTOR,
+        cublasFillMode_t::CUBLAS_FILL_MODE_LOWER,
+        n_bands,
+        x,
+        s,
+        eigenvalues,
+        info,
+    )?;
     Ok(())
 }
 
@@ -360,11 +359,11 @@ pub(crate) unsafe fn solve_generalized(
 // ---------------------------------------------------------------------------
 
 pub(crate) unsafe fn rotate_basis(
-    psi: &CudaSlice<CudaComplex>,
-    hpsi: &CudaSlice<CudaComplex>,
+    psi: &PwCoefficients,
+    hpsi: &PwCoefficients,
     x: &CudaSlice<CudaComplex>,
-    psi_out: &mut CudaSlice<CudaComplex>,
-    hpsi_out: &mut CudaSlice<CudaComplex>,
+    psi_out: &mut PwCoefficients,
+    hpsi_out: &mut PwCoefficients,
     n_pw: i32,
     n_bands: i32,
     blas: &BlasHandle,
