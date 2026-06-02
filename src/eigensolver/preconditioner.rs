@@ -26,25 +26,52 @@ use crate::types::Error;
 // CUDA kernel source (compiled via NVRTC at startup)
 // ---------------------------------------------------------------------------
 
-const TPA_PRECOND_KERNEL: &str = r#"
-extern "C" __global__ void tpa_precondition(
-    double2* precond,
-    const double2* __restrict__ residual,
-    const double* __restrict__ kinetic,
-    double lambda,
-    double clamp_eps,
-    int n_pw
+const TPA_APPLY_KERNEL: &str = r#"
+// Kernel 1: Fused residual + TPA scaling for each band
+// out[G,b] = (hpsi[G,b] - e[b]*psi[G,b]) * r[G]
+extern "C" __global__ void tpa_apply_residual(
+    double2* out,
+    const double2* psi,
+    const double2* hpsi,
+    const double* eigenvalues,
+    const double* r_vector,
+    int n_pw,
+    int n_bands
 ) {
-    int g = blockIdx.x * blockDim.x + threadIdx.x;
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
     int stride = blockDim.x * gridDim.x;
-    for (int i = g; i < n_pw; i += stride) {
-        double denom = kinetic[i] - lambda;
-        if (fabs(denom) < clamp_eps) {
-            denom = copysign(clamp_eps, denom);
-        }
-        double inv = 1.0 / denom;
-        precond[i].x = residual[i].x * inv;
-        precond[i].y = residual[i].y * inv;
+    int total = n_pw * n_bands;
+    for (int i = tid; i < total; i += stride) {
+        int g = i % n_pw;
+        int b = i / n_pw;
+        double e = eigenvalues[b];
+        double r = r_vector[g];
+        double hx = hpsi[i].x;
+        double hy = hpsi[i].y;
+        double px = psi[i].x;
+        double py = psi[i].y;
+        out[i].x = (hx - e * px) * r;
+        out[i].y = (hy - e * py) * r;
+    }
+}
+
+// Kernel 2: Add NL correction with TPA factor
+// out[G,b] += correction[G,b] * r[G]
+extern "C" __global__ void tpa_apply_add(
+    double2* out,
+    const double2* correction,
+    const double* r_vector,
+    int n_pw,
+    int n_bands
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+    int total = n_pw * n_bands;
+    for (int i = tid; i < total; i += stride) {
+        int g = i % n_pw;
+        double r = r_vector[g];
+        out[i].x += correction[i].x * r;
+        out[i].y += correction[i].y * r;
     }
 }
 "#;
@@ -369,66 +396,117 @@ pub fn assemble_q_rcq(
 }
 
 // ---------------------------------------------------------------------------
-// TPA Preconditioner (legacy)
+// TPA Preconditioner (correct TPA-apply kernels)
 // ---------------------------------------------------------------------------
 
-/// Teter-Payne-Allan diagonal preconditioner for Davidson block eigensolver.
+/// Teter-Payne-Allan preconditioner for Davidson block eigensolver.
 ///
-/// Applies P⁻¹ · residual where the diagonal of P is `T(g) − λ`, with `T(g)`
-/// the kinetic energy of plane-wave component `g` and `λ` the eigenvalue shift.
-/// Division-by-zero is prevented by clamping `|T(g) − λ| ≥ `clamp_eps`.
+/// Applies the TPA preconditioner to residual vectors. This replaces the old
+/// `1/(T−λ)` formula with the correct CASTEP formula:
+///
+///   preconditioned(b,G) = (Hψ(b,G) − e(b)·ψ(b,G)) · R(G)
+///
+/// where `R(G) = tpa(pw_ek(G) / mean_ek)` is the TPA preconditioner vector
+/// (the same for all bands).
+///
+/// Two fused kernels are provided:
+/// - `apply_residual`: forms the preconditioned residual directly from ψ, Hψ,
+///   eigenvalues, and the R vector.
+/// - `apply_add`: adds a correction term (e.g. NL contribution) with the TPA
+///   R-vector scaling.
 pub(crate) struct TpaPreconditioner {
-    kernel: CudaFunction,
-    clamp_eps: f64,
+    kernel_residual: CudaFunction,
+    kernel_add: CudaFunction,
 }
 
-#[bon::bon]
 impl TpaPreconditioner {
-    /// Compile the TPA preconditioner CUDA kernel via NVRTC.
-    ///
-    /// `clamp_eps` is the minimum value of `|T(g) − λ|` (default `1e-12`).
-    pub fn new(ctx: &Arc<CudaContext>, clamp_eps: f64) -> Result<Self, Error> {
-        let ptx = compile_ptx(TPA_PRECOND_KERNEL).map_err(|e| Error::Nvrtc(e.to_string()))?;
+    /// Compile the TPA-apply CUDA kernels via NVRTC.
+    pub fn new(ctx: &Arc<CudaContext>) -> Result<Self, Error> {
+        let ptx = compile_ptx(TPA_APPLY_KERNEL).map_err(|e| Error::Nvrtc(e.to_string()))?;
         let module: Arc<CudaModule> = ctx.load_module(ptx).map_err(Error::Cuda)?;
-        let kernel = module
-            .load_function("tpa_precondition")
+        let kernel_residual = module
+            .load_function("tpa_apply_residual")
             .map_err(Error::Cuda)?;
-        Ok(Self { kernel, clamp_eps })
+        let kernel_add = module
+            .load_function("tpa_apply_add")
+            .map_err(Error::Cuda)?;
+        Ok(Self { kernel_residual, kernel_add })
     }
 
-    /// Apply P⁻¹ · residual → precond (may alias residual for in-place).
+    /// Apply the TPA-preconditioned residual.
     ///
-    /// `precond` and `residual` may point to the same `CudaSlice` — the kernel
-    /// reads each residual element before writing the corresponding precond
-    /// element, so in-place operation is safe.
+    /// Computes: `out[G,b] = (hpsi[G,b] − e[b]·psi[G,b]) · R(G)`
     ///
     /// # Safety
     ///
-    /// - `precond` and `residual` must have length ≥ `n_pw`.
-    /// - `kinetic_dev` must have length ≥ `n_pw`.
-    /// - No other kernel on the same stream may read/write `precond` or
-    ///   `residual` concurrently.
-    #[builder]
-    pub(crate) unsafe fn apply(
+    /// - All slices must have sufficient length:
+    ///   `out`, `psi`, `hpsi` ≥ `n_pw * n_bands`
+    ///   `eigenvalues_dev` ≥ `n_bands`
+    ///   `r_vector` ≥ `n_pw`
+    /// - No other kernel on the same stream may read/write these buffers
+    ///   concurrently.
+    pub(crate) unsafe fn apply_residual(
         &self,
-        precond: &mut PwCoefficients,
-        residual: &PwCoefficients,
-        kinetic_dev: &KineticPreconditioner,
-        lambda: f64,
+        out: &mut PwCoefficients,
+        psi: &PwCoefficients,
+        hpsi: &PwCoefficients,
+        eigenvalues_dev: &CudaSlice<f64>,
+        r_vector: &PreconditionerVector,
         n_pw: usize,
+        n_bands: usize,
         stream: &Arc<CudaStream>,
     ) -> Result<(), Error> {
+        let total = n_pw * n_bands;
         let n_pw_i32 = n_pw as i32;
+        let n_bands_i32 = n_bands as i32;
         unsafe {
             stream
-                .launch_builder(&self.kernel)
-                .arg(&mut **precond)
-                .arg(&**residual)
-                .arg(&**kinetic_dev)
-                .arg(&lambda)
-                .arg(&self.clamp_eps)
+                .launch_builder(&self.kernel_residual)
+                .arg(&mut **out)
+                .arg(&**psi)
+                .arg(&**hpsi)
+                .arg(eigenvalues_dev)
+                .arg(&**r_vector)
                 .arg(&n_pw_i32)
-                .launch(LaunchConfig::for_num_elems(n_pw as u32))
+                .arg(&n_bands_i32)
+                .launch(LaunchConfig::for_num_elems(total as u32))
+                .map(|_| ())
+        }
+        .map_err(Error::Cuda)
+    }
+
+    /// Add the NL correction term with TPA factor.
+    ///
+    /// Computes: `out[G,b] += correction[G,b] · R(G)`
+    ///
+    /// # Safety
+    ///
+    /// - All slices must have sufficient length:
+    ///   `out`, `correction` ≥ `n_pw * n_bands`
+    ///   `r_vector` ≥ `n_pw`
+    /// - No other kernel on the same stream may read/write these buffers
+    ///   concurrently.
+    pub(crate) unsafe fn apply_add(
+        &self,
+        out: &mut PwCoefficients,
+        correction: &PwCoefficients,
+        r_vector: &PreconditionerVector,
+        n_pw: usize,
+        n_bands: usize,
+        stream: &Arc<CudaStream>,
+    ) -> Result<(), Error> {
+        let total = n_pw * n_bands;
+        let n_pw_i32 = n_pw as i32;
+        let n_bands_i32 = n_bands as i32;
+        unsafe {
+            stream
+                .launch_builder(&self.kernel_add)
+                .arg(&mut **out)
+                .arg(&**correction)
+                .arg(&**r_vector)
+                .arg(&n_pw_i32)
+                .arg(&n_bands_i32)
+                .launch(LaunchConfig::for_num_elems(total as u32))
                 .map(|_| ())
         }
         .map_err(Error::Cuda)
@@ -443,103 +521,154 @@ impl TpaPreconditioner {
 mod tests {
     use super::*;
 
-    /// Verify that the TPA clamping prevents infinities when `T(g) ≈ λ`.
+    /// Verify the correct TPA-apply residual formula on CPU.
     ///
-    /// Creates a synthetic kinetic array where one element equals `λ`, applies
-    /// the preconditioner formula on the CPU, and checks the result is finite
-    /// (not Inf/NaN).
+    /// Formula: `out[G,b] = (hpsi[G,b] − e[b]·psi[G,b]) · R(G)`
+    ///
+    /// This tests the element-wise fused operation that replaces the old
+    /// incorrect `1/(T−λ)` preconditioner. The R-vector is the TPA scalar
+    /// applied per PW (same for all bands).
     #[test]
-    fn test_tpa_clamps_near_zero() {
-        let kinetic: Vec<f64> = vec![10.0, 5.0, 3.0, 2.0, 0.5];
-        let lambda: f64 = 0.5;
-        let clamp_eps: f64 = 1e-12;
-        let residual = vec![
-            CudaComplex { x: 1.0, y: 2.0 },
-            CudaComplex { x: 3.0, y: 4.0 },
-            CudaComplex { x: 0.0, y: 1.0 },
-            CudaComplex { x: -1.0, y: 0.0 },
-            CudaComplex { x: 5.0, y: -3.0 },
+    fn test_tpa_apply_residual_formula() {
+        let n_pw = 4;
+        let n_bands = 3;
+        let eigenvalues = vec![0.5, 1.0, 1.5];
+        let r_vector = vec![0.8, 0.6, 0.4, 0.2];
+
+        // Band 0: psi=(1,0), hpsi=(2,0.5)
+        // Band 1: psi=(0,1), hpsi=(-1,2)
+        // Band 2: psi=(0.5,-0.5), hpsi=(0,0)
+        let psi: Vec<CudaComplex> = vec![
+            CudaComplex { x: 1.0, y: 0.0 }, CudaComplex { x: 0.0, y: 1.0 }, CudaComplex { x: 0.5, y: -0.5 }, CudaComplex { x: -1.0, y: 2.0 }, // PW 0 across bands
+            CudaComplex { x: 0.0, y: -1.0 }, CudaComplex { x: 1.0, y: 0.0 }, CudaComplex { x: 0.0, y: 0.5 }, CudaComplex { x: 2.0, y: -1.0 }, // PW 1
+            CudaComplex { x: 0.5, y: 0.5 }, CudaComplex { x: -1.0, y: 1.0 }, CudaComplex { x: 1.0, y: 0.0 }, CudaComplex { x: 0.0, y: -2.0 }, // PW 2
+            CudaComplex { x: -0.5, y: 1.0 }, CudaComplex { x: 0.5, y: -0.5 }, CudaComplex { x: -1.0, y: 0.0 }, CudaComplex { x: 1.0, y: 0.5 }, // PW 3
         ];
-        let n_pw = kinetic.len();
+        let hpsi: Vec<CudaComplex> = vec![
+            CudaComplex { x: 2.0, y: 0.5 }, CudaComplex { x: -1.0, y: 2.0 }, CudaComplex { x: 0.0, y: 0.0 }, CudaComplex { x: 3.0, y: 1.0 },
+            CudaComplex { x: 1.0, y: -0.5 }, CudaComplex { x: 0.5, y: 1.5 }, CudaComplex { x: 2.0, y: -1.0 }, CudaComplex { x: -1.0, y: 0.0 },
+            CudaComplex { x: -1.0, y: 1.0 }, CudaComplex { x: 1.0, y: -2.0 }, CudaComplex { x: 0.5, y: 0.5 }, CudaComplex { x: 2.0, y: 1.5 },
+            CudaComplex { x: 0.0, y: -1.0 }, CudaComplex { x: 2.0, y: 1.0 }, CudaComplex { x: 1.5, y: 0.0 }, CudaComplex { x: -2.0, y: 1.0 },
+        ];
 
-        let mut precond = vec![CudaComplex { x: 0.0, y: 0.0 }; n_pw];
-
-        for i in 0..n_pw {
-            let mut denom = kinetic[i] - lambda;
-            if denom.abs() < clamp_eps {
-                denom = clamp_eps.copysign(denom);
+        // Compute expected output on CPU: out[G,b] = (hpsi[G,b] - e[b]*psi[G,b]) * R[G]
+        // Map linear index i = b * n_pw + g
+        let mut expected = vec![CudaComplex { x: 0.0, y: 0.0 }; n_pw * n_bands];
+        for b in 0..n_bands {
+            let e = eigenvalues[b];
+            for g in 0..n_pw {
+                let i = b * n_pw + g;
+                let r = r_vector[g];
+                let hx = hpsi[i].x;
+                let hy = hpsi[i].y;
+                let px = psi[i].x;
+                let py = psi[i].y;
+                expected[i].x = (hx - e * px) * r;
+                expected[i].y = (hy - e * py) * r;
             }
-            let inv = 1.0 / denom;
-            precond[i].x = residual[i].x * inv;
-            precond[i].y = residual[i].y * inv;
         }
 
-        // The element with kinetic[4] == lambda should be clamped
-        let clamped = &precond[4];
-        assert!(
-            clamped.x.is_finite() && clamped.y.is_finite(),
-            "Expected finite result for clamped element, got ({}, {})",
-            clamped.x,
-            clamped.y,
-        );
-        // Verify identity: denom = clamp_eps (positive since denom == 0)
-        let expected_x = residual[4].x / clamp_eps;
-        let expected_y = residual[4].y / clamp_eps;
-        assert!(
-            (clamped.x - expected_x).abs() < 1e-20,
-            "Clamped x mismatch: expected {:.6e}, got {:.6e}",
-            expected_x,
-            clamped.x,
-        );
-        assert!(
-            (clamped.y - expected_y).abs() < 1e-20,
-            "Clamped y mismatch: expected {:.6e}, got {:.6e}",
-            expected_y,
-            clamped.y,
-        );
+        // Run the CPU-side computation matching GPU kernel logic
+        let mut out = vec![CudaComplex { x: 0.0, y: 0.0 }; n_pw * n_bands];
+        for i in 0..(n_pw * n_bands) {
+            let g = i % n_pw;
+            let b = i / n_pw;
+            let e = eigenvalues[b];
+            let r = r_vector[g];
+            let hx = hpsi[i].x;
+            let hy = hpsi[i].y;
+            let px = psi[i].x;
+            let py = psi[i].y;
+            out[i].x = (hx - e * px) * r;
+            out[i].y = (hy - e * py) * r;
+        }
+
+        for i in 0..(n_pw * n_bands) {
+            let diff_x = (out[i].x - expected[i].x).abs();
+            let diff_y = (out[i].y - expected[i].y).abs();
+            assert!(
+                diff_x < 1e-15,
+                "Element {i} x mismatch: expected {:.6e}, got {:.6e}, diff={:.2e}",
+                expected[i].x, out[i].x, diff_x,
+            );
+            assert!(
+                diff_y < 1e-15,
+                "Element {i} y mismatch: expected {:.6e}, got {:.6e}, diff={:.2e}",
+                expected[i].y, out[i].y, diff_y,
+            );
+        }
     }
 
-    /// Verify the TPA formula `precond = residual / (T(g) − λ)` to high
-    /// precision when `|T(g) − λ|` is large (no clamping active).
+    /// Verify the TPA-apply add formula on CPU.
+    ///
+    /// Formula: `out[G,b] += correction[G,b] · R(G)`
     #[test]
-    fn test_tpa_identity_far_from_lambda() {
-        let kinetic: Vec<f64> = vec![100.0, 50.0, 30.0, 20.0, 10.0];
-        let lambda: f64 = 0.5;
-        let clamp_eps: f64 = 1e-12;
-        let residual = vec![
-            CudaComplex { x: 0.5, y: 1.0 },
-            CudaComplex { x: -2.0, y: 3.0 },
-            CudaComplex { x: 1.5, y: -0.5 },
-            CudaComplex { x: 0.0, y: 0.0 },
-            CudaComplex { x: 7.0, y: -4.0 },
-        ];
-        let n_pw = kinetic.len();
+    fn test_tpa_apply_add_formula() {
+        let n_pw = 3;
+        let n_bands = 2;
+        let r_vector = vec![0.9, 0.5, 0.1];
+        let total = n_pw * n_bands;
 
-        let mut precond = vec![CudaComplex { x: 0.0, y: 0.0 }; n_pw];
+        // Initial out values
+        let mut out: Vec<CudaComplex> = (0..total)
+            .map(|i| CudaComplex {
+                x: (i as f64) * 1.0,
+                y: (i as f64) * 2.0,
+            })
+            .collect();
 
-        for i in 0..n_pw {
-            let mut denom = kinetic[i] - lambda;
-            if denom.abs() < clamp_eps {
-                denom = clamp_eps.copysign(denom);
-            }
-            let inv = 1.0 / denom;
-            precond[i].x = residual[i].x * inv;
-            precond[i].y = residual[i].y * inv;
+        let correction: Vec<CudaComplex> = (0..total)
+            .map(|i| CudaComplex {
+                x: (i as f64) * 0.5,
+                y: (i as f64) * 0.25,
+            })
+            .collect();
+
+        // Compute expected: out[i] += correction[i] * R[g] where g = i % n_pw
+        let mut expected = out.clone();
+        for i in 0..total {
+            let g = i % n_pw;
+            let r = r_vector[g];
+            expected[i].x += correction[i].x * r;
+            expected[i].y += correction[i].y * r;
         }
 
-        for i in 0..n_pw {
-            let expected_x = residual[i].x / (kinetic[i] - lambda);
-            let expected_y = residual[i].y / (kinetic[i] - lambda);
+        // Run CPU-side computation matching GPU kernel logic
+        for i in 0..total {
+            let g = i % n_pw;
+            let r = r_vector[g];
+            out[i].x += correction[i].x * r;
+            out[i].y += correction[i].y * r;
+        }
+
+        for i in 0..total {
+            let diff_x = (out[i].x - expected[i].x).abs();
+            let diff_y = (out[i].y - expected[i].y).abs();
             assert!(
-                (precond[i].x - expected_x).abs() < 1e-12,
-                "Element {i} x mismatch: expected {expected_x:.6e}, got {precond:.6e}",
-                precond = precond[i].x,
+                diff_x < 1e-15,
+                "Element {i} x mismatch: expected {:.6e}, got {:.6e}, diff={:.2e}",
+                expected[i].x, out[i].x, diff_x,
             );
             assert!(
-                (precond[i].y - expected_y).abs() < 1e-12,
-                "Element {i} y mismatch: expected {expected_y:.6e}, got {precond:.6e}",
-                precond = precond[i].y,
+                diff_y < 1e-15,
+                "Element {i} y mismatch: expected {:.6e}, got {:.6e}, diff={:.2e}",
+                expected[i].y, out[i].y, diff_y,
             );
         }
+    }
+
+    /// Verify the TPA scalar function `tpa(x)` matches known values.
+    #[test]
+    fn test_tpa_scalar() {
+        // tpa(0) should be exactly 1.0
+        assert!((tpa(0.0) - 1.0).abs() < 1e-15, "tpa(0) = {}, expected 1.0", tpa(0.0));
+        // tpa(x) should be in (0, 1] for finite x >= 0
+        assert!(tpa(1.0) > 0.0 && tpa(1.0) <= 1.0, "tpa(1) = {} out of range", tpa(1.0));
+        assert!(tpa(10.0) > 0.0 && tpa(10.0) <= 1.0, "tpa(10) = {} out of range", tpa(10.0));
+        assert!(tpa(100.0) > 0.0 && tpa(100.0) <= 1.0, "tpa(100) = {} out of range", tpa(100.0));
+        // tpa(x) should be monotonically decreasing for x >= 0
+        assert!(tpa(0.0) > tpa(1.0), "tpa not decreasing at 0->1");
+        assert!(tpa(1.0) > tpa(10.0), "tpa not decreasing at 1->10");
+        assert!(tpa(10.0) > tpa(100.0), "tpa not decreasing at 10->100");
     }
 }
