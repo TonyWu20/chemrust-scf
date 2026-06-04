@@ -3004,14 +3004,37 @@ impl<'a> DavidsonBlockCtx<'a> {
 
             // Compute fresh Rayleigh quotients ε_b = Re⟨ψ_b|H|ψ_b⟩
             // from the freshly computed H·psi.
-            // CASTEP hamiltonian.f90:629-642 — use ZHEGVD eigenvalues from the
-            // previous inner iteration (stored in eigenvalues[]). These are more
-            // accurate than Rayleigh quotients from fresh H·psi, especially early
-            // in convergence when the Davidson subspace is small.
-            // active_indices maps compacted workspace column → original band index.
-            let eig_block_cpu: Vec<f64> = (0..self.ncol)
-                .map(|i| self.eigenvalues[self.block_start + self.active_indices[i]])
-                .collect();
+            // Use Rayleigh quotients from fresh H·psi for eigenvalue estimates.
+            // These are more accurate per-band than ZHEGVD eigenvalues on early
+            // iterations because ZHEGVD mixes un-converged bands across the full
+            // superspace.  CASTEP's band-by-band CG has tighter eigenvalue
+            // convergence per band; our block Davidson benefits from local
+            // Rayleigh quotients until the subspace is well converged.
+            let eig_block_cpu: Vec<f64> = {
+                let (block_psi_ptr, _) = self.block_psi_temp.device_ptr(self.stream);
+                let (block_hpsi_ptr, _) = self.block_hpsi_temp.device_ptr(self.stream);
+                let mut rqs = Vec::with_capacity(self.ncol);
+                for i in 0..self.ncol {
+                    let psi_col =
+                        (block_psi_ptr as *const CudaComplex).add(i * self.n_pw);
+                    let hpsi_col =
+                        (block_hpsi_ptr as *const CudaComplex).add(i * self.n_pw);
+                    let mut dot = CudaComplex { x: 0.0, y: 0.0 };
+                    cublasZdotc_v2(
+                        self.handle,
+                        self.n_pw_i32,
+                        psi_col as *const _,
+                        1,
+                        hpsi_col as *const _,
+                        1,
+                        &mut dot as *mut _ as *mut _,
+                    )
+                    .result()
+                    .map_err(Error::Blas)?;
+                    rqs.push(dot.x);
+                }
+                rqs
+            };
             self.stream
                 .memcpy_htod(&eig_block_cpu, &mut self.eig_block_dev)
                 .map_err(Error::Cuda)?;
