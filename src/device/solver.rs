@@ -1,5 +1,8 @@
 // ---------------------------------------------------------------------------
-// cuSOLVER wrapper — dense eigenvalue solver (ZHEGVD)
+// cuSOLVER wrapper — dense eigenvalue solvers (ZHEEVD, ZPOTRF, ZPOTRS)
+//
+// ZHEGVD is gated behind `chebyshev` (suspended path). The Davidson solver
+// uses ZHEEVD (standard EVP) matching CASTEP's algor_diagonalise.
 // ---------------------------------------------------------------------------
 
 use std::sync::Arc;
@@ -38,12 +41,16 @@ impl SolverHandle {
         &self.stream
     }
 
-    /// Solve `A·X = λ·B·X` via ZHEGVD.
+    /// Solve `A·X = λ·B·X` via ZHEGVD (generalized EVP).
+    ///
+    /// Only used by the suspended Chebyshev path (`rayleigh_ritz`).
+    /// Davidson solver uses `zheevd` (standard EVP) matching CASTEP.
     ///
     /// - `a`, `b` are overwritten. On return `a` contains eigenvectors.
     /// - `eigenvalues[0..n-1]` filled on return.
     /// - `info[0]` must be 0 for success.
     #[allow(clippy::too_many_arguments)]
+    #[cfg(any(test, feature = "chebyshev"))]
     pub fn zhegvd(
         &self,
         jobz: cusolverEigMode_t,
@@ -84,6 +91,62 @@ impl SolverHandle {
                 handle, itype, jobz, uplo, n,
                 a_raw, n,
                 b_raw, n,
+                w_raw,
+                work_raw as *mut _, lwork,
+                info_raw,
+            )
+            .result()?;
+
+            Ok(())
+        }
+    }
+
+    /// Solve `A·X = X·Λ` via ZHEEVD (standard Hermitian EVP).
+    ///
+    /// CASTEP `algor_diagonalise` solves the STANDARD eigenvalue problem on
+    /// S-orthonormalized superspace vectors (hamiltonian.f90:476-480).  We
+    /// match this by using ZHEEVD on H_sub directly — no overlap matrix.
+    /// This is more robust than ZHEGVD(B=I) when H_sub has extreme eigenvalue
+    /// spread (cold-start), because ZHEEVD uses QR iteration rather than
+    /// Divide-and-Conquer, avoiding info=N convergence failures.
+    ///
+    /// - `a` overwritten with eigenvectors on return.
+    /// - `eigenvalues[0..n-1]` filled on return.
+    /// - `info[0]` must be 0 for success.
+    pub fn zheevd(
+        &self,
+        jobz: cusolverEigMode_t,
+        uplo: cublasFillMode_t,
+        n: i32,
+        a: &mut CudaSlice<CudaComplex>,
+        eigenvalues: &mut CudaSlice<f64>,
+        info: &mut CudaSlice<i32>,
+    ) -> Result<(), SolverError> {
+        let handle = self.inner.cu();
+
+        unsafe {
+            let a_raw = a.device_ptr_mut(&self.stream).0 as *mut sys::cuDoubleComplex;
+            let w_raw = eigenvalues.device_ptr_mut(&self.stream).0 as *mut f64;
+            let info_raw = info.device_ptr_mut(&self.stream).0 as *mut i32;
+
+            // Query workspace size
+            let mut lwork: i32 = 0;
+            sys::cusolverDnZheevd_bufferSize(
+                handle, jobz, uplo, n,
+                a_raw as *const _, n,
+                w_raw as *const _,
+                &mut lwork as *mut _,
+            )
+            .result()?;
+
+            // Allocate workspace
+            let workspace = self.stream.alloc_zeros::<CudaComplex>(lwork as usize)?;
+            let work_raw = workspace.device_ptr(&self.stream).0 as *const sys::cuDoubleComplex;
+
+            // Solve
+            sys::cusolverDnZheevd(
+                handle, jobz, uplo, n,
+                a_raw, n,
                 w_raw,
                 work_raw as *mut _, lwork,
                 info_raw,
@@ -247,6 +310,7 @@ mod tests {
     use cudarc::driver::CudaContext;
 
     #[test]
+    #[cfg(feature = "chebyshev")]
     fn test_zhegvd_4x4_diagonal() {
         let ctx = CudaContext::new(0).unwrap();
         let stream = ctx.default_stream();

@@ -45,8 +45,8 @@ pub use eigensolver::davidson_types::compute_kinetic_energies;
 #[doc(hidden)]
 pub use eigensolver::davidson::{check_inner_convergence, BandConvStatus};
 /// Rayleigh-Ritz test wrapper (returns subspace matrices for diagnostics).
-/// Gated behind `scf_diag` (default feature) or `test` cfg.
-#[cfg(any(test, feature = "scf_diag"))]
+/// Gated behind `chebyshev` feature + `scf_diag` (default feature) or `test` cfg.
+#[cfg(all(any(test, feature = "scf_diag"), any(test, feature = "chebyshev")))]
 pub use eigensolver::rayleigh_ritz::rayleigh_ritz_with_matrices;
 #[cfg(any(test, feature = "scf_diag"))]
 pub use eigensolver::d_screening::test_api;

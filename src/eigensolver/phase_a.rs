@@ -327,34 +327,6 @@ pub(crate) unsafe fn build_subspace_matrices(
 }
 
 // ---------------------------------------------------------------------------
-// Generalized eigenvalue solve: H_sub · X = lambda · S_sub · X
-// ---------------------------------------------------------------------------
-
-pub(crate) unsafe fn solve_generalized(
-    x: &mut CudaSlice<CudaComplex>,
-    s: &mut CudaSlice<CudaComplex>,
-    eigenvalues: &mut CudaSlice<f64>,
-    info: &mut CudaSlice<i32>,
-    n_bands: i32,
-    solver: &SolverHandle,
-    _stream: &Arc<CudaStream>,
-) -> Result<(), Error> {
-    use cudarc::cusolver::sys::{
-        cublasFillMode_t, cusolverEigMode_t,
-    };
-    solver.zhegvd(
-        cusolverEigMode_t::CUSOLVER_EIG_MODE_VECTOR,
-        cublasFillMode_t::CUBLAS_FILL_MODE_LOWER,
-        n_bands,
-        x,
-        s,
-        eigenvalues,
-        info,
-    )?;
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
 // Basis rotation: psi_out = psi · X, hpsi_out = hpsi · X
 // ---------------------------------------------------------------------------
 

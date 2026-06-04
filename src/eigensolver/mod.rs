@@ -7,6 +7,7 @@ pub(crate) mod kernels;
 pub(crate) mod preconditioner;
 pub(crate) mod d_screening;
 pub mod davidson;
+#[cfg(any(test, feature = "chebyshev"))]
 pub mod rayleigh_ritz;
 pub(crate) mod vnl_data;
 #[cfg(feature = "chebyshev")]
