@@ -701,13 +701,9 @@ pub fn check_inner_convergence(
         converged = true;
     }
 
-    // (b) Relative break condition
+    // (b) Relative break condition (CASTEP hamiltonian.f90:563-589)
     if is_first_step {
         *break_cond_tol = delta_e;
-    } else if delta_e < *break_cond_tol * 1e-15 {
-        // If delta_e is essentially zero relative to break_cond_tol,
-        // the band is numerically converged (or delta_e already below
-        // machine precision). Neither abs tol nor stagnation matters.
     } else if tol_rel > 0.0 && delta_e < *break_cond_tol * tol_rel {
         converged = true;
         opt_stopped = true;
@@ -733,10 +729,17 @@ pub fn check_inner_convergence(
 
 /// Conditionally emit diagnostic output inside `davidson_diagonalise`.
 ///
-/// Expands to an `eprintln!` when `feature = "scf_diag"` is enabled; compiles
-/// to nothing otherwise.  `cfg!()` is a compile-time constant, so the dead
-/// branch is eliminated by the optimizer in release builds.
+/// User-facing progress message: always prints.  Used for `[davidson]` prefix
+/// lines (outer iteration, block loop, convergence).
 macro_rules! davidson_diag {
+    ($($arg:tt)*) => {
+        eprintln!($($arg)*);
+    };
+}
+
+/// Internal diagnostic: compiled only when `feature = "scf_diag"` is enabled.
+/// Used for `[Diag-D*]`, `[mean_ek]`, and per-step detail dumps.
+macro_rules! diag_detail {
     ($($arg:tt)*) => {
         if cfg!(feature = "scf_diag") {
             eprintln!($($arg)*);
@@ -947,7 +950,7 @@ pub(crate) unsafe fn davidson_diagonalise(
         let mean_ek_pw = kinetic_host.iter().sum::<f64>() / kinetic_host.len() as f64;
         let ek_min = band_ek.iter().cloned().fold(f64::INFINITY, f64::min);
         let ek_max = band_ek.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-        davidson_diag!(
+        diag_detail!(
             "[mean_ek] per-band={mean_ek:.6} Ha (min={ek_min:.4}, max={ek_max:.4})  per-PW={mean_ek_pw:.6} Ha  ratio={ratio:.3}",
             ratio = mean_ek_pw / mean_ek
         );
@@ -1009,17 +1012,11 @@ pub(crate) unsafe fn davidson_diagonalise(
     // converges quadratically in eigenvector error, so |Δλ| < tol can
     // hold while ‖r‖ ≫ tol).
     // ------------------------------------------------------------------
-    let mut prev_all_converged = false;
-
     #[allow(unused_assignments)]
     for iteration in 0..max_outer_iter {
         let n_conv = band_converged.iter().filter(|&&c| c).count();
         davidson_diag!("[davidson] outer iter {iteration}: {n_conv}/{n_bands} converged");
 
-        // Note: 2-consecutive-all-converged check is at the END of the outer
-        // iteration (after band_converged is updated), not here.  Checking here
-        // with stale band_converged + prev_all_converged causes an off-by-one
-        // that misses the exit window, letting A1 ZHEGVD corrupt eigenvalues.
 
         // CASTEP hamiltonian.f90:306 — recompute H·ψ every outer iteration.
         // This is the implicit residual check: fresh H·ψ reveals true
@@ -1195,48 +1192,39 @@ pub(crate) unsafe fn davidson_diagonalise(
         // wavefunctions with similar character across blocks — cross-band mixing
         // is never captured.
         //
-        // Skip A1 when all bands were converged in the previous outer iteration.
-        // At convergence, the eigenvectors are already optimal — rotating through
-        // a 160×160 ZHEGVD introduces numerical noise that can shift eigenvalues
-        // by ~1.0 Ha (observed at outer iter 3, band 110).  The Rayleigh quotients
-        // from fresh H·ψ are sufficient for the convergence recheck.
-        if !prev_all_converged {
-            let mut psi_full_rotated = PwCoefficients::new(
-                stream.alloc_zeros(n_elem).map_err(Error::Cuda)?);
-            let mut hpsi_full_rotated = PwCoefficients::new(
-                stream.alloc_zeros(n_elem).map_err(Error::Cuda)?);
-            unsafe {
-                diagonalise_subspace()
-                    .psi_block(&psi_dev)
-                    .hpsi_block(&hpsi_dev)
-                    .vnl_data(vnl_data)
-                    .k(n_bands)
-                    .n_pw(n_pw)
-                    .blas(blas)
-                    .solver(solver)
-                    .stream(stream)
-                    .eigenvalues_out(&mut eigenvalues)
-                    .eig_dev(&mut eig_dev)
-                    .info_dev(&mut info_dev)
-                    .psi_rotated(&mut psi_full_rotated)
-                    .hpsi_rotated(&mut hpsi_full_rotated)
-                    .call()?;
-            }
-            // Copy rotated ψ and Hψ back to persistent buffers.
-            // Both are rotated by the same matrix X, so Hψ_rotated = H·ψ_rotated
-            // (H is linear: H(ψ·X) = (Hψ)·X). h_correct remains true.
-            stream
-                .memcpy_dtod(&*psi_full_rotated, &mut psi_dev.0)
-                .map_err(Error::Cuda)?;
-            stream
-                .memcpy_dtod(&*hpsi_full_rotated, &mut hpsi_dev.0)
-                .map_err(Error::Cuda)?;
-            davidson_diag!(
-                "[davidson] full subspace diag: eigenvalues [{:.6}, ..., {:.6}]",
-                eigenvalues[0],
+        // CASTEP hamiltonian.f90:319 — wave_diagonalise (full subspace rotation).
+        let mut psi_full_rotated = PwCoefficients::new(
+            stream.alloc_zeros(n_elem).map_err(Error::Cuda)?);
+        let mut hpsi_full_rotated = PwCoefficients::new(
+            stream.alloc_zeros(n_elem).map_err(Error::Cuda)?);
+        unsafe {
+            diagonalise_subspace()
+                .psi_block(&psi_dev)
+                .hpsi_block(&hpsi_dev)
+                .vnl_data(vnl_data)
+                .k(n_bands)
+                .n_pw(n_pw)
+                .blas(blas)
+                .solver(solver)
+                .stream(stream)
+                .eigenvalues_out(&mut eigenvalues)
+                .eig_dev(&mut eig_dev)
+                .info_dev(&mut info_dev)
+                .psi_rotated(&mut psi_full_rotated)
+                .hpsi_rotated(&mut hpsi_full_rotated)
+                .call()?;
+        }
+        stream
+            .memcpy_dtod(&*psi_full_rotated, &mut psi_dev.0)
+            .map_err(Error::Cuda)?;
+        stream
+            .memcpy_dtod(&*hpsi_full_rotated, &mut hpsi_dev.0)
+            .map_err(Error::Cuda)?;
+        davidson_diag!(
+            "[davidson] full subspace diag: eigenvalues [{:.6}, ..., {:.6}]",
+            eigenvalues[0],
                 eigenvalues[n_bands - 1]
             );
-        } // end if !prev_all_converged (skip A1 when already converged)
 
         // ---- D1: S-norm diagnostic after A1 full-subspace ZHEGVD ----
         // Verify that rotated eigenvectors maintain ⟨psi|S|psi⟩ ≈ 1.
@@ -1283,7 +1271,7 @@ pub(crate) unsafe fn davidson_diagonalise(
                 let dev = (s_norm.x - 1.0).abs();
                 if dev > max_deviation { max_deviation = dev; }
             }
-            davidson_diag!(
+            diag_detail!(
                 "[Diag-D1] after A1 ZHEGVD: max |S-norm - 1| = {:.3e} (checked {} bands)",
                 max_deviation, n_check
             );
@@ -1322,11 +1310,14 @@ pub(crate) unsafe fn davidson_diagonalise(
         // bands. Each unconverged block runs an inner Davidson loop (residual,
         // S-orthogonalize, H·search, extend superspace, subspace diagonalization).
         // ------------------------------------------------------------------
-        let nblock_base = (2.0 * (n_bands as f64).sqrt()).ceil() as usize;
-        let nblock = (nblock_base + 1) / 2 * 2; // round to next even
+        // CASTEP hamiltonian.f90:197 — nblock = floor(2*sqrt(n_bands))
+        // Round to next even (CASTEP only does this for gamma-point, but
+        // cuBLAS batched transforms benefit from even block sizes).
+        let nblock_base = (2.0 * (n_bands as f64).sqrt()).floor() as usize;
+        let nblock = (nblock_base + 1) / 2 * 2;
         // CASTEP hamiltonian.f90:1079 — superspace_size = 1 + min(max_iterations(1), 5)
-        // Using 4 (morning-tested) for stable convergence rate.
-        let superspace_size = 4_usize;
+        // With max_inner_iter = 10: 1 + min(10, 5) = 6.
+        let superspace_size = 6_usize;
         let superspace_max_bands = superspace_size * nblock;
 
         // Allocate superspace buffers (reused across blocks)
@@ -1798,11 +1789,9 @@ pub(crate) unsafe fn davidson_diagonalise(
                         }
                     }
 
-                    // (b) Relative break condition
+                    // (b) Relative break condition (CASTEP hamiltonian.f90:563-589)
                     if _inner_iter == 0 {
                         break_cond_tols[global_idx] = delta_e;
-                    } else if delta_e < break_cond_tols[global_idx] * 1e-15 {
-                        // delta_e is essentially zero — numerically converged
                     } else {
                         // Stagnation check: improvement < 30% of first-step improvement
                         // CASTEP hamiltonian.f90:1217 — skip stagnation detection on
@@ -2029,7 +2018,7 @@ pub(crate) unsafe fn davidson_diagonalise(
                     let dev = (s_norm.x - 1.0).abs();
                     if dev > max_deviation { max_deviation = dev; }
                 }
-                davidson_diag!(
+                diag_detail!(
                     "[Diag-D2] after block 0 inner loop: max |S-norm - 1| = {:.3e} (checked {} bands)",
                     max_deviation, current_nblock
                 );
@@ -2055,17 +2044,13 @@ pub(crate) unsafe fn davidson_diagonalise(
         davidson_diag!("[davidson] after convergence check: {n_conv}/{n_bands} converged, eigenvalues: [{:.6}, ..., {:.6}]",
                   eigenvalues[0], eigenvalues[n_bands-1]);
 
-        // Check for 2 consecutive all-converged at END of iteration.
-        // Using freshly-updated band_converged here (not stale from start of iter)
-        // avoids the off-by-one where iter N's A1 ZHEGVD corrupts and the start-of-iter
-        // check misses the exit because prev_all_converged lags.
+        // CASTEP hamiltonian.f90:958-961 — exit on FIRST all-converged iteration.
         let this_all_converged = band_converged.iter().all(|&c| c);
-        if this_all_converged && prev_all_converged && iteration >= min_outer_iter {
-            davidson_diag!("[davidson] all converged for 2 consecutive iterations, exiting outer loop");
+        if this_all_converged && iteration >= min_outer_iter {
+            davidson_diag!("[davidson] all converged, exiting outer loop");
             n_outer_completed = iteration + 1;
             break;
         }
-        prev_all_converged = this_all_converged;
 
         // CASTEP hamiltonian.f90:306 — H·ψ is always recomputed from scratch
         // each outer iteration.  ψ was rotated by ZHEGVD, so the rotated H·ψ
@@ -2305,7 +2290,7 @@ unsafe fn diagonalise_subspace(
                 if a > max_h { max_h = a; }
             }
         }
-        davidson_diag!(
+        diag_detail!(
             "[Diag-D4] H_sub (k={}): min_diag={:.3e} max_diag={:.3e} max|entry|={:.3e}",
             k, min_diag, max_diag, max_h,
         );
@@ -3245,7 +3230,7 @@ impl<'a> DavidsonBlockCtx<'a> {
                     if abs_ov > max_overlap { max_overlap = abs_ov; }
                 }
             }
-            davidson_diag!(
+            diag_detail!(
                 "[Diag-D3] after Stage3a (block_start={}): max |S-overlap| = {:.3e} ({}×{} grid)",
                 self.block_start, max_overlap, n_lower, n_search
             );
