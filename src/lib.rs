@@ -23,6 +23,8 @@ pub use eigensolver::preconditioner::tpa;
 #[doc(hidden)]
 pub use eigensolver::preconditioner::compute_c_matrix;
 #[doc(hidden)]
+pub use eigensolver::preconditioner::compute_c_global;
+#[doc(hidden)]
 pub use eigensolver::preconditioner::invert_q_matrix;
 #[doc(hidden)]
 pub use eigensolver::preconditioner::assemble_r_beta;

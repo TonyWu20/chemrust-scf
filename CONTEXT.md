@@ -193,7 +193,7 @@ storage uses the same convention.
 **FFT axis convention:**
 `RealGrid<T>` stores data in Fortran layout `(ngz, ngy, ngx).f()`.
 `RecipGrid<T>` stores the forward FFT result in the same layout. cuFFT plan
-dims are `(ngx, ngy, ngz)` (innermost first) to match the scatter formula
+dims are `(ngz, ngy, ngx)` (innermost first) to match the scatter formula
 `iz + ngz*(iy + ngy*ix)`. See failure-patterns.md:
 `cufft-dim-ordering-and-rr-transpose-layout`.
 

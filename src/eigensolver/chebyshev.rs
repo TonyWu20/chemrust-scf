@@ -211,7 +211,7 @@ unsafe fn lanczos_upper_bound(
 
     // 1-band FFT plan for the Lanczos vectors
     let plan1 = BatchedFftPlan3d::plan_batched_c2c(
-        ngx as i32, ngy as i32, ngz as i32, 1, stream.clone(),
+        ngz as i32, ngy as i32, ngx as i32, 1, stream.clone(),
     )?;
 
     // Working buffers: v (current), v_prev (previous), Hv
@@ -578,7 +578,7 @@ pub(crate) fn chebyshev_filter(
     // indexing conventions).
     let kinetic_data: Vec<f64> = match external_kinetic {
         Some(ke) => ke.to_vec(),
-        None => compute_kinetic_energies(pw_coords, wave_grid.recip_lattice()).0,
+        None => compute_kinetic_energies(pw_coords, wave_grid.recip_lattice(), _k_point.coords).0,
     };
     let kinetic_dev_values: CudaSlice<f64> =
         stream.clone_htod(&kinetic_data).map_err(Error::Cuda)?;
@@ -587,14 +587,11 @@ pub(crate) fn chebyshev_filter(
 
     // ---- FFT plan (batched C2C) ----
     // cuFFT uses row-major layout: n[0] is slowest-varying (outermost),
-    // n[rank-1] is fastest-varying (innermost). Our scatter index formula
-    // `iz + ngz*(iy + ngy*ix)` makes iz innermost, ix outermost; the
-    // matching plan dims are `(ngx, ngy, ngz)`. Verified by the isolated
-    // FFT test `cufft_dim_ordering_isolated_diagnostic` (only this
-    // ordering reproduces the analytic exp(2πi·G·r) for a single δ in G).
-    // Cubic grids are insensitive to this ordering; non-cubic grids are not.
+    // Fortran data layout (ngz, ngy, ngx) with ngz innermost (stride-1).
+    // cuFFT n[0] is innermost, so plan dims = (ngz, ngy, ngx).
+    // Verified by cufft_dim_ordering_isolated_diagnostic.
     let fft_plan = BatchedFftPlan3d::plan_batched_c2c(
-        ngx as i32, ngy as i32, ngz as i32, n_bands_i32, stream.clone(),
+        ngz as i32, ngy as i32, ngx as i32, n_bands_i32, stream.clone(),
     )?;
 
     // ---- GPU workspace buffers ----
@@ -1201,6 +1198,7 @@ pub fn apply_h_components_for_test(
     kernels: &CudaKernelSet,
     blas: &BlasHandle,
     stream: &Arc<CudaStream>,
+    kpoint_frac: [f64; 3],
 ) -> Result<HComponentsForTest, Error> {
     let n_bands = psi_gpu.shape()[0];
     let n_pw = psi_gpu.shape()[1];
@@ -1213,13 +1211,15 @@ pub fn apply_h_components_for_test(
     let inv_ntotal = 1.0 / (grid_size as f64);
     let grid_alloc = n_bands * grid_size;
 
-    let kinetic_cpu = compute_kinetic_energies(pw_coords, wave_grid.recip_lattice());
+    let kinetic_cpu = compute_kinetic_energies(pw_coords, wave_grid.recip_lattice(), kpoint_frac);
     let kinetic_raw: CudaSlice<f64> = stream.clone_htod(&kinetic_cpu.0).map_err(Error::Cuda)?;
     let kinetic_dev = KineticPreconditioner::new(kinetic_raw);
 
-    // Plan with the cuFFT-correct dim ordering (matches chebyshev_filter at line 844).
+    // Fortran data layout (ngz, ngy, ngx) with ngz innermost (stride-1).
+    // cuFFT n[0] is innermost, so plan dims = (ngz, ngy, ngx).
+    // Verified by cufft_dim_ordering_isolated_diagnostic.
     let fft_plan = BatchedFftPlan3d::plan_batched_c2c(
-        ngx as i32, ngy as i32, ngz as i32, n_bands_i32, stream.clone(),
+        ngz as i32, ngy as i32, ngx as i32, n_bands_i32, stream.clone(),
     )?;
 
     let v_eff_dev = v_eff_gpu.as_device_slice();

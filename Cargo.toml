@@ -17,7 +17,7 @@ rand = "0.8"
 faer = "0.24"
 
 [features]
-default = ["scf_diag"]
+default = []
 scf_diag = []
 chebyshev = []
 

@@ -9,6 +9,9 @@ use crate::eigensolver::kernels::CudaKernelSet;
 use chemrust_hamiltonian_core::pseudopotential::HasAugmentationData;
 use chemrust_hamiltonian_core::Pseudopotential;
 use cudarc::driver::{CudaSlice, CudaStream};
+use faer::linalg::solvers::{DenseSolveCore, Llt};
+use faer::mat::Mat;
+use faer::Side;
 use num_complex::Complex64;
 
 use crate::device::blas::{self, ZgemmConfig};
@@ -183,7 +186,7 @@ impl VnlBatchData {
 
         let mut entries = Vec::new();
         // Collectors for the global Woodbury assembly (after the per-ion loop).
-        let mut per_ion_q_inv: Vec<Vec<f64>> = Vec::new();
+        let mut per_ion_q: Vec<Vec<f64>> = Vec::new();
         let mut per_ion_beta_flat: Vec<Vec<CudaComplex>> = Vec::new();
         let mut per_ion_ne: Vec<usize> = Vec::new();
 
@@ -271,14 +274,45 @@ impl VnlBatchData {
             };
 
             // Diagnostic: report D magnitudes per ion to catch screening explosions.
-            let d_min = d_screened.iter().cloned().fold(f64::INFINITY, f64::min);
-            let d_max = d_screened.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-            let d_amax = d_screened.iter().map(|d| d.abs()).fold(0.0_f64, f64::max);
-            let d0_amax = d0_expanded.iter().map(|d| d.abs()).fold(0.0_f64, f64::max);
-            eprintln!(
-                "[D_screened] ion={ion_idx:2} sym={symbol} ne={n_expanded:2}  \
-                 d0_amax={d0_amax:.4e}  d_screen_min={d_min:.4e} d_screen_max={d_max:.4e} d_screen_amax={d_amax:.4e}"
-            );
+            // NOTE: when V_eff is unavailable at init time (cold-start), this prints
+            // bare unscreened d0 values — the d_screen_amax == d0_amax you see here
+            // is from the fallback d0_expanded.clone().  The actual screened D is
+            // computed later in rescreen_d() when V_eff is available, and the values
+            // here are NOT what the Davidson solver uses.
+            #[cfg(feature = "scf_diag")]
+            {
+                let d_min = d_screened.iter().cloned().fold(f64::INFINITY, f64::min);
+                let d_max = d_screened.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                let d_amax = d_screened.iter().map(|d| d.abs()).fold(0.0_f64, f64::max);
+                let d0_amax = d0_expanded.iter().map(|d| d.abs()).fold(0.0_f64, f64::max);
+                eprintln!(
+                    "[D_screened] ion={ion_idx:2} sym={symbol} ne={n_expanded:2}  \
+                     d0_amax={d0_amax:.4e}  d_screen_min={d_min:.4e} d_screen_max={d_max:.4e} d_screen_amax={d_amax:.4e}  \
+                     (init, pre-rescreen)"
+                );
+            }
+
+            // Diag: β-projector L2 norms per ion/projector
+            #[cfg(feature = "scf_diag")]
+            {
+                let n_g = beta_g.nrows();
+                let np = beta_g.ncols();
+                let mut beta_norms: Vec<f64> = Vec::with_capacity(np);
+                for n in 0..np {
+                    let mut nrm2 = 0.0f64;
+                    for g in 0..n_g {
+                        let v = beta_g[[g, n]];
+                        nrm2 += v.re * v.re + v.im * v.im;
+                    }
+                    beta_norms.push(nrm2.sqrt());
+                }
+                let min_bn = beta_norms.iter().cloned().fold(f64::INFINITY, f64::min);
+                let max_bn = beta_norms.iter().cloned().fold(0.0f64, f64::max);
+                eprintln!(
+                    "[Diag-beta] ion={ion_idx:2} sym={symbol} ne={np}:  \
+                     |beta| min={min_bn:.4e} max={max_bn:.4e}  n_wave_grid={n_g}",
+                );
+            }
 
             let beta_flat: Vec<CudaComplex> =
                 beta_g.iter().map(|&c| crate::device::complex_to_cuda(c)).collect();
@@ -297,79 +331,16 @@ impl VnlBatchData {
             let q_dev = stream.clone_htod(&q_flat).map_err(Error::Cuda)?;
             pcie.h2d_bytes += q_flat.len() * std::mem::size_of::<CudaComplex>();
 
-            // Precompute S^{-1} Woodbury matrix: M^{-1} = (Q^{-1} + G)^{-1}
-            // where G = beta_g^H · beta_g is the projector Gram matrix.
+            // Precompute Woodbury components for global S^{-1} assembly.
+            // Q (real, block-diagonal) saved for global Cholesky inversion;
+            // beta saved for B^H·B Gram (ZGEMM on GPU, preserves cross-ion imag).
             let ne = n_expanded as usize;
-            let beta_arr = beta_g; // &Array2<Complex64>, shape (ne, n_pw)
-            let n_pw_local = beta_arr.shape()[1];
 
-            // G[i,j] = Σ_g beta_i^*(g) · beta_j(g)  → real symmetric
-            let mut gram = vec![0.0_f64; ne * ne];
-            for i in 0..ne {
-                for j in i..ne {
-                    let mut s = 0.0_f64;
-                    for g in 0..n_pw_local {
-                        s += (beta_arr[[i, g]].conj() * beta_arr[[j, g]]).re;
-                    }
-                    gram[i * ne + j] = s;
-                    gram[j * ne + i] = s;
-                }
-            }
-
-            // M = Q^{-1} + G.  Compute Q^{-1} by direct inversion (ne ≤ 18).
-            let eps_reg = 1e-12_f64;
-
-            // First invert Q → q_inv using Gauss-Jordan on a copy.
-            let mut q_inv = q_cpu.clone();
-            // Augment with identity in-place using row operations
-            let mut inv = vec![0.0_f64; ne * ne];
-            for i in 0..ne { inv[i * ne + i] = 1.0; }
-            for col in 0..ne {
-                let mut pivot = col;
-                for row in col..ne {
-                    if q_inv[row * ne + col].abs() > q_inv[pivot * ne + col].abs() {
-                        pivot = row;
-                    }
-                }
-                if q_inv[pivot * ne + col].abs() < eps_reg {
-                    // Singular column — Q has no contribution for this projector.
-                    // Leave q_inv row as zero (effectively no 1/Q term for this channel).
-                    // Zero out the corresponding row of inv.
-                    for c in 0..ne { inv[col * ne + c] = 0.0; }
-                    continue;
-                }
-                for c in 0..ne {
-                    q_inv.swap(col * ne + c, pivot * ne + c);
-                    inv.swap(col * ne + c, pivot * ne + c);
-                }
-                let piv_val = q_inv[col * ne + col];
-                for c in 0..ne {
-                    q_inv[col * ne + c] /= piv_val;
-                    inv[col * ne + c] /= piv_val;
-                }
-                for row in 0..ne {
-                    if row == col { continue; }
-                    let factor = q_inv[row * ne + col];
-                    if factor.abs() < eps_reg { continue; }
-                    for c in 0..ne {
-                        q_inv[row * ne + c] -= factor * q_inv[col * ne + c];
-                        inv[row * ne + c] -= factor * inv[col * ne + c];
-                    }
-                }
-            }
-            // q_inv no longer needed; inv now holds Q^{-1} (or pseudo-inverse for
-            // singular rows).
-
-            // M = Q^{-1} + G
-            let mut m_mat = gram.clone();
-            for i in 0..ne {
-                for j in 0..ne {
-                    m_mat[i * ne + j] += inv[i * ne + j];
-                }
-            }
-
-            // Save per-ion Q⁻¹ and beta for global Woodbury assembly.
-            per_ion_q_inv.push(inv);
+            // Save per-ion Q matrix for global Woodbury assembly.
+            // (Q is block-diagonal across ions; we build the full global
+            // block-diagonal Q below and invert it in one Cholesky pass,
+            // matching CASTEP nlpot_prepare_Sinv_full lines 11166-11193.)
+            per_ion_q.push(q_cpu);
             let beta_this_ion = beta_flat.clone();
             per_ion_beta_flat.push(beta_this_ion);
             per_ion_ne.push(ne);
@@ -388,32 +359,63 @@ impl VnlBatchData {
         // -----------------------------------------------------------------------
         let n_total_expanded: i32 = per_ion_ne.iter().map(|&ne| ne as i32).sum();
 
-        // 1. Block-diagonal Q⁻¹ as complex (Q is real, so y = 0.0).
+        // 1. Build global block-diagonal Q matrix (real, n_expanded per ion).
+        //    CASTEP nlpot_prepare_Sinv_full lines 11166-11193: Q is block-diagonal
+        //    with `ps_q(m,n,nsp)` entries multiplied by `mixture_weight` (≈1.0).
+        //    We assemble the full matrix and invert it globally in one Cholesky pass.
         let nte = n_total_expanded as usize;
-        let mut q_inv_blkdiag = vec![CudaComplex { x: 0.0, y: 0.0 }; nte * nte];
-        let mut offset = 0;
-        for (ion_idx, &ne) in per_ion_ne.iter().enumerate() {
-            let inv = &per_ion_q_inv[ion_idx];
-            for i in 0..ne {
-                for j in 0..ne {
-                    q_inv_blkdiag[(offset + i) * nte + (offset + j)].x = inv[i * ne + j];
+        let mut q_global = vec![0.0_f64; nte * nte];
+        {
+            let mut offset = 0;
+            for (ion_idx, &ne) in per_ion_ne.iter().enumerate() {
+                let q = &per_ion_q[ion_idx];
+                for i in 0..ne {
+                    for j in 0..ne {
+                        q_global[(offset + i) * nte + (offset + j)] = q[i * ne + j];
+                    }
                 }
+                offset += ne;
             }
-            offset += ne;
         }
 
-        // 2. Concatenate B: shape n_pw × n_total_expanded (col-major).
+        // 2. Invert Q globally via Cholesky (faer), matching CASTEP's
+        //    `invert_q_matrix` from preconditioner.rs with TINY = 1e-14.
+        //    Rows/cols with |diag| ≤ TINY are zeroed (pseudo-inverse for
+        //    singular Q channels; cf. nlpot.f90:13920-13932).
+        const Q_TINY: f64 = 1e-14;
+        let nonsingular: Vec<usize> =
+            (0..nte).filter(|&i| q_global[i * nte + i].abs() > Q_TINY).collect();
+        let mut q_inv_global = vec![0.0_f64; nte * nte];
+        let m = nonsingular.len();
+        if m > 0 {
+            let mut sub_q = Mat::<f64>::zeros(m, m);
+            for (ki, &i) in nonsingular.iter().enumerate() {
+                for (kj, &j) in nonsingular.iter().enumerate() {
+                    sub_q[(ki, kj)] = q_global[i * nte + j];
+                }
+            }
+            if let Ok(llt) = Llt::new(sub_q.as_ref(), Side::Lower) {
+                let sub_inv = llt.inverse();
+                for (ki, &i) in nonsingular.iter().enumerate() {
+                    for (kj, &j) in nonsingular.iter().enumerate() {
+                        q_inv_global[i * nte + j] = sub_inv[(ki, kj)];
+                    }
+                }
+            }
+            // If Cholesky fails (not SPD), leave singular rows/cols zeroed
+            // (safe fallback — the LU below handles the resulting M).
+        }
+
+        // 3. Concatenate B: shape n_pw × n_total_expanded (col-major).
         let mut b_concat_cpu: Vec<CudaComplex> = Vec::with_capacity(n_pw * nte);
         for (ion_idx, _ne) in per_ion_ne.iter().enumerate() {
             let beta_flat = &per_ion_beta_flat[ion_idx];
-            // beta_flat is ne × n_pw in row-major = n_pw × ne in col-major (lda = n_pw).
-            // Concatenate along the column axis → append all ne*n_pw elements.
             b_concat_cpu.extend_from_slice(beta_flat);
         }
         let b_concat = stream.clone_htod(&b_concat_cpu).map_err(Error::Cuda)?;
         pcie.h2d_bytes += b_concat_cpu.len() * std::mem::size_of::<CudaComplex>();
 
-        // 3. Compute B^H·B on GPU, keep full complex (cross-ion blocks have
+        // 4. Compute B^H·B on GPU, keep full complex (cross-ion blocks have
         //    non-zero imaginary parts from structure-factor phase differences).
         let mut bh_b_dev: CudaSlice<CudaComplex> =
             stream.alloc_zeros(nte * nte).map_err(Error::Cuda)?;
@@ -439,18 +441,17 @@ impl VnlBatchData {
         // D2H: copy full complex B^H·B to CPU for M assembly.
         let mut m_cpu: Vec<CudaComplex> = stream.clone_dtoh(&bh_b_dev).map_err(Error::Cuda)?;
 
-        // 4. M = Q⁻¹ + B^H·B + ε·I  (complex, in-place on m_cpu).
-        //    Q⁻¹ is real (im part stays 0 from step 1).
+        // 5. M = Q⁻¹ + B^H·B + ε·I  (complex, in-place on m_cpu).
+        //    Q⁻¹ is real; imaginary parts come solely from B^H·B cross-ion phases.
         for i in 0..nte {
             for j in 0..nte {
-                m_cpu[i * nte + j].x += q_inv_blkdiag[i * nte + j].x;
-                // imag stays from B^H·B (no Q⁻¹ imag contribution)
+                m_cpu[i * nte + j].x += q_inv_global[i * nte + j];
             }
-            // Vestigial regularisation prevents exact-zero pivot from zgetrf.
+            // Regularisation prevents exact-zero pivot from zgetrf.
             m_cpu[i * nte + i].x += 1e-12;
         }
 
-        // 5. LU factor M = P·L·U.
+        // 6. LU factor M = P·L·U.
         let mut lu_m_dev = stream.clone_htod(&m_cpu).map_err(Error::Cuda)?;
         pcie.h2d_bytes += m_cpu.len() * std::mem::size_of::<CudaComplex>();
         let mut lu_ipiv_dev = stream.alloc_zeros::<i32>(nte).map_err(Error::Cuda)?;

@@ -947,7 +947,7 @@ pub(crate) unsafe fn davidson_diagonalise(
         let mean_ek_pw = kinetic_host.iter().sum::<f64>() / kinetic_host.len() as f64;
         let ek_min = band_ek.iter().cloned().fold(f64::INFINITY, f64::min);
         let ek_max = band_ek.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-        eprintln!(
+        davidson_diag!(
             "[mean_ek] per-band={mean_ek:.6} Ha (min={ek_min:.4}, max={ek_max:.4})  per-PW={mean_ek_pw:.6} Ha  ratio={ratio:.3}",
             ratio = mean_ek_pw / mean_ek
         );

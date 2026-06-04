@@ -567,8 +567,6 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
                 psi_abs_min, psi_abs_max,
             );
         }
-        let v_eff_gpu = Gpu::from_host_with(&v_eff_wave, &stream, &mut pcie)?;
-
         // Clone host data BEFORE moving self.psi into GPU
         let pw_coords = self.pw_coords.clone();
         let psi_host = self.psi.data.clone();
@@ -579,11 +577,12 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
         let psi_gpu = Gpu::from_host_with(&self.psi, &stream, &mut pcie)?;
 
         // Save the input ψ for Procrustes pinning (prev_psi_dev)
-        // This is the basis we hand to Chebyshev before filter/GS produce ψ_after_GS.
         let _prev_psi_dev = psi_gpu.as_device_slice();
 
         // V_NL precomputation (CPU, uses chemrust-hamiltonian, one-time cost)
         // Pass the downsampled V_eff for D-matrix screening (D = D0 + ∫ Q·V_eff).
+        // Clone BEFORE transposing V_eff for GPU so screening uses the original
+        // C-order layout from the CPU FFT pipeline.
         let v_eff_for_d = chemrust_hamiltonian_core::EffectivePotential::from_inner(
             chemrust_hamiltonian_core::fft::RealGrid::from_inner(v_eff_wave.as_fine_array().clone()),
         );
@@ -595,6 +594,22 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
             d_override_per_ion,
             &stream, &mut pcie, &blas, &kernels, &solver,
         )?;
+
+        // Transpose V_eff to match cuFFT grid layout (z-innermost).
+        // cuFFT plan (ngx=54, ngy=90, ngz=90) maps outermost→innermost,
+        // so dim 2=ngz=90 is innermost (z-fastest). Scatter formula
+        // iz + ngz*(iy + ngy*ix) uses same convention.
+        // V_eff[iz + ngz*iy + ngz*ngy*ix] must = V_eff_original[[ix, iy, iz]].
+        let [ngz_wg, ngy_wg, ngx_wg] = self.wave_grid.grid();
+        let v_eff_arr = v_eff_wave.as_fine_array();
+        let v_eff_fortran = ndarray::Array3::from_shape_fn(
+            (ngz_wg, ngy_wg, ngx_wg),
+            |(iz, iy, ix)| v_eff_arr[[ix, iy, iz]]
+        );
+        let v_eff_wave_gpu = EffectivePotential::from_inner(
+            FineGridArray::from_inner(v_eff_fortran)
+        );
+        let v_eff_gpu = Gpu::from_host_with(&v_eff_wave_gpu, &stream, &mut pcie)?;
 
         // Always pass eigenvalues=None. Das et al. (2025) main.tex:612 proves
         // that when ζ = ‖D⁻¹ − B⁻¹‖ = 0 (exact S⁻¹), R-ChFSI ≡ standard ChFSI
@@ -623,6 +638,7 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
             let kinetic_cpu = compute_kinetic_energies(
                 &self.pw_coords,
                 self.wave_grid.recip_lattice(),
+                self.k_point.coords,
             );
             let kinetic_dev: CudaSlice<f64> = stream
                 .clone_htod(&kinetic_cpu.0)
@@ -630,7 +646,9 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
             let kinetic_precond = KineticPreconditioner::new(kinetic_dev);
             pcie.h2d_bytes += kinetic_cpu.0.len() * std::mem::size_of::<f64>();
 
-            // FFT plan (batched C2C) — same as chebyshev_filter creates
+            // FFT plan (batched C2C). cuFFT uses x-innermost (C-order):
+            // element (ix,iy,iz) at index ix + nx*iy + nx*ny*iz.
+            // Scatter formula matches: ix + ngx*(iy + ngy*iz).
             let fft_plan = BatchedFftPlan3d::plan_batched_c2c(
                 ngx as i32, ngy as i32, ngz as i32, n_bands as i32,
                 stream.clone(),
@@ -657,6 +675,7 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
                     .fft_plan(&fft_plan)
                     .tol_abs(1e-5)
                     .max_outer_iter(30)
+                    .min_outer_iter(0)
                     .blas(&blas)
                     .solver(&solver)
                     .kernels(&kernels)
@@ -932,6 +951,7 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
         crate::eigensolver::chebyshev::apply_h_components_for_test(
             &psi_gpu, &v_eff_gpu, &self.wave_grid, &self.pw_coords,
             &vnl_data, &fft_idx_dev, &kernels, &blas, &stream,
+            self.k_point.coords,
         )
     }
 

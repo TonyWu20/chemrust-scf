@@ -308,3 +308,145 @@ Tightening b_low across the relevant range produces NO improvement; lifting it w
 
 **Resolution**: `notes/debug/debug-20260524-blow-tightening/RESOLUTION.md`
 
+## 2026-06-04: ffi-fortran-1-based-index-mismatch-in-scatter-gather
+
+**Root cause**: CASTEP passes `fft_idx` as 1-based Fortran grid indices (`pw_grid_index`,
+range `1..grid_size`) through the FFI boundary with no conversion. Rust copies them raw
+at `ffi.rs:418` and uploads to GPU. The scatter/gather kernels at `kernels.rs:53,68,97`
+use them directly as 0-based C indices (`grid[b*grid_size + fft_idx[g]]`), causing a
++1 offset in every real-space grid access:
+
+- `grid[0]` (DC G=0 component) is NEVER populated — every V_loc operation loses the
+  spatially-averaged potential
+- `grid[grid_size]` is accessed out-of-bounds (reads uninitialized GPU memory for the
+  last band, next band's DC position for others)
+- All local potential contributions are computed at wrong spatial positions
+- V_contrib for band 0: **+0.712 Ha** instead of **−1.879 Ha** (sign flip + magnitude error)
+- Band 0 eigenvalue: **+1.536 Ha** instead of **−1.055 Ha** (wrong sign)
+- Wrong eigenvalues feed the preconditioner as ε-estimates → NL correction weight
+  explodes → |hpsi|² after V_loc hits 10⁶→10⁶³→10⁷⁴→10⁸⁶→10¹⁰⁸ → ZHEGVD fails
+
+**Fix**: `ffi.rs:418` — convert 1-based Fortran indices to 0-based C indices during
+the host-side copy with `.map(|&i| i - 1)`. Added `debug_assert!` for range validation.
+
+**Pattern**: `1-based-index-leak-across-ffi`. Fortran passes 1-based grid indices
+through a C FFI boundary; Rust receives them as raw `c_int` values with no semantic
+conversion. The bug is silent because:
+1. No diagnostic cross-checked V_contrib against CASTEP's internal H·ψ decomposition
+2. The standalone SCF path generates its own 0-based FFT indices via
+   `pw_coords_to_fft_indices`, so the bug only manifests through the FFI path
+3. The KE factor diagnostic (which passes) tests the `fft_idx_to_coord` path at
+   `ffi.rs:40-49` — which DOES subtract 1 at line 41. This is a DIFFERENT code path
+   from the scatter/gather kernels. Two functions consuming the same `fft_idx` raw
+   array: one correct (subtracts 1 internally), one wrong (assumes 0-based).
+4. The V_eff round-trip check (which passes) tests the V_eff upload path — a third
+   independent code path unaffected by the scatter/gather index bug
+
+**Lesson**: When receiving integer index arrays across an FFI boundary, NEVER assume
+the indexing convention matches. Add an explicit conversion AND a range assertion.
+A `debug_assert!` that min≥0 and max<grid_size catches the mismatch before any
+computation.
+
+**Lesson 2**: Two functions can consume the same `fft_idx` raw data with different
+assumptions, and both can have diagnostic cross-checks that pass — because each
+cross-check tests only ONE function's path. Proof that a value is correct in one
+function does NOT prove it's correctly consumed in another. Audit ALL consumers
+of FFI integer arrays, not just the one with the first diagnostic.
+
+**Resolution**: `notes/debug/eigenvalue-explosion-20260604/INVESTIGATION.md` (FFI Data Boundary Hypothesis)
+**Commit**: `b58d33a` (fix), `c644514` (prior eigensolver fixes)
+**Duration**: ~1 day from symptom identification to root cause
+
+## 2026-06-04: ffi-warm-start-test-is-critical-discriminator
+
+**Context**: The two current test modes for the Rust eigensolver are:
+1. **Standalone SCF test**: Loads CASTEP checkpoint data from disk (`.orbitals`,
+   `.pot_fmt`, etc.) and runs the full SCF loop in pure Rust. Validates the Rust
+   eigensolver/hamiltonian/density code against CASTEP data. ALL diagnostics pass
+   for converged wavefunctions — eigenvalues match to ~10⁻⁸ Ha.
+2. **FFI cold-start test**: CASTEP calls `chemrust_diagonalise_h` via cdylib with
+   atomic-guess wavefunctions. Validates the full Fortran→Rust FFI boundary from
+   zero. Eigenvalues are poor (cold-start), but tests the data transfer path.
+
+The warm-start test fills the gap between them: CASTEP calls `chemrust_diagonalise_h`
+with **converged wavefunctions** from a CASTEP checkpoint. This tests:
+- The full FFI data transfer path (like cold-start)
+- With known-good wavefunctions where the Rust eigensolver is proven correct (like standalone)
+- Isolates ANY data corruption at the Fortran→Rust boundary as the sole variable
+
+**Why this test is critical**: Without the warm-start test, the `1-based-index-leak`
+bug above would remain invisible indefinitely:
+- Standalone test: correct (uses 0-based indices from `pw_coords_to_fft_indices`)
+- Cold-start test: explodes (but wrongly attributed to cold-start being "expected to
+  be noisy" — the explosion masked the systematic index offset)
+- Warm-start test: explodes **with known-good wavefunctions** — this discriminates
+  "FFI data path" from "bad initial guess" unambiguously
+
+The warm-start test isolated the FFI boundary as the failure site within one run.
+Without it, debugging would require instrumenting both the Fortran and Rust sides
+to compare intermediate values — a multi-day effort for the same conclusion.
+
+**Pattern**: `missing-discriminator-allows-silent-ffi-corruption`. When a system has
+two code paths (standalone and FFI), a test that exercises only the standalone path
+cannot catch FFI-specific bugs. The warm-start test — same wavefunctions, different
+entry point — creates a controlled experiment where the ONLY variable is the data
+transfer mechanism. Any divergence in eigenvalues between standalone and warm-start
+ISOLATES the FFI boundary as the cause.
+
+**Setup**: `/export/public_castep_jobs/tony/Cu111_CO_Single_Point_0604_warm_start/`
+- Uses CASTEP checkpoint from a converged SCF run (continuation)
+- `slurm_job_Cu111_CO.sh` submits with `sbatch`
+- Rust cdylib must be rebuilt with `nix develop --command "make-castep-chemrust"` before each test
+- Output: `slurm_output_*.txt` — key diagnostics at lines 70-80 (initial eigenvalues, H·psi decomposition)
+- Compare initial eigenvalues against standalone test: must match within ~10⁻⁸ Ha
+- Compare V_contrib for band 0: must have correct sign (negative for occupied bands)
+- Monitor |hpsi|² after V_loc: must stay bounded (< 1e4) for all iterations
+
+## 2026-06-05: ffi-fortran-grid-layout-convention-mismatch (RESOLVED — FIRST SUCCESS)
+
+**Root cause**: CASTEP uses Fortran ix-innermost grid convention (column-major,
+`ix + ngx·iy + ngx·ngy·iz`). The Rust code uses iz-innermost (z-fastest,
+`iz + ngz·iy + ngz·ngy·ix`, from `pw_coords_to_fft_indices`). The FFI boundary
+received ix-innermost data from CASTEP but treated it as iz-innermost.
+Four independent manifestations across three data channels:
+
+1. **fft_idx 1→0 based** (`b58d33a`): `pw_grid_index` is 1-based Fortran;
+   scatter/gather kernels are 0-based. grid[0] never populated, grid[grid_size] OOB.
+
+2. **fft_idx ix→iz transpose** (`22c97a2`): CASTEP's flat index formula
+   `ix + ngx·iy + ngx·ngy·iz` differs from Rust's `iz + ngz·iy + ngz·ngy·ix`.
+   On non-cubic grids (ngx=54≠ngz=90 for Cu111_CO), G-vectors map to wrong
+   real-space positions.
+
+3. **V_eff x↔z transpose** (`22c97a2`): cuFFT with plan (ngx,ngy,ngz) uses
+   n[rank-1]=ngz innermost. V_eff with ix-innermost layout has ngx innermost.
+   Axis swap needed for V_eff×ψ multiplication to be physically correct.
+
+4. **D-screening uses original V_eff** (`22c97a2`): The screening integral
+   ∫Q·V_eff needs the physical (x,y,z) layout, not the FFT-transposed (z,y,x)
+   layout. D matrices were computed with x↔z-swapped V_eff, corrupting V_NL.
+
+**Cumulative error**: +2.591 Ha (V_contrib went from −1.879 Ha correct to
++0.712 Ha). Each individual bug contributed ~0.2–2.4 Ha of error. The compound
+bug was: V_loc effectively computed at random spatial positions → averaged to
+V_eff_mean (~−0.07 Ha) instead of ~−2.6 Ha at ion cores → wrong eigenvalues
+→ preconditioner amplification → search direction explosion (10⁶→10⁶³→10¹⁰⁸).
+
+**Fix**: Three changes in `src/ffi.rs`:
+- V_eff transpose: `ndarray::Array3::from_shape_fn((ngz,ngy,ngx), |(iz,iy,ix)| arr_ix_fast[[ix,iy,iz]])` — matching `scf.rs:598-608`
+- fft_idx transpose: decode ix-innermost → (ix,iy,iz) → re-encode iz-innermost during 1→0 conversion
+- D-screening: pass original `arr_ix_fast.clone()` (not transposed `arr_iz_fast`)
+
+**Pattern**: `ffi-grid-layout-convention-mismatch`. When receiving multi-dimensional
+grid data across a Fortran→C FFI boundary, EVERY channel must be audited independently
+for: (a) base convention (0 vs 1-based indices), (b) axis ordering (innermost dimension),
+(c) derived quantities that need the physical grid layout, not the FFT layout.
+
+**Critical discriminator**: The warm-start test (`/export/public_castep_jobs/tony/Cu111_CO_Single_Point_0604_warm_start/`) isolates FFI boundary corruption from eigensolver correctness. It feeds CONVERGED CASTEP wavefunctions through the FFI boundary and asserts eigenvalues match the standalone Rust test exactly.
+
+**Resolution**: `notes/ffi-grid-layout-resolution.md`
+**Commit**: `b58d33a` (1→0), `22c97a2` (transposes + D-screening)
+**Duration**: ~2 days from symptom to resolution across ~12 job submissions
+**Related**: §2026-06-04 ffi-fortran-1-based-index-mismatch-in-scatter-gather (Bug 1),
+§2026-05-20 cufft-dim-ordering-and-rr-transpose-layout (prior cuFFT ordering bug in Chebyshev path)
+

@@ -66,9 +66,11 @@ fn shape3(arr: &Array3<f64>) -> Vec<usize> {
 }
 
 pub(crate) fn flatten_f64(arr: &Array3<f64>) -> Vec<f64> {
-    // Flatten in Fortran order (x fastest) to match cuFFT 3-D layout.
-    // ndarray's default C-order iterator would put z-first on GPU,
-    // which disagrees with how cuFFT and CASTEP index the grid.
+    // Flatten in C order (x fastest → z slowest), matching CASTEP's
+    // Fortran convention where the first dimension (x) varies fastest.
+    // The GPU scatter formula iz + ngz*(iy + ngy*ix) uses a different
+    // convention (z fastest); this is handled by transposing V_eff
+    // before GPU upload in the diagonalize path.
     let (nx, ny, nz) = (arr.shape()[0], arr.shape()[1], arr.shape()[2]);
     let mut out = Vec::with_capacity(nx * ny * nz);
     for z in 0..nz {
@@ -82,7 +84,7 @@ pub(crate) fn flatten_f64(arr: &Array3<f64>) -> Vec<f64> {
 }
 
 pub(crate) fn unflatten_f64(data: Vec<f64>, shape: &[usize]) -> Array3<f64> {
-    // Inverse of flatten_f64 — interprets flat data as Fortran order.
+    // Inverse of flatten_f64 — interprets flat data as C order (x fastest).
     let (nx, ny, nz) = (shape[0], shape[1], shape[2]);
     let mut arr = Array3::zeros((nx, ny, nz));
     let mut idx = 0;

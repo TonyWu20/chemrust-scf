@@ -309,10 +309,11 @@ pub fn construct_density_gpu(
     .map_err(Error::Cuda)?;
 
     // 4. Batched C2C IFFT (in-place on grid_dev)
-    // cuFFT: n[0] outermost, n[rank-1] innermost. Our scatter formula makes
-    // iz innermost, so plan dims = (ngx, ngy, ngz). See chebyshev.rs:844.
+    // Fortran data layout (ngz, ngy, ngx) with ngz innermost (stride-1).
+    // cuFFT n[0] is innermost, so plan dims = (ngz, ngy, ngx).
+    // Verified by cufft_dim_ordering_isolated_diagnostic.
     let fft_plan = BatchedFftPlan3d::plan_batched_c2c(
-        ngx as i32, ngy as i32, ngz as i32,
+        ngz as i32, ngy as i32, ngx as i32,
         n_bands as i32, Arc::clone(stream),
     )?;
     // In-place IFFT: same buffer for input and output via raw pointer

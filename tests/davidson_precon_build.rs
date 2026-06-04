@@ -664,8 +664,22 @@ mod davidson_precon_build {
         let ion_offsets = vec![0, ne0, n_total_proj];
         let mixture_weights = vec![1.0, 1.0];
 
+        // Build block-diagonal c_global from per-ion C matrices
+        let mut c_global = Array2::<Complex64>::zeros((n_total_proj, n_total_proj));
+        for m in 0..ne0 {
+            for n in 0..ne0 {
+                c_global[[m, n]] = c0[[m, n]];
+            }
+        }
+        for m in 0..ne1 {
+            for n in 0..ne1 {
+                c_global[[ne0 + m, ne0 + n]] = c1[[m, n]];
+            }
+        }
+
         let q_rcq = assemble_q_rcq(
-            &[q0, q1], &[c0, c1], &[rb0, rb1], &ion_offsets, &mixture_weights,
+            &[q0, q1], &c_global, &[rb0, rb1],
+            &ion_offsets, &mixture_weights,
         );
 
         assert_eq!(
@@ -724,9 +738,9 @@ mod davidson_precon_build {
         let ion_offsets = vec![0, n_total_proj];
         let mixture_weights = vec![mixture_weight];
 
-        // Production path
+        // Production path (single ion: c_global is just c)
         let q_rcq = assemble_q_rcq(
-            &[q.clone()], &[c.clone()], &[r_beta.clone()], &ion_offsets, &mixture_weights,
+            &[q.clone()], &c, &[r_beta.clone()], &ion_offsets, &mixture_weights,
         );
 
         // Manual path: explicit -Q + C·Q - R_beta·(C·Q)
@@ -809,8 +823,21 @@ mod davidson_precon_build {
         let ion_offsets = vec![0, ne0, n_total_proj];
         let mixture_weights = vec![1.0, 1.0];
 
+        // Build block-diagonal c_global from per-ion C matrices
+        let mut c_global = Array2::<Complex64>::zeros((n_total_proj, n_total_proj));
+        for m in 0..ne0 {
+            for n in 0..ne0 {
+                c_global[[m, n]] = c0[[m, n]];
+            }
+        }
+        for m in 0..ne1 {
+            for n in 0..ne1 {
+                c_global[[ne0 + m, ne0 + n]] = c1[[m, n]];
+            }
+        }
+
         let q_rcq = assemble_q_rcq(
-            &[q0, q1], &[c0.clone(), c1.clone()], &[rb0.clone(), rb1.clone()],
+            &[q0, q1], &c_global, &[rb0.clone(), rb1.clone()],
             &ion_offsets, &mixture_weights,
         );
 

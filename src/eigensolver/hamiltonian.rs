@@ -13,7 +13,8 @@
 
 use std::sync::Arc;
 
-use cudarc::driver::{CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
+use cudarc::cublas::sys::{cublasHandle_t, cublasZdotc_v2};
+use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, LaunchConfig, PushKernelArg};
 use cudarc::cusolver::sys::cublasOperation_t;
 
 use crate::device::blas::{self, BlasHandle, ZgemmConfig};
@@ -76,10 +77,14 @@ pub(crate) unsafe fn apply_v_loc_hamiltonian(
     n_pw: i32,
     n_bands: i32,
     grid_size: i32,
+    ngx: i32,
+    ngy: i32,
+    ngz: i32,
     inv_ntotal: f64,
     fft_plan: &BatchedFftPlan3d,
     kernels: &CudaKernelSet,
     stream: &Arc<CudaStream>,
+    blas: Option<&BlasHandle>,
 ) -> Result<(), Error> {
     // 1. hpsi = kinetic * psi  (T|psi>)
     unsafe {
@@ -94,9 +99,16 @@ pub(crate) unsafe fn apply_v_loc_hamiltonian(
     }
     .map_err(Error::Cuda)?;
 
-    // TEMPORARY: skip V_loc (FFT round-trip) to isolate kinetic+V_NL.
-    // If V(pot) in Diag-HOp is unchanged, V_loc was never contributing.
-    // If V(pot) changes (gets smaller/closer to 0), V_loc was contributing.
+    // Diag: |hpsi|² for last band after kinetic
+    #[cfg(feature = "scf_diag")]
+    if let Some(bh) = blas {
+        let lb = n_bands as usize - 1;
+        let (h_ptr, _) = (&*hpsi_dev).device_ptr(stream);
+        let col = (h_ptr as *const CudaComplex).add(lb * n_pw as usize);
+        let mut nrm2 = CudaComplex { x: 0.0, y: 0.0 };
+        unsafe { cublasZdotc_v2(bh.raw_handle(), n_pw, col as *const _, 1, col as *const _, 1, &mut nrm2 as *mut _ as *mut _); }
+        eprintln!("[Diag-hpsi-step] after kinetic: |hpsi[{}]|²={:.6e}", lb, nrm2.x);
+    }
 
     // 2. Zero grid, then scatter psi to FFT grid positions
     unsafe {
@@ -108,15 +120,25 @@ pub(crate) unsafe fn apply_v_loc_hamiltonian(
     }
     .map_err(Error::Cuda)?;
 
+    // Nyquist: -1 if odd-sized (no Nyquist plane), N/2 if even.
+    let nyq_x = if ngx % 2 == 0 { ngx / 2 } else { -1 };
+    let nyq_y = if ngy % 2 == 0 { ngy / 2 } else { -1 };
+    let nyq_z = if ngz % 2 == 0 { ngz / 2 } else { -1 };
+
     unsafe {
         stream
-            .launch_builder(&kernels.scatter_pw_to_grid)
+            .launch_builder(&kernels.scatter_pw_to_grid_nyq)
             .arg(&**psi_dev)
             .arg(fft_idx_dev)
             .arg(&mut *grid_dev)
             .arg(&n_pw)
             .arg(&n_bands)
             .arg(&grid_size)
+            .arg(&ngy)
+            .arg(&ngz)
+            .arg(&nyq_x)
+            .arg(&nyq_y)
+            .arg(&nyq_z)
             .launch(LaunchConfig::for_num_elems((n_bands * n_pw) as u32))
     }
     .map_err(Error::Cuda)?;
@@ -154,6 +176,16 @@ pub(crate) unsafe fn apply_v_loc_hamiltonian(
             .launch(LaunchConfig::for_num_elems((n_bands * n_pw) as u32))
     }
     .map_err(Error::Cuda)?;
+    // Diag: |hpsi|² for last band after kinetic+Vloc
+    #[cfg(feature = "scf_diag")]
+    if let Some(bh) = blas {
+        let lb = n_bands as usize - 1;
+        let (h_ptr, _) = (&*hpsi_dev).device_ptr(stream);
+        let col = (h_ptr as *const CudaComplex).add(lb * n_pw as usize);
+        let mut nrm2 = CudaComplex { x: 0.0, y: 0.0 };
+        unsafe { cublasZdotc_v2(bh.raw_handle(), n_pw, col as *const _, 1, col as *const _, 1, &mut nrm2 as *mut _ as *mut _); }
+        eprintln!("[Diag-hpsi-step] after kinetic+Vloc: |hpsi[{}]|²={:.6e}", lb, nrm2.x);
+    }
     Ok(())
 }
 
@@ -190,10 +222,14 @@ pub unsafe fn apply_full_hamiltonian(
             .n_pw(n_pw as i32)
             .n_bands(n_bands as i32)
             .grid_size(grid_size as i32)
+            .ngx(fft_plan.nx())
+            .ngy(fft_plan.ny())
+            .ngz(fft_plan.nz())
             .inv_ntotal(inv_ntotal)
             .fft_plan(fft_plan)
             .kernels(kernels)
             .stream(stream)
+            .maybe_blas(Some(blas))
             .call()?;
 
         apply_v_nl_hamiltonian()
@@ -205,6 +241,17 @@ pub unsafe fn apply_full_hamiltonian(
             .blas(blas)
             .stream(stream)
             .call()?;
+
+        // Diag: |hpsi|² for last band after full H (kinetic+Vloc+VNL)
+        #[cfg(feature = "scf_diag")]
+        {
+            let lb = n_bands - 1;
+            let (h_ptr, _) = (&*hpsi_dev).device_ptr(stream);
+            let col = (h_ptr as *const CudaComplex).add(lb * n_pw);
+            let mut nrm2 = CudaComplex { x: 0.0, y: 0.0 };
+            unsafe { cublasZdotc_v2(blas.raw_handle(), n_pw as i32, col as *const _, 1, col as *const _, 1, &mut nrm2 as *mut _ as *mut _); }
+            eprintln!("[Diag-hpsi-step] after kinetic+Vloc+VNL: |hpsi[{}]|²={:.6e}", lb, nrm2.x);
+        }
     }
     Ok(())
 }

@@ -68,7 +68,7 @@ fn debug_rayleigh() {
     let mut grid_dev = stream.alloc_zeros::<CudaComplex>(nb*gs).unwrap();
 
     // Kinetic
-    let kcpu = compute_kinetic_energies(&pwc, wg.recip_lattice());
+    let kcpu = compute_kinetic_energies(&pwc, wg.recip_lattice(), kpt.coords);
     let kdev: CudaSlice<f64> = stream.clone_htod(&kcpu.0).unwrap();
     let kpre = KineticPreconditioner::new(kdev);
 

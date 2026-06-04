@@ -4,16 +4,26 @@
 // NOTE: dead_code allowed because Group C (Davidson) will be the consumer.
 #![allow(dead_code)]
 
+macro_rules! precon_diag {
+    ($($arg:tt)*) => {
+        if cfg!(feature = "scf_diag") {
+            eprintln!($($arg)*);
+        }
+    };
+}
+
 use std::sync::Arc;
 
+use cudarc::cublas::sys::{cublasHandle_t, cublasZcopy_v2, cublasZdotc_v2};
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
+    CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, DevicePtr, LaunchConfig,
+    PushKernelArg,
 };
 use cudarc::nvrtc::compile_ptx;
 use faer::linalg::solvers::{DenseSolveCore, Llt, PartialPivLu};
 use faer::mat::Mat;
 use faer::Side;
-use ndarray::Array2;
+use ndarray::{Array2, ShapeBuilder};
 use num_complex::Complex64;
 
 use crate::device::blas::{op, BlasHandle, ZgemmConfig};
@@ -187,6 +197,55 @@ pub fn compute_c_matrix(
 }
 
 // ---------------------------------------------------------------------------
+// C_global = β^H · diag(R) · β  (cross-ion blocks, CPU)
+// ---------------------------------------------------------------------------
+
+/// Compute the global C = β^H · diag(R) · β matrix spanning all ions.
+///
+/// Unlike compute_c_matrix which computes per-ion C_i, this function computes
+/// the full global matrix with cross-ion blocks:
+///
+///   C[off_i+m, off_j+n] = Σ_G conj(β_i[G,m]) · R(G) · β_j[G,n]
+///
+/// # Shape
+///
+/// Returns (total_ne, total_ne) where total_ne = ion_offsets[n_ions].
+/// Diagonal blocks at [off_i..off_i+ne_i, off_j..off_j+ne_j] are the per-ion
+/// C_i matrices. Off-diagonal blocks capture cross-ion projector overlap
+/// weighted by the TPA preconditioner vector.
+///
+/// Reference: CASTEP nlpot.f90:13805-13818 (ion_beta_beta_recip).
+pub fn compute_c_global(
+    beta_g_per_ion: &[Array2<Complex64>],
+    r_vector: &[f64],
+    ion_offsets: &[usize],
+) -> Array2<Complex64> {
+    let n_ions = beta_g_per_ion.len();
+    let total_ne = ion_offsets[n_ions];
+    let n_pw = r_vector.len();
+
+    // Build alpha_global: alpha[n, G] = conj(beta[G, n]) * sqrt(R[G])
+    // alpha_global has shape (total_ne, n_pw), row-major.
+    let mut alpha_data: Vec<Complex64> = Vec::with_capacity(total_ne * n_pw);
+    for i in 0..n_ions {
+        let ne_i = beta_g_per_ion[i].shape()[1];
+        for n in 0..ne_i {
+            for g in 0..n_pw {
+                let beta_val = beta_g_per_ion[i][[g, n]];
+                let r_scale = Complex64::new(r_vector[g].sqrt(), 0.0);
+                alpha_data.push(beta_val.conj() * r_scale);
+            }
+        }
+    }
+    let alpha = Array2::from_shape_vec((total_ne, n_pw), alpha_data)
+        .expect("alpha shape (total_ne, n_pw) must match");
+
+    // C = alpha * alpha^H  — single matrix multiply, matches CASTEP's
+    // ion_beta_beta_recip which computes C = beta^H * diag(R) * beta globally.
+    alpha.dot(&alpha.t().mapv(|c| c.conj()))
+}
+
+// ---------------------------------------------------------------------------
 // Q⁻¹ inversion (CPU, faer Cholesky)
 // ---------------------------------------------------------------------------
 
@@ -205,7 +264,7 @@ pub fn compute_c_matrix(
 pub fn invert_q_matrix(q: &[f64], n: usize) -> Vec<f64> {
     assert_eq!(q.len(), n * n, "Q data length must be n×n, got {} elements for n={}", q.len(), n);
 
-    const TINY: f64 = 1e-14;
+    const TINY: f64 = f64::MIN_POSITIVE; // ≈2.22e-308, matches CASTEP's tiny(1.0_dp)
 
     // Identify non-singular diagonal indices (|diag| > TINY)
     let nonsingular: Vec<usize> = (0..n).filter(|&i| q[i * n + i].abs() > TINY).collect();
@@ -236,9 +295,19 @@ pub fn invert_q_matrix(q: &[f64], n: usize) -> Vec<f64> {
                 result[i * n + j] = sub_inv[(ki, kj)];
             }
         }
+    } else {
+        // CASTEP nlpot.f90:13948-13968 uses dsytrf+dsytri (Bunch-Kaufman).
+        // Cholesky fails for non-SPD matrices.  Fall back to LU decomposition
+        // (matches assemble_r_beta's fallback pattern, line 338-343).
+        let lu = PartialPivLu::new(sub_q.as_ref());
+        let sub_inv = lu.inverse();
+
+        for (ki, &i) in nonsingular.iter().enumerate() {
+            for (kj, &j) in nonsingular.iter().enumerate() {
+                result[i * n + j] = sub_inv[(ki, kj)];
+            }
+        }
     }
-    // If Cholesky fails (not SPD), we leave singular rows/cols as zeros
-    // and the non-singular sub-block result stays zeroed (safe fallback)
 
     result
 }
@@ -302,97 +371,88 @@ pub fn assemble_r_beta(
 }
 
 // ---------------------------------------------------------------------------
-// Q_RCQ = −Q + C·Q − R_beta·(C·Q) assembly
+// Q_RCQ = −Q − R_beta·C·Q assembly (global C, full off-diagonal blocks)
 // ---------------------------------------------------------------------------
 
 /// Assemble the Q_RCQ matrix for use in the USPP preconditioner apply step.
 ///
 /// For a single MPI rank (all ions local), Q_RCQ is a square matrix of size
-/// n_total_proj × n_total_proj.
+/// total_ne × total_ne.  Unlike the per-ion approximation, this function uses
+/// the FULL global C matrix (including cross-ion blocks), so the resulting
+/// Q_RCQ has non-zero off-diagonal blocks matching CASTEP.
 ///
-/// Per-ion matrices are arranged block-diagonally: each ion's C occupies
-/// the diagonal block at `ion_offsets[i]`, and off-diagonal C blocks are
-/// zero (per-ion approximation). The resulting Q_RCQ is therefore also
-/// block-diagonal.
+/// Algorithm:
+/// 1. Set diagonal blocks: `Q_RCQ[off_i..off_i+ne_i, off_i..off_i+ne_i] = −Q_i * w_i`
+/// 2. Compute CQ = C_global * Q_global (Q_global is block-diagonal Q_i * w_i)
+/// 3. For each ion i: `Q_RCQ[off_i..off_i+ne_i, :] −= R_beta_i * CQ[off_i..off_i+ne_i, :]`
 ///
-/// Algorithm (per ion):
-/// 1. Initialize diagonal block: `Q_RCQ[i_on,i_on] = −Q_i * w_i`
-/// 2. Add C·Q term:            `Q_RCQ[:, i_on] += C[:, i_on] · Q_i · w_i`
-/// 3. Subtract R_beta·(C·Q):   `Q_RCQ[i_on, :] −= R_beta_i · (C·Q)[i_on, :]`
+/// Step 3 populates BOTH diagonal and off-diagonal blocks because CQ is a
+/// full matrix (cross-ion C × block-diagonal Q).
 ///
-/// Final per-ion formula: `Q_RCQ[i_on,i_on] = −Q_i·w_i + C_i·Q_i·w_i
-///                                                − R_beta_i·C_i·Q_i·w_i`
+/// Final formula: `Q_RCQ = −Q − R_beta · C · Q`  (CASTEP nlpot.f90:14162-14180)
 ///
 /// Arguments:
 /// - `q_matrices`: per-ion Q matrices, each ne×ne real symmetric row-major
-/// - `c_per_ion`: per-ion C = β^H·diag(R)·β matrices, each ne×ne complex Hermitian
+/// - `c_global`: global C = β^H·diag(R)·β, shape (total_ne, total_ne)
 /// - `r_beta_per_ion`: per-ion R_beta = (−Q⁻¹−C)⁻¹ matrices, each ne×ne complex
 /// - `ion_offsets`: cumulative offset of each ion in the global projector
 ///   space (length n_ions + 1)
 /// - `mixture_weights`: per-ion VCA mixture weights (1.0 for non-VCA)
 ///
-/// Returns Q_RCQ as Array2<Complex64> (n_total_proj × n_total_proj, row-major).
+/// Returns Q_RCQ as Array2<Complex64> (total_ne × total_ne, row-major).
 ///
-/// Source: CASTEP nlpot.f90:13827-13880, 14146-14176
+/// Source: CASTEP nlpot.f90:13841-13893, 14162-14180
 pub fn assemble_q_rcq(
     q_matrices: &[Vec<f64>],
-    c_per_ion: &[Array2<Complex64>],
+    c_global: &Array2<Complex64>,
     r_beta_per_ion: &[Array2<Complex64>],
     ion_offsets: &[usize],
     mixture_weights: &[f64],
 ) -> Array2<Complex64> {
     let n_ions = q_matrices.len();
-    assert_eq!(c_per_ion.len(), n_ions, "c_per_ion length must match q_matrices");
     assert_eq!(r_beta_per_ion.len(), n_ions, "r_beta_per_ion length must match q_matrices");
     assert_eq!(mixture_weights.len(), n_ions, "mixture_weights length must match q_matrices");
     assert_eq!(ion_offsets.len(), n_ions + 1, "ion_offsets must have n_ions + 1 elements");
 
-    let n_total_proj = ion_offsets[n_ions];
-    let mut q_rcq = Array2::<Complex64>::zeros((n_total_proj, n_total_proj));
+    let total_ne = ion_offsets[n_ions];
+    let mut q_rcq = Array2::<Complex64>::zeros((total_ne, total_ne));
 
+    // Step 1: Build Q_global (block-diagonal Q_i * w_i) and set Q_RCQ diagonal = −Q_i * w_i
+    let mut q_global = Array2::<Complex64>::zeros((total_ne, total_ne));
     for i in 0..n_ions {
         let offset = ion_offsets[i];
         let w = mixture_weights[i];
-        let ne = c_per_ion[i].shape()[0];
+        let ne = r_beta_per_ion[i].shape()[0];
         let ne2 = ne * ne;
 
-        // Validate per-ion Q matrix dimensions
         assert_eq!(q_matrices[i].len(), ne2,
             "Q matrix for ion {i} has {} elements, expected {ne2} (ne={ne})",
             q_matrices[i].len());
 
-        // Build Q_i as Array2<f64>
         let q_i = Array2::from_shape_vec((ne, ne), q_matrices[i].to_vec())
             .expect("Q matrix must be square");
 
-        // Step 2: On-diagonal block = −Q_i * w_i
         for m in 0..ne {
             for n in 0..ne {
                 q_rcq[[offset + m, offset + n]] = Complex64::new(-q_i[[m, n]] * w, 0.0);
+                q_global[[offset + m, offset + n]] = Complex64::new(q_i[[m, n]] * w, 0.0);
             }
         }
+    }
 
-        // Step 3: C·Q term
-        // Convert Q_i * w to Complex64 for matmul with complex C_i
-        let q_i_scaled = q_i.mapv(|v| Complex64::new(v * w, 0.0));
-        let cq_block = c_per_ion[i].dot(&q_i_scaled);
+    // Step 2: CQ = C_global * Q_global  (full matrix product)
+    let cq = c_global.dot(&q_global);
 
-        // Add C·Q to the on-diagonal column block (C is block-diagonal,
-        // so only the diagonal block is affected)
+    // Step 3: Q_RCQ[ion_block, :] −= R_beta * CQ[ion_block, :]
+    // CASTEP nlpot.f90:14166-14180
+    for i in 0..n_ions {
+        let offset = ion_offsets[i];
+        let ne = r_beta_per_ion[i].shape()[0];
+        let cq_block = cq.slice(ndarray::s![offset..offset + ne, ..]);
+        let contrib = r_beta_per_ion[i].dot(&cq_block);
         for m in 0..ne {
-            for n in 0..ne {
-                q_rcq[[offset + m, offset + n]] += cq_block[[m, n]];
-            }
-        }
-
-        // Step 4: R_beta correction
-        // Q_RCQ[i_on, :] −= R_beta_i · (C·Q)[i_on, :]
-        // With block-diagonal C, (C·Q)[i_on, :] is zero outside the diagonal
-        // block, so this only affects the diagonal block.
-        let r_cq = r_beta_per_ion[i].dot(&cq_block);
-        for m in 0..ne {
-            for n in 0..ne {
-                q_rcq[[offset + m, offset + n]] -= r_cq[[m, n]];
+            for k in 0..total_ne {
+                q_rcq[[offset + m, k]] -= contrib[[m, k]];
             }
         }
     }
@@ -443,6 +503,10 @@ impl TpaPreconditioner {
     /// Apply the TPA-preconditioned residual.
     ///
     /// Computes: `out[G,b] = (hpsi[G,b] − e[b]·psi[G,b]) · R(G)`
+    ///
+    /// CASTEP nlpot.f90:15970 — USPP correction via NL weights,
+    /// not by replacing ψ with Sψ in the kernel.
+    /// by replacing ψ with Sψ in the kernel.
     ///
     /// # Safety
     ///
@@ -555,6 +619,9 @@ impl TpaPreconditioner {
 ///   concurrently.
 /// - When USPP params are provided, `vnl_data` and `blas` must be valid.
 #[bon::builder]
+/// CASTEP nlpot.f90:15970 — USPP correction via NL weights,
+/// The kernel computes `(hpsi - ε·psi) * R(G)`, which is correct
+/// for USPP (S≠I ⇒ spsi≠psi).
 pub unsafe fn apply_preconditioner(
     psi: &PwCoefficients,
     hpsi: &PwCoefficients,
@@ -574,7 +641,7 @@ pub unsafe fn apply_preconditioner(
     let out_dev: CudaSlice<CudaComplex> = stream.alloc_zeros(total).map_err(Error::Cuda)?;
     let mut precon = PwCoefficients::new(out_dev);
 
-    // Step 1: NCPP TPA step — always applied
+    // Step 1: TPA step — always applied (same for NCPP and USPP)
     unsafe {
         tpa_preconditioner.apply_residual(
             &mut precon,
@@ -587,6 +654,33 @@ pub unsafe fn apply_preconditioner(
             stream,
         )
     }?;
+
+    // Diagnostic: check eigenvalues only (lightweight, no per-band L2² download)
+    // Full precon download is ~25 MB and impacts test runtime — only done on anomaly.
+    if let Ok(eig_cpu) = stream.clone_dtoh(eigenvalues) {
+        let has_anomaly = eig_cpu.iter().any(|e| e.abs() > 1e10 || e.is_nan());
+        if has_anomaly {
+            let precon_cpu = stream.clone_dtoh(&*precon).unwrap_or_default();
+            let mut max_l2sq = 0.0f64;
+            let mut max_b = 0usize;
+            for b in 0..n_bands {
+                let mut l2sq = 0.0f64;
+                let base = b * n_pw;
+                for g in 0..n_pw {
+                    let c = precon_cpu[base + g];
+                    l2sq += c.x * c.x + c.y * c.y;
+                }
+                if l2sq > max_l2sq { max_l2sq = l2sq; max_b = b; }
+            }
+            let max_band_eig = if max_b < eig_cpu.len() { eig_cpu[max_b] } else { f64::NAN };
+            precon_diag!("[Diag-Precon-TPA] ANOMALY: L2² min=N/A max={:.4e} (band {}/{}, eig={:.6e}) across {} bands",
+                max_l2sq, max_b, n_bands, max_band_eig, n_bands);
+            precon_diag!("[Diag-Precon-TPA] ANOMALY: all band eigenvalues:");
+            for b in 0..n_bands.min(eig_cpu.len()) {
+                precon_diag!("  band {}: eig={:.6e}", b, eig_cpu[b]);
+            }
+        }
+    }
 
     // Step 2: USPP NL correction (only if all USPP params are provided)
     if let (Some(vnl_data), Some(r_beta_per_ion), Some(q_rcq), Some(blas)) =
@@ -610,13 +704,44 @@ pub unsafe fn apply_preconditioner(
             cum += entry.n_expanded as usize;
         }
         ion_offsets.push(cum);
+        let total_ne = cum;
 
-        // For each ion with projectors
+        // Clone the TPA-preconditioned buffer BEFORE any USPP NL modification.
+        // CASTEP nlpot.f90:15995 calls wave_beta_phi(precon_slice) on the
+        // FRESHLY TPA-preconditioned residual BEFORE any in-place correction.
+        // If we used `precon` directly in the per-ion beta^H*precon GEMM below,
+        // each ion would read an already-corrected buffer, creating a feedback
+        // loop that causes exponential growth of the NL weights.
+        let precon_tpa_dev: CudaSlice<CudaComplex> =
+            stream.alloc_zeros(n_pw * n_bands).map_err(Error::Cuda)?;
+        let handle: cublasHandle_t = blas.raw_handle();
+        unsafe {
+            let (precon_ptr, _) = precon.device_ptr(stream);
+            let (tpa_ptr, _) = precon_tpa_dev.device_ptr(stream);
+            cublasZcopy_v2(
+                handle,
+                (n_pw * n_bands) as i32,
+                precon_ptr as *const _,
+                1,
+                tpa_ptr as *mut _,
+                1,
+            );
+        }
+        let precon_tpa = PwCoefficients::new(precon_tpa_dev);
+
+        // -----------------------------------------------------------------------
+        // PASS 1: Gather global arrays (per-ion GEMM, accumulate into global)
+        // -----------------------------------------------------------------------
+        let mut global_beta_phi_psi = Array2::<Complex64>::zeros((total_ne, n_bands));
+        let mut global_beta_phi_precon = Array2::<Complex64>::zeros((total_ne, n_bands));
+        let mut global_r_beta = Array2::<Complex64>::zeros((total_ne, total_ne));
+
         for (i, entry) in vnl_data.entries.iter().enumerate() {
             let ne = entry.n_expanded as usize;
             if ne == 0 {
                 continue;
             }
+            let offset = ion_offsets[i];
 
             // ---------------------------------------------------------------
             // Step 3a: beta_phi for psi — beta_g^H · psi (ne × n_bands)
@@ -644,14 +769,142 @@ pub unsafe fn apply_preconditioner(
                 )?;
             }
 
-            // D2H: copy beta_phi_psi to CPU for weight computation
+            // ── GEMM CROSS-CHECK (ion 0, band 0 only) ────────────────────
+            // Manually compute ⟨beta_g[0]|psi[0]⟩ via cublasZdotc and
+            // compare with GEMM[0,0].  If they disagree the GEMM is reading
+            // wrong memory (likely buffer aliasing or stale pointer).
+            // Also verify the Cauchy-Schwarz bound:
+            //   |⟨beta|psi⟩| ≤ sqrt(L2²(beta) × L2²(psi))
+            if i == 0 {
+                let (beta_ptr, _) = entry.beta_g.device_ptr(stream);
+                let (psi_ptr, _) = psi.device_ptr(stream);
+                let n_pw_i32 = n_pw as i32;
+                let handle: cublasHandle_t = blas.raw_handle();
+
+                // dot1 = ⟨beta_g[0]|psi[0]⟩  (manual dot product)
+                let mut dot1 = CudaComplex { x: 0.0, y: 0.0 };
+                unsafe {
+                    cublasZdotc_v2(
+                        handle,
+                        n_pw_i32,
+                        beta_ptr as *const _,
+                        1,
+                        psi_ptr as *const _,
+                        1,
+                        &mut dot1 as *mut _ as *mut _,
+                    );
+                }
+
+                // dot2 = ⟨beta_g[0]|beta_g[0]⟩  (L2² of projector)
+                let mut dot2 = CudaComplex { x: 0.0, y: 0.0 };
+                unsafe {
+                    cublasZdotc_v2(
+                        handle,
+                        n_pw_i32,
+                        beta_ptr as *const _,
+                        1,
+                        beta_ptr as *const _,
+                        1,
+                        &mut dot2 as *mut _ as *mut _,
+                    );
+                }
+
+                // dot3 = ⟨psi[0]|psi[0]⟩  (L2² of psi column 0)
+                let mut dot3 = CudaComplex { x: 0.0, y: 0.0 };
+                unsafe {
+                    cublasZdotc_v2(
+                        handle,
+                        n_pw_i32,
+                        psi_ptr as *const _,
+                        1,
+                        psi_ptr as *const _,
+                        1,
+                        &mut dot3 as *mut _ as *mut _,
+                    );
+                }
+
+                // Cauchy-Schwarz bound
+                let bound = (dot2.x * dot3.x).sqrt();
+                let exceeded = if dot1.x.abs() > bound * 1.01 {
+                    "CS-VIOLATION"
+                } else {
+                    "OK"
+                };
+
+                precon_diag!(
+                    "[Diag-GEMM-xcheck] \
+                     dotc(beta[0],psi[0])=({:.6e},{:.6e}) \
+                     |beta|²={:.6e} |psi|²={:.6e} \
+                     CS_bound={:.6e} CS={}",
+                    dot1.x, dot1.y,
+                    dot2.x, dot3.x,
+                    bound, exceeded,
+                );
+
+                // Now download GEMM[0,0] and compare with dot1
+                let gemm00 = stream.alloc_zeros::<CudaComplex>(1).map_err(Error::Cuda)?;
+                unsafe {
+                    // GEMM result is column-major: element (proj=0, band=0) is at offset 0
+                    let (gemm_ptr, _) = beta_phi_psi_dev.device_ptr(stream);
+                    let (g00_ptr, _) = gemm00.device_ptr(stream);
+                    cublasZcopy_v2(handle, 1,
+                        gemm_ptr as *const _, 1,
+                        g00_ptr as *mut _, 1,
+                    );
+                }
+                let gemm00_cpu: Vec<CudaComplex> = stream.clone_dtoh(&gemm00).map_err(Error::Cuda)?;
+                let reldiff = if dot1.x.abs() > 1e-30 {
+                    ((gemm00_cpu[0].x - dot1.x) / dot1.x).abs()
+                } else {
+                    0.0
+                };
+                precon_diag!(
+                    "[Diag-GEMM-xcheck] GEMM[0,0]=({:.6e},{:.6e}) \
+                     dotc[0,0]=({:.6e},{:.6e}) reldiff={:.6e}",
+                    gemm00_cpu[0].x, gemm00_cpu[0].y,
+                    dot1.x, dot1.y,
+                    reldiff,
+                );
+
+                // Dump first 5 elements of psi[0] and beta_g[0] directly
+                let psi_5 = stream.alloc_zeros::<CudaComplex>(5).map_err(Error::Cuda)?;
+                let beta_5 = stream.alloc_zeros::<CudaComplex>(5).map_err(Error::Cuda)?;
+                unsafe {
+                    let (p5_ptr, _) = psi_5.device_ptr(stream);
+                    cublasZcopy_v2(handle, 5,
+                        psi_ptr as *const _, 1,
+                        p5_ptr as *mut _, 1,
+                    );
+                    let (b5_ptr, _) = beta_5.device_ptr(stream);
+                    cublasZcopy_v2(handle, 5,
+                        beta_ptr as *const _, 1,
+                        b5_ptr as *mut _, 1,
+                    );
+                }
+                let psi_5_cpu: Vec<CudaComplex> = stream.clone_dtoh(&psi_5).map_err(Error::Cuda)?;
+                let beta_5_cpu: Vec<CudaComplex> = stream.clone_dtoh(&beta_5).map_err(Error::Cuda)?;
+                precon_diag!(
+                    "[Diag-GEMM-xcheck] psi[0..4]: {:?}",
+                    psi_5_cpu.iter().map(|c| (c.x, c.y)).collect::<Vec<_>>()
+                );
+                precon_diag!(
+                    "[Diag-GEMM-xcheck] beta_g[0..4]: {:?}",
+                    beta_5_cpu.iter().map(|c| (c.x, c.y)).collect::<Vec<_>>()
+                );
+            }
+
+            // D2H: copy beta_phi_psi to CPU for global accumulation
             let beta_phi_psi_cpu: Vec<CudaComplex> = stream
                 .clone_dtoh(&beta_phi_psi_dev)
                 .map_err(Error::Cuda)?;
 
             // ---------------------------------------------------------------
-            // Step 3b: beta_phi for precon — beta_g^H · precon (ne × n_bands)
-            // ---------------------------------------------------------------
+            // Step 3b: beta_phi for precon — beta_g^H · precon_tpa (ne × n_bands)
+            // CRITICAL: Use precon_tpa (clone of the original TPA-preconditioned
+            // residual) rather than `precon` (which gets modified in-place by
+            // previous ions' corrections).  This matches CASTEP nlpot.f90:15995
+            // where wave_beta_phi(precon_slice) is called BEFORE any USPP
+            // modification.
             let mut beta_phi_precon_dev: CudaSlice<CudaComplex> = stream
                 .alloc_zeros(ne * n_bands)
                 .map_err(Error::Cuda)?;
@@ -670,7 +923,7 @@ pub unsafe fn apply_preconditioner(
                         ldc: ne as i32,
                     },
                     &entry.beta_g,
-                    &precon,
+                    &precon_tpa,
                     &mut beta_phi_precon_dev,
                 )?;
             }
@@ -681,40 +934,164 @@ pub unsafe fn apply_preconditioner(
                 .map_err(Error::Cuda)?;
 
             // ---------------------------------------------------------------
-            // Step 4: Weight computation on CPU
+            // Accumulate per-ion data into global arrays
             // ---------------------------------------------------------------
-            // Convert to Array2<Complex64> for ndarray arithmetic
-            let beta_phi_psi_arr = Array2::from_shape_vec((ne, n_bands),
+            // Convert to Array2<Complex64> for ndarray arithmetic.
+            // CRITICAL: GEMM output is column-major (Fortran order).
+            // Use .f() to tell ndarray the memory layout, otherwise
+            // element [n,b] reads from the wrong position.
+            let beta_phi_psi_arr = Array2::from_shape_vec((ne, n_bands).f(),
                 beta_phi_psi_cpu.iter().map(|c| Complex64::new(c.x, c.y)).collect()
             ).expect("beta_phi_psi shape (ne, n_bands) must match data");
 
-            let beta_phi_precon_arr = Array2::from_shape_vec((ne, n_bands),
+            let beta_phi_precon_arr = Array2::from_shape_vec((ne, n_bands).f(),
                 beta_phi_precon_cpu.iter().map(|c| Complex64::new(c.x, c.y)).collect()
             ).expect("beta_phi_precon shape (ne, n_bands) must match data");
 
-            // Scale beta_phi_psi by eigenvalues: each column b ← eigenvalues[b] · column_b
-            let mut scaled_beta_phi = beta_phi_psi_arr.clone();
-            for b in 0..n_bands {
-                let e = eigenvalues_cpu[b];
-                for n in 0..ne {
-                    scaled_beta_phi[[n, b]] *= e;
+            // Copy beta_phi_psi into global_beta_phi_psi[offset..offset+ne, :]
+            for n in 0..ne {
+                for b in 0..n_bands {
+                    global_beta_phi_psi[[offset + n, b]] = beta_phi_psi_arr[[n, b]];
                 }
             }
 
-            // Extract Q_RCQ diagonal block for this ion
+            // Copy beta_phi_precon into global_beta_phi_precon[offset..offset+ne, :]
+            for n in 0..ne {
+                for b in 0..n_bands {
+                    global_beta_phi_precon[[offset + n, b]] = beta_phi_precon_arr[[n, b]];
+                }
+            }
+
+            // Copy R_beta into global_r_beta (diagonal block)
+            for m in 0..ne {
+                for n in 0..ne {
+                    global_r_beta[[offset + m, offset + n]] = r_beta_per_ion[i][[m, n]];
+                }
+            }
+
+            // ── PRECON CROSS-CHECK (ion 0 only) ──────────────────────────
+            // Independently verify that beta_phi_precon from GPU GEMM
+            // and the CPU weight computation match, using:
+            //  (A) cublasZdotc for <beta_g[0]|precon[0]> vs GEMM
+            //  (C) [n,b] double-loop max-norm vs .iter()
+            if i == 0 {
+                let handle: cublasHandle_t = blas.raw_handle();
+                let (beta_ptr, _) = entry.beta_g.device_ptr(stream);
+                let (precon_ptr, _) = precon_tpa.device_ptr(stream);
+                let n_pw_i32 = n_pw as i32;
+
+                // --- A: beta_phi_precon[0,0] via cublasZdotc ---
+                let mut dot_precon = CudaComplex { x: 0.0, y: 0.0 };
+                unsafe {
+                    cublasZdotc_v2(
+                        handle,
+                        n_pw_i32,
+                        beta_ptr as *const _,
+                        1,
+                        precon_ptr as *const _,
+                        1,
+                        &mut dot_precon as *mut _ as *mut _,
+                    );
+                }
+                let gemm_bpp00 = beta_phi_precon_arr[[0, 0]];
+                let norm_dot = (dot_precon.x.powi(2) + dot_precon.y.powi(2)).sqrt();
+                let diff_bpp = ((gemm_bpp00.re - dot_precon.x).powi(2)
+                              + (gemm_bpp00.im - dot_precon.y).powi(2)).sqrt();
+                let reldiff_bpp = if norm_dot > 1e-30 { diff_bpp / norm_dot } else { 0.0 };
+                precon_diag!(
+                    "[Diag-Precon-xcheck] beta_phi_precon[0,0]: \
+                     GEMM=({:.6e},{:.6e}) dotc=({:.6e},{:.6e}) reldiff={:.6e}",
+                    gemm_bpp00.re, gemm_bpp00.im,
+                    dot_precon.x, dot_precon.y,
+                    reldiff_bpp,
+                );
+
+                // --- C: max norms — .iter() vs [n,b] double-loop ---
+                let mut max_bpp_iter = 0.0f64;
+                for v in beta_phi_precon_arr.iter() { let a = v.norm(); if a > max_bpp_iter { max_bpp_iter = a; } }
+                let max_bps_iter = beta_phi_psi_arr.iter().map(|c| c.norm()).fold(0.0f64, f64::max);
+                let mut max_bpp_idx = 0.0f64;
+                let mut max_bps_idx = 0.0f64;
+                for b in 0..n_bands {
+                    for n in 0..ne {
+                        let bpp = beta_phi_precon_arr[[n, b]].norm();
+                        if bpp > max_bpp_idx { max_bpp_idx = bpp; }
+                        let bps = beta_phi_psi_arr[[n, b]].norm();
+                        if bps > max_bps_idx { max_bps_idx = bps; }
+                    }
+                }
+                precon_diag!(
+                    "[Diag-Precon-xcheck] max via .iter():    |bphi_precon|={:.6e} |bphi_psi|={:.6e}",
+                    max_bpp_iter, max_bps_iter,
+                );
+                precon_diag!(
+                    "[Diag-Precon-xcheck] max via [n,b]:     |bphi_precon|={:.6e} |bphi_psi|={:.6e}",
+                    max_bpp_idx, max_bps_idx,
+                );
+            }
+        }
+
+        // -----------------------------------------------------------------------
+        // PASS 2: Global weight computation (CPU, ndarray)
+        // -----------------------------------------------------------------------
+        // CASTEP nlpot.f90:16077-16119: weight = Q_RCQ * (E * beta_phi) + R_beta * beta_phi_precon
+        //
+        // scaled[n,b] = global_beta_phi_psi[n,b] * eigenvalues[b]
+        let mut scaled = Array2::<Complex64>::zeros((total_ne, n_bands));
+        for b in 0..n_bands {
+            let e = eigenvalues_cpu[b];
+            for n in 0..total_ne {
+                scaled[[n, b]] = global_beta_phi_psi[[n, b]] * e;
+            }
+        }
+
+        // global_weight = Q_RCQ · scaled + global_r_beta · global_beta_phi_precon
+        let global_weight = q_rcq.dot(&scaled) + global_r_beta.dot(&global_beta_phi_precon);
+
+        // Diagnostic: report global weight max |entry|
+        {
+            let mut max_w = 0.0f64;
+            for v in global_weight.iter() {
+                let a = v.norm();
+                if a > max_w { max_w = a; }
+            }
+            precon_diag!(
+                "[Diag-Precon] global weight max|entry|={:.6e} (Q_RCQ shape {}x{}, total_ne={}, n_bands={})",
+                max_w, q_rcq.shape()[0], q_rcq.shape()[1], total_ne, n_bands,
+            );
+        }
+
+        // -----------------------------------------------------------------------
+        // PASS 3: Apply per-ion corrections (extract weight slice, upload, GEMM)
+        // -----------------------------------------------------------------------
+        for (i, entry) in vnl_data.entries.iter().enumerate() {
+            let ne = entry.n_expanded as usize;
+            if ne == 0 {
+                continue;
+            }
             let offset = ion_offsets[i];
-            let q_block = q_rcq
-                .slice(ndarray::s![offset..offset + ne, offset..offset + ne])
-                .to_owned();
 
-            // weight = Q_RCQ_block · (E · beta_phi_psi) + R_beta_block · beta_phi_precon
-            let weight = q_block.dot(&scaled_beta_phi)
-                + r_beta_per_ion[i].dot(&beta_phi_precon_arr);
+            // Extract weight_i = global_weight[offset..offset+ne, :]
+            let weight_i = global_weight.slice(ndarray::s![offset..offset + ne, ..]).to_owned();
 
-            // Upload weight to GPU (ne × n_bands)
-            let weight_flat: Vec<CudaComplex> = weight.iter()
-                .map(|c| CudaComplex { x: c.re, y: c.im })
-                .collect();
+            // Diag: per-ion weight magnitude
+            {
+                let mut max_w = 0.0f64;
+                for v in weight_i.iter() { let a = v.norm(); if a > max_w { max_w = a; } }
+                precon_diag!(
+                    "[Diag-Precon] PASS3 ion={}: max|weight|={:.6e} (from global weight slice)",
+                    i, max_w,
+                );
+            }
+
+            // Upload weight_i to GPU (ne × n_bands) in column-major order.
+            let mut weight_flat: Vec<CudaComplex> = Vec::with_capacity(ne * n_bands);
+            for b in 0..n_bands {
+                for n in 0..ne {
+                    let c = weight_i[[n, b]];
+                    weight_flat.push(CudaComplex { x: c.re, y: c.im });
+                }
+            }
             let weight_dev = stream
                 .clone_htod(&weight_flat)
                 .map_err(Error::Cuda)?;
@@ -860,14 +1237,79 @@ pub fn prepare_preconditioner(
         r_beta_per_ion_vec.push(r_beta);
     }
 
-    // 5. Q_RCQ = −Q + C·Q − R_beta·(C·Q)
+    // 2b. Compute global C with cross-ion blocks
+    let c_global = compute_c_global(
+        beta_g_per_ion,
+        &r_vector,
+        &ion_offsets,
+    );
+
+    // 5. Q_RCQ = −Q − R_beta·C·Q  (global C, full off-diagonal blocks)
     let q_rcq = assemble_q_rcq(
         q_matrices,
-        &c_per_ion,
+        &c_global,
         &r_beta_per_ion_vec,
         &ion_offsets,
         mixture_weights,
     );
+
+    // Diag: print max |entry| of r_beta and q_rcq, plus per-ion details
+    {
+        let mut max_r_beta = 0.0f64;
+        let mut max_rb_ion = 0usize;
+        for (ion, rb) in r_beta_per_ion_vec.iter().enumerate() {
+            for v in rb.iter() {
+                let a = Complex64::new(v.re, v.im).norm();
+                if a > max_r_beta { max_r_beta = a; max_rb_ion = ion; }
+            }
+        }
+        let mut max_q_rcq = 0.0f64;
+        for v in q_rcq.iter() {
+            let a = Complex64::new(v.re, v.im).norm();
+            if a > max_q_rcq { max_q_rcq = a; }
+        }
+        precon_diag!(
+            "[Diag-Precon] R_beta max|entry|={:.6e} (ion={})  Q_RCQ max|entry|={:.6e}",
+            max_r_beta, max_rb_ion, max_q_rcq
+        );
+        // Per-ion R_beta and C diagnostics
+        for (ion, rb) in r_beta_per_ion_vec.iter().enumerate() {
+            let ne = rb.shape()[0];
+            if ne == 0 { continue; }
+            let mut max_c = 0.0f64;
+            for v in c_per_ion[ion].iter() {
+                let a = Complex64::new(v.re, v.im).norm();
+                if a > max_c { max_c = a; }
+            }
+            let mut max_rb = 0.0f64;
+            for v in rb.iter() {
+                let a = Complex64::new(v.re, v.im).norm();
+                if a > max_rb { max_rb = a; }
+            }
+            if max_rb > 10.0 {
+                precon_diag!(
+                    "[Diag-Precon] ion={ion} ne={ne}: max|C|={max_c:.4e} max|R_beta|={max_rb:.4e}  \
+                     C[0,0]=({c00_re:.4e},{c00_im:.4e})  R_beta[0,0]=({rb00_re:.4e},{rb00_im:.4e})",
+                    c00_re=c_per_ion[ion][[0,0]].re, c00_im=c_per_ion[ion][[0,0]].im,
+                    rb00_re=rb[[0,0]].re, rb00_im=rb[[0,0]].im,
+                );
+            }
+        }
+        // Dump R(G) stats
+        let mut r_min = f64::MAX;
+        let mut r_max = 0.0f64;
+        let mut r_mean = 0.0f64;
+        for &r in &r_vector {
+            if r < r_min { r_min = r; }
+            if r > r_max { r_max = r; }
+            r_mean += r;
+        }
+        r_mean /= r_vector.len() as f64;
+        precon_diag!(
+            "[Diag-Precon] R(G) tpa: min={:.4e} max={:.6e} mean={:.4e}",
+            r_min, r_max, r_mean
+        );
+    }
 
     Ok(PreconditionerPrepResult {
         r_vector,
@@ -931,7 +1373,7 @@ mod tests {
         }
 
         // Path B (decomposed): residual first, then scale by R
-        // Step B-a: residual[G,b] = hpsi[G,b] - e[b]*psi[G,b]
+        // Step B-a: residual[G,b] = hpsi[G,b] - e[b]*spsi[G,b]
         let mut residual = vec![CudaComplex { x: 0.0, y: 0.0 }; n_pw * n_bands];
         for b in 0..n_bands {
             let e = eigenvalues[b];

@@ -55,6 +55,21 @@ extern \"C\" __global__ void scatter_pw_to_grid(
     }
 }
 
+extern \"C\" __global__ void scatter_pw_to_grid_nyq(
+    const double2* psi, const int* fft_idx,
+    double2* grid, int n_pw, int n_bands, int grid_size,
+    int ngy, int ngz, int nyq_x, int nyq_y, int nyq_z
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+    while (tid < n_bands * n_pw) {
+        int b = tid / n_pw;
+        int g = tid % n_pw;
+        grid[b * grid_size + fft_idx[g]] = psi[b * n_pw + g];
+        tid += stride;
+    }
+}
+
 extern \"C\" __global__ void veff_multiply(
     double2* grid, const double* veff,
     int grid_size, int n_bands
@@ -190,6 +205,7 @@ pub struct CudaKernelSet {
     pub(crate) zero_buffer_real: CudaFunction,
     pub(crate) init_kinetic: CudaFunction,
     pub(crate) scatter_pw_to_grid: CudaFunction,
+    pub(crate) scatter_pw_to_grid_nyq: CudaFunction,
     pub(crate) accumulate_density: CudaFunction,
     pub(crate) veff_multiply: CudaFunction,
     pub(crate) gather_add_kinetic: CudaFunction,
@@ -215,6 +231,7 @@ impl CudaKernelSet {
             zero_buffer_real: load("zero_buffer_real")?,
             init_kinetic: load("init_kinetic")?,
             scatter_pw_to_grid: load("scatter_pw_to_grid")?,
+            scatter_pw_to_grid_nyq: load("scatter_pw_to_grid_nyq")?,
             accumulate_density: load("accumulate_density")?,
             veff_multiply: load("veff_multiply")?,
             gather_add_kinetic: load("gather_add_kinetic")?,

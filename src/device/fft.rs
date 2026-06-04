@@ -224,6 +224,9 @@ impl BatchedFftPlan3d {
     pub fn batch(&self) -> i32 { self.batch }
     pub fn idist(&self) -> usize { self.idist }
     pub fn odist(&self) -> usize { self.odist }
+    pub fn nx(&self) -> i32 { self.nx }
+    pub fn ny(&self) -> i32 { self.ny }
+    pub fn nz(&self) -> i32 { self.nz }
     pub fn grid_dims(&self) -> (i32, i32, i32) { (self.nx, self.ny, self.nz) }
 }
 

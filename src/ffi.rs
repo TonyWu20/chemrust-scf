@@ -202,6 +202,7 @@ fn init_inner(
         // CASTEP's gvec_all_kpt is pw_g_vector = G+k (Cartesian)
         // Our pw_coords are G Miller indices → G_cart = G * rcip
         // Difference should be k_cart
+        #[cfg(feature = "scf_diag")]
         {
             let gv = unsafe { std::slice::from_raw_parts(gvec_all_kpt as *const f64, 3*maxpw*nk) };
             let n_check = n_pw.min(10);
@@ -411,7 +412,7 @@ unsafe fn step_inner(
     );
     let veff = EffectivePotential(FineGridArray(arr_iz_fast));
     let v_eff_gpu = if cache_reuse {
-        eprintln!("[chemrust] V_eff cache HIT norm={:.6e}", ve_norm);
+        if cfg!(feature = "scf_diag") { eprintln!("[chemrust] V_eff cache HIT norm={:.6e}", ve_norm); }
         // TODO(phase-5 deferred): Pre-allocate a persistent scratch buffer in
         // ChemrustHandle to avoid per-HIT alloc_zeros + memcpy_dtod below.
         // Currently each HIT allocates a fresh GPU buffer and copies from cache,
@@ -425,7 +426,7 @@ unsafe fn step_inner(
             _marker: std::marker::PhantomData,
         }
     } else {
-        eprintln!("[chemrust] V_eff cache MISS norm={:.6e} prev={:.6e}", ve_norm, h.v_eff_norm);
+        if cfg!(feature = "scf_diag") { eprintln!("[chemrust] V_eff cache MISS norm={:.6e} prev={:.6e}", ve_norm, h.v_eff_norm); }
         // Verify round-trip: flatten transposed array and compare against
         // raw CASTEP data after applying the same x↔z transpose.
         #[cfg(feature = "scf_diag")]

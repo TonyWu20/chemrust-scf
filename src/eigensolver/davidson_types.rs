@@ -240,8 +240,13 @@ impl DerefMut for BlockIndex {
 pub fn compute_kinetic_energies(
     pw_coords: &[[i32; 3]],
     recip_lattice: &chemrust_hamiltonian_core::RecipLattice,
+    kpoint_frac: [f64; 3],
 ) -> KineticEnergies {
     let r = recip_lattice.as_array();
+    // k-point in Cartesian: k_cart = Σ_i kfrac_i * recip_lattice[i]
+    let kx = kpoint_frac[0] * r[0][0] + kpoint_frac[1] * r[1][0] + kpoint_frac[2] * r[2][0];
+    let ky = kpoint_frac[0] * r[0][1] + kpoint_frac[1] * r[1][1] + kpoint_frac[2] * r[2][1];
+    let kz = kpoint_frac[0] * r[0][2] + kpoint_frac[1] * r[1][2] + kpoint_frac[2] * r[2][2];
     let ke: Vec<f64> = pw_coords
         .iter()
         .map(|&[h, k, l]| {
@@ -251,7 +256,10 @@ pub fn compute_kinetic_energies(
             let gx = hf * r[0][0] + kf * r[1][0] + lf * r[2][0];
             let gy = hf * r[0][1] + kf * r[1][1] + lf * r[2][1];
             let gz = hf * r[0][2] + kf * r[1][2] + lf * r[2][2];
-            0.5 * (gx * gx + gy * gy + gz * gz)
+            let kgx = kx + gx;
+            let kgy = ky + gy;
+            let kgz = kz + gz;
+            0.5 * (kgx * kgx + kgy * kgy + kgz * kgz)
         })
         .collect();
     KineticEnergies(ke)
