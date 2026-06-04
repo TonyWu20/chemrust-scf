@@ -560,7 +560,7 @@ unsafe fn step_inner(
             .inv_ntotal(inv_ntotal)
             .fft_plan(&fft_plan)
             .tol_abs(1e-8)
-            .max_outer_iter(10)
+            .max_outer_iter(2)
             .min_outer_iter(0)
             .blas(blas)
             .solver(solver)

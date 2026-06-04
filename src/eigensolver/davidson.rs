@@ -1487,10 +1487,12 @@ pub(crate) unsafe fn davidson_diagonalise(
             // Inner Davidson loop: build → diagonalize → update ψ (CASTEP-aligned)
             // ------------------------------------------------------------------
             // CASTEP hamiltonian.f90:424 — max_iterations(1), default 10.
-            // Reduced to 6: superspace accumulation and conduction seeding
-            // already enrich the subspace, making fewer iterations sufficient
-            // while avoiding the O(n³) ZHEGVD cost growth from k_super expansion.
-            let max_inner_iter = 6_usize;
+            // Superspace accumulation and conduction seeding enrich the
+            // subspace per iteration, making fewer inner iterations
+            // sufficient.  More iterations produce eigenvalues converged
+            // beyond what the SCF outer loop needs, wasting FFT+ZHEGVD
+            // work for no SCF convergence benefit.
+            let max_inner_iter = 4_usize;
             let mut ncol = current_nblock;
             // CASTEP hamiltonian.f90:629-646 — after compaction, the active
             // workspace columns hold a subset of the original block bands.
