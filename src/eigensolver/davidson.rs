@@ -880,6 +880,11 @@ pub(crate) unsafe fn davidson_diagonalise(
     inv_ntotal: f64,
     fft_plan: &BatchedFftPlan3d,
     tol_abs: f64,
+    /// CASTEP convergence_tols(2): relative convergence tolerance (Hartree).
+    /// When > 0, bands with |ΔE| < tol_rel * break_cond_tol are marked as
+    /// both converged AND stopped (hamiltonian.f90:563-589).  Default 0.0 (off).
+    #[builder(default = 0.0)]
+    tol_rel: f64,
     max_outer_iter: usize,
     min_outer_iter: usize,
     blas: &BlasHandle,
@@ -1335,6 +1340,16 @@ pub(crate) unsafe fn davidson_diagonalise(
 
         davidson_diag!("[davidson] block loop: nblock={nblock} superspace_size={superspace_size}");
 
+        // ---- Conduction state buffers (CASTEP hamiltonian.f90:392-401) ----
+        // After each block's inner loop, higher eigenstates from ZHEGVD
+        // (positions current_nblock..superspace_index in super_wvfn) are
+        // saved and reused as initial search directions for the next block.
+        let mut cond_wvfn = PwCoefficients::new(
+            stream.alloc_zeros(super_alloc).map_err(Error::Cuda)?);
+        let mut cond_h_wvfn = PwCoefficients::new(
+            stream.alloc_zeros(super_alloc).map_err(Error::Cuda)?);
+        let mut cond_count: usize = 0;
+
         for block_start in (0..n_bands).step_by(nblock) {
             let mut current_nblock = nblock.min(n_bands - block_start);
 
@@ -1479,6 +1494,30 @@ pub(crate) unsafe fn davidson_diagonalise(
             // break_cond_tols) always use ORIGINAL band indices throughout.
             let mut active_indices: Vec<usize> = (0..current_nblock).collect();
             let mut superspace_index = current_nblock;
+
+            // ---- Conduction state seeding (CASTEP hamiltonian.f90:392-401) ----
+            if cond_count > 0 {
+                let count = cond_count.min(superspace_max_bands - current_nblock);
+                let (super_mut, _) = super_wvfn.device_ptr_mut(stream);
+                let (h_super_mut, _) = h_super_wvfn.device_ptr_mut(stream);
+                let (cond_ptr, _) = cond_wvfn.device_ptr(stream);
+                let (cond_h_ptr, _) = cond_h_wvfn.device_ptr(stream);
+                for k in 0..count {
+                    cublasZcopy_v2(handle, n_pw_i32,
+                        (cond_ptr as *const CudaComplex).add(k * n_pw) as *const _, 1,
+                        (super_mut as *mut CudaComplex).add((current_nblock + k) * n_pw) as *mut _, 1,
+                    ).result().map_err(Error::Blas)?;
+                    cublasZcopy_v2(handle, n_pw_i32,
+                        (cond_h_ptr as *const CudaComplex).add(k * n_pw) as *const _, 1,
+                        (h_super_mut as *mut CudaComplex).add((current_nblock + k) * n_pw) as *mut _, 1,
+                    ).result().map_err(Error::Blas)?;
+                }
+                superspace_index = current_nblock + count;
+                davidson_diag!(
+                    "[davidson]   block {block_start}: seeded {count} conduction states"
+                );
+            }
+
             // CASTEP hamiltonian.f90:427 — initialize previous_eigenvalues from
             // the current eigenvalue estimates, not zeros.  Zero initialization
             // causes the first inner-iteration convergence check to compare
@@ -1792,7 +1831,11 @@ pub(crate) unsafe fn davidson_diagonalise(
                     // (b) Relative break condition (CASTEP hamiltonian.f90:563-589)
                     if _inner_iter == 0 {
                         break_cond_tols[global_idx] = delta_e;
-                    } else {
+                    } else if tol_rel > 0.0 && delta_e < break_cond_tols[global_idx] * tol_rel {
+                        // Relative tolerance: band is both converged AND stopped
+                        band_conv = true;
+                        band_stopped = true;
+                    } else if tol_rel <= 0.0 {
                         // Stagnation check: improvement < 30% of first-step improvement
                         // CASTEP hamiltonian.f90:1217 — skip stagnation detection on
                         // the last outer iteration to avoid trapping the SCF loop.
@@ -1975,6 +2018,31 @@ pub(crate) unsafe fn davidson_diagonalise(
                     break;
                 }
             } // end inner loop (for _inner_iter)
+
+            // ---- Save conduction states for next block (CASTEP hamiltonian.f90:392-401) ----
+            // Higher eigenstates (current_nblock..superspace_index) from the
+            // final ZHEGVD are valid Ritz vectors beyond this block's bands.
+            cond_count = superspace_index.saturating_sub(current_nblock);
+            if cond_count > 0 {
+                let count = cond_count.min(superspace_max_bands);
+                let (super_ptr, _) = super_wvfn.device_ptr(stream);
+                let (h_super_ptr, _) = h_super_wvfn.device_ptr(stream);
+                let (cond_mut, _) = cond_wvfn.device_ptr_mut(stream);
+                let (cond_h_mut, _) = cond_h_wvfn.device_ptr_mut(stream);
+                for k in 0..count {
+                    cublasZcopy_v2(handle, n_pw_i32,
+                        (super_ptr as *const CudaComplex).add((current_nblock + k) * n_pw) as *const _, 1,
+                        (cond_mut as *mut CudaComplex).add(k * n_pw) as *mut _, 1,
+                    ).result().map_err(Error::Blas)?;
+                    cublasZcopy_v2(handle, n_pw_i32,
+                        (h_super_ptr as *const CudaComplex).add((current_nblock + k) * n_pw) as *const _, 1,
+                        (cond_h_mut as *mut CudaComplex).add(k * n_pw) as *mut _, 1,
+                    ).result().map_err(Error::Blas)?;
+                }
+                davidson_diag!(
+                    "[davidson]   block {block_start}: saved {count} conduction states for next block"
+                );
+            }
 
             // ---- D2: S-norm diagnostic after block 0 inner loop ----
             // Block 0's A2 (post-ZHEGVD S-orthonormalize) is skipped because
