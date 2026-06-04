@@ -1540,6 +1540,7 @@ pub(crate) unsafe fn davidson_diagonalise(
                 v_eff_dev, kinetic_dev, fft_idx_dev,
                 fft_plan, kernels,
                 Some(&precon_prep.r_beta_per_ion), Some(&precon_prep.q_rcq),
+                active_indices.clone(),
             )?;
 
             // Raw pointers to eigenvalues data (bypass borrow checker for writes)
@@ -1998,6 +1999,7 @@ pub(crate) unsafe fn davidson_diagonalise(
                         ncol = j;
                         current_nblock = j;
                         block_ctx.ncol = j;
+                        block_ctx.active_indices = active_indices.clone();
                         // CASTEP hamiltonian.f90:512 — superspace accumulates.
                         // Higher eigenstates (ncol_old..k_super-1) are untouched
                         // by compaction and remain valid enrichment for the
@@ -2825,6 +2827,9 @@ struct DavidsonBlockCtx<'a> {
     hpsi_dev: &'a PwCoefficients,
     n_bands_total: usize,
     eigenvalues: &'a [f64],
+    /// Maps compacted workspace column → original global band index.
+    /// Updated after compaction alongside `ncol`.
+    active_indices: Vec<usize>,
     r_vector: &'a PreconditionerVector,
     tpa_preconditioner: &'a TpaPreconditioner,
     vnl_data: &'a VnlBatchData,
@@ -2876,6 +2881,7 @@ impl<'a> DavidsonBlockCtx<'a> {
         kernels: &'a CudaKernelSet,
         r_beta_per_ion: Option<&'a [Array2<Complex64>]>,
         q_rcq: Option<&'a Array2<Complex64>>,
+        active_indices: Vec<usize>,
     ) -> Result<Self, Error> {
         Ok(Self {
             block_start,
@@ -2902,6 +2908,7 @@ impl<'a> DavidsonBlockCtx<'a> {
             kernels,
             r_beta_per_ion,
             q_rcq,
+            active_indices,
             block_psi_temp: PwCoefficients::new(
                 stream.alloc_zeros(n_pw * ncol).map_err(Error::Cuda)?),
             block_hpsi_temp: PwCoefficients::new(
@@ -2995,31 +3002,14 @@ impl<'a> DavidsonBlockCtx<'a> {
 
             // Compute fresh Rayleigh quotients ε_b = Re⟨ψ_b|H|ψ_b⟩
             // from the freshly computed H·psi.
-            let eig_block_cpu: Vec<f64> = {
-                let (block_psi_ptr, _) = self.block_psi_temp.device_ptr(self.stream);
-                let (block_hpsi_ptr, _) = self.block_hpsi_temp.device_ptr(self.stream);
-                let mut rqs = Vec::with_capacity(self.ncol);
-                for i in 0..self.ncol {
-                    let psi_col =
-                        (block_psi_ptr as *const CudaComplex).add(i * self.n_pw);
-                    let hpsi_col =
-                        (block_hpsi_ptr as *const CudaComplex).add(i * self.n_pw);
-                    let mut dot = CudaComplex { x: 0.0, y: 0.0 };
-                    cublasZdotc_v2(
-                        self.handle,
-                        self.n_pw_i32,
-                        psi_col as *const _,
-                        1,
-                        hpsi_col as *const _,
-                        1,
-                        &mut dot as *mut _ as *mut _,
-                    )
-                    .result()
-                    .map_err(Error::Blas)?;
-                    rqs.push(dot.x);
-                }
-                rqs
-            };
+            // CASTEP hamiltonian.f90:629-642 — use ZHEGVD eigenvalues from the
+            // previous inner iteration (stored in eigenvalues[]). These are more
+            // accurate than Rayleigh quotients from fresh H·psi, especially early
+            // in convergence when the Davidson subspace is small.
+            // active_indices maps compacted workspace column → original band index.
+            let eig_block_cpu: Vec<f64> = (0..self.ncol)
+                .map(|i| self.eigenvalues[self.block_start + self.active_indices[i]])
+                .collect();
             self.stream
                 .memcpy_htod(&eig_block_cpu, &mut self.eig_block_dev)
                 .map_err(Error::Cuda)?;
