@@ -737,14 +737,16 @@ macro_rules! davidson_diag {
     };
 }
 
-/// Internal diagnostic: compiled only when `feature = "scf_diag"` is enabled.
-/// Used for `[Diag-D*]`, `[mean_ek]`, and per-step detail dumps.
+/// Internal diagnostic: compiles to nothing unless `feature = "scf_diag"`.
+#[cfg(feature = "scf_diag")]
 macro_rules! diag_detail {
     ($($arg:tt)*) => {
-        if cfg!(feature = "scf_diag") {
-            eprintln!($($arg)*);
-        }
+        eprintln!($($arg)*);
     };
+}
+#[cfg(not(feature = "scf_diag"))]
+macro_rules! diag_detail {
+    ($($arg:tt)*) => {};
 }
 
 /// Run the outer Davidson loop with subspace diagonalization.

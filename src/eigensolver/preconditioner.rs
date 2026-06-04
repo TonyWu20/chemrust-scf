@@ -4,12 +4,15 @@
 // NOTE: dead_code allowed because Group C (Davidson) will be the consumer.
 #![allow(dead_code)]
 
+#[cfg(feature = "scf_diag")]
 macro_rules! precon_diag {
     ($($arg:tt)*) => {
-        if cfg!(feature = "scf_diag") {
-            eprintln!($($arg)*);
-        }
+        eprintln!($($arg)*);
     };
+}
+#[cfg(not(feature = "scf_diag"))]
+macro_rules! precon_diag {
+    ($($arg:tt)*) => {};
 }
 
 use std::sync::Arc;
