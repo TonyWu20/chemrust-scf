@@ -1478,10 +1478,8 @@ pub(crate) unsafe fn davidson_diagonalise(
             // ------------------------------------------------------------------
             // Inner Davidson loop: build → diagonalize → update ψ (CASTEP-aligned)
             // ------------------------------------------------------------------
-            // CASTEP hamiltonian.f90:1079 — max_inner_iter = max_iterations(1)
-            // Reduced from max_outer_iter to 4 to limit eigenvalue drift from
-            // USPP correction contamination in cold-start calculations.
-            let max_inner_iter = 4_usize;
+            // CASTEP hamiltonian.f90:424 — max_iterations(1), default 10.
+            let max_inner_iter = 10_usize;
             let mut ncol = current_nblock;
             // CASTEP hamiltonian.f90:629-646 — after compaction, the active
             // workspace columns hold a subset of the original block bands.
@@ -1650,9 +1648,11 @@ pub(crate) unsafe fn davidson_diagonalise(
                         CudaComplex { x: inner_eigenvalues[i], y: 0.0 };
                 }
 
-                // Reset superspace_index: first current_nblock columns are the
-                // new eigenstates; search directions will be appended after them.
-                superspace_index = current_nblock;
+                // CASTEP hamiltonian.f90:512 — superspace_index accumulates
+                // monotonically; higher eigenstates from ZHEGVD (beyond
+                // current_nblock) are kept as enrichment for the next inner
+                // iteration.  This gives ZHEGVD a larger, richer subspace.
+                superspace_index = k_super;
 
                 // ---- A2 (inner): S-orthogonalize + S-orthonormalize first
                 // current_nblock columns after ZHEGVD rotation.
@@ -1958,14 +1958,22 @@ pub(crate) unsafe fn davidson_diagonalise(
                         // band_converged, break_cond_tols) are NOT touched —
                         // they remain in original band order throughout.
 
+                        let ncol_old = ncol;
                         davidson_diag!(
                             "[davidson]     inner iter {}: compacted {} -> {} active bands (CASTEP hamiltonian.f90:628-642)",
-                            _inner_iter, ncol, j
+                            _inner_iter, ncol_old, j
                         );
                         ncol = j;
                         current_nblock = j;
                         block_ctx.ncol = j;
-                        superspace_index = j;
+                        // CASTEP hamiltonian.f90:512 — superspace accumulates.
+                        // Higher eigenstates (ncol_old..k_super-1) are untouched
+                        // by compaction and remain valid enrichment for the
+                        // next inner iteration's ZHEGVD.  Reduce only by the
+                        // number of bands that converged/stopped (ncol_old - j).
+                        if superspace_index > ncol_old + 1 {
+                            superspace_index -= ncol_old.saturating_sub(j);
+                        }
                         if j == 0 {
                             // All bands in this block converged — nothing left to iterate
                             break;
