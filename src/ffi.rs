@@ -54,6 +54,7 @@ struct KptData {
     vnl: VnlBatchData,
     wave_grid: GVectorGrid,
     pw_coords: Vec<[i32; 3]>,
+    kpoint_frac: [f64; 3],
     pcie: PcieAccount,
 }
 
@@ -238,7 +239,7 @@ fn init_inner(
             &stream, &mut pcie, &blas, &kernels, &solver,
         ).map_err(|e| { eprintln!("[chemrust] precompute kpt {ik} failed: {e}"); CHEM_EIG_CUDA_ERROR })?;
 
-        kpts.push(KptData { vnl, wave_grid: wg, pw_coords, pcie });
+        kpts.push(KptData { vnl, wave_grid: wg, pw_coords, kpoint_frac: kf, pcie });
     }
 
     Ok(Box::into_raw(Box::new(ChemrustHandle {
@@ -308,7 +309,7 @@ unsafe fn step_inner(
     // Diagnostic: verify KE consistency
     {
         let n_print = kd.pw_coords.len().min(5);
-        let ke_rust = crate::eigensolver::davidson_types::compute_kinetic_energies(&kd.pw_coords, kd.wave_grid.recip_lattice());
+        let ke_rust = crate::eigensolver::davidson_types::compute_kinetic_energies(&kd.pw_coords, kd.wave_grid.recip_lattice(), kd.kpoint_frac);
         let mut all_ok = true;
         for i in 0..n_print {
             let diff = (ke_castep[i] - ke_rust.0[i]).abs();
@@ -413,8 +414,17 @@ unsafe fn step_inner(
     kd.vnl.rescreen_d(veff.as_fine_array(), &h.stream, &h.kernels, &h.blas)
         .map_err(|e| { eprintln!("[chemrust] D re-screen failed: {e}"); CHEM_EIG_CUDA_ERROR })?;
 
-    // Upload FFT index
-    let fft_idx: Vec<i32> = unsafe { std::slice::from_raw_parts(fft_idx_data as *const c_int, n_pw) }.to_vec();
+    // Upload FFT index (CASTEP passes 1-based Fortran indices; convert to 0-based)
+    let fft_idx: Vec<i32> = unsafe { std::slice::from_raw_parts(fft_idx_data as *const c_int, n_pw) }
+        .iter()
+        .map(|&i| i - 1)
+        .collect();
+    debug_assert!(
+        fft_idx.iter().all(|&i| i >= 0 && (i as usize) < gs),
+        "fft_idx out of range after 1→0 conversion: min={} max={} gs={gs}",
+        fft_idx.iter().min().unwrap_or(&0),
+        fft_idx.iter().max().unwrap_or(&0),
+    );
     let mut fft_idx_dev: CudaSlice<i32> = h.stream.alloc_zeros(n_pw).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
     h.stream.memcpy_htod(&fft_idx, &mut fft_idx_dev).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
 
@@ -466,6 +476,7 @@ unsafe fn step_inner(
             .fft_plan(&fft_plan)
             .tol_abs(1e-8)
             .max_outer_iter(10)
+            .min_outer_iter(0)
             .blas(blas)
             .solver(solver)
             .kernels(kernels)
