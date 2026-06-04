@@ -326,6 +326,50 @@ unsafe fn step_inner(
     let psi_host: Vec<num_complex::Complex64> = unsafe {
         std::slice::from_raw_parts(psi_data as *const CudaComplex, n_pw * n_bands)
     }.iter().map(|c| num_complex::Complex64::new(c.x, c.y)).collect();
+
+    // ---- FFI boundary diagnostic: dump raw ψ[0] coefficients ----
+    // Compare against standalone test values to detect phase / layout mismatches.
+    #[cfg(feature = "scf_diag")]
+    {
+        let psi_band0 = &psi_host[0..n_pw];
+        let l2_sq: f64 = psi_band0.iter().map(|c| c.norm_sqr()).sum();
+        eprintln!(
+            "[Diag-FFI-psi] band 0: L2²={:.6e} n_pw={} |psi[0]|²={:.6e}",
+            l2_sq, n_pw, psi_band0[0].norm_sqr(),
+        );
+        eprintln!(
+            "[Diag-FFI-psi] band 0 first5=[[({:.15e}, {:.15e}), ({:.15e}, {:.15e}), ({:.15e}, {:.15e}), ({:.15e}, {:.15e}), ({:.15e}, {:.15e})]]",
+            psi_band0[0].re, psi_band0[0].im,
+            psi_band0[1].re, psi_band0[1].im,
+            psi_band0[2].re, psi_band0[2].im,
+            psi_band0[3].re, psi_band0[3].im,
+            psi_band0[4].re, psi_band0[4].im,
+        );
+        // Dump band 1 for sign-consistency check
+        let psi_band1 = &psi_host[n_pw..2*n_pw];
+        let l2_sq1: f64 = psi_band1.iter().map(|c| c.norm_sqr()).sum();
+        eprintln!(
+            "[Diag-FFI-psi] band 1: L2²={:.6e} first5=[[({:.15e}, {:.15e}), ({:.15e}, {:.15e}), ({:.15e}, {:.15e}), ({:.15e}, {:.15e}), ({:.15e}, {:.15e})]]",
+            l2_sq1,
+            psi_band1[0].re, psi_band1[0].im,
+            psi_band1[1].re, psi_band1[1].im,
+            psi_band1[2].re, psi_band1[2].im,
+            psi_band1[3].re, psi_band1[3].im,
+            psi_band1[4].re, psi_band1[4].im,
+        );
+        // Dump band 25 (first band of second block) for sign-consistency
+        let psi_b25 = &psi_host[25*n_pw..26*n_pw];
+        let l2_sq25: f64 = psi_b25.iter().map(|c| c.norm_sqr()).sum();
+        eprintln!(
+            "[Diag-FFI-psi] band 25: L2²={:.6e} first5=[[({:.15e}, {:.15e}), ({:.15e}, {:.15e}), ({:.15e}, {:.15e}), ({:.15e}, {:.15e}), ({:.15e}, {:.15e})]]",
+            l2_sq25,
+            psi_b25[0].re, psi_b25[0].im,
+            psi_b25[1].re, psi_b25[1].im,
+            psi_b25[2].re, psi_b25[2].im,
+            psi_b25[3].re, psi_b25[3].im,
+            psi_b25[4].re, psi_b25[4].im,
+        );
+    }
     let wfn = WavefunctionSet::<ColumnDistributed>::new(psi_host, n_bands, n_pw);
     let psi_gpu = Gpu::from_host(&wfn, &h.stream).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
 
@@ -352,9 +396,20 @@ unsafe fn step_inner(
     // Uses max-norm for cheap change detection (threshold 1e-8 Ha).
     let cache_reuse = h.v_eff_cached.as_ref().is_some_and(|_| (ve_norm - h.v_eff_norm).abs() < 1e-8);
 
-    let arr = crate::device::unflatten_f64(ve_host, &[h.ngx as usize, h.ngy as usize, h.ngz as usize]);
-    let veff = EffectivePotential(FineGridArray(arr));
-
+    // CASTEP passes V_eff as ix-innermost flat array (Fortran column-major).
+    // cuFFT with plan (ngx, ngy, ngz) expects n[rank-1]=ngz innermost (z-fastest),
+    // matching the scatter formula iz + ngz*(iy + ngy*ix).  Transpose x↔z axes
+    // so V_eff data lands at the grid positions cuFFT and the scatter/gather
+    // kernels expect.  See scf.rs:598-608 for the identical standalone logic.
+    let ngx_u = h.ngx as usize;
+    let ngy_u = h.ngy as usize;
+    let ngz_u = h.ngz as usize;
+    let arr_ix_fast = crate::device::unflatten_f64(ve_host, &[ngx_u, ngy_u, ngz_u]);
+    let arr_iz_fast = ndarray::Array3::from_shape_fn(
+        (ngz_u, ngy_u, ngx_u),
+        |(iz, iy, ix)| arr_ix_fast[[ix, iy, iz]]
+    );
+    let veff = EffectivePotential(FineGridArray(arr_iz_fast));
     let v_eff_gpu = if cache_reuse {
         eprintln!("[chemrust] V_eff cache HIT norm={:.6e}", ve_norm);
         // TODO(phase-5 deferred): Pre-allocate a persistent scratch buffer in
@@ -365,32 +420,44 @@ unsafe fn step_inner(
         h.stream.memcpy_dtod(h.v_eff_cached.as_ref().unwrap(), &mut slice).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
         Gpu::<EffectivePotential> {
             slice,
-            shape: vec![h.ngx as usize, h.ngy as usize, h.ngz as usize],
+            shape: vec![ngz_u, ngy_u, ngx_u],
             ctx: h.ctx.clone(),
             _marker: std::marker::PhantomData,
         }
     } else {
         eprintln!("[chemrust] V_eff cache MISS norm={:.6e} prev={:.6e}", ve_norm, h.v_eff_norm);
-        // Verify round-trip: flatten back and compare
+        // Verify round-trip: flatten transposed array and compare against
+        // raw CASTEP data after applying the same x↔z transpose.
         #[cfg(feature = "scf_diag")]
         {
             let ve_rt: Vec<f64> = crate::device::flatten_f64(veff.0.as_array());
+            // After transpose, ve_rt has z-innermost layout. Reconstruct the
+            // expected values from the raw ix-innermost data by transposing.
             let mut rt_err = 0.0f64;
-            for i in 0..gs.min(10) {
-                let d = (ve_rt[i] - ve_raw[i]).abs();
-                rt_err = rt_err.max(d);
+            for iz in 0..ngz_u.min(2) {
+                for iy in 0..ngy_u.min(2) {
+                    for ix in 0..ngx_u.min(3) {
+                        // Transposed flat index: iz + ngz*iy + ngz*ngy*ix
+                        let idx_t = iz + ngz_u * (iy + ngy_u * ix);
+                        // Original flat index: ix + ngx*iy + ngx*ngy*iz
+                        let idx_o = ix + ngx_u * (iy + ngy_u * iz);
+                        let d = (ve_rt[idx_t] - ve_raw[idx_o]).abs();
+                        rt_err = rt_err.max(d);
+                    }
+                }
             }
-            eprintln!("[Diag-Veff] round-trip max error (first 10): {:.3e}", rt_err);
+            eprintln!("[Diag-Veff] round-trip max error after x↔z transpose: {:.3e}", rt_err);
         }
         let vg = Gpu::from_host(&veff, &h.stream).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
-        // Verify GPU upload: read back from GPU and compare
+        // Verify GPU upload: read back and compare against host transposed data
         #[cfg(feature = "scf_diag")]
         {
+            let ve_rt: Vec<f64> = crate::device::flatten_f64(veff.0.as_array());
             let ve_gpu_back: Vec<f64> = h.stream.clone_dtoh(vg.as_device_slice())
                 .map_err(|_| CHEM_EIG_CUDA_ERROR)?;
             let mut gpu_err = 0.0f64;
             for i in 0..gs.min(10) {
-                let d = (ve_gpu_back[i] - ve_raw[i]).abs();
+                let d = (ve_gpu_back[i] - ve_rt[i]).abs();
                 gpu_err = gpu_err.max(d);
             }
             eprintln!("[Diag-Veff] GPU upload verified: max error (first 10): {:.3e}", gpu_err);
@@ -409,19 +476,36 @@ unsafe fn step_inner(
         vg
     };
 
-    // Re-screen D matrices using the current V_eff (must happen before
-    // Hamiltonian application so V_NL reflects the updated potential).
-    kd.vnl.rescreen_d(veff.as_fine_array(), &h.stream, &h.kernels, &h.blas)
+    // Re-screen D matrices using the ORIGINAL (ix-innermost) V_eff.
+    // D-screening computes ∫Q·V_eff at ion positions — it needs the
+    // physical (x,y,z) grid layout, not the transposed FFT layout.
+    let veff_original = EffectivePotential(FineGridArray(arr_ix_fast.clone()));
+    kd.vnl.rescreen_d(veff_original.as_fine_array(), &h.stream, &h.kernels, &h.blas)
         .map_err(|e| { eprintln!("[chemrust] D re-screen failed: {e}"); CHEM_EIG_CUDA_ERROR })?;
 
-    // Upload FFT index (CASTEP passes 1-based Fortran indices; convert to 0-based)
+    // Upload FFT index.  CASTEP passes 1-based Fortran grid indices with
+    // ix-innermost flat layout:  idx = 1 + ix + ngx*iy + ngx*ngy*iz.
+    // The Rust scatter/gather kernels and cuFFT expect iz-innermost layout
+    // (matching pw_coords_to_fft_indices):  idx = iz + ngz*(iy + ngy*ix).
+    // Convert 1→0 based AND transpose x↔z in one pass.
+    let ngx_i = h.ngx;
+    let ngy_i = h.ngy;
+    let ngz_i = h.ngz;
     let fft_idx: Vec<i32> = unsafe { std::slice::from_raw_parts(fft_idx_data as *const c_int, n_pw) }
         .iter()
-        .map(|&i| i - 1)
+        .map(|&idx_1based| {
+            // Decode CASTEP's ix-innermost grid position (0-based)
+            let idx0 = (idx_1based - 1).max(0);
+            let ix = idx0 % ngx_i;
+            let iy = (idx0 / ngx_i) % ngy_i;
+            let iz = idx0 / (ngx_i * ngy_i);
+            // Re-encode with iz-innermost layout for cuFFT/scatter/gather
+            iz + ngz_i * (iy + ngy_i * ix)
+        })
         .collect();
     debug_assert!(
         fft_idx.iter().all(|&i| i >= 0 && (i as usize) < gs),
-        "fft_idx out of range after 1→0 conversion: min={} max={} gs={gs}",
+        "fft_idx out of range after 1→0+transpose: min={} max={} gs={gs}",
         fft_idx.iter().min().unwrap_or(&0),
         fft_idx.iter().max().unwrap_or(&0),
     );
