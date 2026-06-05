@@ -1484,7 +1484,7 @@ pub(crate) unsafe fn davidson_diagonalise(
             // Raw pointer casts are used for psi_dev/hpsi_dev copy-back to avoid
             // borrow conflicts — device_ptr_mut needs &mut self on CudaSlice.
             let mut block_ctx = DavidsonBlockCtx::new(
-                &psi_dev, n_bands,
+                &psi_dev, n_bands, &eigenvalues,
                 block_start, n_pw, n_pw_i32,
                 grid_size, inv_ntotal, superspace_max_bands,
                 &r_vector, tpa_preconditioner, vnl_data,
@@ -2772,8 +2772,13 @@ struct DavidsonBlockCtx<'a> {
     // --- Outer state (borrowed) ---
     psi_dev: &'a PwCoefficients,
     n_bands_total: usize,
+    /// Global eigenvalues from the most recent ZHEEVD subspace
+    /// diagonalization.  Indexed by global band index.  Passed to
+    /// the preconditioner for USPP NL correction weight assembly
+    /// (CASTEP hamiltonian.f90:629-642).
+    eigenvalues: &'a [f64],
     /// Maps compacted workspace column → original global band index.
-    /// Updated after compaction alongside `ncol`.
+    /// Updated after compaction.
     active_indices: Vec<usize>,
     r_vector: &'a PreconditionerVector,
     tpa_preconditioner: &'a TpaPreconditioner,
@@ -2826,6 +2831,7 @@ impl<'a> DavidsonBlockCtx<'a> {
     fn new(
         psi_dev: &'a PwCoefficients,
         n_bands_total: usize,  // total n_bands (for full eigenvector S-orth)
+        eigenvalues: &'a [f64], // global eigenvalues from ZHEEVD (for preconditioner)
         block_start: usize,
         n_pw: usize,
         n_pw_i32: i32,
@@ -2857,6 +2863,7 @@ impl<'a> DavidsonBlockCtx<'a> {
             superspace_max_bands,
             psi_dev,
             n_bands_total,
+            eigenvalues,
             r_vector,
             tpa_preconditioner,
             vnl_data,
@@ -2961,39 +2968,15 @@ impl<'a> DavidsonBlockCtx<'a> {
                     .call()?;
             }
 
-            // Compute fresh Rayleigh quotients ε_b = Re⟨ψ_b|H|ψ_b⟩
-            // from the freshly computed H·psi.
-            // Use Rayleigh quotients from fresh H·psi for eigenvalue estimates.
-            // These are more accurate per-band than ZHEGVD eigenvalues on early
-            // iterations because ZHEGVD mixes un-converged bands across the full
-            // superspace.  CASTEP's band-by-band CG has tighter eigenvalue
-            // convergence per band; our block Davidson benefits from local
-            // Rayleigh quotients until the subspace is well converged.
-            let eig_block_cpu: Vec<f64> = {
-                let (block_psi_ptr, _) = self.block_psi_temp.device_ptr(self.stream);
-                let (block_hpsi_ptr, _) = self.block_hpsi_temp.device_ptr(self.stream);
-                let mut rqs = Vec::with_capacity(self.active_indices.len());
-                for i in 0..self.active_indices.len() {
-                    let psi_col =
-                        (block_psi_ptr as *const CudaComplex).add(i * self.n_pw);
-                    let hpsi_col =
-                        (block_hpsi_ptr as *const CudaComplex).add(i * self.n_pw);
-                    let mut dot = CudaComplex { x: 0.0, y: 0.0 };
-                    cublasZdotc_v2(
-                        self.handle,
-                        self.n_pw_i32,
-                        psi_col as *const _,
-                        1,
-                        hpsi_col as *const _,
-                        1,
-                        &mut dot as *mut _ as *mut _,
-                    )
-                    .result()
-                    .map_err(Error::Blas)?;
-                    rqs.push(dot.x);
-                }
-                rqs
-            };
+            // Use ZHEEVD subspace eigenvalues for the preconditioner shift.
+            // CASTEP hamiltonian.f90:629-642 — passes slice_eigenvalues from
+            // the superspace diagonalization to nlpot_apply_precon_ES_slice.
+            // Subspace eigenvalues incorporate band coupling via the full H_sub
+            // matrix, producing more accurate USPP NL correction weights than
+            // per-band Rayleigh quotients from freshly computed H·psi.
+            let eig_block_cpu: Vec<f64> = active_bands(&self.active_indices, self.block_start)
+                .map(|(_ci, gi)| self.eigenvalues[gi])
+                .collect();
             self.stream
                 .memcpy_htod(&eig_block_cpu, &mut self.eig_block_dev)
                 .map_err(Error::Cuda)?;
