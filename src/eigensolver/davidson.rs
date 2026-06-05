@@ -665,10 +665,12 @@ pub fn check_inner_convergence(
     }
 
     // (c) Uphill detection — eigenvalue went UP → numerical noise
-    //     Override convergence: band is NOT marked converged.
+    //     Override convergence: band is NOT converged AND not stopped.
+    //     CASTEP hamiltonian.f90:593-597 resets both flags.
     let uphill_threshold = -100.0 * (f64::EPSILON).max(f64::EPSILON * prev_eig.abs());
     if prev_eig - new_eig < uphill_threshold {
         converged = false;
+        opt_stopped = false;
     }
 
     BandConvStatus { converged, opt_stopped }
