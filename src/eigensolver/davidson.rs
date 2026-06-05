@@ -2404,12 +2404,12 @@ unsafe fn diagonalise_subspace(
 
 /// S-orthogonalize search directions against superspace columns.
 ///
-/// For each superspace column si, precompute S·super_si ONCE, then for
-/// each search column j, compute dot = ⟨S·super_si | search_j⟩ and
-/// subtract dot·super_si from search_j.
+/// CASTEP wave.f90:13388-13414 — batch ZGEMM approach:
+///   1. Compute S·search for all columns in one batch
+///   2. Compute overlap = super_wvfn^H * (S·search) via ZGEMM
+///   3. search -= super_wvfn * overlap via ZGEMM
 ///
-/// This avoids O(ncol × superspace_index) calls to the expensive
-/// apply_s_times.
+/// This matches CASTEP's wave_Sorthogonalise_wv_slice exactly.
 #[builder]
 #[allow(clippy::too_many_arguments, unsafe_op_in_unsafe_fn)]
 pub(crate) unsafe fn s_orthogonalise(
@@ -2426,111 +2426,89 @@ pub(crate) unsafe fn s_orthogonalise(
     s_orth_out: &mut PwCoefficients,
     handle: cublasHandle_t,
 ) -> Result<(), Error> {
-    let (search_mut, _) = search_dev.device_ptr_mut(stream);
-    let (super_ptr, _) = super_wvfn.device_ptr(stream);
-
-    for si in 0..superspace_index {
-        let super_si = (super_ptr as *const CudaComplex).add(si * n_pw);
-
-        // Compute S·super_si ONCE -> s_orth_out
-        let (s_in_mut, _) = s_orth_in.device_ptr_mut(stream);
-        cublasZcopy_v2(
-            handle,
-            n_pw_i32,
-            super_si as *const _,
-            1,
-            s_in_mut as *mut _,
-            1,
-        )
-        .result()
-        .map_err(Error::Blas)?;
-
-        let (s_out_mut, _) = s_orth_out.device_ptr_mut(stream);
-        cublasZcopy_v2(
-            handle,
-            n_pw_i32,
-            super_si as *const _,
-            1,
-            s_out_mut as *mut _,
-            1,
-        )
-        .result()
-        .map_err(Error::Blas)?;
-
-        unsafe {
-            apply_s_times()
-                .psi_dev(&*s_orth_in)
-                .spsi_dev(&mut *s_orth_out)
-                .vnl_data(vnl_data)
-                .n_bands(1_i32)
-                .n_pw(n_pw_i32)
-                .blas(blas)
-                .stream(stream)
-                .call()?;
-        }
-        let (s_out_ptr, _) = s_orth_out.device_ptr(stream);
-
-        // FIX F2: Compute S-norm of the reference column ONCE.
-        // The projection formula search_j -= ⟨S·super_si|search_j⟩ · super_si
-        // is correct ONLY when ⟨super_si|S|super_si⟩ = 1.  If the reference
-        // column's S-norm has drifted from 1.0 (e.g. from ZHEGVD regularization
-        // contamination), the projection is incomplete and residual S-overlap
-        // accumulates across reference columns, making S_sub near-singular.
-        // Dividing by the actual S-norm makes the formula correct regardless.
-        let mut s_norm = CudaComplex { x: 0.0, y: 0.0 };
-        cublasZdotc_v2(
-            handle,
-            n_pw_i32,
-            super_si as *const _,
-            1,
-            s_out_ptr as *const _,
-            1,
-            &mut s_norm as *mut _ as *mut _,
-        )
-        .result()
-        .map_err(Error::Blas)?;
-        let s_norm_scale = if s_norm.x.abs() < 1e-30 {
-            0.0 // degenerate: skip projection entirely
-        } else {
-            1.0 / s_norm.x
-        };
-
-        // Project ALL search columns against this superspace column
-        // using the precomputed S·super_si
-        for j in 0..ncol {
-            let search_j = (search_mut as *mut CudaComplex).add(j * n_pw);
-
-            let mut dot = CudaComplex { x: 0.0, y: 0.0 };
-            cublasZdotc_v2(
-                handle,
-                n_pw_i32,
-                s_out_ptr as *const _,
-                1,
-                search_j as *const _,
-                1,
-                &mut dot as *mut _ as *mut _,
-            )
-            .result()
-            .map_err(Error::Blas)?;
-
-            // search_j -= (dot / s_norm) * super_si
-            let neg_dot = CudaComplex {
-                x: -dot.x * s_norm_scale,
-                y: -dot.y * s_norm_scale,
-            };
-            cublasZaxpy_v2(
-                handle,
-                n_pw_i32,
-                &neg_dot as *const _ as *const _,
-                super_si as *const _,
-                1,
-                search_j as *mut _,
-                1,
-            )
-            .result()
-            .map_err(Error::Blas)?;
-        }
+    if superspace_index == 0 {
+        return Ok(());
     }
+
+    // Step 1: Compute S·search in batch → s_orth_out (n_pw × ncol)
+    let (search_ptr, _) = search_dev.device_ptr(stream);
+    let (s_in_mut, _) = s_orth_in.device_ptr_mut(stream);
+    // copy all ncol search columns to s_orth_in
+    for j in 0..ncol {
+        cublasZcopy_v2(
+            handle, n_pw_i32,
+            (search_ptr as *const CudaComplex).add(j * n_pw) as *const _, 1,
+            (s_in_mut as *mut CudaComplex).add(j * n_pw) as *mut _, 1,
+        ).result().map_err(Error::Blas)?;
+    }
+    unsafe {
+        apply_s_times()
+            .psi_dev(&*s_orth_in)
+            .spsi_dev(&mut *s_orth_out)
+            .vnl_data(vnl_data)
+            .n_bands(ncol as i32)
+            .n_pw(n_pw_i32)
+            .blas(blas)
+            .stream(stream)
+            .call()?;
+    }
+
+    // Step 2: Compute overlap = super_wvfn^H * (S·search) via ZGEMM
+    // overlap is (superspace_index × ncol)
+    let mut overlap_dev: CudaSlice<CudaComplex> =
+        stream.alloc_zeros(superspace_index * ncol).map_err(Error::Cuda)?;
+    unsafe {
+        blas.gemm_c64(
+            ZgemmConfig {
+                transa: op::C,   // super_wvfn^H
+                transb: op::N,   // S·search
+                m: superspace_index as i32,
+                n: ncol as i32,
+                k: n_pw_i32,
+                alpha: CudaComplex { x: 1.0, y: 0.0 },
+                lda: n_pw_i32,
+                ldb: n_pw_i32,
+                beta: CudaComplex { x: 0.0, y: 0.0 },
+                ldc: superspace_index as i32,
+            },
+            super_wvfn,
+            &*s_orth_out,
+            &mut overlap_dev,
+        )?;
+    }
+
+    // Step 3: search -= super_wvfn * overlap via ZGEMM
+    // Negate overlap: overlap *= -1
+    unsafe {
+        let alpha = CudaComplex { x: -1.0, y: 0.0 };
+        cublasZscal_v2(
+            handle,
+            (superspace_index * ncol) as i32,
+            &alpha as *const _ as *const _,
+            overlap_dev.device_ptr_mut(stream).0 as *mut _,
+            1,
+        ).result().map_err(Error::Blas)?;
+    }
+    unsafe {
+        blas.gemm_c64(
+            ZgemmConfig {
+                transa: op::N,   // super_wvfn
+                transb: op::N,   // -overlap
+                m: n_pw_i32,
+                n: ncol as i32,
+                k: superspace_index as i32,
+                alpha: CudaComplex { x: 1.0, y: 0.0 },
+                lda: n_pw_i32,
+                ldb: superspace_index as i32,
+                beta: CudaComplex { x: 1.0, y: 0.0 },
+                ldc: n_pw_i32,
+            },
+            super_wvfn,
+            &overlap_dev,
+            search_dev,
+        )?;
+    }
+
     Ok(())
 }
 
