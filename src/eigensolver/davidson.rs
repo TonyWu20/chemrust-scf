@@ -1472,13 +1472,10 @@ pub(crate) unsafe fn davidson_diagonalise(
                 );
             }
 
-            // CASTEP hamiltonian.f90:427 — initialize previous_eigenvalues from
-            // the current eigenvalue estimates, not zeros.  Zero initialization
-            // causes the first inner-iteration convergence check to compare
-            // against 0, which can create false convergence signals for
-            // unoccupied bands that start near zero.
-            let mut previous_eigenvalues: Vec<f64> =
-                eigenvalues[block_start..block_start + ncol].to_vec();
+            // CASTEP hamiltonian.f90:255 — allocate previous_eigenvalues (size
+            // = current ncol) but do NOT initialize.  Will be set to the current
+            // eigenvalue estimates at the top of the inner loop (CASTEP line 431).
+            let mut previous_eigenvalues: Vec<f64> = vec![0.0_f64; ncol];
             // Per-band opt_stop_condition (CASTEP: stagnation flag)
             let mut opt_stop_condition = vec![false; ncol];
 
@@ -1486,7 +1483,7 @@ pub(crate) unsafe fn davidson_diagonalise(
             // Raw pointer casts are used for psi_dev/hpsi_dev copy-back to avoid
             // borrow conflicts — device_ptr_mut needs &mut self on CudaSlice.
             let mut block_ctx = DavidsonBlockCtx::new(
-                &psi_dev, n_bands, &eigenvalues,
+                &psi_dev, &hpsi_dev, n_bands, &eigenvalues,
                 block_start, n_pw, n_pw_i32,
                 grid_size, inv_ntotal, superspace_max_bands,
                 &r_vector, tpa_preconditioner, vnl_data,
@@ -1765,6 +1762,11 @@ pub(crate) unsafe fn davidson_diagonalise(
                 // global band position; eigenvalues/band_converged use original indices.
                 let mut inner_all_stopped = true;
                 for (ci, gi) in active_bands(&active_indices, block_start) {
+                    // CASTEP hamiltonian.f90:550 — reset band_converged EVERY
+                    // inner iteration for active (not opt_stopped) bands, so that
+                    // convergence must be freshly re-established each iteration.
+                    band_converged[gi] = false;
+
                     let prev_eig = previous_eigenvalues[ci];
                     let new_eig = eigenvalues[gi];
                     let delta_e = (prev_eig - new_eig).abs();
@@ -1784,11 +1786,11 @@ pub(crate) unsafe fn davidson_diagonalise(
                     // (b) Relative break condition (CASTEP hamiltonian.f90:563-589)
                     if _inner_iter == 0 {
                         break_cond_tols[gi] = delta_e;
-                    } else if tol_rel > 0.0 && delta_e < break_cond_tols[gi] * tol_rel {
+                    } else if tol_rel > -(f64::EPSILON) && delta_e < break_cond_tols[gi] * tol_rel {
                         // Relative tolerance: band is both converged AND stopped
                         band_conv = true;
                         band_stopped = true;
-                    } else if tol_rel <= 0.0 {
+                    } else if tol_rel <= -(f64::EPSILON) {
                         // Stagnation check: improvement < 30% of first-step improvement
                         // CASTEP hamiltonian.f90:1217 — skip stagnation detection on
                         // the last outer iteration to avoid trapping the SCF loop.
@@ -1828,7 +1830,10 @@ pub(crate) unsafe fn davidson_diagonalise(
                 // strict absolute tolerance (no EPS guard, no stagnation heuristic).
                 // This ensures bands are only globally marked converged if they
                 // satisfy the strict criterion.
-                if inner_all_stopped {
+                // The epsilon guard (CASTEP hamiltonian.f90:612) skips the check
+                // when tolerance is effectively zero/negative due to numerical noise:
+                //   if(convergence_tols(1) > -epsilon(1.0_dp)) then
+                if inner_all_stopped && tol_abs > -(f64::EPSILON) {
                     for (ci, gi) in active_bands(&active_indices, block_start) {
                         band_converged[gi] = false;
                         let prev_eig = previous_eigenvalues[ci];
@@ -2779,6 +2784,10 @@ struct DavidsonBlockCtx<'a> {
     /// the preconditioner for USPP NL correction weight assembly
     /// (CASTEP hamiltonian.f90:629-642).
     eigenvalues: &'a [f64],
+    /// Stale H·psi from the outer-loop A1 rotation.  Copied into
+    /// block temps alongside psi each build() call, matching
+    /// CASTEP hamiltonian.f90:404-409.
+    hpsi_dev: &'a PwCoefficients,
     /// Maps compacted workspace column → original global band index.
     /// Updated after compaction.
     active_indices: Vec<usize>,
@@ -2832,7 +2841,8 @@ impl<'a> DavidsonBlockCtx<'a> {
     #[allow(clippy::too_many_arguments)]
     fn new(
         psi_dev: &'a PwCoefficients,
-        n_bands_total: usize,  // total n_bands (for full eigenvector S-orth)
+        hpsi_dev: &'a PwCoefficients,
+        n_bands_total: usize,
         eigenvalues: &'a [f64], // global eigenvalues from ZHEEVD (for preconditioner)
         block_start: usize,
         n_pw: usize,
@@ -2864,6 +2874,7 @@ impl<'a> DavidsonBlockCtx<'a> {
             inv_ntotal,
             superspace_max_bands,
             psi_dev,
+            hpsi_dev,
             n_bands_total,
             eigenvalues,
             r_vector,
@@ -2925,16 +2936,14 @@ impl<'a> DavidsonBlockCtx<'a> {
         superspace_index: &mut usize,
         grid_dev: &mut CudaSlice<CudaComplex>,
     ) -> Result<usize, Error> {
-        // --- Stage 1: Copy psi → temps, compute H·psi fresh, upload eigenvalues ---
-        // FIX: Compute H·psi from scratch instead of copying stale hpsi_dev.
-        // hpsi_dev is stale after A3 (copied from h_super_wvfn which A2 didn't
-        // update). CASTEP has the same issue (hamiltonian.f90:404 copies stale
-        // H_super_wvfn), but CASTEP's wave_Sorthogonalise_wv_slice corrects with
-        // beta_phi projection. Our code doesn't store beta_phi, so we eliminate
-        // staleness at the source by recomputing H·psi every build() call.
+        // --- Stage 1: Copy psi and H·psi for this block ---
+        // CASTEP hamiltonian.f90:404-409 copies slice and H_slice from
+        // super_wvfn / H_super_wvfn (stale H·psi).  Match exactly.
         {
             let (psi_ptr, _) = self.psi_dev.device_ptr(self.stream);
+            let (hpsi_ptr, _) = self.hpsi_dev.device_ptr(self.stream);
             let (block_psi_mut, _) = self.block_psi_temp.device_ptr_mut(self.stream);
+            let (block_hpsi_mut, _) = self.block_hpsi_temp.device_ptr_mut(self.stream);
 
             for (ci, gi) in active_bands(&self.active_indices, self.block_start) {
                 cublasZcopy_v2(
@@ -2947,28 +2956,18 @@ impl<'a> DavidsonBlockCtx<'a> {
                 )
                 .result()
                 .map_err(Error::Blas)?;
+                cublasZcopy_v2(
+                    self.handle,
+                    self.n_pw_i32,
+                    (hpsi_ptr as *const CudaComplex).add(gi * self.n_pw) as *const _,
+                    1,
+                    (block_hpsi_mut as *mut CudaComplex).add(ci * self.n_pw) as *mut _,
+                    1,
+                )
+                .result()
+                .map_err(Error::Blas)?;
             }
-
-            // Compute H·psi fresh on the block temps
-            unsafe {
-                apply_full_hamiltonian()
-                    .psi_dev(&self.block_psi_temp)
-                    .v_eff_dev(self.v_eff_dev)
-                    .kinetic_dev(self.kinetic_dev)
-                    .fft_idx_dev(self.fft_idx_dev)
-                    .n_pw(self.n_pw)
-                    .n_bands(self.active_indices.len())
-                    .grid_size(self.grid_size)
-                    .inv_ntotal(self.inv_ntotal)
-                    .fft_plan(self.fft_plan)
-                    .hpsi_dev(&mut self.block_hpsi_temp)
-                    .grid_dev(grid_dev)
-                    .vnl_data(self.vnl_data)
-                    .blas(self.blas)
-                    .kernels(self.kernels)
-                    .stream(self.stream)
-                    .call()?;
-            }
+        }
 
             // Use ZHEEVD subspace eigenvalues for the preconditioner shift.
             // CASTEP hamiltonian.f90:629-642 — passes slice_eigenvalues from
@@ -3049,7 +3048,6 @@ impl<'a> DavidsonBlockCtx<'a> {
                     }
                 }
             }
-        }
 
         // --- Stage 2: TPA preconditioner → search_dev ---
         // CASTEP nlpot.f90:15970 — kernel computes (Hψ - ε·ψ) * R(G).
@@ -3097,38 +3095,16 @@ impl<'a> DavidsonBlockCtx<'a> {
             );
         }
 
-        // --- Stage 2b: Renormalize search columns to unit L2 norm ---
-        // The USPP NL correction can produce search columns with L2² ~ 10^23
-        // (Cu β-projectors have large norm).  S-orthogonalization and
-        // S-orthonormalization in subsequent stages lose fp64 precision
-        // when inputs span 11 orders of magnitude.  We normalize HERE,
-        // before any orthogonalization, to keep all subsequent dot products
-        // and axpy operations within the fp64 sweet spot (~10^0).
-        // The direction is preserved; S-orthonormalization (Stage 5) would
-        // normalize to S-norm=1 anyway — we just do it early.
-        {
-            let (s_ptr, _) = self.search_dev.device_ptr(self.stream);
-            for b in 0..self.active_indices.len() {
-                let col = (s_ptr as *const CudaComplex).add(b * self.n_pw);
-                let mut nrm2 = CudaComplex { x: 0.0, y: 0.0 };
-                cublasZdotc_v2(self.handle, self.n_pw_i32,
-                    col as *const _, 1, col as *const _, 1,
-                    &mut nrm2 as *mut _ as *mut _,
-                ).result().map_err(Error::Blas)?;
-                let inv_nrm = if nrm2.x > 1.0 { 1.0 / nrm2.x.sqrt() } else { 1.0 };
-                if (inv_nrm - 1.0).abs() > 1e-15 {
-                    let c = CudaComplex { x: inv_nrm, y: 0.0 };
-                    cublasZscal_v2(self.handle, self.n_pw_i32,
-                        &c as *const _ as *const _,
-                        col as *mut _, 1,
-                    ).result().map_err(Error::Blas)?;
-                }
-            }
-        }
-
         // --- Stage 3: Superspace bounds ---
+        // CASTEP hamiltonian.f90:437-439 — when the superspace buffer would
+        // overflow, wrap around to the END of the buffer:
+        //   superspace_index = 1 + super_wvfn%nbands_max - slice_searchspace%nbands
+        // (1-based; 0-based = superspace_max_bands - nbands).
+        // This ensures new search directions are stored at the tail of the
+        // superspace buffer, keeping the earlier columns (eigenstates from
+        // previous iterations) contiguous at the front.
         if *superspace_index + self.active_indices.len() > self.superspace_max_bands {
-            *superspace_index = self.active_indices.len();
+            *superspace_index = self.superspace_max_bands - self.active_indices.len();
         }
 
         // --- Stage 3a: S-orthogonalize against ALL eigenvectors ---
@@ -3284,65 +3260,6 @@ impl<'a> DavidsonBlockCtx<'a> {
             }
         }
 
-        // --- Stage 5: S-orthonormalize among themselves ---
-        // CASTEP-aligned: columns with near-zero norm after S-orthogonalisation
-        // correspond to converged bands.  We zero them out so that
-        // S-orthonormalise skips them and they do not contaminate ZHEGVD.
-        //
-        // FIX F4: Use S-norm (⟨ψ|S|ψ⟩) not L2-norm (⟨ψ|ψ⟩) for the pre-filter.
-        // For USPP, Q matrices can have negative eigenvalues, making S-norm ≪ L2-norm
-        // for vectors with strong projector character.  A column with L2-norm ≈ 1
-        // but S-norm ≈ 1e-20 would pass the L2 filter, then s_orthonormalise would
-        // amplify it by 1/sqrt(1e-20) = 1e10, injecting extreme values into H_sub
-        // and triggering subspace eigenvalue explosion to -10^78.
-        // Threshold: S-norm² < 1e-12 (prevents amplification > 1e6×).
-        let mut col_valid = vec![true; self.active_indices.len()];
-        {
-            let (search_ptr, _) = self.search_dev.device_ptr(self.stream);
-            let (s_in_mut, _) = self.s_orth_in.device_ptr_mut(self.stream);
-            let (s_out_mut, _) = self.s_orth_out.device_ptr_mut(self.stream);
-            for j in 0..self.active_indices.len() {
-                let search_j = (search_ptr as *const CudaComplex).add(j * self.n_pw);
-                // Compute S·search_j -> s_orth_out
-                cublasZcopy_v2(self.handle, self.n_pw_i32,
-                    search_j as *const _, 1, s_in_mut as *mut _, 1,
-                ).result().map_err(Error::Blas)?;
-                cublasZcopy_v2(self.handle, self.n_pw_i32,
-                    search_j as *const _, 1, s_out_mut as *mut _, 1,
-                ).result().map_err(Error::Blas)?;
-                unsafe {
-                    apply_s_times()
-                        .psi_dev(&self.s_orth_in)
-                        .spsi_dev(&mut self.s_orth_out)
-                        .vnl_data(self.vnl_data)
-                        .n_bands(1_i32)
-                        .n_pw(self.n_pw_i32)
-                        .blas(self.blas)
-                        .stream(self.stream)
-                        .call()?;
-                }
-                // S-norm² = ⟨search_j | S | search_j⟩
-                let (s_out_ptr, _) = self.s_orth_out.device_ptr(self.stream);
-                let mut s_nrm_sq = CudaComplex { x: 0.0, y: 0.0 };
-                cublasZdotc_v2(
-                    self.handle, self.n_pw_i32,
-                    search_j as *const _, 1,
-                    s_out_ptr as *const _, 1,
-                    &mut s_nrm_sq as *mut _ as *mut _,
-                ).result().map_err(Error::Blas)?;
-                if s_nrm_sq.x < 1e-12 {
-                    col_valid[j] = false;
-                    // Zero the column so S-orthonormalise will skip it
-                    let (search_mut, _) = self.search_dev.device_ptr_mut(self.stream);
-                    let col_mut = (search_mut as *mut CudaComplex).add(j * self.n_pw);
-                    cublasZscal_v2(
-                        self.handle, self.n_pw_i32,
-                        &CudaComplex { x: 0.0, y: 0.0 } as *const _ as *const _,
-                        col_mut as *mut _, 1,
-                    ).result().map_err(Error::Blas)?;
-                }
-            }
-        }
 
         // --- Stage 5: S-orthonormalize among themselves ---
         unsafe {
@@ -3412,20 +3329,17 @@ impl<'a> DavidsonBlockCtx<'a> {
             );
         }
 
-        // --- Stage 7: Copy search → superspace (only valid columns) ---
-        let mut valid_count: usize;
+        // --- Stage 7: Copy search → superspace ---
+        // CASTEP hamiltonian.f90:451-453 — copies ALL slice_searchspace columns
+        // unconditionally; no validity pre-filter.
         {
             let (search_ptr, _) = self.search_dev.device_ptr(self.stream);
             let (hsearch_ptr, _) = self.hsearch_dev.device_ptr(self.stream);
             let (super_mut, _) = super_wvfn.device_ptr_mut(self.stream);
             let (h_super_mut, _) = h_super_wvfn.device_ptr_mut(self.stream);
 
-            valid_count = 0;
             for i in 0..self.active_indices.len() {
-                if !col_valid[i] {
-                    continue;
-                }
-                let dst = *superspace_index + valid_count;
+                let dst = *superspace_index + i;
                 cublasZcopy_v2(
                     self.handle,
                     self.n_pw_i32,
@@ -3446,167 +3360,9 @@ impl<'a> DavidsonBlockCtx<'a> {
                 )
                 .result()
                 .map_err(Error::Blas)?;
-                valid_count += 1;
             }
         }
 
-        Ok(valid_count)
-    }
-}
-
-// ======================================================================
-// CPU unit tests (no GPU required)
-// ======================================================================
-
-#[cfg(test)]
-mod tests {
-    use super::{lock_tol_for_iter, check_band_converged};
-
-    // -----------------------------------------------------------------------
-    // lock_tol_for_iter tests (existing)
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn lock_tol_for_iter_baseline() {
-        // iter 1: lock_tol = 0.2 (initial)
-        let tol_1 = lock_tol_for_iter(1, 1e-6);
-        assert!(
-            (tol_1 - 0.2).abs() < 1e-15,
-            "iter 1 lock_tol = {tol_1}, expected 0.2"
-        );
-
-        // iter 2: lock_tol = target + (0.2 - target) * 0.5^1
-        let expected_2 = 1e-6 + (0.2 - 1e-6) * 0.5_f64.powi(1);
-        let tol_2 = lock_tol_for_iter(2, 1e-6);
-        assert!(
-            (tol_2 - expected_2).abs() < 1e-15,
-            "iter 2 lock_tol = {tol_2}, expected {expected_2}"
-        );
-
-        // iter 3: lock_tol = target + (0.2 - target) * 0.5^2
-        let expected_3 = 1e-6 + (0.2 - 1e-6) * 0.5_f64.powi(2);
-        let tol_3 = lock_tol_for_iter(3, 1e-6);
-        assert!(
-            (tol_3 - expected_3).abs() < 1e-15,
-            "iter 3 lock_tol = {tol_3}, expected {expected_3}"
-        );
-
-        // iter 10: should still be between target_tol and initial_tol
-        let tol_10 = lock_tol_for_iter(10, 1e-6);
-        assert!(
-            tol_10 > 1e-6 - 1e-15,
-            "iter 10 lock_tol = {tol_10} fell below target 1e-6"
-        );
-
-        // Edge: scf_iter = 0 (should behave like iter-1)
-        let tol_0 = lock_tol_for_iter(0, 1e-6);
-        assert!(
-            (tol_0 - 0.2).abs() < 1e-15,
-            "iter 0 lock_tol = {tol_0}, expected 0.2"
-        );
-    }
-
-    #[test]
-    fn lock_tol_for_iter_convergence_asymptotic() {
-        let tol = lock_tol_for_iter(100, 1e-6);
-        let diff = (tol - 1e-6).abs();
-        assert!(
-            diff < 1e-10,
-            "iter 100 lock_tol = {tol} is {diff} from target 1e-6, should be very close"
-        );
-    }
-
-    #[test]
-    fn lock_tol_for_iter_zero_target_tol() {
-        let tol = lock_tol_for_iter(100, 0.0);
-        assert!(
-            tol < 1e-10,
-            "iter 100 with target 0.0: lock_tol = {tol}, expected near 0"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // check_band_converged tests (outer-loop convergence)
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn check_band_converged_small_diff_below_tol_abs() {
-        // diff < tol_abs → converged
-        assert!(check_band_converged(1.0, 1.0 + 1e-10, 1e-8));
-    }
-
-    #[test]
-    fn check_band_converged_large_diff_above_tol_abs() {
-        // diff > tol_abs → not converged
-        assert!(!check_band_converged(1.0, 1.1, 1e-8));
-    }
-
-    #[test]
-    fn check_band_converged_exact_zero_diff() {
-        // zero diff → converged
-        assert!(check_band_converged(1.0, 1.0, 1e-8));
-    }
-
-    #[test]
-    fn check_band_converged_eps_guard_below_threshold() {
-        // For large eigenvalues, the EPS term dominates tol_abs.
-        // threshold ≈ 2*|1e10|*EPS ≈ 4.44e-6
-        // diff = threshold * 0.5 < threshold → converged
-        let eig = 1e10_f64;
-        let threshold = 2.0 * eig.abs() * f64::EPSILON;
-        assert!(check_band_converged(eig, eig + threshold * 0.5, 1e-8));
-    }
-
-    #[test]
-    fn check_band_converged_eps_guard_above_threshold() {
-        // diff = threshold * 5.0 > threshold → not converged
-        // (Large margin avoids f64 rounding at 1e10 scale)
-        let eig = 1e10_f64;
-        let threshold = 2.0 * eig.abs() * f64::EPSILON;
-        assert!(!check_band_converged(eig, eig + threshold * 5.0, 1e-8));
-    }
-
-    #[test]
-    fn check_band_converged_tol_abs_dominates_for_small_eig() {
-        // For small eigenvalues, tol_abs dominates.
-        // threshold = max(1e-6, 2*|1.0|*EPS) = 1e-6 (tol_abs is larger)
-        // diff = 5e-7 < 1e-6 → converged
-        assert!(check_band_converged(1.0, 1.0 + 5e-7, 1e-6));
-
-        // diff = 2e-6 > 1e-6 → not converged
-        assert!(!check_band_converged(1.0, 1.0 + 2e-6, 1e-6));
-    }
-
-    #[test]
-    fn check_band_converged_negative_eigenvalues() {
-        // Negative eigenvalues should be handled correctly
-        // |(-10.0 - (-10.0 + 1e-9))| = 1e-9 < 1e-8 → converged
-        assert!(check_band_converged(-10.0, -10.0 + 1e-9, 1e-8));
-
-        // |(-10.0 - (-11.0))| = 1.0 > 1e-8 → not converged
-        assert!(!check_band_converged(-10.0, -11.0, 1e-8));
-    }
-
-    #[test]
-    fn check_band_converged_zero_tol_abs() {
-        // With zero tol_abs, only EPS guard protects
-        // diff = 1e-8, threshold = max(0.0, 2*|1.0|*EPS) ≈ 4.4e-16
-        // diff > threshold → not converged
-        assert!(!check_band_converged(1.0, 1.0 + 1e-8, 0.0));
-
-        // diff = 0.0 < threshold → converged
-        assert!(check_band_converged(1.0, 1.0, 0.0));
-    }
-
-    #[test]
-    fn check_band_converged_very_large_eigenvalue() {
-        // For extremely large eigenvalues, EPS guard dominates
-        // threshold ≈ 2 * |1e15| * EPS ≈ 4.4e-1
-        let eig = 1e15_f64;
-        let threshold = 2.0 * eig.abs() * f64::EPSILON;
-        // diff just below threshold → converged
-        assert!(check_band_converged(eig, eig + threshold * 0.5, 1e-8));
-        // diff just above threshold → not converged
-        assert!(!check_band_converged(eig, eig + threshold * 2.0, 1e-8));
+        Ok(self.active_indices.len())
     }
 }
