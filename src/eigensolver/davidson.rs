@@ -1664,9 +1664,9 @@ pub(crate) unsafe fn davidson_diagonalise(
                     }
 
                     let mut inner_s_orth_in = PwCoefficients::new(
-                        stream.alloc_zeros(n_pw).map_err(Error::Cuda)?);
+                        stream.alloc_zeros(n_pw * current_nblock).map_err(Error::Cuda)?);
                     let mut inner_s_orth_out = PwCoefficients::new(
-                        stream.alloc_zeros(n_pw).map_err(Error::Cuda)?);
+                        stream.alloc_zeros(n_pw * current_nblock).map_err(Error::Cuda)?);
 
                     // S-orthogonalize against lower bands (only when there ARE lower bands)
                     if block_start > 0 {
@@ -2880,9 +2880,9 @@ impl<'a> DavidsonBlockCtx<'a> {
                 stream.alloc_zeros(n_pw * ncol).map_err(Error::Cuda)?,
             ),
             s_orth_in: PwCoefficients::new(
-                stream.alloc_zeros(n_pw).map_err(Error::Cuda)?),
+                stream.alloc_zeros(n_pw * ncol).map_err(Error::Cuda)?),
             s_orth_out: PwCoefficients::new(
-                stream.alloc_zeros(n_pw).map_err(Error::Cuda)?),
+                stream.alloc_zeros(n_pw * ncol).map_err(Error::Cuda)?),
         })
     }
 
