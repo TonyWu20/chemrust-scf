@@ -213,7 +213,6 @@ pub struct CudaKernelSet {
     pub(crate) transpose_col_to_row: CudaFunction,
     #[allow(dead_code)]
     pub(crate) transpose_row_to_col: CudaFunction,
-    pub(crate) band_scale_axpy: CudaFunction,
     pub(crate) cpx_mul_inplace: CudaFunction,
     pub(crate) cpx_conj_mul: CudaFunction,
 }
@@ -237,7 +236,6 @@ impl CudaKernelSet {
             gather_add_kinetic: load("gather_add_kinetic")?,
             transpose_col_to_row: load("transpose_col_to_row")?,
             transpose_row_to_col: load("transpose_row_to_col")?,
-            band_scale_axpy: load("band_scale_axpy")?,
             cpx_mul_inplace: load("cpx_mul_inplace")?,
             cpx_conj_mul: load("cpx_conj_mul")?,
         })

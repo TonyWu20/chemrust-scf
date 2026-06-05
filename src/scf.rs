@@ -6,7 +6,7 @@ use chemrust_hamiltonian_core::{
     CellGeometry, GVectorGrid, NonSpin, PseudopotentialSet, SpinCollinear, SpinPolicy, VEffBuilder,
 };
 use cudarc::driver::{CudaContext, CudaSlice};
-use ndarray::{Array2, Array3, ShapeBuilder};
+use ndarray::{Array3, ShapeBuilder};
 use num_complex::Complex64;
 
 use crate::device::blas::{op, BlasHandle, ZgemmConfig};
@@ -532,7 +532,7 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
 
         // Downsample V_eff from fine grid to wave grid
         let v_eff_wave = downsample_array_to_wave_grid(v_eff_arr, &self.fine_grid, &self.wave_grid)?;
-        let (min_veff, max_veff) = {
+        let (_min_veff, _max_veff) = {
             let arr = v_eff_wave.as_fine_array();
             let min = arr.iter().cloned().fold(f64::INFINITY, f64::min);
             let max = arr.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
@@ -561,7 +561,7 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
             #[cfg(feature = "scf_diag")]
             eprintln!(
                 "[V_eff] min={:.4} max={:.4} range={:.4} Ha  [Density] rho_sum={:.4e} rho_min={:.4e} rho_max={:.4e}  total_e(raw_conv=sum/N)={:.6}  total_e(phys_conv=sum*Ω/N)={:.6}  [psi] |c|_min={:.3e} |c|_max={:.3e}",
-                min_veff, max_veff, max_veff - min_veff,
+                _min_veff, _max_veff, _max_veff - _min_veff,
                 rho_sum, rho_min, rho_max,
                 total_e_raw_conv, total_e_phys_conv,
                 psi_abs_min, psi_abs_max,
@@ -744,7 +744,7 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
             &psi_gpu, &v_eff_gpu, &self.pots,
             &self.wave_grid, &self.k_point, &self.cell,
             &self.pw_coords,
-            &vnl_data, &fft_idx_dev, min_veff, max_veff,
+            &vnl_data, &fft_idx_dev, _min_veff, _max_veff,
             &kernels, &mut pcie, eig, ndeg, &blas, &solver, &stream, &ctx,
             filter_mode,
             None,

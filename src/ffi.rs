@@ -52,10 +52,6 @@ fn fft_idx_to_coord(idx_1based: i32, ngx: i32, ngy: i32, ngz: i32) -> [i32; 3] {
 
 struct KptData {
     vnl: VnlBatchData,
-    wave_grid: GVectorGrid,
-    pw_coords: Vec<[i32; 3]>,
-    kpoint_frac: [f64; 3],
-    pcie: PcieAccount,
 }
 
 // ---- Opaque handle ---------------------------------------------------------
@@ -67,24 +63,11 @@ struct ChemrustHandle {
     solver: SolverHandle,
     kernels: CudaKernelSet,
     ngx: i32, ngy: i32, ngz: i32,
-    fft_plan: Option<BatchedFftPlan3d>,
     kpts: Vec<KptData>,
     /// Cached GPU copy of V_eff for skip-upload optimization.
     v_eff_cached: Option<CudaSlice<f64>>,
     /// Max-norm of the cached V_eff, used for change detection.
     v_eff_norm: f64,
-}
-
-impl ChemrustHandle {
-    fn fft(&mut self, n_bands: i32) -> Result<&BatchedFftPlan3d, c_int> {
-        let ok = self.fft_plan.as_ref().map(|p| p.batch() == n_bands).unwrap_or(false);
-        if !ok {
-            self.fft_plan = Some(BatchedFftPlan3d::plan_batched_c2c(
-                self.ngx, self.ngy, self.ngz, n_bands, self.stream.clone(),
-            ).map_err(|_| CHEM_EIG_CUDA_ERROR)?);
-        }
-        Ok(self.fft_plan.as_ref().unwrap())
-    }
 }
 
 // ---- Init ------------------------------------------------------------------
@@ -240,12 +223,12 @@ fn init_inner(
             &stream, &mut pcie, &blas, &kernels, &solver,
         ).map_err(|e| { eprintln!("[chemrust] precompute kpt {ik} failed: {e}"); CHEM_EIG_CUDA_ERROR })?;
 
-        kpts.push(KptData { vnl, wave_grid: wg, pw_coords, kpoint_frac: kf, pcie });
+        kpts.push(KptData { vnl });
     }
 
     Ok(Box::into_raw(Box::new(ChemrustHandle {
         ctx, stream, blas, solver, kernels,
-        ngx, ngy, ngz, fft_plan: None, kpts,
+        ngx, ngy, ngz, kpts,
         v_eff_cached: None,
         v_eff_norm: 0.0,
     })))
@@ -379,7 +362,7 @@ unsafe fn step_inner(
     // now expects Fortran order so the GPU upload via flatten_f64 produces
     // the correct x-fastest layout that cuFFT expects.
     let ve_host: Vec<f64> = unsafe { std::slice::from_raw_parts(v_eff_data, gs) }.to_vec();
-    let ve_raw = unsafe { std::slice::from_raw_parts(v_eff_data, gs) };
+    let _ve_raw = unsafe { std::slice::from_raw_parts(v_eff_data, gs) };
     let ve_norm: f64 = ve_host.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
 
     #[cfg(feature = "scf_diag")]

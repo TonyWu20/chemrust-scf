@@ -42,9 +42,7 @@ use crate::device::CudaComplex;
 use crate::eigensolver::davidson_types::*;
 use ndarray::Array2;
 use num_complex::Complex64;
-use crate::eigensolver::hamiltonian::{apply_full_hamiltonian, apply_s_times, apply_v_loc_hamiltonian};
-#[cfg(feature = "scf_diag")]
-use crate::eigensolver::hamiltonian::apply_s_inverse;
+use crate::eigensolver::hamiltonian::{apply_full_hamiltonian, apply_s_times};
 use crate::eigensolver::kernels::CudaKernelSet;
 use crate::eigensolver::preconditioner::{apply_preconditioner, compute_r_vector, prepare_preconditioner, TpaPreconditioner};
 use crate::eigensolver::vnl_data::VnlBatchData;
@@ -104,29 +102,6 @@ pub struct DavidsonDiagnostic {
 /// Most recent Davidson v1 diagnostic, accessible for tests.
 pub static DAVIDSON_LAST_DIAG: std::sync::Mutex<Option<DavidsonDiagnostic>> =
     std::sync::Mutex::new(None);
-
-// ---------------------------------------------------------------------------
-// Lock tolerance ratchet schedule
-// ---------------------------------------------------------------------------
-
-/// Compute Davidson lock tolerance for a given SCF iteration.
-///
-/// Starts at 0.2 Ha — loose enough to lock most bands at iter-1
-/// (max observed S⁻¹ residual ≈ 0.104 Ha for continuation ψ with our V_eff),
-/// tightens geometrically toward `target_tol`.
-///
-/// S⁻¹-weighted norms are ~100× larger than plain L2 norms for the Cu111+CO
-/// system. Phase 0's 0.5 Ha (calibrated for L2) maps to ~0.2 Ha for S⁻¹.
-pub(crate) fn lock_tol_for_iter(scf_iter: usize, target_tol: f64) -> f64 {
-    let initial: f64 = 0.2;
-    let decay: f64 = 0.5;
-    if scf_iter <= 1 {
-        initial
-    } else {
-        let gap = initial - target_tol;
-        (target_tol + gap * decay.powi(scf_iter as i32 - 1)).max(target_tol)
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Main driver
@@ -607,30 +582,6 @@ unsafe fn davidson_v1(
 }
 
 // ======================================================================
-// Outer-loop convergence check
-// ======================================================================
-
-/// Check whether a band has converged based on eigenvalue stability.
-///
-/// A band is converged if the eigenvalue change after subspace rotation
-/// is below the threshold: `|prev - new| < max(tol_abs, 2*|new|*EPS)`.
-///
-/// The EPS guard prevents near-zero tol_abs from demanding convergence
-/// beyond machine precision for large eigenvalues.
-///
-/// # Arguments
-/// - `prev`: eigenvalue before subspace rotation
-/// - `new`: eigenvalue after subspace rotation
-/// - `tol_abs`: absolute convergence tolerance (Hartree)
-///
-/// Returns `true` if the band is converged.
-pub(crate) fn check_band_converged(prev: f64, new: f64, tol_abs: f64) -> bool {
-    let diff = (prev - new).abs();
-    let threshold = tol_abs.max(2.0 * new.abs() * f64::EPSILON);
-    diff < threshold
-}
-
-// ======================================================================
 // Inner-loop convergence check (block-level Davidson)
 // ======================================================================
 
@@ -954,12 +905,12 @@ pub(crate) unsafe fn davidson_diagonalise(
     // CASTEP convention.  The old per-PW average (kinetic_host sum / n_pw) is
     // printed alongside for comparison.
     {
-        let mean_ek_pw = kinetic_host.iter().sum::<f64>() / kinetic_host.len() as f64;
-        let ek_min = band_ek.iter().cloned().fold(f64::INFINITY, f64::min);
-        let ek_max = band_ek.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let _mean_ek_pw = kinetic_host.iter().sum::<f64>() / kinetic_host.len() as f64;
+        let _ek_min = band_ek.iter().cloned().fold(f64::INFINITY, f64::min);
+        let _ek_max = band_ek.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
         diag_detail!(
-            "[mean_ek] per-band={mean_ek:.6} Ha (min={ek_min:.4}, max={ek_max:.4})  per-PW={mean_ek_pw:.6} Ha  ratio={ratio:.3}",
-            ratio = mean_ek_pw / mean_ek
+            "[mean_ek] per-band={mean_ek:.6} Ha (min={_ek_min:.4}, max={_ek_max:.4})  per-PW={_mean_ek_pw:.6} Ha  ratio={ratio:.3}",
+            ratio = _mean_ek_pw / mean_ek
         );
     }
 
@@ -1533,7 +1484,7 @@ pub(crate) unsafe fn davidson_diagonalise(
             // Raw pointer casts are used for psi_dev/hpsi_dev copy-back to avoid
             // borrow conflicts — device_ptr_mut needs &mut self on CudaSlice.
             let mut block_ctx = DavidsonBlockCtx::new(
-                &psi_dev, &hpsi_dev, n_bands, &eigenvalues,
+                &psi_dev, n_bands,
                 block_start, n_pw, n_pw_i32,
                 grid_size, inv_ntotal, superspace_max_bands,
                 &r_vector, tpa_preconditioner, vnl_data,
@@ -2299,7 +2250,7 @@ pub(crate) unsafe fn davidson_diagonalise(
 unsafe fn diagonalise_subspace(
     psi_block: &PwCoefficients,
     hpsi_block: &PwCoefficients,
-    vnl_data: &VnlBatchData,
+    _vnl_data: &VnlBatchData,
     k: usize,
     n_pw: usize,
     blas: &BlasHandle,
@@ -2820,9 +2771,7 @@ struct DavidsonBlockCtx<'a> {
 
     // --- Outer state (borrowed) ---
     psi_dev: &'a PwCoefficients,
-    hpsi_dev: &'a PwCoefficients,
     n_bands_total: usize,
-    eigenvalues: &'a [f64],
     /// Maps compacted workspace column → original global band index.
     /// Updated after compaction alongside `ncol`.
     active_indices: Vec<usize>,
@@ -2876,9 +2825,7 @@ impl<'a> DavidsonBlockCtx<'a> {
     #[allow(clippy::too_many_arguments)]
     fn new(
         psi_dev: &'a PwCoefficients,
-        hpsi_dev: &'a PwCoefficients,
         n_bands_total: usize,  // total n_bands (for full eigenvector S-orth)
-        eigenvalues: &'a [f64],
         block_start: usize,
         n_pw: usize,
         n_pw_i32: i32,
@@ -2909,9 +2856,7 @@ impl<'a> DavidsonBlockCtx<'a> {
             inv_ntotal,
             superspace_max_bands,
             psi_dev,
-            hpsi_dev,
             n_bands_total,
-            eigenvalues,
             r_vector,
             tpa_preconditioner,
             vnl_data,
@@ -2947,17 +2892,6 @@ impl<'a> DavidsonBlockCtx<'a> {
     /// extension stage that follows this pipeline in the caller).
     fn search_dev(&self) -> &PwCoefficients {
         &self.search_dev
-    }
-
-    /// Convenience accessor: global band index for a compacted column.
-    ///
-    /// `compacted_col` is a position `0..active_indices.len()` in the
-    /// compacted workspace.  Returns the original global band index
-    /// `block_start + active_indices[compacted_col]`.
-    #[inline]
-    fn global_band(&self, compacted_col: usize) -> usize {
-        debug_assert!(compacted_col < self.active_indices.len());
-        self.block_start + self.active_indices[compacted_col]
     }
 
     /// Run the full search-direction pipeline for one inner iteration.

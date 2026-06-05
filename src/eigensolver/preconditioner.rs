@@ -675,12 +675,12 @@ pub unsafe fn apply_preconditioner(
                 }
                 if l2sq > max_l2sq { max_l2sq = l2sq; max_b = b; }
             }
-            let max_band_eig = if max_b < eig_cpu.len() { eig_cpu[max_b] } else { f64::NAN };
+            let _max_band_eig = if max_b < eig_cpu.len() { eig_cpu[max_b] } else { f64::NAN };
             precon_diag!("[Diag-Precon-TPA] ANOMALY: L2² min=N/A max={:.4e} (band {}/{}, eig={:.6e}) across {} bands",
-                max_l2sq, max_b, n_bands, max_band_eig, n_bands);
+                max_l2sq, max_b, n_bands, _max_band_eig, n_bands);
             precon_diag!("[Diag-Precon-TPA] ANOMALY: all band eigenvalues:");
-            for b in 0..n_bands.min(eig_cpu.len()) {
-                precon_diag!("  band {}: eig={:.6e}", b, eig_cpu[b]);
+            for _b in 0..n_bands.min(eig_cpu.len()) {
+                precon_diag!("  band {}: eig={:.6e}", _b, eig_cpu[_b]);
             }
         }
     }
@@ -828,7 +828,7 @@ pub unsafe fn apply_preconditioner(
 
                 // Cauchy-Schwarz bound
                 let bound = (dot2.x * dot3.x).sqrt();
-                let exceeded = if dot1.x.abs() > bound * 1.01 {
+                let _exceeded = if dot1.x.abs() > bound * 1.01 {
                     "CS-VIOLATION"
                 } else {
                     "OK"
@@ -841,7 +841,7 @@ pub unsafe fn apply_preconditioner(
                      CS_bound={:.6e} CS={}",
                     dot1.x, dot1.y,
                     dot2.x, dot3.x,
-                    bound, exceeded,
+                    bound, _exceeded,
                 );
 
                 // Now download GEMM[0,0] and compare with dot1
@@ -856,7 +856,7 @@ pub unsafe fn apply_preconditioner(
                     );
                 }
                 let gemm00_cpu: Vec<CudaComplex> = stream.clone_dtoh(&gemm00).map_err(Error::Cuda)?;
-                let reldiff = if dot1.x.abs() > 1e-30 {
+                let _reldiff = if dot1.x.abs() > 1e-30 {
                     ((gemm00_cpu[0].x - dot1.x) / dot1.x).abs()
                 } else {
                     0.0
@@ -866,7 +866,7 @@ pub unsafe fn apply_preconditioner(
                      dotc[0,0]=({:.6e},{:.6e}) reldiff={:.6e}",
                     gemm00_cpu[0].x, gemm00_cpu[0].y,
                     dot1.x, dot1.y,
-                    reldiff,
+                    _reldiff,
                 );
 
                 // Dump first 5 elements of psi[0] and beta_g[0] directly
@@ -884,15 +884,15 @@ pub unsafe fn apply_preconditioner(
                         b5_ptr as *mut _, 1,
                     );
                 }
-                let psi_5_cpu: Vec<CudaComplex> = stream.clone_dtoh(&psi_5).map_err(Error::Cuda)?;
-                let beta_5_cpu: Vec<CudaComplex> = stream.clone_dtoh(&beta_5).map_err(Error::Cuda)?;
+                let _psi_5_cpu: Vec<CudaComplex> = stream.clone_dtoh(&psi_5).map_err(Error::Cuda)?;
+                let _beta_5_cpu: Vec<CudaComplex> = stream.clone_dtoh(&beta_5).map_err(Error::Cuda)?;
                 precon_diag!(
                     "[Diag-GEMM-xcheck] psi[0..4]: {:?}",
-                    psi_5_cpu.iter().map(|c| (c.x, c.y)).collect::<Vec<_>>()
+                    _psi_5_cpu.iter().map(|c| (c.x, c.y)).collect::<Vec<_>>()
                 );
                 precon_diag!(
                     "[Diag-GEMM-xcheck] beta_g[0..4]: {:?}",
-                    beta_5_cpu.iter().map(|c| (c.x, c.y)).collect::<Vec<_>>()
+                    _beta_5_cpu.iter().map(|c| (c.x, c.y)).collect::<Vec<_>>()
                 );
             }
 
@@ -1000,19 +1000,19 @@ pub unsafe fn apply_preconditioner(
                 let norm_dot = (dot_precon.x.powi(2) + dot_precon.y.powi(2)).sqrt();
                 let diff_bpp = ((gemm_bpp00.re - dot_precon.x).powi(2)
                               + (gemm_bpp00.im - dot_precon.y).powi(2)).sqrt();
-                let reldiff_bpp = if norm_dot > 1e-30 { diff_bpp / norm_dot } else { 0.0 };
+                let _reldiff_bpp = if norm_dot > 1e-30 { diff_bpp / norm_dot } else { 0.0 };
                 precon_diag!(
                     "[Diag-Precon-xcheck] beta_phi_precon[0,0]: \
                      GEMM=({:.6e},{:.6e}) dotc=({:.6e},{:.6e}) reldiff={:.6e}",
                     gemm_bpp00.re, gemm_bpp00.im,
                     dot_precon.x, dot_precon.y,
-                    reldiff_bpp,
+                    _reldiff_bpp,
                 );
 
                 // --- C: max norms — .iter() vs [n,b] double-loop ---
                 let mut max_bpp_iter = 0.0f64;
                 for v in beta_phi_precon_arr.iter() { let a = v.norm(); if a > max_bpp_iter { max_bpp_iter = a; } }
-                let max_bps_iter = beta_phi_psi_arr.iter().map(|c| c.norm()).fold(0.0f64, f64::max);
+                let _max_bps_iter = beta_phi_psi_arr.iter().map(|c| c.norm()).fold(0.0f64, f64::max);
                 let mut max_bpp_idx = 0.0f64;
                 let mut max_bps_idx = 0.0f64;
                 for b in 0..n_bands {
@@ -1259,11 +1259,11 @@ pub fn prepare_preconditioner(
     // Diag: print max |entry| of r_beta and q_rcq, plus per-ion details
     {
         let mut max_r_beta = 0.0f64;
-        let mut max_rb_ion = 0usize;
+        let mut _max_rb_ion = 0usize;
         for (ion, rb) in r_beta_per_ion_vec.iter().enumerate() {
             for v in rb.iter() {
                 let a = Complex64::new(v.re, v.im).norm();
-                if a > max_r_beta { max_r_beta = a; max_rb_ion = ion; }
+                if a > max_r_beta { max_r_beta = a; _max_rb_ion = ion; }
             }
         }
         let mut max_q_rcq = 0.0f64;
@@ -1273,7 +1273,7 @@ pub fn prepare_preconditioner(
         }
         precon_diag!(
             "[Diag-Precon] R_beta max|entry|={:.6e} (ion={})  Q_RCQ max|entry|={:.6e}",
-            max_r_beta, max_rb_ion, max_q_rcq
+            max_r_beta, _max_rb_ion, max_q_rcq
         );
         // Per-ion R_beta and C diagnostics
         for (ion, rb) in r_beta_per_ion_vec.iter().enumerate() {
@@ -1301,16 +1301,16 @@ pub fn prepare_preconditioner(
         // Dump R(G) stats
         let mut r_min = f64::MAX;
         let mut r_max = 0.0f64;
-        let mut r_mean = 0.0f64;
+        let mut _r_mean = 0.0f64;
         for &r in &r_vector {
             if r < r_min { r_min = r; }
             if r > r_max { r_max = r; }
-            r_mean += r;
+            _r_mean += r;
         }
-        r_mean /= r_vector.len() as f64;
+        _r_mean /= r_vector.len() as f64;
         precon_diag!(
             "[Diag-Precon] R(G) tpa: min={:.4e} max={:.6e} mean={:.4e}",
-            r_min, r_max, r_mean
+            r_min, r_max, _r_mean
         );
     }
 

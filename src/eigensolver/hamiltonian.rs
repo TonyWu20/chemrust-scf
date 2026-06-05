@@ -8,18 +8,13 @@
 //   3. apply_v_nl_hamiltonian — V_NL via cuBLAS gemm with β-projectors
 //   4. apply_full_hamiltonian — composes V_loc + V_NL
 //   5. apply_s_times — S·ψ = ψ + β·Q·β^H·ψ (USPP overlap)
-//   6. apply_s_inverse — S⁻¹ via Woodbury
-//   7. check_s_inv_s_identity — diagnostic: verifies S⁻¹·S ≈ I
 
 use std::sync::Arc;
 
-use cudarc::cublas::sys::{cublasHandle_t, cublasZdotc_v2};
-use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, LaunchConfig, PushKernelArg};
-use cudarc::cusolver::sys::cublasOperation_t;
+use cudarc::driver::{CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
 
 use crate::device::blas::{self, BlasHandle, ZgemmConfig};
 use crate::device::fft::BatchedFftPlan3d;
-use crate::device::solver::SolverHandle;
 use crate::device::CudaComplex;
 use crate::eigensolver::davidson_types::{
     KineticPreconditioner, PwCoefficients,
@@ -84,7 +79,7 @@ pub(crate) unsafe fn apply_v_loc_hamiltonian(
     fft_plan: &BatchedFftPlan3d,
     kernels: &CudaKernelSet,
     stream: &Arc<CudaStream>,
-    blas: Option<&BlasHandle>,
+    _blas: Option<&BlasHandle>,
 ) -> Result<(), Error> {
     // 1. hpsi = kinetic * psi  (T|psi>)
     unsafe {
@@ -101,7 +96,7 @@ pub(crate) unsafe fn apply_v_loc_hamiltonian(
 
     // Diag: |hpsi|² for last band after kinetic
     #[cfg(feature = "scf_diag")]
-    if let Some(bh) = blas {
+    if let Some(bh) = _blas {
         let lb = n_bands as usize - 1;
         let (h_ptr, _) = (&*hpsi_dev).device_ptr(stream);
         let col = (h_ptr as *const CudaComplex).add(lb * n_pw as usize);
@@ -178,7 +173,7 @@ pub(crate) unsafe fn apply_v_loc_hamiltonian(
     .map_err(Error::Cuda)?;
     // Diag: |hpsi|² for last band after kinetic+Vloc
     #[cfg(feature = "scf_diag")]
-    if let Some(bh) = blas {
+    if let Some(bh) = _blas {
         let lb = n_bands as usize - 1;
         let (h_ptr, _) = (&*hpsi_dev).device_ptr(stream);
         let col = (h_ptr as *const CudaComplex).add(lb * n_pw as usize);
@@ -355,87 +350,6 @@ pub(crate) unsafe fn apply_v_nl_hamiltonian(
 }
 
 // ---------------------------------------------------------------------------
-// S⁻¹ (USPP overlap inverse via Woodbury)
-// ---------------------------------------------------------------------------
-
-/// Apply the USPP overlap inverse to each band of `hpsi`.
-///
-/// Uses the global Woodbury formula (PHASE_PLAN.md):
-///   S⁻¹·v = v − B · M⁻¹ · (B^H · v)
-///   where M = Q⁻¹ + B^H·B (Cholesky-factored in VnlBatchData::precompute).
-#[builder]
-#[allow(clippy::too_many_arguments)]
-pub(crate) unsafe fn apply_s_inverse(
-    hpsi_dev: &mut PwCoefficients,
-    vnl_data: &VnlBatchData,
-    n_bands: i32,
-    n_pw: i32,
-    blas: &BlasHandle,
-    stream: &Arc<CudaStream>,
-    solver: &SolverHandle,
-) -> Result<(), Error> {
-    let nte = vnl_data.n_total_expanded;
-
-    // 1. temp = B^H · hpsi  (nte × n_bands)
-    let mut temp: CudaSlice<CudaComplex> =
-        stream.alloc_zeros(nte as usize * n_bands as usize).map_err(Error::Cuda)?;
-    unsafe {
-        blas.gemm_c64(
-            ZgemmConfig {
-                transa: blas::op::C,
-                transb: blas::op::N,
-                m: nte,
-                n: n_bands,
-                k: n_pw,
-                alpha: CudaComplex { x: 1.0, y: 0.0 },
-                lda: n_pw,
-                ldb: n_pw,
-                beta: CudaComplex { x: 0.0, y: 0.0 },
-                ldc: nte,
-            },
-            &vnl_data.b_concat,
-            hpsi_dev,
-            &mut temp,
-        )?;
-    }
-
-    // 2. Solve M·x = temp via LU factor (zgetrs, in-place overwrites temp).
-    let mut info_dev = stream.alloc_zeros::<i32>(1).map_err(Error::Cuda)?;
-    solver.zgetrs(
-        cublasOperation_t::CUBLAS_OP_N,
-        nte,
-        n_bands,
-        &vnl_data.lu_m,
-        &vnl_data.lu_ipiv,
-        &mut temp,
-        &mut info_dev,
-    )?;
-
-    // 3. hpsi −= B · x  (accumulate with α = −1)
-    unsafe {
-        blas.gemm_c64(
-            ZgemmConfig {
-                transa: blas::op::N,
-                transb: blas::op::N,
-                m: n_pw,
-                n: n_bands,
-                k: nte,
-                alpha: CudaComplex { x: -1.0, y: 0.0 },
-                lda: n_pw,
-                ldb: nte,
-                beta: CudaComplex { x: 1.0, y: 0.0 },
-                ldc: n_pw,
-            },
-            &vnl_data.b_concat,
-            &temp,
-            hpsi_dev,
-        )?;
-    }
-
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
 // S operator (USPP overlap)
 // ---------------------------------------------------------------------------
 
@@ -534,98 +448,3 @@ pub unsafe fn apply_s_times(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// S⁻¹·S identity diagnostic
-// ---------------------------------------------------------------------------
-
-#[doc(hidden)]
-pub fn check_s_inv_s_identity(
-    psi_host: &[num_complex::Complex64],
-    n_pw: usize,
-    vnl_data: &VnlBatchData,
-    blas: &BlasHandle,
-    stream: &Arc<CudaStream>,
-    solver: &SolverHandle,
-) -> Result<f64, Error> {
-    use crate::device::blas::op;
-    let n = n_pw as i32;
-    let psi_cuda: Vec<CudaComplex> = psi_host
-        .iter()
-        .map(|&c| CudaComplex { x: c.re, y: c.im })
-        .collect();
-    let psi_dev: CudaSlice<CudaComplex> = stream
-        .clone_htod(&psi_cuda).map_err(Error::Cuda)?;
-
-    // 1. Build S·psi = psi + Σ β_g · q_matrix · (β_g^H · psi)
-    let mut spsi_dev: CudaSlice<CudaComplex> =
-        stream.alloc_zeros(n_pw).map_err(Error::Cuda)?;
-    stream.memcpy_dtod(&psi_dev, &mut spsi_dev).map_err(Error::Cuda)?;
-
-    for entry in &vnl_data.entries {
-        let ne = entry.n_expanded;
-
-        // c_proj = β_g^H · psi  (ne × 1)
-        let mut c_proj: CudaSlice<CudaComplex> =
-            stream.alloc_zeros(ne as usize).map_err(Error::Cuda)?;
-        unsafe {
-            blas.gemv_c64(
-                op::C, n, ne,
-                CudaComplex { x: 1.0, y: 0.0 },
-                &entry.beta_g, n,
-                &psi_dev, 1,
-                CudaComplex { x: 0.0, y: 0.0 },
-                &mut c_proj, 1,
-            ).map_err(Error::Blas)?;
-        }
-
-        // temp = q_matrix · c_proj  (ne × 1)
-        let mut temp: CudaSlice<CudaComplex> =
-            stream.alloc_zeros(ne as usize).map_err(Error::Cuda)?;
-        unsafe {
-            blas.gemv_c64(
-                op::N, ne, ne,
-                CudaComplex { x: 1.0, y: 0.0 },
-                &entry.q_matrix, ne,
-                &c_proj, 1,
-                CudaComplex { x: 0.0, y: 0.0 },
-                &mut temp, 1,
-            ).map_err(Error::Blas)?;
-        }
-
-        // spsi += β_g · temp  (n_pw × 1)
-        unsafe {
-            blas.gemv_c64(
-                op::N, n, ne,
-                CudaComplex { x: 1.0, y: 0.0 },
-                &entry.beta_g, n,
-                &temp, 1,
-                CudaComplex { x: 1.0, y: 0.0 },
-                &mut spsi_dev, 1,
-            ).map_err(Error::Blas)?;
-        }
-    }
-
-    // 2. Apply S⁻¹ to spsi, then D2H
-    let mut spsi_pw = PwCoefficients(spsi_dev);
-    unsafe {
-        apply_s_inverse()
-            .hpsi_dev(&mut spsi_pw)
-            .vnl_data(vnl_data)
-            .n_bands(1)
-            .n_pw(n)
-            .blas(blas)
-            .stream(stream)
-            .solver(solver)
-            .call()?;
-    }
-    let result: Vec<CudaComplex> = stream.clone_dtoh(&*spsi_pw).map_err(Error::Cuda)?;
-    let max_residual = psi_host.iter().zip(result.iter())
-        .map(|(&p, &r)| {
-            let dr = r.x - p.re;
-            let di = r.y - p.im;
-            (dr * dr + di * di).sqrt()
-        })
-        .fold(0.0_f64, f64::max);
-
-    Ok(max_residual)
-}
