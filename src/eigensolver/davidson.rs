@@ -1343,9 +1343,6 @@ pub(crate) unsafe fn davidson_diagonalise(
         davidson_diag!("[davidson] block loop: nblock={nblock} superspace_size={superspace_size}");
 
         // ---- Conduction state buffers (CASTEP hamiltonian.f90:392-401) ----
-        // After each block's inner loop, higher eigenstates from ZHEGVD
-        // (positions current_nblock..superspace_index in super_wvfn) are
-        // saved and reused as initial search directions for the next block.
         let mut cond_wvfn = PwCoefficients::new(
             stream.alloc_zeros(super_alloc).map_err(Error::Cuda)?);
         let mut cond_h_wvfn = PwCoefficients::new(
@@ -1537,7 +1534,7 @@ pub(crate) unsafe fn davidson_diagonalise(
             // borrow conflicts — device_ptr_mut needs &mut self on CudaSlice.
             let mut block_ctx = DavidsonBlockCtx::new(
                 &psi_dev, &hpsi_dev, n_bands, &eigenvalues,
-                block_start, ncol, n_pw, n_pw_i32,
+                block_start, n_pw, n_pw_i32,
                 grid_size, inv_ntotal, superspace_max_bands,
                 &r_vector, tpa_preconditioner, vnl_data,
                 blas, stream, handle,
@@ -1564,9 +1561,8 @@ pub(crate) unsafe fn davidson_diagonalise(
                 // (1) Save previous eigenvalues for convergence tracking
                 // CASTEP hamiltonian.f90:427 — use ORIGINAL band indices
                 // via active_indices mapping (compacted→original block position).
-                for b in 0..ncol {
-                    previous_eigenvalues[b] =
-                        eigenvalues[block_start + active_indices[b]];
+                for (ci, gi) in active_bands(&active_indices, block_start) {
+                    previous_eigenvalues[ci] = eigenvalues[gi];
                 }
 
                 // (2)-(7) Build search directions: preconditioner → S-orth → S-orthonorm → H·search
@@ -1787,14 +1783,14 @@ pub(crate) unsafe fn davidson_diagonalise(
                     let (super_ptr, _) = super_wvfn.device_ptr(stream);
                     let (h_super_ptr, _) = h_super_wvfn.device_ptr(stream);
 
-                    for i in 0..current_nblock {
-                        let dst_off = (block_start + active_indices[i]) * n_pw;
+                    for (ci, gi) in active_bands(&active_indices, block_start) {
+                        let dst_off = gi * n_pw;
                         cublasZcopy_v2(handle, n_pw_i32,
-                            (super_ptr as *const CudaComplex).add(i * n_pw) as *const _, 1,
+                            (super_ptr as *const CudaComplex).add(ci * n_pw) as *const _, 1,
                             psi_dev_raw.add(dst_off) as *mut _, 1,
                         ).result().map_err(Error::Blas)?;
                         cublasZcopy_v2(handle, n_pw_i32,
-                            (h_super_ptr as *const CudaComplex).add(i * n_pw) as *const _, 1,
+                            (h_super_ptr as *const CudaComplex).add(ci * n_pw) as *const _, 1,
                             hpsi_dev_raw.add(dst_off) as *mut _, 1,
                         ).result().map_err(Error::Blas)?;
                     }
@@ -1802,8 +1798,8 @@ pub(crate) unsafe fn davidson_diagonalise(
 
                 // Update eigenvalues for current block (raw ptr bypasses block_ctx borrow)
                 // active_indices maps super_wvfn column → original global band position.
-                for i in 0..current_nblock {
-                    unsafe { *eig_ptr.add(block_start + active_indices[i]) = inner_eigenvalues[i]; }
+                for (ci, gi) in active_bands(&active_indices, block_start) {
+                    unsafe { *eig_ptr.add(gi) = inner_eigenvalues[ci]; }
                 }
                 davidson_diag!(
                     "[davidson]     inner iter {_inner_iter} eig: [{:.6}, ..., {:.6}]",
@@ -1815,10 +1811,9 @@ pub(crate) unsafe fn davidson_diagonalise(
                 // active_indices maps compacted workspace column → original
                 // global band position; eigenvalues/band_converged use original indices.
                 let mut inner_all_stopped = true;
-                for i in 0..current_nblock {
-                    let global_idx = block_start + active_indices[i];
-                    let prev_eig = previous_eigenvalues[i];
-                    let new_eig = eigenvalues[global_idx];
+                for (ci, gi) in active_bands(&active_indices, block_start) {
+                    let prev_eig = previous_eigenvalues[ci];
+                    let new_eig = eigenvalues[gi];
                     let delta_e = (prev_eig - new_eig).abs();
                     let eps_guard = 2.0 * new_eig.abs() * f64::EPSILON;
 
@@ -1828,15 +1823,15 @@ pub(crate) unsafe fn davidson_diagonalise(
 
                     // (a) Absolute tolerance
                     if delta_e < tol_abs.max(eps_guard) {
-                        if !opt_stop_condition[i] {
+                        if !opt_stop_condition[ci] {
                             band_conv = true;
                         }
                     }
 
                     // (b) Relative break condition (CASTEP hamiltonian.f90:563-589)
                     if _inner_iter == 0 {
-                        break_cond_tols[global_idx] = delta_e;
-                    } else if tol_rel > 0.0 && delta_e < break_cond_tols[global_idx] * tol_rel {
+                        break_cond_tols[gi] = delta_e;
+                    } else if tol_rel > 0.0 && delta_e < break_cond_tols[gi] * tol_rel {
                         // Relative tolerance: band is both converged AND stopped
                         band_conv = true;
                         band_stopped = true;
@@ -1845,7 +1840,7 @@ pub(crate) unsafe fn davidson_diagonalise(
                         // CASTEP hamiltonian.f90:1217 — skip stagnation detection on
                         // the last outer iteration to avoid trapping the SCF loop.
                         if iteration + 1 < max_outer_iter
-                            && delta_e < break_cond_tols[global_idx] * 0.3
+                            && delta_e < break_cond_tols[gi] * 0.3
                         {
                             band_stopped = true;
                         }
@@ -1861,13 +1856,13 @@ pub(crate) unsafe fn davidson_diagonalise(
 
                     // Store opt_stop_condition for D1 re-check
                     if band_stopped {
-                        opt_stop_condition[i] = true;
+                        opt_stop_condition[ci] = true;
                     } else {
-                        opt_stop_condition[i] = false;
+                        opt_stop_condition[ci] = false;
                     }
 
                     if band_conv {
-                        band_converged[global_idx] = true;
+                        band_converged[gi] = true;
                     }
                     if !band_conv && !band_stopped {
                         inner_all_stopped = false;
@@ -1881,13 +1876,12 @@ pub(crate) unsafe fn davidson_diagonalise(
                 // This ensures bands are only globally marked converged if they
                 // satisfy the strict criterion.
                 if inner_all_stopped {
-                    for i in 0..current_nblock {
-                        let global_idx = block_start + active_indices[i];
-                        band_converged[global_idx] = false;
-                        let prev_eig = previous_eigenvalues[i];
-                        let new_eig = eigenvalues[global_idx];
+                    for (ci, gi) in active_bands(&active_indices, block_start) {
+                        band_converged[gi] = false;
+                        let prev_eig = previous_eigenvalues[ci];
+                        let new_eig = eigenvalues[gi];
                         if (prev_eig - new_eig).abs() < tol_abs {
-                            band_converged[global_idx] = true;
+                            band_converged[gi] = true;
                         }
                     }
                     davidson_diag!(
@@ -2002,7 +1996,6 @@ pub(crate) unsafe fn davidson_diagonalise(
                         );
                         ncol = j;
                         current_nblock = j;
-                        block_ctx.ncol = j;
                         block_ctx.active_indices = active_indices.clone();
                         // CASTEP hamiltonian.f90:512 — superspace accumulates.
                         // Higher eigenstates (ncol_old..k_super-1) are untouched
@@ -2819,7 +2812,6 @@ pub(crate) unsafe fn s_orthonormalise(
 struct DavidsonBlockCtx<'a> {
     // --- Block dimensions ---
     block_start: usize,
-    ncol: usize,
     n_pw: usize,
     n_pw_i32: i32,
     grid_size: usize,
@@ -2858,6 +2850,28 @@ struct DavidsonBlockCtx<'a> {
     s_orth_out: PwCoefficients,
 }
 
+/// Iterator over active (unconverged) bands in a Davidson block.
+///
+/// Yields `(compacted_col, global_band_index)` pairs, where `compacted_col`
+/// is the position in the compacted workspace (`0..active_indices.len()`)
+/// and `global_band_index = block_start + active_indices[compacted_col]`
+/// is the original global band position.
+///
+/// This replaces manual `block_start + active_indices[i]` indexing, which
+/// is a proven defect vector (see compaction index bug fix):
+/// `block_start + i` is NOT the same as `block_start + active_indices[i]`
+/// after compaction removes converged bands from the active set.
+#[inline]
+fn active_bands(
+    active_indices: &[usize],
+    block_start: usize,
+) -> impl Iterator<Item = (usize, usize)> + '_ {
+    active_indices
+        .iter()
+        .enumerate()
+        .map(move |(ci, &orig_idx)| (ci, block_start + orig_idx))
+}
+
 impl<'a> DavidsonBlockCtx<'a> {
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -2866,7 +2880,6 @@ impl<'a> DavidsonBlockCtx<'a> {
         n_bands_total: usize,  // total n_bands (for full eigenvector S-orth)
         eigenvalues: &'a [f64],
         block_start: usize,
-        ncol: usize,
         n_pw: usize,
         n_pw_i32: i32,
         grid_size: usize,
@@ -2887,9 +2900,9 @@ impl<'a> DavidsonBlockCtx<'a> {
         q_rcq: Option<&'a Array2<Complex64>>,
         active_indices: Vec<usize>,
     ) -> Result<Self, Error> {
+        let ncol = active_indices.len();
         Ok(Self {
             block_start,
-            ncol,
             n_pw,
             n_pw_i32,
             grid_size,
@@ -2936,6 +2949,17 @@ impl<'a> DavidsonBlockCtx<'a> {
         &self.search_dev
     }
 
+    /// Convenience accessor: global band index for a compacted column.
+    ///
+    /// `compacted_col` is a position `0..active_indices.len()` in the
+    /// compacted workspace.  Returns the original global band index
+    /// `block_start + active_indices[compacted_col]`.
+    #[inline]
+    fn global_band(&self, compacted_col: usize) -> usize {
+        debug_assert!(compacted_col < self.active_indices.len());
+        self.block_start + self.active_indices[compacted_col]
+    }
+
     /// Run the full search-direction pipeline for one inner iteration.
     ///
     /// Stages:
@@ -2969,14 +2993,13 @@ impl<'a> DavidsonBlockCtx<'a> {
             let (psi_ptr, _) = self.psi_dev.device_ptr(self.stream);
             let (block_psi_mut, _) = self.block_psi_temp.device_ptr_mut(self.stream);
 
-            for i in 0..self.ncol {
-                let b = self.block_start + i;
+            for (ci, gi) in active_bands(&self.active_indices, self.block_start) {
                 cublasZcopy_v2(
                     self.handle,
                     self.n_pw_i32,
-                    (psi_ptr as *const CudaComplex).add(b * self.n_pw) as *const _,
+                    (psi_ptr as *const CudaComplex).add(gi * self.n_pw) as *const _,
                     1,
-                    (block_psi_mut as *mut CudaComplex).add(i * self.n_pw) as *mut _,
+                    (block_psi_mut as *mut CudaComplex).add(ci * self.n_pw) as *mut _,
                     1,
                 )
                 .result()
@@ -2991,7 +3014,7 @@ impl<'a> DavidsonBlockCtx<'a> {
                     .kinetic_dev(self.kinetic_dev)
                     .fft_idx_dev(self.fft_idx_dev)
                     .n_pw(self.n_pw)
-                    .n_bands(self.ncol)
+                    .n_bands(self.active_indices.len())
                     .grid_size(self.grid_size)
                     .inv_ntotal(self.inv_ntotal)
                     .fft_plan(self.fft_plan)
@@ -3015,8 +3038,8 @@ impl<'a> DavidsonBlockCtx<'a> {
             let eig_block_cpu: Vec<f64> = {
                 let (block_psi_ptr, _) = self.block_psi_temp.device_ptr(self.stream);
                 let (block_hpsi_ptr, _) = self.block_hpsi_temp.device_ptr(self.stream);
-                let mut rqs = Vec::with_capacity(self.ncol);
-                for i in 0..self.ncol {
+                let mut rqs = Vec::with_capacity(self.active_indices.len());
+                for i in 0..self.active_indices.len() {
                     let psi_col =
                         (block_psi_ptr as *const CudaComplex).add(i * self.n_pw);
                     let hpsi_col =
@@ -3079,7 +3102,7 @@ impl<'a> DavidsonBlockCtx<'a> {
                 let has_anomaly = eig_block_cpu.iter().any(|e| e.abs() > 1e10 || e.is_nan());
                 if has_anomaly {
                     eprintln!("[Diag-D9] ANOMALY detected in eigenvalues — dumping per-band psi/hpsi norms:");
-                    for i in 0..self.ncol {
+                    for i in 0..self.active_indices.len() {
                         let pcol = (psi_ptr as *const CudaComplex).add(i * self.n_pw);
                         let hcol = (hpsi_ptr as *const CudaComplex).add(i * self.n_pw);
                         let mut p_nrm = CudaComplex { x: 0.0, y: 0.0 };
@@ -3119,7 +3142,7 @@ impl<'a> DavidsonBlockCtx<'a> {
                 .eigenvalues(&self.eig_block_dev)
                 .r_vector(self.r_vector)
                 .tpa_preconditioner(self.tpa_preconditioner)
-                .n_bands(self.ncol)
+                .n_bands(self.active_indices.len())
                 .n_pw(self.n_pw)
                 .stream(self.stream)
                 .vnl_data(self.vnl_data)
@@ -3166,7 +3189,7 @@ impl<'a> DavidsonBlockCtx<'a> {
         // normalize to S-norm=1 anyway — we just do it early.
         {
             let (s_ptr, _) = self.search_dev.device_ptr(self.stream);
-            for b in 0..self.ncol {
+            for b in 0..self.active_indices.len() {
                 let col = (s_ptr as *const CudaComplex).add(b * self.n_pw);
                 let mut nrm2 = CudaComplex { x: 0.0, y: 0.0 };
                 cublasZdotc_v2(self.handle, self.n_pw_i32,
@@ -3185,8 +3208,8 @@ impl<'a> DavidsonBlockCtx<'a> {
         }
 
         // --- Stage 3: Superspace bounds ---
-        if *superspace_index + self.ncol > self.superspace_max_bands {
-            *superspace_index = self.ncol;
+        if *superspace_index + self.active_indices.len() > self.superspace_max_bands {
+            *superspace_index = self.active_indices.len();
         }
 
         // --- Stage 3a: S-orthogonalize against ALL eigenvectors ---
@@ -3210,7 +3233,7 @@ impl<'a> DavidsonBlockCtx<'a> {
                         .search_dev(&mut self.search_dev)
                         .super_wvfn(self.psi_dev)
                         .superspace_index(self.n_bands_total)
-                        .ncol(self.ncol)
+                        .ncol(self.active_indices.len())
                         .n_pw(self.n_pw)
                         .n_pw_i32(self.n_pw_i32)
                         .vnl_data(self.vnl_data)
@@ -3278,7 +3301,7 @@ impl<'a> DavidsonBlockCtx<'a> {
             let (s_in_mut, _) = self.s_orth_in.device_ptr_mut(self.stream);
 
             let n_lower = self.block_start.min(10); // sample first 10 lower bands
-            let n_search = self.ncol.min(5);         // sample first 5 search cols
+            let n_search = self.active_indices.len().min(5);         // sample first 5 search cols
             let mut max_overlap: f64 = 0.0;
 
             for si in 0..n_lower {
@@ -3329,7 +3352,7 @@ impl<'a> DavidsonBlockCtx<'a> {
                     .search_dev(&mut self.search_dev)
                     .super_wvfn(&*super_wvfn)
                     .superspace_index(*superspace_index)
-                    .ncol(self.ncol)
+                    .ncol(self.active_indices.len())
                     .n_pw(self.n_pw)
                     .n_pw_i32(self.n_pw_i32)
                     .vnl_data(self.vnl_data)
@@ -3354,12 +3377,12 @@ impl<'a> DavidsonBlockCtx<'a> {
         // amplify it by 1/sqrt(1e-20) = 1e10, injecting extreme values into H_sub
         // and triggering subspace eigenvalue explosion to -10^78.
         // Threshold: S-norm² < 1e-12 (prevents amplification > 1e6×).
-        let mut col_valid = vec![true; self.ncol];
+        let mut col_valid = vec![true; self.active_indices.len()];
         {
             let (search_ptr, _) = self.search_dev.device_ptr(self.stream);
             let (s_in_mut, _) = self.s_orth_in.device_ptr_mut(self.stream);
             let (s_out_mut, _) = self.s_orth_out.device_ptr_mut(self.stream);
-            for j in 0..self.ncol {
+            for j in 0..self.active_indices.len() {
                 let search_j = (search_ptr as *const CudaComplex).add(j * self.n_pw);
                 // Compute S·search_j -> s_orth_out
                 cublasZcopy_v2(self.handle, self.n_pw_i32,
@@ -3406,7 +3429,7 @@ impl<'a> DavidsonBlockCtx<'a> {
         unsafe {
             s_orthonormalise()
                 .search_dev(&mut self.search_dev)
-                .ncol(self.ncol)
+                .ncol(self.active_indices.len())
                 .n_pw(self.n_pw)
                 .n_pw_i32(self.n_pw_i32)
                 .vnl_data(self.vnl_data)
@@ -3426,7 +3449,7 @@ impl<'a> DavidsonBlockCtx<'a> {
                 .kinetic_dev(self.kinetic_dev)
                 .fft_idx_dev(self.fft_idx_dev)
                 .n_pw(self.n_pw)
-                .n_bands(self.ncol)
+                .n_bands(self.active_indices.len())
                 .grid_size(self.grid_size)
                 .inv_ntotal(self.inv_ntotal)
                 .fft_plan(self.fft_plan)
@@ -3479,7 +3502,7 @@ impl<'a> DavidsonBlockCtx<'a> {
             let (h_super_mut, _) = h_super_wvfn.device_ptr_mut(self.stream);
 
             valid_count = 0;
-            for i in 0..self.ncol {
+            for i in 0..self.active_indices.len() {
                 if !col_valid[i] {
                     continue;
                 }
