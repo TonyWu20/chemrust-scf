@@ -266,6 +266,17 @@ fn davidson_hdump_validation() {
         dump_band("band 0", 0);
         dump_band("band 1", n_pw);
         dump_band("band 25", 25 * n_pw);
+        dump_band("band 104", 104 * n_pw);
+    }
+    // Cross-check: reference eigenvalues for bands at FFI dump positions
+    {
+        let ref_eigs = &fx.bands_eigenvalues;
+        eprintln!("[Diag-FFI-ref] reference eig: band   0={:.6} band  25={:.6} band 104={:.6} band 105={:.6}",
+            ref_eigs.get(0).copied().unwrap_or(f64::NAN),
+            ref_eigs.get(25).copied().unwrap_or(f64::NAN),
+            ref_eigs.get(104).copied().unwrap_or(f64::NAN),
+            ref_eigs.get(105).copied().unwrap_or(f64::NAN),
+        );
     }
     let psi = WavefunctionSet::<ColumnDistributed>::new(flat_bands, n_bands, n_pw);
 
@@ -411,7 +422,6 @@ fn davidson_hdump_validation() {
     // Extract results
     // -----------------------------------------------------------------------
     let eigenvalues = wfn_result.eigenvalues().to_vec();
-    let diagnostics = wfn_result.davidson_diagnostics();
 
     // Reference eigenvalues
     let ref_eigs = &fx.bands_eigenvalues;
@@ -513,37 +523,34 @@ fn davidson_hdump_validation() {
     );
 
     // -----------------------------------------------------------------------
-    // C2: max ‖r_b‖_S⁻¹ < 1e-5 Ha
+    // C2: max ‖r_b‖_S⁻¹ < 1e-5 Ha (requires scf_diag feature)
     // -----------------------------------------------------------------------
-    if let Some(diag) = diagnostics {
+    #[cfg(feature = "scf_diag")]
+    if let Some(diag) = wfn_result.davidson_diagnostics() {
         let max_res = diag.max_residual_sinv;
         let n_locked = diag.n_locked;
         let n_unconv = diag.n_unconverged;
 
-        eprintln!(
-            "[hdump] === C2: S⁻¹ residual norms ==="
-        );
-        eprintln!(
-            "[hdump]   max_residual_sinv = {:.6e} Ha",
-            max_res,
-        );
-        eprintln!(
-            "[hdump]   n_locked = {n_locked}, n_unconverged = {n_unconv}",
-        );
-        eprintln!(
-            "[hdump]   C2 criterion: max_res < {C2_RESIDUAL_TOL_HA:.0e} Ha  →  {}",
-            if max_res < C2_RESIDUAL_TOL_HA { "PASS" } else { "FAIL" },
-        );
+        eprintln!("[hdump] === C2: S⁻¹ residual norms ===");
+        eprintln!("[hdump]   max_residual_sinv = {:.6e} Ha", max_res);
+        eprintln!("[hdump]   n_locked = {n_locked}, n_unconverged = {n_unconv}");
+        eprintln!("[hdump]   C2 criterion: max_res < {C2_RESIDUAL_TOL_HA:.0e} Ha  →  {}",
+            if max_res < C2_RESIDUAL_TOL_HA { "PASS" } else { "FAIL" });
 
-        // C2 assertion — single-iteration USPP residual floor ~2.1e-3 Ha
         assert!(
             max_res < C2_RESIDUAL_TOL_HA,
             "C2 FAIL: max ‖r_b‖_S⁻¹ = {:.6e} Ha exceeds {C2_RESIDUAL_TOL_HA:.0e} Ha",
             max_res,
         );
-    } else {
+    }
+    #[cfg(feature = "scf_diag")]
+    if wfn_result.davidson_diagnostics().is_none() {
         eprintln!("[hdump] C2: Davidson diagnostics not available (Chebyshev path may have been used instead)");
         eprintln!("[hdump] C2: SKIPPED (no diagnostic data)");
+    }
+    #[cfg(not(feature = "scf_diag"))]
+    {
+        eprintln!("[hdump] C2: SKIPPED (requires scf_diag feature)");
     }
 
     // -----------------------------------------------------------------------
@@ -670,14 +677,17 @@ fn davidson_hdump_validation() {
     eprintln!("[hdump]   C1 (eigenvalues):    max|Δ| = {:.4e} Ha  (tol={EIGVAL_TOL_HA:.0e})",
         max_eig_diff,
     );
+    #[cfg(feature = "scf_diag")]
     eprintln!(
         "[hdump]   C2 (residuals):       {}",
-        if let Some(d) = diagnostics {
+        if let Some(d) = wfn_result.davidson_diagnostics() {
             format!("max_res = {:.4e} Ha  (tol={TOL_ABS_HA:.0e})", d.max_residual_sinv)
         } else {
             "N/A (no diagnostics)".to_string()
         },
     );
+    #[cfg(not(feature = "scf_diag"))]
+    eprintln!("[hdump]   C2 (residuals):       SKIPPED (requires scf_diag feature)");
     eprintln!("[hdump] ==================================================");
 
     unsafe {

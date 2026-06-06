@@ -354,6 +354,21 @@ unsafe fn step_inner(
             psi_b25[4].re, psi_b25[4].im,
         );
     }
+    // Verify psi data at FFI boundary for mid-band (band 104 0-based)
+    // BEFORE any processing by WavefunctionSet/Gpu::from_host
+    {
+        let psi_band104 = &psi_host[104 * n_pw..105 * n_pw];
+        let l2sq: f64 = psi_band104.iter().map(|c| c.norm_sqr()).sum();
+        eprintln!("[Diag-FFI-raw] band 104 (0-based): L2²={:.6e} first5=[({:+.6e},{:+.6e}), ({:+.6e},{:+.6e}), ({:+.6e},{:+.6e}), ({:+.6e},{:+.6e}), ({:+.6e},{:+.6e})]",
+            l2sq,
+            psi_band104[0].re, psi_band104[0].im,
+            psi_band104[1].re, psi_band104[1].im,
+            psi_band104[2].re, psi_band104[2].im,
+            psi_band104[3].re, psi_band104[3].im,
+            psi_band104[4].re, psi_band104[4].im,
+        );
+    }
+
     let wfn = WavefunctionSet::<ColumnDistributed>::new(psi_host, n_bands, n_pw);
     let psi_gpu = Gpu::from_host(&wfn, &h.stream).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
 
