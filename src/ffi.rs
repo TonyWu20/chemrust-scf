@@ -51,7 +51,16 @@ fn fft_idx_to_coord(idx_1based: i32, ngx: i32, ngy: i32, ngz: i32) -> [i32; 3] {
 // ---- Per-k-point precomputed data ------------------------------------------
 
 struct KptData {
-    vnl: VnlBatchData,
+    /// Fractional k-point coordinates [kx, ky, kz].
+    /// Used for gamma-point detection (all coords zero → DSYEVD path).
+    kpoint_frac: [f64; 3],
+    /// k-point descriptor (coords only; pw_coords stored separately).
+    k_point: KPoint,
+    /// Plane-wave Miller indices for this k-point.
+    pw_coords: Vec<[i32; 3]>,
+    /// Lazily-initialised V_NL batch data.  Created on the first call to
+    /// step_inner with the REAL psi and n_bands — never dummy values.
+    vnl: Option<VnlBatchData>,
 }
 
 // ---- Opaque handle ---------------------------------------------------------
@@ -68,6 +77,13 @@ struct ChemrustHandle {
     v_eff_cached: Option<CudaSlice<f64>>,
     /// Max-norm of the cached V_eff, used for change detection.
     v_eff_norm: f64,
+    /// Shared across k-points: pseudopotentials, cell geometry, wave grid.
+    /// Stored here so that VnlBatchData can be created in step_inner
+    /// (where real psi/n_bands are available) instead of init_inner
+    /// (where they are not).
+    pots: PseudopotentialSet,
+    cell: CellGeometry,
+    wave_grid: GVectorGrid,
 }
 
 // ---- Init ------------------------------------------------------------------
@@ -156,6 +172,8 @@ fn init_inner(
     let _gv = unsafe { std::slice::from_raw_parts(gvec_all_kpt as *const f64, 3*maxpw*nk) };
     let gidx = unsafe { std::slice::from_raw_parts(pw_grid_idx as *const i32, maxpw*nk) };
 
+    let wg = GVectorGrid::new(ngx as usize, ngy as usize, ngz as usize, RecipLattice::from_inner(rcip));
+
     let mut kpts = Vec::with_capacity(nk);
     for ik in 0..nk {
         let n_pw = npwk[ik] as usize;
@@ -213,24 +231,26 @@ fn init_inner(
                 ik, max_err, n_check);
         }
 
-        let wg = GVectorGrid::new(ngx as usize, ngy as usize, ngz as usize, RecipLattice::from_inner(rcip));
-        let psi_dummy = vec![num_complex::Complex64::new(0.0, 0.0); n_pw];
-        let mut pcie = PcieAccount::default();
-
-        let vnl = VnlBatchData::precompute(
-            &pw_coords, &pots, &cell, &wg, &kpt,
-            &psi_dummy, 1, n_pw, None, None,
-            &stream, &mut pcie, &blas, &kernels, &solver,
-        ).map_err(|e| { eprintln!("[chemrust] precompute kpt {ik} failed: {e}"); CHEM_EIG_CUDA_ERROR })?;
-
-        kpts.push(KptData { vnl });
+        // VnlBatchData is deferred to step_inner where real psi/n_bands are
+        // available.  Store only the ion-independent per-k-point data here.
+        kpts.push(KptData {
+            vnl: None,
+            kpoint_frac: kf,
+            k_point: kpt,
+            pw_coords,
+        });
     }
 
+    let pots_clone = pots.clone();
+    let cell_clone = cell.clone();
     Ok(Box::into_raw(Box::new(ChemrustHandle {
         ctx, stream, blas, solver, kernels,
         ngx, ngy, ngz, kpts,
         v_eff_cached: None,
         v_eff_norm: 0.0,
+        pots: pots_clone,
+        cell: cell_clone,
+        wave_grid: wg,
     })))
 }
 
@@ -285,6 +305,10 @@ unsafe fn step_inner(
     let n_bands_i32 = n_bands as i32;
     let inv_ntotal = 1.0 / gs as f64;
     let kd = &mut h.kpts[ik];
+
+    // Gamma-point detection: all fractional coords near zero → DSYEVD path.
+    // Matches CASTEP hamiltonian.f90:480 — super_wvfn%have_gamma.
+    let have_gamma = kd.kpoint_frac.iter().all(|&c| c.abs() < 1e-12);
 
     // Use CASTEP-provided kinetic energies (pw_ek_data = 0.5*|G+k|^2)
     let ke_castep: Vec<f64> = unsafe { std::slice::from_raw_parts(kinetic_data, n_pw) }.to_vec();
@@ -367,6 +391,18 @@ unsafe fn step_inner(
             psi_band104[3].re, psi_band104[3].im,
             psi_band104[4].re, psi_band104[4].im,
         );
+    }
+
+    // Lazily initialise VnlBatchData on the first call to step_inner, where
+    // real psi and n_bands are available.  init_inner cannot create this
+    // because CASTEP doesn't pass wavefunctions at init time.
+    if kd.vnl.is_none() {
+        let mut pcie = PcieAccount::default();
+        kd.vnl = Some(VnlBatchData::precompute(
+            &kd.pw_coords, &h.pots, &h.cell, &h.wave_grid, &kd.k_point,
+            &psi_host, n_bands, n_pw, None, None,
+            &h.stream, &mut pcie, &h.blas, &h.kernels, &h.solver,
+        ).map_err(|e| { eprintln!("[chemrust] VnlBatchData init failed: {e}"); CHEM_EIG_CUDA_ERROR })?);
     }
 
     let wfn = WavefunctionSet::<ColumnDistributed>::new(psi_host, n_bands, n_pw);
@@ -479,7 +515,7 @@ unsafe fn step_inner(
     // D-screening computes ∫Q·V_eff at ion positions — it needs the
     // physical (x,y,z) grid layout, not the transposed FFT layout.
     let veff_original = EffectivePotential(FineGridArray(arr_ix_fast.clone()));
-    kd.vnl.rescreen_d(veff_original.as_fine_array(), &h.stream, &h.kernels, &h.blas)
+    kd.vnl.as_mut().unwrap().rescreen_d(veff_original.as_fine_array(), &h.stream, &h.kernels, &h.blas)
         .map_err(|e| { eprintln!("[chemrust] D re-screen failed: {e}"); CHEM_EIG_CUDA_ERROR })?;
 
     // Upload FFT index.  CASTEP passes 1-based Fortran grid indices with
@@ -551,7 +587,7 @@ unsafe fn step_inner(
             .v_eff_dev(v_eff_gpu.as_device_slice())
             .kinetic_dev(&kinetic_dev)
             .fft_idx_dev(&fft_idx_dev)
-            .vnl_data(&kd.vnl)
+            .vnl_data(kd.vnl.as_ref().unwrap())
             .n_pw(n_pw)
             .n_bands(n_bands)
             .grid_size(gs)
@@ -566,6 +602,7 @@ unsafe fn step_inner(
             .tpa_preconditioner(&tpa)
             .stream(stream)
             .ctx(ctx)
+            .gamma_point(have_gamma)
             .call()
             .map_err(|e| { eprintln!("[chemrust] davidson_diagonalise failed: {e}"); CHEM_EIG_CUDA_ERROR })?
     };
@@ -587,7 +624,7 @@ unsafe fn step_inner(
             .fft_plan(&fft_plan)
             .hpsi_dev(&mut hpsi_new)
             .grid_dev(&mut grid_buf)
-            .vnl_data(&kd.vnl)
+            .vnl_data(kd.vnl.as_ref().unwrap())
             .blas(blas)
             .kernels(kernels)
             .stream(stream)
