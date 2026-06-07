@@ -1,6 +1,7 @@
 # ADR-0004: Compaction Index Mapping — Iterator-Based Access
 
 **Date:** 2026-06-05
+**Revised:** 2026-06-08 (add `block_bands()` for append-only super_wvfn access)
 **Status:** Accepted
 
 ## Context
@@ -31,16 +32,34 @@ produced silent corruption that the compiler could not catch.
 
 ## Decision
 
-Access to global band indices after compaction goes through a **canonical
-`active_bands()` iterator**. Direct arithmetic on `block_start` for band indexing
-is banned inside `DavidsonBlockCtx::build()`.
+### Two iterators for two data structures
+
+After C3-07 (separate slice workspace, `INNER_LOOP_CHECKLIST_20260606.md` §Component 15),
+there are TWO distinct workspace buffers with fundamentally different indexing:
+
+| Buffer | Compacted? | Iterator | Mapping |
+|--------|-----------|----------|---------|
+| **slice_wvfn** | Yes (compacted after convergence) | `active_bands()` | compacted col `ci` → global band `block_start + active_indices[ci]` |
+| **super_wvfn** | No (append-only, never compacted) | `block_bands()` | column `col` → global band `block_start + col` |
+
+**`super_wvfn` is append-only.** C3-07's slice workspace means compaction copies
+FROM super_wvfn INTO slice without modifying super_wvfn. ZHEGVD eigenvectors are
+always sorted by eigenvalue — position `col` always corresponds to the `col`-th
+lowest energy band in the block. This is the natural `1:1` sequential mapping.
+
+### `active_bands()` — for compacted workspace (slice) access
 
 ```rust
 /// Map compacted workspace column positions to global band indices.
 ///
 /// Yields `(compacted_col, global_band_index)`.  This is the ONLY place
-/// that computes `block_start + active_indices[ci]` — all call sites
-/// destructure the iterator result.
+/// that computes `block_start + active_indices[ci]`.
+///
+/// **Use when:** accessing global arrays (psi_dev, eigenvalues,
+/// band_converged) from compacted workspace columns (slice_wvfn).
+/// **Do NOT use for:** super_wvfn access — super_wvfn is append-only
+/// and column `col` always maps to band `block_start + col` (use
+/// block_bands() instead).
 #[inline]
 fn active_bands(
     active_indices: &[usize],
@@ -53,52 +72,113 @@ fn active_bands(
 }
 ```
 
-All call sites convert from the fragile pattern:
+### `block_bands()` — for append-only (super_wvfn) access
+
 ```rust
-// BEFORE (two known bugs in this family):
+/// Sequential band iterator for append-only super_wvfn access.
+///
+/// Yields `(column, global_band_index)` for ALL current_nblock bands
+/// using the natural 1:1 mapping: column `col` → band `block_start + col`.
+///
+/// **Use when:** copying between super_wvfn and psi_dev (Stage 1, A3).
+/// super_wvfn is NEVER compacted — ZHEGVD eigenvectors at position col
+/// always correspond to the col-th lowest energy band in the block.
+/// Sequential mapping is correct regardless of compaction state.
+///
+/// **Do NOT use for:** compacted workspace (slice) access — use
+/// active_bands() which maps through active_indices.
+#[inline]
+fn block_bands(
+    block_start: usize,
+    current_nblock: usize,
+) -> impl Iterator<Item = (usize, usize)> {
+    (0..current_nblock).map(move |col| (col, block_start + col))
+}
+```
+
+### Call-site conversion rules
+
+For **compacted workspace** (slice, active bands only):
+```rust
+// BEFORE:
 for i in 0..ncol {
     let global_idx = block_start + active_indices[i];
 }
-```
-to the structural pattern:
-```rust
-// AFTER (compiler-enforced correctness):
+// AFTER:
 for (ci, gi) in active_bands(&active_indices, block_start) {
-    // ci: compacted workspace column — safe for local buffers
+    // ci: compacted workspace column — safe for slice indexing
     // gi: global band index         — safe for psi_dev, eigenvalues, etc.
+}
+```
+
+For **append-only superspace** (super_wvfn, all current_nblock bands):
+```rust
+// BEFORE:
+for i in 0..current_nblock {
+    let gi = block_start + i;
+}
+// AFTER:
+for (col, gi) in block_bands(block_start, current_nblock) {
+    // col: super_wvfn column — safe for super_wvfn/h_super_wvfn indexing
+    // gi: global band index   — safe for psi_dev, eigenvalues, etc.
 }
 ```
 
 ### Accompanying structural changes
 
 1. **`ncol` field eliminated from `DavidsonBlockCtx`.** It was always equal to
-   `active_indices.len()` by construction (lines 2002-2003 update both atomically).
-   Deriving it from the vector length eliminates a drift risk.
+   `active_indices.len()` by construction. Deriving it from the vector length
+   eliminates a drift risk.
 
-2. **Free function, not a method.** `active_bands()` is a module-level function
-   so it serves both `DavidsonBlockCtx::build()` (which has `self.active_indices`)
-   and the outer loop in `davidson_diagonalise` (which has a local `active_indices`
-   variable).
+2. **Free functions, not methods.** Both `active_bands()` and `block_bands()` are
+   module-level functions so they serve both `DavidsonBlockCtx::build()` and the
+   outer loop in `davidson_diagonalise`.
 
-3. **All outer-loop call sites converted.** Five sites in `davidson_diagonalise`
-   that computed `block_start + active_indices[i]` manually were converted to
-   the iterator, despite being currently correct — the same pattern of
-   "looks fine at the time" preceded both known bugs.
+3. **All outer-loop call sites converted.** Sites accessing compacted data use
+   `active_bands()`; sites accessing append-only super_wvfn use `block_bands()`.
+
+## Regression: 2026-06-08 (workflow audit commit `fce7fae`)
+
+A 5-agent adversarial workflow incorrectly applied `active_bands()` to Stage 1 and
+A3 — both of which copy between super_wvfn (append-only) and psi_dev (global). The
+correct iterator is `block_bands()` because super_wvfn is never compacted.
+
+**Symptoms:**
+- Block 130 eigenvalue explosion to -10^52 Ha (D10-01 H_sub discrepancy: 3×10^53)
+- Bands 97–116 spuriously un-converged in outer iteration 1 (eigenvalue changes up
+  to 0.012 Ha vs correct values)
+- Convergence degraded from clean 160/160 in 2 iterations to full numerical collapse
+
+**Root cause:** `active_bands()` maps through `active_indices` — after compaction
+the first active band may be at `active_indices[0] = 7`. `active_bands()` writes
+ZHEGVD eigenvector 0 (lowest energy, for band 104) to global band
+`block_start + 7 = 111`, scrambling the eigenvalue→band mapping. This corrupts
+`psi_dev` and `eigenvalues`, contaminating subsequent blocks via conduction state
+seeding and causing cascading eigenvalue explosion.
+
+**Lesson:** CASTEP-faithful implementation decisions (sequential A3, append-only
+super_wvfn) recorded in `INNER_LOOP_CHECKLIST_20260606.md` as VERIFIED/FIXED must
+NEVER be reverted. Future automation/agents must treat that checklist as an
+authoritative constraint — "this matches CASTEP" is a permanent invariant, not a
+negotiable design choice.
 
 ## Consequences
 
-- **Positive:** The compaction-index bug class is structurally eliminated. A new
-  call site that needs a global band index must use the iterator; the `(ci, gi)`
-  destructure makes it obvious which is which.
+- **Positive:** The compaction-index bug class is structurally eliminated.
 - **Positive:** `ncol` and `active_indices` can no longer drift apart.
-- **Positive:** The iterator's `#[inline]` on `enumerate().map()` compiles to
-  identical machine code as manual indexing — zero runtime cost.
-- **Negative:** Minor churn converting existing (correct) call sites.
-- **Negative:** The `global_band()` convenience method on `DavidsonBlockCtx` was
-  added alongside the iterator but has zero call sites — dead code to clean up.
+- **Positive:** The two-iterator design (`active_bands` vs `block_bands`) makes
+  the data structure semantics explicit at every call site — `(ci, gi)` signals
+  "compacted workspace → global", `(col, gi)` signals "append-only superspace → global".
+- **Positive:** Zero runtime cost — `#[inline]` on `Iterator::map()` compiles to
+  identical machine code as manual indexing.
+- **Negative:** Applying the wrong iterator (e.g., `active_bands` to super_wvfn)
+  causes catastrophic eigenvalue explosion. The structural pattern eliminates
+  *forgetting* the mapping but doesn't prevent *choosing the wrong mapping*.
+  Mitigation: checklist explicitly records which iterator each call site uses.
 
 ## Related
 
 - [Memory: Davidson compaction index bug](../../../castep-rust-eigensolve/memory/davidson-compaction-index-bug.md)
-- [Debug session: debug-20260605-1220](../../../notes/debug/debug-20260605-1220/)
-- CASTEP reference: `hamiltonian.f90:628-646` (compaction), `hamiltonian.f90:392-401` (local slice workspace)
+- [Checklist: INNER_LOOP_CHECKLIST_20260606.md](../../notes/audit/INNER_LOOP_CHECKLIST_20260606.md)
+- C3-07 slice workspace: `hamiltonian.f90:628-646` (compaction to separate slice)
+- CASTEP reference: `hamiltonian.f90:523-528` (A3 sequential copy), `hamiltonian.f90:407-408` (Stage 1 sequential copy)
