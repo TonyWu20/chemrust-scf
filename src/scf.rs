@@ -673,7 +673,7 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
                     .grid_size(grid_size_usize)
                     .inv_ntotal(inv_ntotal)
                     .fft_plan(&fft_plan)
-                    .tol_abs(1e-5)
+                    .tol_abs(1e-8)
                     .max_outer_iter(30)
                     .min_outer_iter(0)
                     .blas(&blas)

@@ -3102,9 +3102,60 @@ pub(crate) unsafe fn s_orthonormalise(
                 ).result().map_err(Error::Blas)?;
             }
 
+            // ---- Verify post-Cholesky S-norms (CASTEP wave.f90:11631-11668) ----
+            // GPU ZPOTRF can return info=0 (success) for near-singular S_overlap
+            // matrices while producing numerically inaccurate Cholesky factors.
+            // CASTEP detects this via algor_invert status and falls back to
+            // per-column Gram-Schmidt with S-normalization.  We do the same:
+            // compute S·search[0] → check ⟨search[0]|S|search[0]⟩ ≈ 1.0.
+            // If the S-norm deviates significantly, the factorization was
+            // inaccurate — fall through to MGS.
+            {
+                let (search_ptr, _) = search_dev.device_ptr(stream);
+                let search_0 = search_ptr as *const CudaComplex;
+                let (s_in_mut, _) = s_orth_in.device_ptr_mut(stream);
+                cublasZcopy_v2(handle, n_pw_i32,
+                    search_0 as *const _, 1,
+                    s_in_mut as *mut _, 1,
+                ).result().map_err(Error::Blas)?;
+                let (s_out_mut, _) = s_orth_out.device_ptr_mut(stream);
+                cublasZcopy_v2(handle, n_pw_i32,
+                    search_0 as *const _, 1,
+                    s_out_mut as *mut _, 1,
+                ).result().map_err(Error::Blas)?;
+                unsafe {
+                    apply_s_times()
+                        .psi_dev(&*s_orth_in)
+                        .spsi_dev(&mut *s_orth_out)
+                        .vnl_data(vnl_data)
+                        .n_bands(1_i32)
+                        .n_pw(n_pw_i32)
+                        .blas(blas)
+                        .stream(stream)
+                        .call()?;
+                }
+                let (s_out_ptr, _) = s_orth_out.device_ptr(stream);
+                let mut snorm = CudaComplex { x: 0.0, y: 0.0 };
+                cublasZdotc_v2(handle, n_pw_i32,
+                    search_0 as *const _, 1,
+                    s_out_ptr as *const _, 1,
+                    &mut snorm as *mut _ as *mut _,
+                ).result().map_err(Error::Blas)?;
+                if (snorm.x - 1.0).abs() > 0.1 {
+                    davidson_diag!(
+                        "[Diag-C6] Cholesky post-check FAIL: S-norm[0]={:.6e} > 0.1 off 1.0, falling back to MGS",
+                        snorm.x
+                    );
+                    // Fall through to MGS below
+                } else {
+                    return Ok(());
+                }
+            }
+
             return Ok(());
         }
-        // Cholesky failed — fall through to Gram-Schmidt fallback
+        // Cholesky failed (ZPOTRF error OR post-check deviation > 0.1)
+        // — fall through to Gram-Schmidt fallback
     }
 
     // ---- Gram-Schmidt fallback (CASTEP wave.f90:11645-11663) ----
