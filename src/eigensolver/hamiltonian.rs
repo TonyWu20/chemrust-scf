@@ -19,6 +19,7 @@ use crate::device::CudaComplex;
 use crate::eigensolver::davidson_types::{
     KineticPreconditioner, PwCoefficients,
 };
+use crate::eigensolver::beta_phi_cache::BetaPhiCache;
 use crate::eigensolver::kernels::CudaKernelSet;
 use crate::eigensolver::vnl_data::VnlBatchData;
 use crate::types::Error;
@@ -205,6 +206,7 @@ pub unsafe fn apply_full_hamiltonian(
     blas: &BlasHandle,
     kernels: &CudaKernelSet,
     stream: &Arc<CudaStream>,
+    mut maybe_beta_phi_cache: Option<&mut BetaPhiCache>,
 ) -> Result<(), Error> {
     unsafe {
         apply_v_loc_hamiltonian()
@@ -227,15 +229,24 @@ pub unsafe fn apply_full_hamiltonian(
             .maybe_blas(Some(blas))
             .call()?;
 
-        apply_v_nl_hamiltonian()
-            .psi_dev(psi_dev)
-            .hpsi_dev(hpsi_dev)
-            .vnl_data(vnl_data)
-            .n_bands(n_bands as i32)
-            .n_pw(n_pw as i32)
-            .blas(blas)
-            .stream(stream)
-            .call()?;
+        {
+            // bon::builder unwraps Option<T> — the setter takes T, not Option<T>.
+            // Conditionally attach the cache so the default (None) is used when
+            // no cache is provided (e.g. for search-direction H applications).
+            let vnl_builder = apply_v_nl_hamiltonian()
+                .psi_dev(psi_dev)
+                .hpsi_dev(hpsi_dev)
+                .vnl_data(vnl_data)
+                .n_bands(n_bands as i32)
+                .n_pw(n_pw as i32)
+                .blas(blas)
+                .stream(stream);
+            if let Some(ref mut cache) = maybe_beta_phi_cache {
+                vnl_builder.maybe_beta_phi_cache(cache).call()?;
+            } else {
+                vnl_builder.call()?;
+            }
+        }
 
         // Diag: |hpsi|² for last band after full H (kinetic+Vloc+VNL)
         #[cfg(feature = "scf_diag")]
@@ -271,7 +282,13 @@ pub(crate) unsafe fn apply_v_nl_hamiltonian(
     n_pw: i32,
     blas: &BlasHandle,
     stream: &Arc<CudaStream>,
+    maybe_beta_phi_cache: Option<&mut BetaPhiCache>,
 ) -> Result<(), Error> {
+    // TODO: Phase 6 — consume maybe_beta_phi_cache.  When the cache is
+    // Some and are_all_valid(), the per-ion β^H·ψ ZGEMM (step 1) can be
+    // skipped and the cached projections used directly.
+    let _ = maybe_beta_phi_cache;
+
     for entry in &vnl_data.entries {
         let ne = entry.n_expanded;
 

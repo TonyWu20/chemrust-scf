@@ -1,5 +1,6 @@
 #[cfg(feature = "chebyshev")]
 pub(crate) mod chebyshev;
+pub(crate) mod beta_phi_cache;
 #[doc(hidden)]
 pub mod davidson_types;
 pub(crate) mod hamiltonian;

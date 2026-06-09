@@ -11,6 +11,7 @@ use cudarc::cusolver::result::CusolverError;
 use cudarc::cusolver::safe::DnHandle;
 use cudarc::cusolver::sys::{
     self as sys, cublasFillMode_t, cublasOperation_t, cusolverEigMode_t,
+    cusolverEigType_t,
 };
 use cudarc::driver::{result::DriverError, CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
 use thiserror::Error;
@@ -655,5 +656,210 @@ mod tests {
             "zgetrs multi-rhs max error = {:.2e} >= 1e-12",
             max_err,
         );
+    }
+
+    /// Synthesis test: cuSOLVER ZPOTRF vs CPU Cholesky on near-singular matrices.
+    ///
+    /// Generates complex Hermitian positive-definite matrices with controlled
+    /// condition numbers and compares whether cuSOLVER ZPOTRF and an independent
+    /// CPU Cholesky both succeed or fail.  This tests the claim that cuSOLVER's
+    /// ZPOTRF is less robust than LAPACK's for near-singular matrices.
+    ///
+    /// The test builds A = Q · diag(λ_i) · Q^H where eigenvalues λ_i are:
+    ///   - First n_big eigenvalues: 1.0
+    ///   - Remaining eigenvalues: ε (controlled → 1/condition_number)
+    /// The condition number is κ = 1/ε.
+    #[test]
+    fn zpotrf_near_singular_cpu_comparison() {
+        let ctx = cudarc::driver::CudaContext::new(0).expect("CUDA context");
+        let stream = ctx.default_stream();
+        let solver = SolverHandle::new(stream.clone()).expect("SolverHandle");
+
+        // Matrix sizes to test — 52, 78, 130, 156 (typical superspace sizes)
+        let sizes = [52, 78, 130, 156];
+        // Condition numbers: κ = 1/ε
+        let conds = [1e8_f64, 1e10, 1e12, 1e14, 1e15, 1e16];
+        // How many "big" eigenvalues (the rest are ε)
+        let n_big_ratios = [0.2_f64, 0.5, 0.8]; // 20%, 50%, 80% big eigenvalues
+
+        let mut summary = Vec::new();
+
+        for &n in &sizes {
+            for &frac in &n_big_ratios {
+                let n_big = (n as f64 * frac).round() as usize;
+                for &cond in &conds {
+                    let eps = 1.0 / cond;
+                    // Build eigenvalues
+                    let mut evals = vec![eps; n];
+                    for i in 0..n_big.min(n) {
+                        evals[i] = 1.0;
+                    }
+
+                    // Build random orthonormal basis Q via QR on random matrix
+                    let mut rng_q: Vec<f64> = (0..(n * n * 2))
+                        .map(|i| {
+                            let x = (i as f64 * 1.23456789).sin() * 1000.0;
+                            x - x.floor()
+                        })
+                        .collect();
+                    // Simple Gram-Schmidt to get Q
+                    let mut q_re = vec![0.0_f64; n * n];
+                    let mut q_im = vec![0.0_f64; n * n];
+                    for col in 0..n {
+                        // Start with random vector
+                        for row in 0..n {
+                            let idx = (row * n + col) * 2;
+                            q_re[row * n + col] = rng_q[idx];
+                            q_im[row * n + col] = rng_q[idx + 1];
+                        }
+                        // Orthogonalize against previous columns
+                        for prev in 0..col {
+                            let mut dot_re = 0.0_f64;
+                            let mut dot_im = 0.0_f64;
+                            for row in 0..n {
+                                let a_re = q_re[row * n + prev];
+                                let a_im = q_im[row * n + prev];
+                                let b_re = q_re[row * n + col];
+                                let b_im = q_im[row * n + col];
+                                // conj(a) * b = (a_re - i*a_im) * (b_re + i*b_im)
+                                dot_re += a_re * b_re + a_im * b_im;
+                                dot_im += a_re * b_im - a_im * b_re;
+                            }
+                            for row in 0..n {
+                                q_re[row * n + col] -= dot_re * q_re[row * n + prev] - dot_im * q_im[row * n + prev];
+                                q_im[row * n + col] -= dot_re * q_im[row * n + prev] + dot_im * q_re[row * n + prev];
+                            }
+                        }
+                        // Normalize
+                        let mut norm = 0.0_f64;
+                        for row in 0..n {
+                            norm += q_re[row * n + col].powi(2) + q_im[row * n + col].powi(2);
+                        }
+                        let inv_norm = 1.0 / norm.sqrt();
+                        for row in 0..n {
+                            q_re[row * n + col] *= inv_norm;
+                            q_im[row * n + col] *= inv_norm;
+                        }
+                    }
+
+                    // Build A = Q · diag(λ) · Q^H, stored column-major (Fortran order)
+                    let mut a_cpu = vec![num_complex::Complex64::new(0.0, 0.0); n * n];
+                    for i in 0..n {
+                        for j in 0..n {
+                            // A[i,j] = Σ_k Q[i,k] * λ_k * conj(Q[j,k])
+                            let mut sum_re = 0.0_f64;
+                            let mut sum_im = 0.0_f64;
+                            for k in 0..n {
+                                let q_ik_re = q_re[i * n + k];
+                                let q_ik_im = q_im[i * n + k];
+                                let q_jk_re = q_re[j * n + k];
+                                let q_jk_im = q_im[j * n + k];
+                                // q_ik * λ_k * conj(q_jk) = λ_k * (q_ik_re + i*q_ik_im) * (q_jk_re - i*q_jk_im)
+                                let l = evals[k];
+                                sum_re += l * (q_ik_re * q_jk_re + q_ik_im * q_jk_im);
+                                sum_im += l * (q_ik_im * q_jk_re - q_ik_re * q_jk_im);
+                            }
+                            a_cpu[i + j * n] = num_complex::Complex64::new(sum_re, sum_im);
+                        }
+                    }
+
+                    // --- CPU Cholesky (independent reference) ---
+                    let mut a_cpu_chol = a_cpu.clone();
+                    let cpu_ok = cpu_cholesky_upper(&mut a_cpu_chol, n);
+
+                    // --- GPU cuSOLVER ZPOTRF ---
+                    let mut h_a_gpu: Vec<CudaComplex> = a_cpu.iter()
+                        .map(|c| CudaComplex { x: c.re, y: c.im })
+                        .collect();
+                    let mut d_a = stream.alloc_zeros::<CudaComplex>(n * n).unwrap();
+                    stream.memcpy_htod(&h_a_gpu, &mut d_a).unwrap();
+                    let mut d_info = stream.alloc_zeros::<i32>(1).unwrap();
+
+                    let result = solver.zpotrf(
+                        cublasFillMode_t::CUBLAS_FILL_MODE_UPPER,
+                        n as i32,
+                        &mut d_a,
+                        &mut d_info,
+                    );
+                    let gpu_ok = if result.is_ok() {
+                        let info: Vec<i32> = stream.clone_dtoh(&d_info).unwrap();
+                        info[0] == 0
+                    } else {
+                        false
+                    };
+
+                    summary.push(format!(
+                        "n={:3} n_big={:3}/{:3} κ={:.0e}  CPU={} GPU={}",
+                        n, n_big, n, cond,
+                        if cpu_ok { "OK " } else { "FAIL" },
+                        if gpu_ok { "OK " } else { "FAIL" },
+                    ));
+
+                    // Assert: for well-conditioned matrices (κ ≤ 1e10), GPU must match CPU
+                    if cond <= 1e10 {
+                        assert_eq!(
+                            gpu_ok, cpu_ok,
+                            "GPU/CPU mismatch at n={n} n_big={n_big} κ={cond:.0e}"
+                        );
+                    }
+                }
+            }
+        }
+
+        eprintln!("=== ZPOTRF near-singular synthesis test ===");
+        for line in &summary {
+            eprintln!("  {line}");
+        }
+
+        // Count GPU failures for κ ≥ 1e14
+        let gpu_fail_high = summary.iter()
+            .filter(|s| s.contains("GPU=FAIL") && (s.contains("κ=1e14") || s.contains("κ=1e15") || s.contains("κ=1e16")))
+            .count();
+        let cpu_fail_high = summary.iter()
+            .filter(|s| s.contains("CPU=FAIL") && (s.contains("κ=1e14") || s.contains("κ=1e15") || s.contains("κ=1e16")))
+            .count();
+        eprintln!("  GPU failures at κ≥1e14: {gpu_fail_high}");
+        eprintln!("  CPU failures at κ≥1e14: {cpu_fail_high}");
+
+        // If GPU fails more than CPU at high κ, cuSOLVER is less robust
+        if gpu_fail_high > cpu_fail_high {
+            eprintln!("  RESULT: cuSOLVER ZPOTRF is LESS ROBUST than CPU Cholesky at high κ");
+        } else if gpu_fail_high < cpu_fail_high {
+            eprintln!("  RESULT: cuSOLVER ZPOTRF is MORE ROBUST than CPU Cholesky at high κ");
+        } else {
+            eprintln!("  RESULT: cuSOLVER ZPOTRF and CPU Cholesky have SIMILAR robustness");
+        }
+    }
+
+    /// Independent CPU-side Cholesky factorization (upper triangle).
+    /// Returns false if factorization fails (diagonal ≤ 0).
+    fn cpu_cholesky_upper(a: &mut [num_complex::Complex64], n: usize) -> bool {
+        for k in 0..n {
+            // U[k,k] = sqrt(A[k,k] - Σ_{p<k} |U[p,k]|²)
+            let mut sum_sq = 0.0_f64;
+            for p in 0..k {
+                let upk = a[p + k * n];
+                sum_sq += upk.re.powi(2) + upk.im.powi(2);
+            }
+            let akk = a[k + k * n].re - sum_sq;
+            if akk <= 0.0 {
+                return false;
+            }
+            let ukk = akk.sqrt();
+            a[k + k * n] = num_complex::Complex64::new(ukk, 0.0);
+
+            // U[k,j] = (A[k,j] - Σ_{p<k} conj(U[p,k]) * U[p,j]) / U[k,k]
+            for j in (k + 1)..n {
+                let mut sum = num_complex::Complex64::new(0.0, 0.0);
+                for p in 0..k {
+                    let upk = a[p + k * n];
+                    let upj = a[p + j * n];
+                    sum += upk.conj() * upj;
+                }
+                let akj = a[k + j * n] - sum;
+                a[k + j * n] = akj / ukk;
+            }
+        }
+        true
     }
 }

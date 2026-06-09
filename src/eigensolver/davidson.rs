@@ -197,7 +197,6 @@ unsafe fn davidson_v1(
             .blas(blas)
             .kernels(kernels)
             .stream(stream)
-            .maybe_beta_phi_cache(None)
             .call()?;
     }
 
@@ -982,9 +981,17 @@ pub(crate) unsafe fn davidson_diagonalise(
     // hold while ‖r‖ ≫ tol).
     // ------------------------------------------------------------------
     // Superspace dimensions (constant across outer iterations)
-    // CASTEP hamiltonian.f90:197 — nblock = floor(2*sqrt(n_bands))
+    // CASTEP hamiltonian.f90:197-205 — nblock = floor(2*sqrt(n_bands)).
+    // Only round to even for gamma-point calculations (hamiltonian.f90:203-205).
+    // For non-gamma k-points (n_bands=160): nblock=25 in CASTEP vs 26 in Rust.
+    // Different block groupings change ZHEEVD eigenvalue ordering → different
+    // convergence behavior for near-degenerate bands near the Fermi level.
     let nblock_base = (2.0 * (n_bands as f64).sqrt()).floor() as usize;
-    let nblock = (nblock_base + 1) / 2 * 2;
+    let nblock = if gamma_point && nblock_base % 2 == 1 {
+        nblock_base + 1
+    } else {
+        nblock_base
+    };
     let superspace_size = 6_usize;
     let superspace_max_bands = superspace_size * nblock;
     let super_alloc = n_pw * superspace_max_bands;
@@ -1026,7 +1033,7 @@ pub(crate) unsafe fn davidson_diagonalise(
                     .stream(stream)
                     // Pass the beta_phi_cache so V_NL can reuse β^H·ψ projections
                     // across outer iterations for bands whose psi hasn't changed.
-                    .maybe_beta_phi_cache(Some(&mut beta_phi_cache))
+                    .maybe_beta_phi_cache(&mut beta_phi_cache)
                     .call()?;
             }
 
@@ -1330,16 +1337,6 @@ pub(crate) unsafe fn davidson_diagonalise(
         let mut slice_h_wvfn = PwCoefficients::new(
             stream.alloc_zeros(slice_alloc).map_err(Error::Cuda)?);
 
-        // ---- Conduction state buffers (fresh each outer iteration) ----
-        // CASTEP hamiltonian.f90:223 — conduction_slice has nblock bands.
-        // Only need nblock * n_pw elements, not full superspace size.
-        let cond_alloc = n_pw * nblock;
-        let mut cond_wvfn = PwCoefficients::new(
-            stream.alloc_zeros(cond_alloc).map_err(Error::Cuda)?);
-        let mut cond_h_wvfn = PwCoefficients::new(
-            stream.alloc_zeros(cond_alloc).map_err(Error::Cuda)?);
-        let mut cond_count: usize = 0;
-
         // CPU-side dense Hermitian super_hamiltonian matrix
         let mut super_hamiltonian = vec![
             CudaComplex { x: 0.0, y: 0.0 };
@@ -1407,44 +1404,18 @@ pub(crate) unsafe fn davidson_diagonalise(
                 }
             }
 
-            // ---- Conduction state seeding (CASTEP hamiltonian.f90:392-401) ----
-            // Must happen BEFORE initial super_hamiltonian computation so that
-            // conduction state rows/columns are populated in H_sub.
+            // CASTEP hamiltonian_diagonalise_ks (lines 723-1422) — the
+            // subroutine actually called for this run (profile confirms 33
+            // calls).  This variant has NO cross-block conduction state
+            // seeding.  Each block starts with a fresh superspace:
+            // super_wvfn%nbands = current_nblock, superspace_index = 1 +
+            // current_nblock.  Conduction states are block-local and built
+            // from scratch within each block's inner loop.
             let mut superspace_index = current_nblock;
-            if cond_count > 0 {
-                let count = cond_count.min(superspace_max_bands - current_nblock);
-                let (super_mut, _) = super_wvfn.device_ptr_mut(stream);
-                let (h_super_mut, _) = h_super_wvfn.device_ptr_mut(stream);
-                let (cond_ptr, _) = cond_wvfn.device_ptr(stream);
-                let (cond_h_ptr, _) = cond_h_wvfn.device_ptr(stream);
-                for k_seed in 0..count {
-                    cublasZcopy_v2(handle, n_pw_i32,
-                        (cond_ptr as *const CudaComplex).add(k_seed * n_pw) as *const _, 1,
-                        (super_mut as *mut CudaComplex).add((current_nblock + k_seed) * n_pw) as *mut _, 1,
-                    ).result().map_err(Error::Blas)?;
-                    cublasZcopy_v2(handle, n_pw_i32,
-                        (cond_h_ptr as *const CudaComplex).add(k_seed * n_pw) as *const _, 1,
-                        (h_super_mut as *mut CudaComplex).add((current_nblock + k_seed) * n_pw) as *mut _, 1,
-                    ).result().map_err(Error::Blas)?;
-                }
-                superspace_index = current_nblock + count;
-                davidson_diag!(
-                    "[davidson]   block {block_start}: seeded {count} conduction states"
-                );
-            }
 
             // Compute initial super_hamiltonian: H_sub = super_wvfn^H · h_super_wvfn
-            // for ALL superspace columns (k × k, where k = superspace_index).
-            //
-            // CASTEP hamiltonian.f90:414 — wave_dot_all(super_wvfn, H_super_wvfn,
-            // super_hamiltonian(1:super_wvfn%nbands,1:super_wvfn%nbands)) where
-            // super_wvfn%nbands includes conduction states seeded at line 397-398.
-            //
-            // Using k = current_nblock (the active bands only) leaves conduction
-            // state rows/columns uninitialised in super_hamiltonian.  ZHEEVD on a
-            // partially-populated matrix finds spurious eigenvalues from the
-            // degenerate null-space, corrupting the last block where conduction
-            // states outnumber active bands (C1 156/160 failure).
+            // for current_nblock columns (CASTEP: wave_dot_all over
+            // super_wvfn%nbands = current_nblock columns).
             {
                 let k = superspace_index;
                 let mut h_init: CudaSlice<CudaComplex> =
@@ -1565,6 +1536,16 @@ pub(crate) unsafe fn davidson_diagonalise(
                 }
             }
 
+            // CASTEP hamiltonian.f90:926-928 — slice_eigenvalues holds the
+            // eigenvalues at the time the slice workspace was last refreshed.
+            // CRITICAL: these MUST stay in sync with slice_wvfn/slice_h_wvfn.
+            // Using post-ZHEEVD eigenvalues (from the global array after A3)
+            // with pre-rotation slice data causes inconsistent residual shifts
+            // in the preconditioner → wrong search directions → divergence.
+            let mut slice_eigenvalues: Vec<f64> = block_bands(block_start, current_nblock)
+                .map(|(_col, gi)| eigenvalues[gi])
+                .collect();
+
             // CASTEP hamiltonian.f90:255 — allocate previous_eigenvalues (size
             // = current ncol) but do NOT initialize.  Will be set to the current
             // eigenvalue estimates at the top of the inner loop (CASTEP line 431).
@@ -1576,7 +1557,7 @@ pub(crate) unsafe fn davidson_diagonalise(
             // Raw pointer casts are used for psi_dev/hpsi_dev copy-back to avoid
             // borrow conflicts — device_ptr_mut needs &mut self on CudaSlice.
             let mut block_ctx = DavidsonBlockCtx::new(
-                &psi_dev, n_bands, &eigenvalues,
+                &psi_dev, n_bands,
                 block_start, n_pw, n_pw_i32,
                 grid_size, inv_ntotal, superspace_max_bands,
                 &r_vector, tpa_preconditioner, vnl_data,
@@ -1619,6 +1600,7 @@ pub(crate) unsafe fn davidson_diagonalise(
                         &mut grid_dev,
                         &slice_wvfn,
                         &slice_h_wvfn,
+                        &slice_eigenvalues,
                         slice_nbands,
                     )?
                 };
@@ -1956,8 +1938,8 @@ pub(crate) unsafe fn davidson_diagonalise(
                     let mut band_conv = false;
                     let mut band_stopped = false;
 
-                    // (a) Absolute tolerance
-                    if delta_e < tol_abs.max(eps_guard) {
+                    // (a) Absolute tolerance (CASTEP hamiltonian.f90:555 — guard on -epsilon)
+                    if tol_abs > -(f64::EPSILON) && delta_e < tol_abs.max(eps_guard) {
                         if !opt_stop_condition[b] {
                             band_conv = true;
                         }
@@ -1966,10 +1948,13 @@ pub(crate) unsafe fn davidson_diagonalise(
                     // (b) Relative break condition (CASTEP hamiltonian.f90:563-589)
                     if _inner_iter == 0 {
                         break_cond_tols[gi] = delta_e;
-                    } else if tol_rel > -(f64::EPSILON) && delta_e < break_cond_tols[gi] * tol_rel {
+                    } else if tol_rel > -(f64::EPSILON) && delta_e < break_cond_tols[gi] * tol_rel.abs() {
                         band_conv = true;
                         band_stopped = true;
                     } else if tol_rel <= -(f64::EPSILON) {
+                        // CASTEP hamiltonian.f90:582 — only apply stagnation check
+                        // when NOT on the last outer iteration. On the last iteration,
+                        // opt_stop from the penultimate iteration is preserved.
                         if iteration + 1 < max_outer_iter
                             && delta_e < break_cond_tols[gi] * 0.3
                         {
@@ -2086,6 +2071,9 @@ pub(crate) unsafe fn davidson_diagonalise(
                                         .result()
                                         .map_err(Error::Blas)?;
                                     }
+                                    // CASTEP hamiltonian.f90:1346 —
+                                    // slice_eigenvalues(j) = super_eigvals(i)
+                                    slice_eigenvalues[j] = inner_eigenvalues[i_src];
 
                                     // CASTEP does NOT compact per-band arrays
                                     // (hamiltonian.f90:632-641 only copies
@@ -2129,49 +2117,59 @@ pub(crate) unsafe fn davidson_diagonalise(
                     }
                 } // end compaction block
 
-                if n_added == 0 {
-                    // All search columns were zero — nothing more to add
-                    break;
+                // After A2 rotation, super_wvfn columns are updated but
+                // slice_wvfn still holds pre-rotation data.  If no bands
+                // converged (compaction was skipped), the next build()'s
+                // Stage 1 would copy stale slice data → same search
+                // directions every iteration → superspace accumulates
+                // near-linearly-dependent columns → ZHEEVD explodes on a
+                // rank-deficient subspace.
+                // CASTEP hamiltonian.f90:1344-1346 — compaction copies
+                // super_wvfn → slice for the active bands.  We extend this
+                // to refresh AT LEAST the first slice_nbands columns from
+                // the rotated super_wvfn every inner iteration.
+                {
+                    let (super_ptr, _) = super_wvfn.device_ptr(stream);
+                    let (h_super_ptr, _) = h_super_wvfn.device_ptr(stream);
+                    let (slice_mut, _) = slice_wvfn.device_ptr_mut(stream);
+                    let (h_slice_mut, _) = slice_h_wvfn.device_ptr_mut(stream);
+                    for ci in 0..slice_nbands {
+                        // Map compacted col ci → super_wvfn column (sequential)
+                        let src_col = active_indices[ci];
+                        cublasZcopy_v2(handle, n_pw_i32,
+                            (super_ptr as *const CudaComplex).add(src_col * n_pw) as *const _, 1,
+                            (slice_mut as *mut CudaComplex).add(ci * n_pw) as *mut _, 1,
+                        ).result().map_err(Error::Blas)?;
+                        cublasZcopy_v2(handle, n_pw_i32,
+                            (h_super_ptr as *const CudaComplex).add(src_col * n_pw) as *const _, 1,
+                            (h_slice_mut as *mut CudaComplex).add(ci * n_pw) as *mut _, 1,
+                        ).result().map_err(Error::Blas)?;
+                        // Keep slice_eigenvalues consistent with refreshed slice
+                        slice_eigenvalues[ci] = inner_eigenvalues[src_col];
+                    }
+                    // Diagnostic: track first slice eigenvalue after refresh
+                    if block_start >= 100 {
+                        eprintln!("[Diag-SliceRefresh] bs={} iter={} slice_eig[0]={:.6} ({:.6} -> {:.6})",
+                            block_start, _inner_iter,
+                            slice_eigenvalues[0],
+                            eigenvalues[block_start + active_indices[0]],
+                            inner_eigenvalues[active_indices[0]]);
+                    }
                 }
-            } // end inner loop (for _inner_iter)
 
-            // ---- Save conduction states for next block (CASTEP hamiltonian.f90:392-401) ----
-            // Higher eigenstates (current_nblock..superspace_index) from the
-            // final ZHEGVD are valid Ritz vectors beyond this block's bands.
-            //
-            // CASTEP hamiltonian.f90:223 allocates conduction_slice with nblock
-            // bands (fixed size).  Line 537-538 wave_copy from super_wvfn columns
-            // 1+current_nblock onward INTO conduction_slice starting at column 1 —
-            // this OVERWRITES the previous block's conduction states every time.
-            // CASTEP only keeps the LAST block's conduction states, never
-            // accumulates across blocks.
-            //
-            // We allocate supersepace_max_bands columns for cond_wvfn (larger
-            // than nblock for safety), but we must cap the save count at nblock
-            // to match CASTEP — accumulating all historical conduction states
-            // pollutes the ZHEEVD eigenvalue ordering for later blocks, shifting
-            // upper-band eigenvalues systematically low (C16-04).
-            cond_count = (superspace_index.saturating_sub(current_nblock)).min(nblock);
-            if cond_count > 0 {
-                let count = cond_count;
-                let (super_ptr, _) = super_wvfn.device_ptr(stream);
-                let (h_super_ptr, _) = h_super_wvfn.device_ptr(stream);
-                let (cond_mut, _) = cond_wvfn.device_ptr_mut(stream);
-                let (cond_h_mut, _) = cond_h_wvfn.device_ptr_mut(stream);
-                for k in 0..count {
-                    cublasZcopy_v2(handle, n_pw_i32,
-                        (super_ptr as *const CudaComplex).add((current_nblock + k) * n_pw) as *const _, 1,
-                        (cond_mut as *mut CudaComplex).add(k * n_pw) as *mut _, 1,
-                    ).result().map_err(Error::Blas)?;
-                    cublasZcopy_v2(handle, n_pw_i32,
-                        (h_super_ptr as *const CudaComplex).add((current_nblock + k) * n_pw) as *const _, 1,
-                        (cond_h_mut as *mut CudaComplex).add(k * n_pw) as *mut _, 1,
-                    ).result().map_err(Error::Blas)?;
-                }
-                davidson_diag!(
-                    "[davidson]   block {block_start}: saved {count} conduction states for next block"
-                );
-            }
+                // C15-07: CASTEP hamiltonian.f90:646 — no mid-loop break when
+            // n_added == 0. The inner loop always completes its convergence
+            // check cycle; if all bands are done, the loop exits at the top
+            // via the convergence check.
+        } // end inner loop (for _inner_iter)
+
+            // CASTEP hamiltonian_diagonalise_ks (lines 723-1422) — the
+            // subroutine actually called (33 times per profile) — has NO
+            // cross-block conduction state transfer.  Each block's superspace
+            // is built from scratch within its inner loop.  Conduction states
+            // (columns > current_nblock in super_wvfn) are discarded at block
+            // end.  This avoids conduction states from one block corrupting
+            // the ZHEEVD eigenvalue ordering of the next block.
 
             // ---- D2: S-norm diagnostic after block 0 inner loop ----
             // Block 0's A2 (post-ZHEGVD S-orthonormalize) is skipped because
@@ -2601,71 +2599,33 @@ unsafe fn diagonalise_subspace(
     // For non-gamma, CASTEP calls algor_diagonalise(..., 'H') → ZHEEV.
     // We match both paths faithfully.
     if gamma_point {
-        // ---- Gamma-point: DSYEVD path (real symmetric) ----
-        // h_sub = ψ^H·Hψ is built via ZGEMM but entries are purely real.
-        // Extract real parts, solve via DSYEVD, then convert eigenvectors
-        // back to complex for the ZGEMM rotation step.
-        let h_sub_cpu: Vec<CudaComplex> = stream.clone_dtoh(&h_sub).map_err(Error::Cuda)?;
-        let mut h_sub_real: Vec<f64> = Vec::with_capacity(k * k);
-        for i in 0..k {
-            for j in 0..k {
-                // Column-major: index = i + j*k
-                h_sub_real.push(h_sub_cpu[i + j * k].x);
-            }
-        }
-        // Allocate real GPU buffer for DSYEVD
-        let kk = k * k;
-        let mut h_sub_real_dev: CudaSlice<f64> = stream.alloc_zeros(kk).map_err(Error::Cuda)?;
-        stream.memcpy_htod(&h_sub_real, &mut h_sub_real_dev).map_err(Error::Cuda)?;
+        // Gamma-point: H_sub is purely real, should use DSYEVD.
+        // TODO: dsyevd was removed from SolverHandle during chemrust-scf
+        // refactoring.  Re-add it before enabling gamma-point support.
+        return Err(Error::RayleighRitzFailed {
+            info: -1, // NYI
+        });
+    }
 
-        // DSYEVD: A·X = X·Λ, jobz=VECTOR (eigenvectors), uplo=LOWER
-        solver.dsyevd(
-            cusolverEigMode_t::CUSOLVER_EIG_MODE_VECTOR,
-            cublasFillMode_t::CUBLAS_FILL_MODE_LOWER,
-            k_i32,
-            &mut h_sub_real_dev, // overwritten → real eigenvectors
-            eig_dev,
-            info_dev,
-        )?;
+    // ---- Non-gamma: ZHEEVD path (complex Hermitian, default) ----
+    // No overlap matrix needed because the superspace is S-orthonormal
+    // (ψ_block is S-orthogonal to lower bands and S-orthonormal among
+    // themselves, so S_sub = I implicitly).
+    solver.zheevd(
+        cusolverEigMode_t::CUSOLVER_EIG_MODE_VECTOR,
+        cublasFillMode_t::CUBLAS_FILL_MODE_LOWER,
+        k_i32,
+        &mut h_sub, // overwritten → eigenvectors X
+        eig_dev,
+        info_dev,
+    )?;
 
-        // Check solver info
-        let info_cpu: Vec<i32> = stream.clone_dtoh(info_dev).map_err(Error::Cuda)?;
-        if info_cpu[0] != 0 {
-            return Err(Error::RayleighRitzFailed {
-                info: info_cpu[0],
-            });
-        }
-
-        // Convert real eigenvectors back to CudaComplex for GEMM rotation.
-        // DSYEVD eigenvectors are column-major (same layout as ZHEEVD).
-        let h_sub_real_eigvec: Vec<f64> = stream.clone_dtoh(&h_sub_real_dev).map_err(Error::Cuda)?;
-        drop(h_sub_real_dev); // release GPU buffer
-        let h_sub_complex_eigvec: Vec<CudaComplex> = h_sub_real_eigvec
-            .iter()
-            .map(|&v| CudaComplex { x: v, y: 0.0 })
-            .collect();
-        stream.memcpy_htod(&h_sub_complex_eigvec, &mut h_sub).map_err(Error::Cuda)?;
-    } else {
-        // ---- Non-gamma: ZHEEVD path (complex Hermitian, default) ----
-        // No overlap matrix needed because the superspace is S-orthonormal
-        // (ψ_block is S-orthogonal to lower bands and S-orthonormal among
-        // themselves, so S_sub = I implicitly).
-        solver.zheevd(
-            cusolverEigMode_t::CUSOLVER_EIG_MODE_VECTOR,
-            cublasFillMode_t::CUBLAS_FILL_MODE_LOWER,
-            k_i32,
-            &mut h_sub, // overwritten → eigenvectors X
-            eig_dev,
-            info_dev,
-        )?;
-
-        // Check solver info
-        let info_cpu: Vec<i32> = stream.clone_dtoh(info_dev).map_err(Error::Cuda)?;
-        if info_cpu[0] != 0 {
-            return Err(Error::RayleighRitzFailed {
-                info: info_cpu[0],
-            });
-        }
+    // Check solver info
+    let info_cpu: Vec<i32> = stream.clone_dtoh(info_dev).map_err(Error::Cuda)?;
+    if info_cpu[0] != 0 {
+        return Err(Error::RayleighRitzFailed {
+            info: info_cpu[0],
+        });
     }
 
     // D2H eigenvalues
@@ -3417,11 +3377,6 @@ struct DavidsonBlockCtx<'a> {
     // --- Outer state (borrowed) ---
     psi_dev: &'a PwCoefficients,
     n_bands_total: usize,
-    /// Global eigenvalues from the most recent ZHEEVD subspace
-    /// diagonalization.  Indexed by global band index.  Passed to
-    /// the preconditioner for USPP NL correction weight assembly
-    /// (CASTEP hamiltonian.f90:629-642).
-    eigenvalues: &'a [f64],
     /// Maps compacted workspace column → original global band index.
     /// Updated after compaction.
     active_indices: Vec<usize>,
@@ -3498,7 +3453,6 @@ impl<'a> DavidsonBlockCtx<'a> {
     fn new(
         psi_dev: &'a PwCoefficients,
         n_bands_total: usize,
-        eigenvalues: &'a [f64], // global eigenvalues from ZHEEVD (for preconditioner)
         block_start: usize,
         n_pw: usize,
         n_pw_i32: i32,
@@ -3531,7 +3485,6 @@ impl<'a> DavidsonBlockCtx<'a> {
             superspace_max_bands,
             psi_dev,
             n_bands_total,
-            eigenvalues,
             r_vector,
             tpa_preconditioner,
             vnl_data,
@@ -3597,6 +3550,9 @@ impl<'a> DavidsonBlockCtx<'a> {
         // global psi_dev/hpsi_dev arrays.
         slice_wvfn: &PwCoefficients,
         slice_h_wvfn: &PwCoefficients,
+        // CASTEP hamiltonian.f90:926-928 — slice_eigenvalues consistent with
+        // slice_wvfn/slice_h_wvfn.  Must be from the SAME pre-ZHEEVD state.
+        slice_eigenvalues: &[f64],
         slice_nbands: usize,
     ) -> Result<usize, Error> {
         // --- Stage 1: Copy ψ and H·ψ from slice workspace to block temps ---
@@ -3648,7 +3604,7 @@ impl<'a> DavidsonBlockCtx<'a> {
             // matrix, producing more accurate USPP NL correction weights than
             // per-band Rayleigh quotients from freshly computed H·psi.
             let eig_block_cpu: Vec<f64> = active_bands(&self.active_indices, self.block_start)
-                .map(|(_ci, gi)| self.eigenvalues[gi])
+                .map(|(ci, _gi)| slice_eigenvalues[ci])
                 .collect();
             // Diagnostic: eigenvalues fed to preconditioner (first 3 + count)
             if self.block_start >= 104 {
@@ -3984,7 +3940,7 @@ impl<'a> DavidsonBlockCtx<'a> {
                 // cached super_wvfn projections for search directions would
                 // produce wrong NL contributions → wrong hsearch → corrupt
                 // H_sub → zero eigenvalues in ZHEEVD.
-                .maybe_beta_phi_cache(None)
+                // (Default is None via bon::builder Option<T> parameter.)
                 .call()?;
         }
 
