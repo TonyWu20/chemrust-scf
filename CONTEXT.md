@@ -203,3 +203,40 @@ PW ρ_PW. Total ρ = ρ_PW + ρ_aug. The `.castep_bin` density already stores th
 sum. In the SCF loop: `construct_density_gpu` produces smooth-only ρ_PW;
 `compute_aug_density_gpu` adds ρ_aug; `build_v_eff_with_energy_impl` sums them
 before Poisson + XC.
+
+### Spin-polarised
+
+**SpinChannelData\<T\>**:
+Per-spin container of length `S::nspins()`. Encodes "this is indexed by spin
+channel" at the type level. For `NonSpin`, holds exactly 1 element; for
+`SpinCollinear`, holds 2 (up=0, down=1). Prevents `Vec<Vec<T>>` ambiguity.
+_Avoid_: raw `Vec<T>`, `[T; 2]` — neither communicates the spin dimension.
+
+**Spin Channel**:
+One of `nspins` independent eigensolver invocations per SCF iteration.
+For collinear spin: spin-up (ispin=0) and spin-down (ispin=1). The
+eigensolver is stateless per channel — it receives one channel's ψ and
+V_eff, returns that channel's eigenvalues.
+_Avoid_: "spin component", "spin direction", "spin band"
+
+**Spin Density**:
+`ρ_spin(r) = ρ_up(r) − ρ_down(r)`, a real-space field on the wave grid.
+Stored as `Density` (same newtype as total density) but semantically distinct.
+Used by `compute_pbe_xc_spin` to produce `V_xc_up ≠ V_xc_dn`.
+_Avoid_: "magnetisation density" (conflates with orbital + spin magnetisation),
+"spin polarisation" (ambiguous — integral vs field)
+
+**Spin Fix** (`spin_fix`):
+Early SCF iterations where `N_up` and `N_dn` are pinned to target values from
+the `.cell SPIN=` block. After `spin_fix` iterations (default 5), the constraint
+releases and spin varies freely via `electronic_find_fermi_free`. Controlled
+by the `spin_fix` keyword.
+_Avoid_: "spin lock", "fixed spin"
+
+**Fermi Fix vs Fermi Free**:
+Two occupation-search strategies. `fermi_fix`: bisection per spin channel to
+find `E_F` giving exactly `N_spin` electrons — used for spin-fixed iterations.
+`fermi_free`: separate Fermi energies for up/down with shared chemical potential
+constraint — used after spin is released. CASTEP `electronic_find_fermi_fix`
+and `electronic_find_fermi_free` respectively.
+_Avoid_: "constrained/unconstrained" (too generic)
