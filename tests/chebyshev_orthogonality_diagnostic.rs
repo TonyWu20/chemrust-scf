@@ -208,6 +208,7 @@ fn run_orthogonality_diagnostic(filter_mode: chemrust_scf::FilterMode, mode_name
     let pw_coords = &kpt_block.pw_grid_coord;
     let k_point = chemrust_scf::KPoint {
         coords: kpt_block.coords,
+        weight: 1.0,
     };
     let psi_input: Vec<Complex64> = kpt_block.bands.concat();
 
@@ -543,6 +544,7 @@ fn diagnostic_2_residual_norms_after_chebyshev_filter() {
     let pw_coords = &kpt_block.pw_grid_coord;
     let k_point = chemrust_scf::KPoint {
         coords: kpt_block.coords,
+        weight: 1.0,
     };
     let psi_input: Vec<num_complex::Complex64> = kpt_block.bands.concat();
 
@@ -1117,7 +1119,7 @@ fn diagnostic_s_norm_baseline() {
         &fx.pots,
         &fx.bin.cell,
         &wave_grid,
-        &chemrust_scf::KPoint { coords: kpt_block.coords },
+        &chemrust_scf::KPoint { coords: kpt_block.coords, weight: 1.0 },
         &psi_input,
         kpt_block.bands.len(),
         n_pw,
@@ -1316,7 +1318,7 @@ fn diagnostic_h_psi_differential() {
 
     let mut pcie = chemrust_scf::PcieAccount::default();
     let pw_coords = &kpt_block.pw_grid_coord;
-    let k_point = chemrust_scf::KPoint { coords: kpt_block.coords };
+    let k_point = chemrust_scf::KPoint { coords: kpt_block.coords, weight: 1.0 };
 
     let n_electrons: f64 = fx.bin.cell.species_iter()
         .map(|info| fx.pots.get(info.symbol).and_then(|p| p.ionic_charge()).unwrap_or(0.0) * info.num_ions as f64)
@@ -1501,6 +1503,7 @@ fn diagnostic_3_outer_loop_convergence() {
     let pw_coords = &kpt_block.pw_grid_coord;
     let k_point = chemrust_scf::KPoint {
         coords: kpt_block.coords,
+        weight: 1.0,
     };
     let psi_input: Vec<Complex64> = kpt_block.bands.concat();
 
@@ -1952,7 +1955,7 @@ fn diagnostic_h_psi_component_breakdown() {
     );
     let mut pcie = chemrust_scf::PcieAccount::default();
     let pw_coords = &kpt_block.pw_grid_coord;
-    let k_point = chemrust_scf::KPoint { coords: kpt_block.coords };
+    let k_point = chemrust_scf::KPoint { coords: kpt_block.coords, weight: 1.0 };
     let cell = &fx.bin.cell;
 
     // Occupations from CASTEP eigenvalues

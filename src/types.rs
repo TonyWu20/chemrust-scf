@@ -193,11 +193,13 @@ impl Mul<f64> for DensityUpsampled {
 #[derive(Debug, Clone, Copy)]
 pub struct KPoint {
     pub coords: [f64; 3],
+    /// K-point weight (sum of weights = 1 for Monkhorst-Pack, 1 for Gamma-point).
+    pub weight: f64,
 }
 
 impl Default for KPoint {
     fn default() -> Self {
-        Self { coords: [0.0, 0.0, 0.0] }
+        Self { coords: [0.0, 0.0, 0.0], weight: 1.0 }
     }
 }
 
@@ -229,7 +231,7 @@ pub struct SmearingParams {
 #[derive(Debug, Clone)]
 pub struct FinalResult {
     pub density: Density,
-    pub eigenvalues: Vec<f64>,
+    pub eigenvalues: crate::spin_types::PerSpinEigenvalues,
     pub total_energy: f64,
 }
 

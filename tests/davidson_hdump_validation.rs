@@ -38,7 +38,7 @@ use std::sync::Arc;
 use cudarc::driver::CudaContext;
 use chemrust_hamiltonian_core::NonSpin;
 use chemrust_scf::{
-    ColumnDistributed, Density, KPoint, PerSpinDensity, PerSpinPwCoefficients,
+    ColumnDistributed, Density, KPoint, KptDataSet, PerSpinDensity, PerSpinPwCoefficients,
     PwCoefficients, ScfIteration, SmearingParams, SmearingScheme,
     SpinChannelData, WaveGridArray, WavefunctionSet,
     device::CudaComplex,
@@ -286,7 +286,9 @@ fn davidson_hdump_validation() {
     }
     // Wrap in per-spin types (NonSpin: single channel)
     let per_spin_density = PerSpinDensity(SpinChannelData::new::<NonSpin>(vec![density]));
-    let per_spin_psi_data = vec![flat_bands.clone()];
+    let per_spin_psi_data = SpinChannelData::new::<NonSpin>(
+        vec![KptDataSet::new(vec![flat_bands.clone()], 1)],
+    );
     let psi_host = WavefunctionSet::<ColumnDistributed>::new(flat_bands, n_bands, n_pw);
     // Upload psi to GPU for PerSpinPwCoefficients
     let ctx = Arc::new(CudaContext::new(0).map_err(|e| {
@@ -298,11 +300,12 @@ fn davidson_hdump_validation() {
         .collect();
     let psi_dev = stream.clone_htod(&psi_flat).unwrap();
     let per_spin_psi = PerSpinPwCoefficients(SpinChannelData::new::<NonSpin>(
-        vec![PwCoefficients::new(psi_dev)],
+        vec![KptDataSet::new(vec![PwCoefficients::new(psi_dev)], 1)],
     ));
 
     let k_point = KPoint {
         coords: kpt.coords,
+        weight: 1.0,
     };
 
     // Smearing: Gaussian, 0.1 eV (CASTEP default).
@@ -328,9 +331,9 @@ fn davidson_hdump_validation() {
         .density(per_spin_density)
         .psi(per_spin_psi)
         .psi_data(per_spin_psi_data)
-        .pw_coords(pw_coords)
-        .pw_fft_indices(pw_fft_indices)
-        .k_point(k_point)
+        .pw_coords(KptDataSet::new(vec![pw_coords], 1))
+        .pw_fft_indices(KptDataSet::new(vec![pw_fft_indices], 1))
+        .k_points(KptDataSet::new(vec![k_point], 1))
         .smearing(smearing)
         .max_history(8)
         .build();

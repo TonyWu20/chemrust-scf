@@ -1529,7 +1529,7 @@ pub fn chebyshev_filter_for_test(
     let kernels = CudaKernelSet::new(ctx)?;
 
     // Dummy k-point (unused by chebyshev_filter)
-    let dummy_kpoint = KPoint { coords: [0.0, 0.0, 0.0] };
+    let dummy_kpoint = KPoint { coords: [0.0, 0.0, 0.0], weight: 1.0 };
 
     // Run chebyshev_filter
     let (psi_filtered_row, _hpsi_row) = chebyshev_filter(
@@ -1628,7 +1628,7 @@ pub fn chebyshev_filter_for_test_gpu(
     let kernels = CudaKernelSet::new(ctx)?;
 
     // Dummy k-point (unused by chebyshev_filter)
-    let dummy_kpoint = KPoint { coords: [0.0, 0.0, 0.0] };
+    let dummy_kpoint = KPoint { coords: [0.0, 0.0, 0.0], weight: 1.0 };
 
     // Run chebyshev_filter — keeps results GPU-resident
     let (psi_filtered_row, hpsi_filtered_row) = chebyshev_filter(
@@ -1693,7 +1693,7 @@ pub fn chebyshev_filter_iteration_gpu(
     stream: &Arc<CudaStream>,
     ctx: &Arc<CudaContext>,
 ) -> ChebyshevResult {
-    let dummy_kpoint = KPoint { coords: [0.0, 0.0, 0.0] };
+    let dummy_kpoint = KPoint { coords: [0.0, 0.0, 0.0], weight: 1.0 };
     let mut pcie = PcieAccount::default();
     chebyshev_filter(
         psi_gpu, v_eff_gpu, pots, wave_grid, &dummy_kpoint, cell,

@@ -68,8 +68,8 @@ pub use types::{
     SmearingParams, SmearingScheme, WaveGridArray,
 };
 pub use spin_types::{
-    ElectronCounts, FermiEnergies, OccupationSet, PerSpinAugDensity, PerSpinBetaProjections, PerSpinDensity,
-    PerSpinEigenvalues, PerSpinPwCoefficients, SpinChannelData, SpinDensity,
+    ElectronCounts, FermiEnergies, KptDataSet, OccupationSet, PerSpinAugDensity, PerSpinBetaProjections,
+    PerSpinDensity, PerSpinEigenvalues, PerSpinPwCoefficients, SpinChannelData, SpinDensity,
 };
 pub use layout::{Cpu, ColumnDistributed, Layout, RowDistributed, WavefunctionSet};
 pub use device::{DeviceMapped, Gpu};

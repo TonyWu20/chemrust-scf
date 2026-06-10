@@ -37,7 +37,7 @@ use chemrust_hamiltonian_core::{
     CastepBin, CastepBinFile, CheckFile, GVectorGrid, PseudopotentialSet, SpinCollinear,
 };
 use chemrust_scf::{
-    KPoint, PerSpinDensity,
+    KPoint, KptDataSet, PerSpinDensity,
     PerSpinPwCoefficients, PwCoefficients, ScfIteration, SmearingParams, SmearingScheme,
     SpinChannelData, downsample_array_to_wave_grid, pw_coords_to_fft_indices,
 };
@@ -413,17 +413,21 @@ pub fn build_spin_scf_state(fx: &NioSpinFixture) -> ScfIteration<SpinCollinear> 
         unsafe { stream.alloc_zeros(n_elements) }.expect("GPU alloc spin1");
 
     let psi = PerSpinPwCoefficients(SpinChannelData::new::<SpinCollinear>(vec![
-        PwCoefficients::new(psi_gpu_spin0),
-        PwCoefficients::new(psi_gpu_spin1),
+        KptDataSet::new(vec![PwCoefficients::new(psi_gpu_spin0)], 1),
+        KptDataSet::new(vec![PwCoefficients::new(psi_gpu_spin1)], 1),
     ]));
 
-    let psi_data = vec![psi_data_spin0, psi_data_spin1];
+    let psi_data = SpinChannelData::new::<SpinCollinear>(vec![
+        KptDataSet::new(vec![psi_data_spin0], 1),
+        KptDataSet::new(vec![psi_data_spin1], 1),
+    ]);
 
-    let pw_coords = kpt0_spin0.pw_grid_coord.clone();
-    let pw_fft_indices = pw_coords_to_fft_indices(&pw_coords, &wave_grid);
+    let pw_coords = KptDataSet::new(vec![kpt0_spin0.pw_grid_coord.clone()], 1);
+    let pw_fft_indices = KptDataSet::new(vec![pw_coords_to_fft_indices(&kpt0_spin0.pw_grid_coord, &wave_grid)], 1);
 
     let k_point = KPoint {
         coords: kpt0_spin0.coords,
+        weight: 1.0,
     };
 
     // Smearing: Gaussian, 0.1 eV (CASTEP default). NiO.param says smearing_width=0.1 eV.
@@ -443,7 +447,7 @@ pub fn build_spin_scf_state(fx: &NioSpinFixture) -> ScfIteration<SpinCollinear> 
         .psi_data(psi_data)
         .pw_coords(pw_coords)
         .pw_fft_indices(pw_fft_indices)
-        .k_point(k_point)
+        .k_points(KptDataSet::new(vec![k_point], 1))
         .smearing(smearing)
         .max_history(8)
         .build()
@@ -565,8 +569,8 @@ fn nio_warm_start_discriminator() {
     let ref_eigs_spin0 = &fx.bands_eigenvalues_per_spin[0][0]; // kpt=0, spin=0
     let ref_eigs_spin1 = &fx.bands_eigenvalues_per_spin[0][1]; // kpt=0, spin=1
 
-    let eigs_spin0 = &per_spin_eigs[0];
-    let eigs_spin1 = &per_spin_eigs[1];
+    let eigs_spin0 = &per_spin_eigs[0][0];
+    let eigs_spin1 = &per_spin_eigs[1][0];
 
     let max_err0: f64 = eigs_spin0
         .iter()

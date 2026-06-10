@@ -103,21 +103,97 @@ impl<T> IndexMut<usize> for SpinChannelData<T> {
 }
 
 // ---------------------------------------------------------------------------
+// KptDataSet<T> — generic container with length validation
+// ---------------------------------------------------------------------------
+
+/// A fixed-length container whose length is the number of k-points.
+///
+/// Construction with `::new(vec, expected_nkpts)` asserts that `vec.len() == expected_nkpts`.
+/// Use `KptDataSet::new(vec![...], 1)` for gamma-point (single-kpt) wrapping.
+///
+/// When nested inside `SpinChannelData`, the full nesting is:
+/// `SpinChannelData<KptDataSet<T>>` — spin-outer, kpt-inner.
+///
+/// Pattern follows `SpinChannelData<T>` exactly.
+#[derive(Debug, Clone)]
+pub struct KptDataSet<T>(Vec<T>);
+
+impl<T> KptDataSet<T> {
+    /// Create a new `KptDataSet`, asserting the vector length matches `expected_nkpts`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `vec.len() != expected_nkpts`.
+    pub fn new(vec: Vec<T>, expected_nkpts: usize) -> Self {
+        assert_eq!(
+            vec.len(),
+            expected_nkpts,
+            "KptDataSet length mismatch: got {}, expected {} k-points",
+            vec.len(),
+            expected_nkpts,
+        );
+        Self(vec)
+    }
+
+    /// Number of k-points.
+    pub fn nkpts(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Consume self and return the inner `Vec<T>`.
+    pub fn into_inner(self) -> Vec<T> {
+        self.0
+    }
+
+    /// Borrow the inner `Vec<T>`.
+    pub fn as_vec(&self) -> &Vec<T> {
+        &self.0
+    }
+}
+
+impl<T> Deref for KptDataSet<T> {
+    type Target = [T];
+    fn deref(&self) -> &[T] {
+        &self.0
+    }
+}
+
+impl<T> DerefMut for KptDataSet<T> {
+    fn deref_mut(&mut self) -> &mut [T] {
+        &mut self.0
+    }
+}
+
+impl<T> Index<usize> for KptDataSet<T> {
+    type Output = T;
+    fn index(&self, index: usize) -> &T {
+        &self.0[index]
+    }
+}
+
+impl<T> IndexMut<usize> for KptDataSet<T> {
+    fn index_mut(&mut self, index: usize) -> &mut T {
+        &mut self.0[index]
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Per-spin eigenvalue and occupation newtypes
 // ---------------------------------------------------------------------------
 
-/// Eigenvalues (Hartree) for each spin channel, each being a `Vec<f64>` of length = nbands.
+/// Eigenvalues (Hartree) for each spin channel, each being a `KptDataSet<Vec<f64>>`
+/// (per-kpt eigenvalues of length = nbands).
 #[derive(Debug, Clone)]
-pub struct PerSpinEigenvalues(pub SpinChannelData<Vec<f64>>);
+pub struct PerSpinEigenvalues(pub SpinChannelData<KptDataSet<Vec<f64>>>);
 
 impl PerSpinEigenvalues {
-    pub fn new(value: SpinChannelData<Vec<f64>>) -> Self {
+    pub fn new(value: SpinChannelData<KptDataSet<Vec<f64>>>) -> Self {
         Self(value)
     }
 }
 
 impl Deref for PerSpinEigenvalues {
-    type Target = SpinChannelData<Vec<f64>>;
+    type Target = SpinChannelData<KptDataSet<Vec<f64>>>;
     fn deref(&self) -> &Self::Target {
         &self.0
     }
@@ -273,18 +349,20 @@ impl DerefMut for ElectronCounts {
 // Per-spin wavefunction / projector newtypes
 // ---------------------------------------------------------------------------
 
-/// Plane-wave coefficients `C_{n𝐤}(𝐆)` for each spin channel.
+/// Plane-wave coefficients `C_{n𝐤}(𝐆)` for each spin channel and k-point.
+///
+/// Nested as `SpinChannelData<KptDataSet<PwCoefficients>>` — spin-outer, kpt-inner.
 #[derive(Debug, Clone)]
-pub struct PerSpinPwCoefficients(pub SpinChannelData<PwCoefficients>);
+pub struct PerSpinPwCoefficients(pub SpinChannelData<KptDataSet<PwCoefficients>>);
 
 impl PerSpinPwCoefficients {
-    pub fn new(value: SpinChannelData<PwCoefficients>) -> Self {
+    pub fn new(value: SpinChannelData<KptDataSet<PwCoefficients>>) -> Self {
         Self(value)
     }
 }
 
 impl Deref for PerSpinPwCoefficients {
-    type Target = SpinChannelData<PwCoefficients>;
+    type Target = SpinChannelData<KptDataSet<PwCoefficients>>;
     fn deref(&self) -> &Self::Target {
         &self.0
     }
@@ -296,22 +374,27 @@ impl DerefMut for PerSpinPwCoefficients {
     }
 }
 
-/// Non-local pseudopotential beta-projector data per spin channel, stored as
+/// Non-local pseudopotential beta-projector data per spin channel and k-point, stored as
 /// `Option` (None if projectors not yet initialised, Some if they are).
 ///
 /// Each element is a `Vec` of beta-projector waves, one per atom, each a
 /// `CudaSlice<CudaComplex>` on the GPU.
+///
+/// Nested as `SpinChannelData<KptDataSet<Option<Vec<CudaSlice<CudaComplex>>>>>` —
+/// spin-outer, kpt-inner.
 #[derive(Debug, Clone)]
-pub struct PerSpinBetaProjections(pub SpinChannelData<Option<Vec<CudaSlice<CudaComplex>>>>);
+pub struct PerSpinBetaProjections(
+    pub SpinChannelData<KptDataSet<Option<Vec<CudaSlice<CudaComplex>>>>>,
+);
 
 impl PerSpinBetaProjections {
-    pub fn new(value: SpinChannelData<Option<Vec<CudaSlice<CudaComplex>>>>) -> Self {
+    pub fn new(value: SpinChannelData<KptDataSet<Option<Vec<CudaSlice<CudaComplex>>>>>) -> Self {
         Self(value)
     }
 }
 
 impl Deref for PerSpinBetaProjections {
-    type Target = SpinChannelData<Option<Vec<CudaSlice<CudaComplex>>>>;
+    type Target = SpinChannelData<KptDataSet<Option<Vec<CudaSlice<CudaComplex>>>>>;
     fn deref(&self) -> &Self::Target {
         &self.0
     }

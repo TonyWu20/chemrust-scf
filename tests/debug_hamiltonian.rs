@@ -78,7 +78,7 @@ fn debug_rayleigh() {
 
     // V_NL
     let pots = PseudopotentialSet::from_dir(PDIR, &cell.species_symbols, &cell.species_pot_files).unwrap();
-    let kp = KPoint{coords:kpt.coords};
+    let kp = KPoint{coords:kpt.coords, weight:1.0};
     let mut pcie = PcieAccount::default();
     let vnl = VnlBatchData::precompute(
         &pwc, &pots, cell, &wg, &kp, &psi_flat, nb, npw, None,

@@ -37,7 +37,8 @@ pub fn capture_as_castep_bin<S: SpinPolicy>(
 ) -> Option<CastepBin> {
     let nspins = S::nspins();
     let n_bands = state.n_bands;
-    let n_pw = state.n_pw;
+    let nkpts = state.nkpts;
+    let n_pw = if nkpts > 0 { state.pw_coords[0].len() } else { 0 };
 
     // --- Version and metadata ---
     let version = Version { major: 6, minor: 110 };
@@ -80,19 +81,38 @@ pub fn capture_as_castep_bin<S: SpinPolicy>(
     let total_energy = state.total_energy.unwrap_or(0.0);
 
     // --- Occupations (recomputed — not stored on ScfIteration) ---
-    let (occupations, _chem_pot) = compute_occupations(&state.eigenvalues[0], &state.smearing, n_electrons)
-        .ok()?;
+    // Use kpt-0 eigenvalues for occupation computation (single-kpt path).
+    let (occupations, _chem_pot) = if nkpts > 0 {
+        compute_occupations(&state.eigenvalues[0][0], &state.smearing, n_electrons)
+            .ok()?
+    } else {
+        return None;
+    };
 
     // --- Band eigenvalues ---
+    // Build per-kpt eigenvalue data from the nested structure
+    let kpoints: Vec<KPointData> = (0..nkpts)
+        .map(|ikpt| {
+            let kpt_coords = state.k_points[ikpt].coords;
+            let kpt_weight = state.k_points[ikpt].weight;
+            let eigs = &state.eigenvalues[0][ikpt];
+            let (occ, _) = compute_occupations(eigs, &state.smearing, n_electrons).ok()
+                .unwrap_or_else(|| {
+                    let occ = vec![0.0; eigs.len()];
+                    (crate::types::Occupations(occ), crate::types::ChemicalPotential(0.0))
+                });
+            KPointData {
+                coords: kpt_coords,
+                spins: vec![SpinChannel {
+                    eigenvalues: eigs.clone(),
+                    occupancies: occ.0,
+                }],
+                kpoint_weight: kpt_weight,
+            }
+        })
+        .collect();
     let eigenvalues = BandEigenvalues {
-        kpoints: vec![KPointData {
-            coords: state.k_point.coords,
-            spins: vec![SpinChannel {
-                eigenvalues: state.eigenvalues[0].clone(),
-                occupancies: occupations.0,
-            }],
-            kpoint_weight: 1.0,
-        }],
+        kpoints,
         nbands_max: n_bands,
         nspins,
         fermi_energy: state.fermi_energy[0],
@@ -138,25 +158,45 @@ pub fn capture_as_castep_bin<S: SpinPolicy>(
 
     // --- Wavefunction coefficients ---
     // psi_cpu is band-major: `data[b * n_pw + g]` is coefficient g of band b.
+    // Use kpt-0 for capture (gamma-point path).
+    let psi_kpt0 = &state.psi_cpu[0][0];
     let bands: Vec<Vec<Complex64>> = (0..n_bands)
         .map(|b| {
             let start = b * n_pw;
-            state.psi_cpu[0][start..start + n_pw].to_vec()
+            psi_kpt0[start..start + n_pw].to_vec()
         })
         .collect();
 
-    let have_gamma = state.k_point.coords.iter().all(|&c| c.abs() < 1e-12);
+    let have_gamma = if nkpts > 0 {
+        state.k_points[0].coords.iter().all(|&c| c.abs() < 1e-12)
+    } else {
+        true
+    };
+
+    let kpt_data: Vec<KptWaveBlock> = (0..nkpts)
+        .map(|ikpt| {
+            let n_pw_kpt = state.pw_coords[ikpt].len();
+            let psi_kpt = &state.psi_cpu[0][ikpt];
+            let bands_kpt: Vec<Vec<Complex64>> = (0..n_bands)
+                .map(|b| {
+                    let start = b * n_pw_kpt;
+                    psi_kpt[start..start + n_pw_kpt].to_vec()
+                })
+                .collect();
+            KptWaveBlock {
+                coords: state.k_points[ikpt].coords,
+                nplw: n_pw_kpt,
+                pw_grid_coord: state.pw_coords[ikpt].clone(),
+                bands: bands_kpt,
+            }
+        })
+        .collect();
 
     let wavefunction = WavefunctionCoeffs {
         have_gamma,
         grid: wave_grid_dims,
         nspins,
-        kpt_data: vec![KptWaveBlock {
-            coords: state.k_point.coords,
-            nplw: n_pw,
-            pw_grid_coord: state.pw_coords.clone(),
-            bands,
-        }],
+        kpt_data,
     };
 
     // --- Electron density ---
@@ -178,7 +218,7 @@ pub fn capture_as_castep_bin<S: SpinPolicy>(
         parameters_raw: vec![],
         cell_raw: vec![],
         orig_cell_raw: vec![],
-        kpoint_weights: vec![1.0], // Single Gamma-point with weight 1.0
+        kpoint_weights: (0..nkpts).map(|ikpt| state.k_points[ikpt].weight).collect(),
         fine_grid: Some(fine_grid_dims),
         wavefunction: Some(wavefunction),
         forces: None,

@@ -296,6 +296,25 @@ pub fn assemble_total_energy(
     e_band - e_hartree + e_xc - rho_vxc + ewald
 }
 
+/// Assemble the KS-DFT total energy from pre-computed band energy.
+///
+/// Same formula as `assemble_total_energy` but accepts the band energy
+/// directly rather than computing it from eigenvalues and occupations.
+/// Useful when the band energy involves a kpt-weighted sum.
+///
+/// ```text
+/// E_total = e_band - E_H + E_xc - ∫ρV_xc + E_ewald
+/// ```
+pub fn assemble_total_energy_from_band(
+    e_band: f64,
+    e_xc: f64,
+    e_hartree: f64,
+    rho_vxc: f64,
+    ewald: f64,
+) -> f64 {
+    e_band - e_hartree + e_xc - rho_vxc + ewald
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

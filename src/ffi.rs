@@ -181,7 +181,7 @@ fn init_inner(
     for ik in 0..nk {
         let n_pw = npwk[ik] as usize;
         let kf = [kfrac[3*ik], kfrac[3*ik+1], kfrac[3*ik+2]];
-        let kpt = KPoint { coords: kf };
+        let kpt = KPoint { coords: kf, weight: 1.0 };
 
         // Convert k-point fractional → Cartesian for diagnostic
         let mut k_cart_diag = [0.0f64; 3];

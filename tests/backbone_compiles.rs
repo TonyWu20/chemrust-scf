@@ -8,7 +8,7 @@ use chemrust_hamiltonian_core::{
     CellGeometry, GVectorGrid, NonSpin, PseudopotentialSet, RealLattice, RecipLattice,
 };
 use chemrust_scf::{
-    Density, KPoint, PerSpinDensity, PerSpinPwCoefficients, PwCoefficients,
+    Density, KPoint, KptDataSet, PerSpinDensity, PerSpinPwCoefficients, PwCoefficients,
     ScfIteration, SmearingParams, SmearingScheme, SpinChannelData, WaveGridArray,
     WavefunctionSet, ColumnDistributed, device::CudaComplex, run_scf,
 };
@@ -78,15 +78,18 @@ fn dummy_per_spin_density() -> PerSpinDensity {
     PerSpinDensity(SpinChannelData::new::<NonSpin>(vec![dummy_density()]))
 }
 
-fn dummy_per_spin_psi() -> (PerSpinPwCoefficients, Vec<Vec<Complex64>>) {
+fn dummy_per_spin_psi() -> (PerSpinPwCoefficients, SpinChannelData<KptDataSet<Vec<Complex64>>>) {
     let wfn = dummy_wavefunctions();
+    let pw = PwCoefficients::new(
+        Arc::new(CudaContext::new(0).unwrap()).default_stream()
+            .alloc_zeros::<CudaComplex>(wfn.data.len()).unwrap()
+    );
     let psi_gpu = PerSpinPwCoefficients(SpinChannelData::new::<NonSpin>(
-        vec![PwCoefficients::new(
-            Arc::new(CudaContext::new(0).unwrap()).default_stream()
-                .alloc_zeros::<CudaComplex>(wfn.data.len()).unwrap()
-        )],
+        vec![KptDataSet::new(vec![pw], 1)],
     ));
-    let psi_data = vec![wfn.data];
+    let psi_data = SpinChannelData::new::<NonSpin>(vec![
+        KptDataSet::new(vec![wfn.data], 1),
+    ]);
     (psi_gpu, psi_data)
 }
 
@@ -94,6 +97,25 @@ fn dummy_per_spin_psi() -> (PerSpinPwCoefficients, Vec<Vec<Complex64>>) {
 #[ignore = "requires GPU; full validation is Group F"]
 fn backbone_compiles() {
     let (psi, psi_data) = dummy_per_spin_psi();
+    let pw_coords: Vec<[i32; 3]> = (0..27)
+        .map(|i| {
+            let iz = i / 9 - 1;
+            let iy = (i / 3) % 3 - 1;
+            let ix = i % 3 - 1;
+            [ix, iy, iz]
+        })
+        .collect();
+    let pw_fft_indices: Vec<i32> = {
+        let ngz = 6; let ngy = 4;
+        (0..27)
+            .map(|i| {
+                let ix = i % 3;
+                let iy = (i / 3) % 3;
+                let iz = i / 9;
+                (iz + ngz * (iy + ngy * ix)) as i32
+            })
+            .collect()
+    };
     let state: ScfIteration = ScfIteration::builder()
         .cell(dummy_cell())
         .pots(PseudopotentialSet::new())
@@ -102,28 +124,9 @@ fn backbone_compiles() {
         .density(dummy_per_spin_density())
         .psi(psi)
         .psi_data(psi_data)
-        .pw_coords(
-            (0..27)
-                .map(|i| {
-                    let iz = i / 9 - 1;
-                    let iy = (i / 3) % 3 - 1;
-                    let ix = i % 3 - 1;
-                    [ix, iy, iz]
-                })
-                .collect::<Vec<[i32; 3]>>(),
-        )
-        .pw_fft_indices({
-            let ngz = 6; let ngy = 4;
-            (0..27)
-                .map(|i| {
-                    let ix = i % 3;
-                    let iy = (i / 3) % 3;
-                    let iz = i / 9;
-                    (iz + ngz * (iy + ngy * ix)) as i32
-                })
-                .collect::<Vec<i32>>()
-        })
-        .k_point(KPoint::default())
+        .pw_coords(KptDataSet::new(vec![pw_coords], 1))
+        .pw_fft_indices(KptDataSet::new(vec![pw_fft_indices], 1))
+        .k_points(KptDataSet::new(vec![KPoint::default()], 1))
         .smearing(SmearingParams {
             width: 0.01,
             electron_temperature: 0.01,

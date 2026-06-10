@@ -85,6 +85,96 @@ fn find_chemical_potential(
     Ok(0.5 * (lo + hi))
 }
 
+/// Multi-kpt weighted occupation search: find μ such that
+/// Σ_k w_k Σ_b erfc((ε_{bk} - μ) / w) = N_electrons_per_spin.
+///
+/// `per_kpt_eigenvalues` is a slice where each element is the eigenvalue list
+/// for one k-point (length = n_bands each). `kpt_weights` must be the same
+/// length and sum to 1.0 (or to N_kpts normalization).
+///
+/// For nkpts=1 with weight=1.0, this is equivalent to `compute_occupations`.
+///
+/// Returns `(Vec<Vec<f64>>, f64)` where the outer Vec is per-kpt occupations
+/// and the inner Vecs are per-band occupations (length = n_bands each).
+pub fn compute_occupations_weighted(
+    per_kpt_eigenvalues: &[Vec<f64>],
+    kpt_weights: &[f64],
+    smearing: &SmearingParams,
+    n_electrons_per_spin: f64,
+) -> Result<(Vec<Vec<f64>>, ChemicalPotential), Error> {
+    match smearing.scheme {
+        SmearingScheme::Gaussian => {
+            // Flatten eigenvalues with weights for chemical potential search.
+            // For the bisection, we need Σ_k w_k Σ_b erfc((ε_{bk} - μ) / w).
+            // We precompute the weighted objective.
+            let mu = find_chemical_potential_weighted(
+                per_kpt_eigenvalues,
+                kpt_weights,
+                smearing.width,
+                n_electrons_per_spin,
+            )?;
+
+            // Compute per-kpt occupations at the found μ
+            let per_kpt_occs: Vec<Vec<f64>> = per_kpt_eigenvalues
+                .iter()
+                .map(|eigs| {
+                    eigs.iter()
+                        .map(|&e| libm::erfc((e - mu) / smearing.width))
+                        .collect()
+                })
+                .collect();
+
+            Ok((per_kpt_occs, ChemicalPotential(mu)))
+        }
+    }
+}
+
+/// Bisection search for μ such that Σ_k w_k Σ_b erfc((ε_{bk} - μ) / w) = N.
+fn find_chemical_potential_weighted(
+    per_kpt_eigenvalues: &[Vec<f64>],
+    kpt_weights: &[f64],
+    width: f64,
+    n_electrons: f64,
+) -> Result<f64, Error> {
+    assert_eq!(
+        per_kpt_eigenvalues.len(),
+        kpt_weights.len(),
+        "kpt_eigenvalues and kpt_weights must have same length"
+    );
+
+    // Find global eigenvalue range across all kpts
+    let mut emin = f64::INFINITY;
+    let mut emax = f64::NEG_INFINITY;
+    for eigs in per_kpt_eigenvalues {
+        for &e in eigs {
+            if e < emin { emin = e; }
+            if e > emax { emax = e; }
+        }
+    }
+    if per_kpt_eigenvalues.is_empty() || emax < emin {
+        return Err(Error::NotImplemented);
+    }
+
+    let mut lo = emin - 10.0 * width;
+    let mut hi = emax + 10.0 * width;
+    for _ in 0..80 {
+        let mid = 0.5 * (lo + hi);
+        let sum: f64 = per_kpt_eigenvalues
+            .iter()
+            .zip(kpt_weights.iter())
+            .flat_map(|(eigs, &w)| {
+                eigs.iter().map(move |&e| w * libm::erfc((e - mid) / width))
+            })
+            .sum();
+        if sum > n_electrons {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    Ok(0.5 * (lo + hi))
+}
+
 /// CASTEP lower-bound bisection for FIXED-spin occupation search.
 ///
 /// Finds the Fermi energy for a single spin channel such that:

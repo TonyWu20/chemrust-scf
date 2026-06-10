@@ -535,7 +535,7 @@ fn test_6_wavefunction_normalization() {
     let kpt_block = &wfc.kpt_data[0];
     let n_bands = kpt_block.bands.len();
     let n_pw = kpt_block.nplw;
-    let k_point = KPoint { coords: kpt_block.coords };
+    let k_point = KPoint { coords: kpt_block.coords, weight: 1.0 };
     let psi_data: Vec<Complex64> = kpt_block.bands.concat();
 
     let ctx = Arc::new(cudarc::driver::CudaContext::new(0).expect("CUDA context"));
