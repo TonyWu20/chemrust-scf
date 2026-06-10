@@ -320,7 +320,7 @@ fn davidson_hdump_validation() {
     // -----------------------------------------------------------------------
     // Build SCF state and pin CASTEP's V_eff
     // -----------------------------------------------------------------------
-    let state = ScfIteration::builder()
+    let state: ScfIteration = ScfIteration::builder()
         .cell(cell.clone())
         .pots(fx.pots.clone())
         .wave_grid(wave_grid)
@@ -347,7 +347,7 @@ fn davidson_hdump_validation() {
             std::env::var("CASTEP_FIXTURE_DIR").unwrap_or_else(|_| H_DUMP_DIR.to_string()));
         if let Ok(pot_text) = std::fs::read_to_string(&pot_path) {
             if let Ok((_grid, ref_pot)) = formatted::parse_pot_fmt(&pot_text) {
-                let our_veff = veff_state.v_eff().as_ref().unwrap();
+                let our_veff: &chemrust_hamiltonian_core::EffectivePotential = veff_state.v_eff().as_ref().unwrap();
                 let our_arr = our_veff.as_real_grid().as_real_array();
                 // ref_pot is on wave grid, our_pot is on wave grid (after downsample).
                 // Both should have the same dimensions.

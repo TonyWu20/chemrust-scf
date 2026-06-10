@@ -58,9 +58,9 @@ struct KptData {
     k_point: KPoint,
     /// Plane-wave Miller indices for this k-point.
     pw_coords: Vec<[i32; 3]>,
-    /// Lazily-initialised V_NL batch data.  Created on the first call to
-    /// step_inner with the REAL psi and n_bands — never dummy values.
-    vnl: Option<VnlBatchData>,
+    /// Lazily-initialised V_NL batch data per spin.  Created on the first call
+    /// to step_inner with the REAL psi and n_bands — never dummy values.
+    vnl: Vec<Option<VnlBatchData>>,
 }
 
 // ---- Opaque handle ---------------------------------------------------------
@@ -72,11 +72,12 @@ struct ChemrustHandle {
     solver: SolverHandle,
     kernels: CudaKernelSet,
     ngx: i32, ngy: i32, ngz: i32,
+    nspins: usize,
     kpts: Vec<KptData>,
-    /// Cached GPU copy of V_eff for skip-upload optimization.
-    v_eff_cached: Option<CudaSlice<f64>>,
-    /// Max-norm of the cached V_eff, used for change detection.
-    v_eff_norm: f64,
+    /// Cached GPU copies of V_eff per spin for skip-upload optimization.
+    v_eff_cached: Vec<Option<CudaSlice<f64>>>,
+    /// Max-norm of the cached V_eff per spin, used for change detection.
+    v_eff_norm: Vec<f64>,
     /// Shared across k-points: pseudopotentials, cell geometry, wave grid.
     /// Stored here so that VnlBatchData can be created in step_inner
     /// (where real psi/n_bands are available) instead of init_inner
@@ -96,13 +97,13 @@ pub unsafe extern "C" fn chemrust_eigensolve_init(
     nkpts: c_int, num_pw_per_kpt: *const c_int, gvec_all_kpt: *const c_double,
     pw_grid_idx: *const c_int,
     kpt_coords: *const c_double,
-    ngx: c_int, ngy: c_int, ngz: c_int,
+    ngx: c_int, ngy: c_int, ngz: c_int, nspins: c_int,
     handle_out: *mut *mut c_void,
 ) -> c_int {
     if handle_out.is_null() { return CHEM_EIG_NULL_HANDLE; }
     let h = match init_inner(num_species, species_symbols, species_pots,
         real_lattice, recip_lattice, num_ions, ion_species, ion_positions,
-        nkpts, num_pw_per_kpt, gvec_all_kpt, pw_grid_idx, kpt_coords, ngx, ngy, ngz)
+        nkpts, num_pw_per_kpt, gvec_all_kpt, pw_grid_idx, kpt_coords, ngx, ngy, ngz, nspins)
     {
         Ok(h) => h,
         Err(code) => return code,
@@ -118,7 +119,7 @@ fn init_inner(
     nkpts: c_int, num_pw_per_kpt: *const c_int, gvec_all_kpt: *const c_double,
     pw_grid_idx: *const c_int,
     kpt_coords: *const c_double,
-    ngx: c_int, ngy: c_int, ngz: c_int,
+    ngx: c_int, ngy: c_int, ngz: c_int, nspins: c_int,
 ) -> Result<*mut ChemrustHandle, c_int> {
     let ctx: Arc<CudaContext> = CudaContext::new(0).map_err(|e| { eprintln!("[chemrust] init: CudaContext failed: {e}"); CHEM_EIG_CUDA_ERROR })?;
     let stream = ctx.default_stream();
@@ -173,6 +174,8 @@ fn init_inner(
     let gidx = unsafe { std::slice::from_raw_parts(pw_grid_idx as *const i32, maxpw*nk) };
 
     let wg = GVectorGrid::new(ngx as usize, ngy as usize, ngz as usize, RecipLattice::from_inner(rcip));
+
+    let nspins_u = nspins as usize;
 
     let mut kpts = Vec::with_capacity(nk);
     for ik in 0..nk {
@@ -234,7 +237,7 @@ fn init_inner(
         // VnlBatchData is deferred to step_inner where real psi/n_bands are
         // available.  Store only the ion-independent per-k-point data here.
         kpts.push(KptData {
-            vnl: None,
+            vnl: (0..nspins_u).map(|_| None).collect(),
             kpoint_frac: kf,
             k_point: kpt,
             pw_coords,
@@ -245,9 +248,9 @@ fn init_inner(
     let cell_clone = cell.clone();
     Ok(Box::into_raw(Box::new(ChemrustHandle {
         ctx, stream, blas, solver, kernels,
-        ngx, ngy, ngz, kpts,
-        v_eff_cached: None,
-        v_eff_norm: 0.0,
+        ngx, ngy, ngz, nspins: nspins_u, kpts,
+        v_eff_cached: (0..nspins_u).map(|_| None).collect(),
+        v_eff_norm: vec![0.0; nspins_u],
         pots: pots_clone,
         cell: cell_clone,
         wave_grid: wg,
@@ -270,12 +273,12 @@ pub unsafe extern "C" fn chemrust_eigensolve_step(
     psi_data: *mut CudaComplex, v_eff_data: *const c_double,
     kinetic_data: *const c_double, fft_idx_data: *const c_int,
     eigenvalues_ptr: *mut c_double, hpsi_out: *mut CudaComplex,
-    npw: c_int, nbands: c_int, ikpt: c_int,
+    npw: c_int, nbands: c_int, ikpt: c_int, ispin: c_int,
     max_deg: c_int,
     converged: *mut c_int,
 ) -> c_int {
     match unsafe { step_inner(handle, psi_data, v_eff_data, kinetic_data, fft_idx_data,
-        eigenvalues_ptr, hpsi_out, npw, nbands, ikpt, max_deg, converged) }
+        eigenvalues_ptr, hpsi_out, npw, nbands, ikpt, ispin, max_deg, converged) }
     {
         Ok(()) => CHEM_EIG_OK,
         Err(c) => c,
@@ -288,7 +291,7 @@ unsafe fn step_inner(
     psi_data: *mut CudaComplex, v_eff_data: *const c_double,
     kinetic_data: *const c_double, fft_idx_data: *const c_int,
     eigenvalues_ptr: *mut c_double, hpsi_out: *mut CudaComplex,
-    npw: c_int, nbands: c_int, ikpt: c_int,
+    npw: c_int, nbands: c_int, ikpt: c_int, ispin: c_int,
     _max_deg: c_int,
     converged: *mut c_int,
 ) -> Result<(), c_int> {
@@ -299,6 +302,8 @@ unsafe fn step_inner(
 
     let ik = ikpt as usize;
     if ik >= h.kpts.len() { return Err(CHEM_EIG_CUDA_ERROR); }
+    let isp = ispin as usize;
+    if isp >= h.nspins { return Err(CHEM_EIG_CUDA_ERROR); }
     let n_pw = npw as usize;
     let n_bands = nbands as usize;
     let gs = (h.ngx * h.ngy * h.ngz) as usize;
@@ -393,12 +398,12 @@ unsafe fn step_inner(
         );
     }
 
-    // Lazily initialise VnlBatchData on the first call to step_inner, where
-    // real psi and n_bands are available.  init_inner cannot create this
+    // Lazily initialise VnlBatchData per spin on the first call to step_inner,
+    // where real psi and n_bands are available.  init_inner cannot create this
     // because CASTEP doesn't pass wavefunctions at init time.
-    if kd.vnl.is_none() {
+    if kd.vnl[isp].is_none() {
         let mut pcie = PcieAccount::default();
-        kd.vnl = Some(VnlBatchData::precompute(
+        kd.vnl[isp] = Some(VnlBatchData::precompute(
             &kd.pw_coords, &h.pots, &h.cell, &h.wave_grid, &kd.k_point,
             &psi_host, n_bands, n_pw, None, None,
             &h.stream, &mut pcie, &h.blas, &h.kernels, &h.solver,
@@ -428,7 +433,7 @@ unsafe fn step_inner(
 
     // V_eff GPU caching: skip H2D transfer if V_eff unchanged since last step.
     // Uses max-norm for cheap change detection (threshold 1e-8 Ha).
-    let cache_reuse = h.v_eff_cached.as_ref().is_some_and(|_| (ve_norm - h.v_eff_norm).abs() < 1e-8);
+    let cache_reuse = h.v_eff_cached[isp].as_ref().is_some_and(|_| (ve_norm - h.v_eff_norm[isp]).abs() < 1e-8);
 
     // CASTEP passes V_eff as ix-innermost flat array (Fortran column-major).
     // cuFFT with plan (ngx, ngy, ngz) expects n[rank-1]=ngz innermost (z-fastest),
@@ -451,7 +456,7 @@ unsafe fn step_inner(
         // Currently each HIT allocates a fresh GPU buffer and copies from cache,
         // which is wasteful for every SCF iteration after the first.
         let mut slice: CudaSlice<f64> = h.stream.alloc_zeros::<f64>(gs).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
-        h.stream.memcpy_dtod(h.v_eff_cached.as_ref().unwrap(), &mut slice).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
+        h.stream.memcpy_dtod(h.v_eff_cached[isp].as_ref().unwrap(), &mut slice).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
         Gpu::<EffectivePotential> {
             slice,
             shape: vec![ngz_u, ngy_u, ngx_u],
@@ -459,7 +464,7 @@ unsafe fn step_inner(
             _marker: std::marker::PhantomData,
         }
     } else {
-        if cfg!(feature = "scf_diag") { eprintln!("[chemrust] V_eff cache MISS norm={:.6e} prev={:.6e}", ve_norm, h.v_eff_norm); }
+        if cfg!(feature = "scf_diag") { eprintln!("[chemrust] V_eff cache MISS norm={:.6e} prev={:.6e}", ve_norm, h.v_eff_norm[isp]); }
         // Verify round-trip: flatten transposed array and compare against
         // raw CASTEP data after applying the same x↔z transpose.
         #[cfg(feature = "scf_diag")]
@@ -500,14 +505,14 @@ unsafe fn step_inner(
                 ve_gpu_back[0], ve_gpu_back[1], ve_gpu_back[2], ve_gpu_back[3], ve_gpu_back[4]);
         }
         // Update cache: preserve GPU copy for next SCF step
-        if h.v_eff_cached.is_none() {
+        if h.v_eff_cached[isp].is_none() {
             let mut cache = h.stream.alloc_zeros::<f64>(gs).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
             h.stream.memcpy_dtod(vg.as_device_slice(), &mut cache).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
-            h.v_eff_cached = Some(cache);
+            h.v_eff_cached[isp] = Some(cache);
         } else {
-            h.stream.memcpy_dtod(vg.as_device_slice(), h.v_eff_cached.as_mut().unwrap()).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
+            h.stream.memcpy_dtod(vg.as_device_slice(), h.v_eff_cached[isp].as_mut().unwrap()).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
         }
-        h.v_eff_norm = ve_norm;
+        h.v_eff_norm[isp] = ve_norm;
         vg
     };
 
@@ -515,7 +520,7 @@ unsafe fn step_inner(
     // D-screening computes ∫Q·V_eff at ion positions — it needs the
     // physical (x,y,z) grid layout, not the transposed FFT layout.
     let veff_original = EffectivePotential(FineGridArray(arr_ix_fast.clone()));
-    kd.vnl.as_mut().unwrap().rescreen_d(veff_original.as_fine_array(), &h.stream, &h.kernels, &h.blas)
+    kd.vnl[isp].as_mut().unwrap().rescreen_d(veff_original.as_fine_array(), &h.stream, &h.kernels, &h.blas)
         .map_err(|e| { eprintln!("[chemrust] D re-screen failed: {e}"); CHEM_EIG_CUDA_ERROR })?;
 
     // Upload FFT index.  CASTEP passes 1-based Fortran grid indices with
@@ -612,7 +617,7 @@ unsafe fn step_inner(
             .v_eff_dev(v_eff_gpu.as_device_slice())
             .kinetic_dev(&kinetic_dev)
             .fft_idx_dev(&fft_idx_dev)
-            .vnl_data(kd.vnl.as_ref().unwrap())
+            .vnl_data(kd.vnl[isp].as_ref().unwrap())
             .n_pw(n_pw)
             .n_bands(n_bands)
             .grid_size(gs)
@@ -649,7 +654,7 @@ unsafe fn step_inner(
             .fft_plan(&fft_plan)
             .hpsi_dev(&mut hpsi_new)
             .grid_dev(&mut grid_buf)
-            .vnl_data(kd.vnl.as_ref().unwrap())
+            .vnl_data(kd.vnl[isp].as_ref().unwrap())
             .blas(blas)
             .kernels(kernels)
             .stream(stream)

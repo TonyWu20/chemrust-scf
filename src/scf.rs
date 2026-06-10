@@ -362,12 +362,12 @@ impl BuildVEff for SpinCollinear {
 }
 
 // --- Private dispatch trait for energy-aware V_eff assembly ---
-// Only NonSpin is implemented initially (energy for SpinCollinear deferred).
 
 pub trait BuildVEffWithEnergy: BuildVEff {
     fn build_v_eff_with_energy_impl(
         cell: &CellGeometry, pots: &PseudopotentialSet,
         rho: &chemrust_hamiltonian_core::Density,
+        spin: Option<&chemrust_hamiltonian_core::Density>,
         rho_aug_fine: Option<&chemrust_hamiltonian_core::fft::RealGrid<f64>>,
         wave_grid: &GVectorGrid, fine_grid: &GVectorGrid,
     ) -> Result<(Self::VEff, f64, f64, f64), chemrust_hamiltonian_core::Error>;
@@ -377,6 +377,7 @@ impl BuildVEffWithEnergy for NonSpin {
     fn build_v_eff_with_energy_impl(
         cell: &CellGeometry, pots: &PseudopotentialSet,
         rho: &chemrust_hamiltonian_core::Density,
+        _spin: Option<&chemrust_hamiltonian_core::Density>,
         rho_aug_fine: Option<&chemrust_hamiltonian_core::fft::RealGrid<f64>>,
         wave_grid: &GVectorGrid, fine_grid: &GVectorGrid,
     ) -> Result<(chemrust_hamiltonian_core::EffectivePotential, f64, f64, f64), chemrust_hamiltonian_core::Error> {
@@ -423,6 +424,119 @@ impl BuildVEffWithEnergy for NonSpin {
     }
 }
 
+impl BuildVEffWithEnergy for SpinCollinear {
+    fn build_v_eff_with_energy_impl(
+        cell: &CellGeometry, pots: &PseudopotentialSet,
+        rho: &chemrust_hamiltonian_core::Density,
+        spin: Option<&chemrust_hamiltonian_core::Density>,
+        rho_aug_fine: Option<&chemrust_hamiltonian_core::fft::RealGrid<f64>>,
+        wave_grid: &GVectorGrid, fine_grid: &GVectorGrid,
+    ) -> Result<(Self::VEff, f64, f64, f64), chemrust_hamiltonian_core::Error> {
+        use chemrust_hamiltonian_core::{
+            nlcc, poisson, upsample_density_to_fine_grid, xc,
+            Density as CoreDensity,
+        };
+        // A spin density is required for SpinCollinear.
+        let rho_spin = spin.ok_or_else(|| chemrust_hamiltonian_core::Error::MissingField(
+            "SpinCollinear BuildVEffWithEnergy requires spin density".into(),
+        ))?;
+
+        // 1. Upsample total density to fine grid
+        let rho_total_fine_pw =
+            upsample_density_to_fine_grid(rho.as_real_grid(), wave_grid, fine_grid)
+                .map_err(|_| chemrust_hamiltonian_core::Error::Format {
+                    section: "build_v_eff_with_energy_spin".into(),
+                    detail: "upsample total density failed".into(),
+                })?;
+
+        // 2. Upsample spin density to fine grid
+        let rho_spin_fine_pw =
+            upsample_density_to_fine_grid(rho_spin.as_real_grid(), wave_grid, fine_grid)
+                .map_err(|_| chemrust_hamiltonian_core::Error::Format {
+                    section: "build_v_eff_with_energy_spin".into(),
+                    detail: "upsample spin density failed".into(),
+                })?;
+
+        // 3. Add augmentation (spin-independent for Phase 7): only to total density.
+        let (rho_total_fine, rho_spin_fine) = match rho_aug_fine {
+            Some(aug) => (
+                chemrust_hamiltonian_core::fft::RealGrid::from_inner(
+                    rho_total_fine_pw.as_real_array() + aug.as_real_array(),
+                ),
+                rho_spin_fine_pw,
+            ),
+            None => (rho_total_fine_pw, rho_spin_fine_pw),
+        };
+
+        // 4. Assemble V_eff via VEffBuilder (returns up/down effective potentials).
+        let v_eff = VEffBuilder::<SpinCollinear>::new(cell, pots, fine_grid)
+            .with_density(CoreDensity::from_inner(rho_total_fine.clone()), Some(CoreDensity::from_inner(rho_spin_fine.clone())))
+            .assemble()?;
+
+        // 5. Recover per-spin densities for double-counting integrals.
+        //    rho_up = (rho_total + rho_spin) / 2, rho_dn = (rho_total - rho_spin) / 2
+        let rho_up = CoreDensity::from_inner(
+            chemrust_hamiltonian_core::fft::RealGrid::from_inner(
+                (rho_total_fine.as_real_array() + rho_spin_fine.as_real_array()) * 0.5,
+            ),
+        );
+        let rho_dn = CoreDensity::from_inner(
+            chemrust_hamiltonian_core::fft::RealGrid::from_inner(
+                (rho_total_fine.as_real_array() - rho_spin_fine.as_real_array()) * 0.5,
+            ),
+        );
+
+        // 6. Reconstruct core density (spin-independent).
+        let rho_core = nlcc::reconstruct_rho_core(cell, pots, fine_grid)?
+            .into_inner();
+        let rho_total_core = CoreDensity::from_inner(
+            rho_total_fine.clone() + &rho_core,
+        );
+
+        // 7. Hartree potential from total density (same for both spins).
+        let v_h = poisson::solve_poisson(
+            &CoreDensity::from_inner(rho_total_fine.clone()),
+            fine_grid,
+        )?;
+
+        // 8. XC potential: spin-polarised PBE.
+        let v_xc = xc::compute_pbe_xc_spin(
+            rho_total_core.as_real_grid().as_real_array(),
+            rho_spin_fine.as_real_array(),
+            fine_grid,
+            cell.volume,
+        )?;
+
+        // 9. Energy integrals — all use d_v = 1/N_grid on the fine grid.
+        //    (CASTEP xc_gga / xc.f90:1056, pot.f90:4205).
+        let n_grid = rho_total_fine.as_real_array().len() as f64;
+        let d_v = 1.0 / n_grid;
+
+        // E_H = 0.5 * sum(rho_total * v_h) / N
+        let e_hartree_raw: f64 = rho_total_fine.as_real_array().iter()
+            .zip(v_h.as_real_grid().as_real_array().iter())
+            .map(|(&rv, &vh)| rv * vh * d_v)
+            .sum();
+        let e_hartree = 0.5 * e_hartree_raw;
+
+        // E_xc from the spin-polarised functional (already integrated).
+        let e_xc = v_xc.energy;
+
+        // CRITICAL C5-S4: rho_vxc = (1/N) * SUM(rho_up[i] * vxc_up[i] + rho_dn[i] * vxc_dn[i])
+        // NOT rho_total * vxc_avg.  CASTEP pot.f90:4205 sums per-spin.
+        let rho_vxc: f64 = rho_up.as_real_grid().as_real_array().iter()
+            .zip(v_xc.v_xc_up.iter())
+            .map(|(&rv, &vxc)| rv * vxc * d_v)
+            .sum::<f64>()
+            + rho_dn.as_real_grid().as_real_array().iter()
+                .zip(v_xc.v_xc_dn.iter())
+                .map(|(&rv, &vxc)| rv * vxc * d_v)
+                .sum::<f64>();
+
+        Ok((v_eff, e_xc, e_hartree, rho_vxc))
+    }
+}
+
 impl<S: SpinPolicy + BuildVEff> ScfIteration<S, Initialized, MixingOff> {
     /// Assemble V_eff[ρ] from the current density.
     /// Consumes `self`, returns a state in the `VEffBuilt` phase.
@@ -442,25 +556,34 @@ impl<S: SpinPolicy + BuildVEff> ScfIteration<S, Initialized, MixingOff> {
     }
 }
 
-impl ScfIteration<NonSpin, Initialized, MixingOff> {
+impl<S: SpinPolicy + BuildVEffWithEnergy> ScfIteration<S, Initialized, MixingOff> {
     /// Assemble V_eff with energy components for total energy computation.
     ///
     /// Same as `build_v_eff` but also populates the energy fields
     /// (`e_xc`, `e_hartree`, `rho_vxc`) from the XC/Hartree evaluation.
     /// These are needed by `check()` for total energy computation.
-    pub fn build_v_eff_with_energy(self) -> Result<ScfIteration<NonSpin, VEffBuilt, MixingOff>, Error> {
+    pub fn build_v_eff_with_energy(self) -> Result<ScfIteration<S, VEffBuilt, MixingOff>, Error> {
         let total_density = self.density.total();
         let core_rho = chemrust_hamiltonian_core::Density::from_inner(
             chemrust_hamiltonian_core::fft::RealGrid::from_inner(total_density.as_wave_array().clone()),
         );
+        let spin_arg = if S::nspins() == 2 {
+            let spin_d = self.density.spin().into_inner();
+            Some(chemrust_hamiltonian_core::Density::from_inner(
+                chemrust_hamiltonian_core::fft::RealGrid::from_inner(spin_d.as_wave_array().clone()),
+            ))
+        } else {
+            None
+        };
         let density_aug = self.density_aug_fine[0].as_ref();
-        let (v_eff, e_xc, e_hartree, rho_vxc) = NonSpin::build_v_eff_with_energy_impl(
+        let (v_eff, e_xc, e_hartree, rho_vxc) = S::build_v_eff_with_energy_impl(
             &self.cell, &self.pots, &core_rho,
+            spin_arg.as_ref(),
             density_aug,
             &self.wave_grid, &self.fine_grid,
         )
         .map_err(|_| Error::NotImplemented)?;
-        let mut next: ScfIteration<NonSpin, VEffBuilt, MixingOff> = self.into_phase();
+        let mut next: ScfIteration<S, VEffBuilt, MixingOff> = self.into_phase();
         next.v_eff = Some(v_eff);
         next.e_xc = Some(e_xc);
         next.e_hartree = Some(e_hartree);
@@ -1626,8 +1749,8 @@ pub fn run_scf<S: SpinPolicy + BuildVEff>(
 ///
 /// When `RUST_LOG=info` is set, emits per-iteration output in the same
 /// column format as CASTEP's SCF convergence table.
-pub fn run_scf_with_energy(
-    state: ScfIteration<NonSpin, Initialized, MixingOff>,
+pub fn run_scf_with_energy<S: SpinPolicy + BuildVEffWithEnergy>(
+    state: ScfIteration<S, Initialized, MixingOff>,
     ndeg: usize,
     tol: f64,
 ) -> Result<FinalResult, Error> {
@@ -1698,8 +1821,8 @@ impl Default for ScfDivergenceGate {
 /// SCF check completes. Any out-of-bounds value triggers a panic with a
 /// structured message identifying which gate fired, the offending value,
 /// the iteration index, and a brief reference to the expected range.
-pub fn run_scf_with_energy_gated(
-    state: ScfIteration<NonSpin, Initialized, MixingOff>,
+pub fn run_scf_with_energy_gated<S: SpinPolicy + BuildVEffWithEnergy>(
+    state: ScfIteration<S, Initialized, MixingOff>,
     ndeg: usize,
     tol: f64,
     gate: Option<ScfDivergenceGate>,
@@ -1723,7 +1846,7 @@ pub fn run_scf_with_energy_gated(
             // can use it for the gate at end-of-iteration.
             let veff_range_now = if gate.is_some() {
                 v_eff.v_eff().as_ref().map(|veff| {
-                    let arr = veff.as_real_grid().as_real_array();
+                    let arr = S::v_eff_for_spin(veff, 0).as_real_grid().as_real_array();
                     let mn = arr.iter().cloned().fold(f64::INFINITY, f64::min);
                     let mx = arr.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
                     mx - mn
