@@ -367,7 +367,7 @@ pub fn build_spin_scf_state(fx: &NioSpinFixture) -> ScfIteration<SpinCollinear> 
 
     // --- Per-spin wavefunctions (first k-point only) ---
     //
-    // kpt_data layout: spin-major → spin0 kpts then spin1 kpts
+    // kpt_data layout: spin-major → spin0 kpts[0..nkpts-1], spin1 kpts[nkpts..]
     let nkpts = wfc.kpt_data.len() / nspins;
     assert!(
         nkpts >= 1,
@@ -375,31 +375,42 @@ pub fn build_spin_scf_state(fx: &NioSpinFixture) -> ScfIteration<SpinCollinear> 
         wfc.kpt_data.len()
     );
 
-    // kpt 0, spin 0
-    let kpt0_spin0 = &wfc.kpt_data[0];
-    // kpt 0, spin 1
-    let kpt0_spin1 = &wfc.kpt_data[nkpts];
-
-    let n_pw = kpt0_spin0.nplw;
+    // Parse k-point weights from the .bands file header.
+    // Each "K-point N kx ky kz weight" line has the weight as the last field.
+    let kpt_weights: Vec<f64> = {
+        let bands_text = std::fs::read_to_string(
+            format!("{}/NiO.bands", std::env::var("NIO_SPIN_FIXTURE_DIR")
+                .unwrap_or_else(|_| NIO_SPIN_DIR.to_string()))
+        ).expect("cannot read NiO.bands for weights");
+        bands_text
+            .lines()
+            .filter(|l| l.trim().starts_with("K-point"))
+            .filter_map(|l| {
+                let parts: Vec<&str> = l.trim().split_whitespace().collect();
+                parts.last()?.parse::<f64>().ok()
+            })
+            .collect()
+    };
     assert_eq!(
-        kpt0_spin1.nplw, n_pw,
-        "nplw must match across spins for same k-point"
-    );
-    let n_bands = kpt0_spin0.bands.len();
-    assert_eq!(
-        kpt0_spin1.bands.len(),
-        n_bands,
-        "n_bands must match across spins"
+        kpt_weights.len(),
+        nkpts,
+        "parsed {} kpt weights, expected {nkpts}",
+        kpt_weights.len(),
     );
 
-    // Flatten per-spin bands: [band][pw] → flat [band0_pw0, band0_pw1, ...]
-    let psi_data_spin0: Vec<num_complex::Complex64> =
-        kpt0_spin0.bands.iter().flatten().copied().collect();
-    let psi_data_spin1: Vec<num_complex::Complex64> =
-        kpt0_spin1.bands.iter().flatten().copied().collect();
+    // Validate n_bands and n_pw are consistent across all kpts and spins.
+    let n_bands = wfc.kpt_data[0].bands.len();
+    let n_pw = wfc.kpt_data[0].nplw;
+    for ikpt in 0..nkpts {
+        let kpt_s0 = &wfc.kpt_data[ikpt];
+        let kpt_s1 = &wfc.kpt_data[nkpts + ikpt];
+        assert_eq!(kpt_s0.bands.len(), n_bands, "n_bands mismatch at kpt={ikpt} spin0");
+        assert_eq!(kpt_s1.bands.len(), n_bands, "n_bands mismatch at kpt={ikpt} spin1");
+        assert_eq!(kpt_s0.nplw, n_pw, "n_pw mismatch at kpt={ikpt} spin0");
+        assert_eq!(kpt_s1.nplw, n_pw, "n_pw mismatch at kpt={ikpt} spin1");
+    }
 
-    // Allocate GPU-resident placeholder PwCoefficients (will be overwritten by
-    // diagonalize_inner's H2D from psi_cpu).
+    // --- Collect per-kpt, per-spin wavefunctions ---
     let ctx = std::sync::Arc::new(
         cudarc::driver::CudaContext::new(0).expect("GPU required for warm-start test"),
     );
@@ -407,28 +418,53 @@ pub fn build_spin_scf_state(fx: &NioSpinFixture) -> ScfIteration<SpinCollinear> 
     let n_elements = n_bands * n_pw;
 
     use cudarc::driver::CudaSlice;
-    let psi_gpu_spin0: CudaSlice<chemrust_scf::device::CudaComplex> =
-        unsafe { stream.alloc_zeros(n_elements) }.expect("GPU alloc spin0");
-    let psi_gpu_spin1: CudaSlice<chemrust_scf::device::CudaComplex> =
-        unsafe { stream.alloc_zeros(n_elements) }.expect("GPU alloc spin1");
+
+    let mut psi_gpu_spin0: Vec<PwCoefficients> = Vec::with_capacity(nkpts);
+    let mut psi_gpu_spin1: Vec<PwCoefficients> = Vec::with_capacity(nkpts);
+    let mut psi_data_spin0: Vec<Vec<num_complex::Complex64>> = Vec::with_capacity(nkpts);
+    let mut psi_data_spin1: Vec<Vec<num_complex::Complex64>> = Vec::with_capacity(nkpts);
+    let mut k_points_vec: Vec<KPoint> = Vec::with_capacity(nkpts);
+    let mut pw_coords_vec: Vec<Vec<[i32; 3]>> = Vec::with_capacity(nkpts);
+    let mut pw_fft_vec: Vec<Vec<i32>> = Vec::with_capacity(nkpts);
+
+    for ikpt in 0..nkpts {
+        let kpt_s0 = &wfc.kpt_data[ikpt];
+        let kpt_s1 = &wfc.kpt_data[nkpts + ikpt];
+
+        // GPU placeholders (overwritten by diagonalize_inner's H2D from psi_cpu)
+        let gpu_s0: CudaSlice<chemrust_scf::device::CudaComplex> =
+            stream.alloc_zeros(n_elements).expect("GPU alloc spin0");
+        let gpu_s1: CudaSlice<chemrust_scf::device::CudaComplex> =
+            stream.alloc_zeros(n_elements).expect("GPU alloc spin1");
+
+        psi_gpu_spin0.push(PwCoefficients::new(gpu_s0));
+        psi_gpu_spin1.push(PwCoefficients::new(gpu_s1));
+
+        // CPU wavefunction data: flatten [band][pw] → [band0_pw0, ...]
+        psi_data_spin0.push(kpt_s0.bands.iter().flatten().copied().collect());
+        psi_data_spin1.push(kpt_s1.bands.iter().flatten().copied().collect());
+
+        k_points_vec.push(KPoint {
+            coords: kpt_s0.coords,
+            weight: kpt_weights[ikpt],
+        });
+        pw_coords_vec.push(kpt_s0.pw_grid_coord.clone());
+        pw_fft_vec.push(pw_coords_to_fft_indices(&kpt_s0.pw_grid_coord, &wave_grid));
+    }
 
     let psi = PerSpinPwCoefficients(SpinChannelData::new::<SpinCollinear>(vec![
-        KptDataSet::new(vec![PwCoefficients::new(psi_gpu_spin0)], 1),
-        KptDataSet::new(vec![PwCoefficients::new(psi_gpu_spin1)], 1),
+        KptDataSet::new(psi_gpu_spin0, nkpts),
+        KptDataSet::new(psi_gpu_spin1, nkpts),
     ]));
 
     let psi_data = SpinChannelData::new::<SpinCollinear>(vec![
-        KptDataSet::new(vec![psi_data_spin0], 1),
-        KptDataSet::new(vec![psi_data_spin1], 1),
+        KptDataSet::new(psi_data_spin0, nkpts),
+        KptDataSet::new(psi_data_spin1, nkpts),
     ]);
 
-    let pw_coords = KptDataSet::new(vec![kpt0_spin0.pw_grid_coord.clone()], 1);
-    let pw_fft_indices = KptDataSet::new(vec![pw_coords_to_fft_indices(&kpt0_spin0.pw_grid_coord, &wave_grid)], 1);
-
-    let k_point = KPoint {
-        coords: kpt0_spin0.coords,
-        weight: 1.0,
-    };
+    let pw_coords = KptDataSet::new(pw_coords_vec, nkpts);
+    let pw_fft_indices = KptDataSet::new(pw_fft_vec, nkpts);
+    let k_points = KptDataSet::new(k_points_vec, nkpts);
 
     // Smearing: Gaussian, 0.1 eV (CASTEP default). NiO.param says smearing_width=0.1 eV.
     let smearing = SmearingParams {
@@ -447,7 +483,7 @@ pub fn build_spin_scf_state(fx: &NioSpinFixture) -> ScfIteration<SpinCollinear> 
         .psi_data(psi_data)
         .pw_coords(pw_coords)
         .pw_fft_indices(pw_fft_indices)
-        .k_points(KptDataSet::new(vec![k_point], 1))
+        .k_points(k_points)
         .smearing(smearing)
         .max_history(8)
         .build()
