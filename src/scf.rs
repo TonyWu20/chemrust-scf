@@ -2301,6 +2301,19 @@ impl<S: SpinPolicy, State: ScfPhase, M: MixingPhase> ScfIteration<S, State, M> {
     #[doc(hidden)]
     pub fn smearing_params(&self) -> &SmearingParams { &self.smearing }
 
+    /// Per-spin eigenvalues from the most recent diagonalization.
+    /// Index `[ispin]` gives the eigenvalues for that spin channel.
+    #[doc(hidden)]
+    pub fn per_spin_eigenvalues(&self) -> &PerSpinEigenvalues { &self.eigenvalues }
+
+    /// Per-spin density (ρ_up, ρ_down for SpinCollinear; ρ for NonSpin).
+    #[doc(hidden)]
+    pub fn per_spin_density(&self) -> &PerSpinDensity { &self.density }
+
+    /// Per-spin Fermi energies from the most recent occupation search.
+    #[doc(hidden)]
+    pub fn fermi_energies(&self) -> &FermiEnergies { &self.fermi_energy }
+
 }
 
 impl<S: SpinPolicy, M: MixingPhase> ScfIteration<S, Mixed, M> {
