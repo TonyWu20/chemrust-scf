@@ -39,7 +39,7 @@ use chemrust_hamiltonian_core::{
 use chemrust_scf::{
     KPoint, PerSpinDensity,
     PerSpinPwCoefficients, PwCoefficients, ScfIteration, SmearingParams, SmearingScheme,
-    SpinChannelData, pw_coords_to_fft_indices,
+    SpinChannelData, downsample_array_to_wave_grid, pw_coords_to_fft_indices,
 };
 
 // ---------------------------------------------------------------------------
@@ -308,12 +308,13 @@ pub fn build_spin_scf_state(fx: &NioSpinFixture) -> ScfIteration<SpinCollinear> 
     let [fgx, fgy, fgz] = fine_grid_dims;
     let fine_grid = GVectorGrid::new(fgx, fgy, fgz, cell.recip_lattice);
 
-    // Verify density grid matches wavefunction grid
+    // Verify density grid matches fine grid (CASTEP stores density on fine grid
+    // where V_eff is assembled and density is mixed/augmented).
     let den_grid = fx.bin.density.grid;
     assert_eq!(
-        den_grid, wave_grid_dims,
-        "density grid {:?} != wavefunction grid {:?}",
-        den_grid, wave_grid_dims,
+        den_grid, fine_grid_dims,
+        "density grid {:?} != fine grid {:?} — CASTEP always stores density on fine grid",
+        den_grid, fine_grid_dims,
     );
 
     let nspins = fx.bin.density.nspins;
@@ -321,20 +322,21 @@ pub fn build_spin_scf_state(fx: &NioSpinFixture) -> ScfIteration<SpinCollinear> 
 
     // --- Per-spin density from CASTEP charge+spin ---
     //
+    // CASTEP stores density on the FINE grid (where V_eff assembly, mixing,
+    // and augmentation happen). The `.castep_bin` charge and spin arrays are
+    // on the fine grid. We must downsample to the wave grid before passing
+    // to ScfIteration (which expects wave-grid density).
+    //
     // CASTEP stores:
     //   charge = ρ_total = ρ_up + ρ_down   (always present)
     //   spin   = ρ_spin  = ρ_up - ρ_down   (present when nspins==2)
-    //
-    // Reconstruct:
-    //   ρ_up   = (charge + spin) / 2
-    //   ρ_down = (charge - spin) / 2
     //
     // Both .castep_bin and .check density are already total (soft + augmented).
     // We set density_aug_fine = None so build_v_eff_with_energy does NOT add
     // augmentation again (it's already baked in).
 
-    let charge_arr = fx.bin.density.charge.as_real_grid().as_real_array();
-    let spin_arr = fx
+    let charge_fine = fx.bin.density.charge.as_real_grid().as_real_array();
+    let spin_fine = fx
         .bin
         .density
         .spin
@@ -342,6 +344,17 @@ pub fn build_spin_scf_state(fx: &NioSpinFixture) -> ScfIteration<SpinCollinear> 
         .expect("NiO must have spin density")
         .as_real_grid()
         .as_real_array();
+
+    // Downsample from fine grid to wave grid via FFT truncation.
+    // Uses the same pipeline as V_eff downsampling in diagonalize_inner:
+    // forward FFT → truncate G-vectors to wave cutoff → inverse FFT.
+    let charge_wave = downsample_array_to_wave_grid(charge_fine, &fine_grid, &wave_grid)
+        .expect("downsample charge density");
+    let spin_wave = downsample_array_to_wave_grid(spin_fine, &fine_grid, &wave_grid)
+        .expect("downsample spin density");
+
+    let charge_arr = charge_wave.as_fine_array();
+    let spin_arr = spin_wave.as_fine_array();
 
     let half = 0.5_f64;
     let rho_up_arr = charge_arr.mapv(|v| v * half) + spin_arr.mapv(|v| v * half);
