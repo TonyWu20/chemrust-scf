@@ -317,7 +317,7 @@ unsafe fn step_inner(
     // Diagnostic: verify KE consistency
     {
         let n_print = kd.pw_coords.len().min(5);
-        let ke_rust = crate::eigensolver::davidson_types::compute_kinetic_energies(&kd.pw_coords, kd.wave_grid.recip_lattice(), kd.kpoint_frac);
+        let ke_rust = crate::eigensolver::davidson_types::compute_kinetic_energies(&kd.pw_coords, h.wave_grid.recip_lattice(), kd.kpoint_frac);
         let mut all_ok = true;
         for i in 0..n_print {
             let diff = (ke_castep[i] - ke_rust.0[i]).abs();
@@ -413,7 +413,6 @@ unsafe fn step_inner(
     // now expects Fortran order so the GPU upload via flatten_f64 produces
     // the correct x-fastest layout that cuFFT expects.
     let ve_host: Vec<f64> = unsafe { std::slice::from_raw_parts(v_eff_data, gs) }.to_vec();
-    let _ve_raw = unsafe { std::slice::from_raw_parts(v_eff_data, gs) };
     let ve_norm: f64 = ve_host.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
 
     #[cfg(feature = "scf_diag")]
@@ -465,6 +464,7 @@ unsafe fn step_inner(
         // raw CASTEP data after applying the same x↔z transpose.
         #[cfg(feature = "scf_diag")]
         {
+            let ve_raw = unsafe { std::slice::from_raw_parts(v_eff_data, gs) };
             let ve_rt: Vec<f64> = crate::device::flatten_f64(veff.0.as_array());
             // After transpose, ve_rt has z-innermost layout. Reconstruct the
             // expected values from the raw ix-innermost data by transposing.
@@ -581,6 +581,31 @@ unsafe fn step_inner(
     })?;
 
     let psi_init = PwCoefficients::new(psi_gpu.as_device_slice().clone());
+
+    // FFI cold-start diagnostic: verify psi data at the boundary before
+    // Davidson solve.  Download band 0 psi to CPU and check L2² + first 5
+    // G-vector entries.  Compare against CPU CASTEP's [CASTEP-A1] values.
+    {
+        use crate::device::CudaComplex;
+        let n_pw_psi = psi_gpu.as_device_slice().len() / n_bands;
+        for &b in &[0usize, 104, 105] {
+            if b >= n_bands { continue; }
+            let start = b * n_pw_psi;
+            let end = (start + n_pw).min(start + n_pw_psi);
+            let band_cpu: Vec<CudaComplex> = stream
+                .clone_dtoh(&psi_gpu.as_device_slice().slice(start..end))
+                .map_err(|_| CHEM_EIG_CUDA_ERROR)?;
+            let l2_sq: f64 = band_cpu.iter().take(n_pw).map(|c| c.x*c.x + c.y*c.y).sum();
+            eprintln!("[FFI-diag] band {b}: psi L2²={:.6e} first5=[{:?}]",
+                l2_sq,
+                band_cpu.iter().take(5).map(|c| (c.x, c.y)).collect::<Vec<_>>());
+        }
+        let v_lo: Vec<f64> = stream
+            .clone_dtoh(&v_eff_gpu.as_device_slice().slice(0..5usize.min(v_eff_gpu.as_device_slice().len())))
+            .map_err(|_| CHEM_EIG_CUDA_ERROR)?;
+        eprintln!("[FFI-diag] V_eff[0..5]={:?}", v_lo);
+    }
+
     let davidson_result = unsafe {
         davidson_diagonalise()
             .psi_init(&psi_init)

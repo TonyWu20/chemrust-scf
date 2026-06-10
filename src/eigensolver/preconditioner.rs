@@ -1012,7 +1012,7 @@ pub unsafe fn apply_preconditioner(
                 // --- C: max norms — .iter() vs [n,b] double-loop ---
                 let mut max_bpp_iter = 0.0f64;
                 for v in beta_phi_precon_arr.iter() { let a = v.norm(); if a > max_bpp_iter { max_bpp_iter = a; } }
-                let _max_bps_iter = beta_phi_psi_arr.iter().map(|c| c.norm()).fold(0.0f64, f64::max);
+                let max_bps_iter = beta_phi_psi_arr.iter().map(|c| c.norm()).fold(0.0f64, f64::max);
                 let mut max_bpp_idx = 0.0f64;
                 let mut max_bps_idx = 0.0f64;
                 for b in 0..n_bands {
@@ -1504,6 +1504,139 @@ mod tests {
             "tpa(1.0) = {:.15e}, expected 65/81 = {:.15e}",
             tpa(1.0),
             expected_tpa_1
+        );
+    }
+
+    /// GPU vs CPU: TPA preconditioner apply_residual at realistic scale.
+    ///
+    /// The kernel formula is:  out[b,G] = (Hψ[b,G] - ε[b]·ψ[b,G]) · r_vector[G]
+    ///
+    /// This is a fused multiply-subtract-scale — tests whether GPU FMA
+    /// (fused multiply-add) produces different results from separate CPU
+    /// operations for the preconditioned residual.
+    #[test]
+    fn tpa_apply_residual_realistic_scale() {
+        use crate::device::CudaComplex;
+        use cudarc::driver::{CudaContext, CudaStream};
+        use std::sync::Arc;
+
+        let ctx = CudaContext::new(0).expect("CUDA context");
+        let stream = ctx.default_stream();
+        let ctx_arc = Arc::new(ctx.clone());
+
+        // Realistic Davidson block size
+        let n_pw = 60067usize;
+        let n_bands = 25;
+        let total = n_pw * n_bands;
+
+        // Generate deterministic pseudo-random data
+        let psi: Vec<CudaComplex> = (0..total)
+            .map(|idx| {
+                let phase = (idx as f64 * 0.987654321).sin() * 1000.0;
+                CudaComplex {
+                    x: (phase * 1.3).sin() * 1e-3,
+                    y: (phase * 1.7).cos() * 1e-3,
+                }
+            }).collect();
+        let hpsi: Vec<CudaComplex> = (0..total)
+            .map(|idx| {
+                let phase = ((idx + 500) as f64 * 0.987654321).sin() * 1000.0;
+                CudaComplex {
+                    x: (phase * 1.9).cos() * 1e-3,
+                    y: (phase * 1.1).sin() * 1e-3,
+                }
+            }).collect();
+        // Realistic eigenvalues: -1.0 to +0.1 Ha
+        let eigenvalues: Vec<f64> = (0..n_bands)
+            .map(|b| -1.0 + (b as f64) * 1.1 / (n_bands - 1) as f64)
+            .collect();
+        // TPA r_vector: real kinetic energies on G-grid
+        let r_vector: Vec<f64> = (0..n_pw)
+            .map(|g| {
+                let x = (g as f64) / (n_pw as f64) * 10.0;
+                tpa(x) // use the real TPA function
+            })
+            .collect();
+
+        // CPU reference: out[b,G] = (Hψ[b,G] - ε[b]·ψ[b,G]) · r_vector[G]
+        let mut cpu_out = vec![CudaComplex { x: 0.0, y: 0.0 }; total];
+        for b in 0..n_bands {
+            let e = eigenvalues[b];
+            for g in 0..n_pw {
+                let i = b * n_pw + g;
+                let r = r_vector[g];
+                cpu_out[i].x = (hpsi[i].x - e * psi[i].x) * r;
+                cpu_out[i].y = (hpsi[i].y - e * psi[i].y) * r;
+            }
+        }
+
+        // GPU: upload data and run kernel
+        use crate::eigensolver::davidson_types::{PwCoefficients, PreconditionerVector};
+        let stream_arc = Arc::new(stream.clone());
+
+        let mut psi_dev = PwCoefficients::new(
+            stream_arc.alloc_zeros::<CudaComplex>(total).expect("alloc psi"));
+        let mut hpsi_dev = PwCoefficients::new(
+            stream_arc.alloc_zeros::<CudaComplex>(total).expect("alloc hpsi"));
+        let mut out_dev = PwCoefficients::new(
+            stream_arc.alloc_zeros::<CudaComplex>(total).expect("alloc out"));
+        let mut eig_dev = stream_arc.alloc_zeros::<f64>(n_bands).expect("alloc eig");
+        let mut rvec_dev = PreconditionerVector::new(
+            stream_arc.alloc_zeros::<f64>(n_pw).expect("alloc rvec"));
+        stream_arc.memcpy_htod(&psi, &mut psi_dev.0).expect("H2D psi");
+        stream_arc.memcpy_htod(&hpsi, &mut hpsi_dev.0).expect("H2D hpsi");
+        stream_arc.memcpy_htod(&eigenvalues, &mut eig_dev).expect("H2D eig");
+        stream_arc.memcpy_htod(&r_vector, &mut rvec_dev.0).expect("H2D rvec");
+
+        let tpa = super::TpaPreconditioner::new(&ctx_arc).expect("TpaPreconditioner");
+        unsafe {
+            tpa.apply_residual(
+                &mut out_dev, &psi_dev, &hpsi_dev, &eig_dev, &rvec_dev,
+                n_pw, n_bands, &stream_arc,
+            ).expect("GPU apply_residual");
+        }
+        stream_arc.synchronize().expect("sync");
+        let gpu_out: Vec<CudaComplex> = stream_arc.clone_dtoh(&out_dev.0).expect("D2H");
+        stream.synchronize().expect("sync");
+        let gpu_out: Vec<CudaComplex> = stream_arc.clone_dtoh(&out_dev.0).expect("D2H");
+
+        // Compare element-wise
+        let mut max_abs = 0.0f64;
+        let mut max_rel = 0.0f64;
+        let mut sum_signed = 0.0f64;
+        for i in 0..total {
+            let cpu = cpu_out[i];
+            let gpu = gpu_out[i];
+            let abs_diff = ((cpu.x - gpu.x).powi(2) + (cpu.y - gpu.y).powi(2)).sqrt();
+            let cpu_norm = (cpu.x.powi(2) + cpu.y.powi(2)).sqrt();
+            let rel = if cpu_norm > 1e-30 { abs_diff / cpu_norm } else { abs_diff };
+            if abs_diff > max_abs { max_abs = abs_diff; }
+            if rel > max_rel { max_rel = rel; }
+            sum_signed += gpu.x - cpu.x;
+        }
+        let mean_signed = sum_signed / total as f64;
+
+        let status = if max_rel > 1e-6 { "HIGH" }
+            else if max_rel > 1e-9 { "WARN" }
+            else { "ok" };
+        eprintln!(
+            "TPA apply_residual (n_pw={n_pw}, n_bands={n_bands}): \
+             max|Δ|={:.3e} max rel={:.3e} mean_signed={:+.3e} [{status}]",
+            max_abs, max_rel, mean_signed,
+        );
+
+        assert!(
+            max_rel < 1e-9,
+            "TPA apply_residual: max rel error {:.3e} exceeds 1e-9.\n\
+             GPU FMA in fused multiply-subtract-scale produces different\n\
+             per-element results vs CPU separate operations.",
+            max_rel,
+        );
+        assert!(
+            mean_signed.abs() < 1e-15,
+            "TPA apply_residual: systematic bias {:.3e} detected.\n\
+             GPU FMA is systematically biasing the preconditioned residual.",
+            mean_signed,
         );
     }
 }

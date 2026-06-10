@@ -862,4 +862,152 @@ mod tests {
         }
         true
     }
+
+    /// Test cuSOLVER ZHEEVD accuracy on near-singular Hermitian matrices.
+    ///
+    /// Simulates a Davidson superspace H_sub where duplicate search columns
+    /// create near-zero eigenvalues: H = Q · diag(λ) · Q^H.
+    /// Some λ_i = ε ≪ 1 simulate duplicate columns → rank deficiency.
+    /// Measures eigenvalue residual ‖H·v_j - λ_j·v_j‖ for the smallest
+    /// eigenvalues and checks that accuracy does not catastrophically degrade.
+    #[test]
+    fn zheevd_near_singular_accuracy() {
+        let ctx = cudarc::driver::CudaContext::new(0).expect("CUDA context");
+        let stream = ctx.default_stream();
+        let solver = SolverHandle::new(stream.clone()).expect("SolverHandle");
+
+        // Simulate a superspace with near-duplicate search columns.
+        // Small ε = 10⁻⁴, 10⁻⁸, 10⁻¹² (condition number κ = 1/ε).
+        // Larger n_big simulates more "real" columns vs duplicate columns.
+        let cases = [
+            (52,  47, 1e-4_f64,   5), // n=52, 5 near-zero eigenvalues at 1e-4
+            (52,  47, 1e-8_f64,   5),
+            (52,  47, 1e-12_f64,  5),
+            (78,  68, 1e-8_f64,  10),
+            (78,  68, 1e-12_f64, 10),
+            (130, 110, 1e-8_f64, 20),
+            (130, 110, 1e-12_f64,20),
+            (156, 126, 1e-8_f64, 30),
+            (156, 126, 1e-12_f64,30),
+        ];
+
+        let mut max_residual = 0.0_f64;
+        for &(n, n_big, eps, n_small) in &cases {
+            let n_small = n_small.min(n - n_big);
+            // Generate eigenvalues: n_big at 1.0, n_small at eps
+            let mut evals: Vec<f64> = vec![1.0; n_big];
+            evals.extend(std::iter::repeat(eps).take(n_small));
+            // Fill remaining with interpolated values
+            while evals.len() < n { evals.push(eps * 10.0); }
+            evals.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
+            // Build random unitary Q via QR on random complex matrix
+            let mut rng: Vec<f64> = (0..(n*n*2)).map(|i| {
+                let x = (i as f64 * 0.987654321).sin() * 1000.0;
+                x - x.floor()
+            }).collect();
+            let mut q_cpu: Vec<CudaComplex> = Vec::with_capacity(n*n);
+            for i in 0..n {
+                for j in 0..n {
+                    q_cpu.push(CudaComplex {
+                        x: rng[2*(i*n+j)] - 0.5,
+                        y: rng[2*(i*n+j)+1] - 0.5,
+                    });
+                }
+            }
+            // Gram-Schmidt orthogonalize columns of Q
+            for j in 0..n {
+                // Normalize column j
+                let mut norm2 = 0.0_f64;
+                for i in 0..n { let c = q_cpu[i + j*n]; norm2 += c.x*c.x + c.y*c.y; }
+                let inv_norm = 1.0 / norm2.sqrt();
+                for i in 0..n { q_cpu[i + j*n].x *= inv_norm; q_cpu[i + j*n].y *= inv_norm; }
+                // Project out previous columns
+                for k in 0..j {
+                    let mut dot_re = 0.0_f64; let mut dot_im = 0.0_f64;
+                    for i in 0..n {
+                        let a = q_cpu[i + j*n]; let b = q_cpu[i + k*n];
+                        dot_re += a.x * b.x + a.y * b.y;
+                        dot_im += a.x * b.y - a.y * b.x;
+                    }
+                    for i in 0..n {
+                        let b = q_cpu[i + k*n];
+                        q_cpu[i + j*n].x -= dot_re * b.x - dot_im * b.y;
+                        q_cpu[i + j*n].y -= dot_re * b.y + dot_im * b.x;
+                    }
+                    // Re-normalize
+                    norm2 = 0.0;
+                    for i in 0..n { let c = q_cpu[i + j*n]; norm2 += c.x*c.x + c.y*c.y; }
+                    let inv_n = 1.0 / norm2.sqrt();
+                    for i in 0..n { q_cpu[i + j*n].x *= inv_n; q_cpu[i + j*n].y *= inv_n; }
+                }
+            }
+
+            // Build H = Q · diag(λ) · Q^H (column-major)
+            let mut h_cpu = vec![CudaComplex{x:0.0,y:0.0}; n*n];
+            for i in 0..n {
+                for j in 0..n {
+                    let mut sum_re = 0.0; let mut sum_im = 0.0;
+                    for k in 0..n {
+                        let q_ik = q_cpu[i + k*n];
+                        let q_jk = q_cpu[j + k*n];
+                        let lam = evals[k];
+                        sum_re += lam * (q_ik.x * q_jk.x + q_ik.y * q_jk.y);
+                        sum_im += lam * (q_ik.x * q_jk.y - q_ik.y * q_jk.x);
+                    }
+                    h_cpu[i + j*n] = CudaComplex{x: sum_re, y: sum_im};
+                }
+            }
+
+            // Upload to GPU
+            let mut h_gpu = stream.alloc_zeros::<CudaComplex>(n*n).expect("alloc H");
+            stream.memcpy_htod(&h_cpu, &mut h_gpu).expect("H2D H");
+            let mut eig_gpu = stream.alloc_zeros::<f64>(n).expect("alloc eig");
+            let mut info_gpu = stream.alloc_zeros::<i32>(1).expect("alloc info");
+
+            solver.zheevd(
+                cusolverEigMode_t::CUSOLVER_EIG_MODE_VECTOR,
+                cublasFillMode_t::CUBLAS_FILL_MODE_LOWER,
+                n as i32, &mut h_gpu, &mut eig_gpu, &mut info_gpu,
+            ).expect("ZHEEVD");
+
+            let info: Vec<i32> = stream.clone_dtoh(&info_gpu).expect("D2H info");
+            assert_eq!(info[0], 0, "ZHEEVD info={} at n={} n_small={} eps={:e}", info[0], n, n_small, eps);
+
+            let ev_gpu: Vec<f64> = stream.clone_dtoh(&eig_gpu).expect("D2H eig");
+            let v_gpu: Vec<CudaComplex> = stream.clone_dtoh(&h_gpu).expect("D2H V"); // overwritten with eigenvectors
+
+            // Check residual ‖H·v_j - λ_j·v_j‖ for small eigenvalues
+            for j in 0..n_small {
+                let lam = ev_gpu[j];
+                // Compute H·v_j on CPU
+                let mut hv_re = vec![0.0_f64; n]; let mut hv_im = vec![0.0_f64; n];
+                for i in 0..n {
+                    for k in 0..n {
+                        let h_ik = h_cpu[i + k*n];
+                        let v_kj = v_gpu[k + j*n];
+                        hv_re[i] += h_ik.x * v_kj.x - h_ik.y * v_kj.y;
+                        hv_im[i] += h_ik.x * v_kj.y + h_ik.y * v_kj.x;
+                    }
+                }
+                // Residual = H·v - λ·v
+                let mut res_norm2 = 0.0_f64;
+                for i in 0..n {
+                    let v_ij = v_gpu[i + j*n];
+                    let dr = hv_re[i] - lam * v_ij.x;
+                    let di = hv_im[i] - lam * v_ij.y;
+                    res_norm2 += dr*dr + di*di;
+                }
+                let res_norm = res_norm2.sqrt();
+                if res_norm > max_residual { max_residual = res_norm; }
+                let status = if res_norm > 1e-6 { "HIGH" } else if res_norm > 1e-9 { "WARN" } else { "ok" };
+                eprintln!("  ZHEEVD res n={} n_small={} eps={:e} j={} λ={:.6e} ‖Hv-λv‖={:.3e} {}",
+                    n, n_small, eps, j, lam, res_norm, status);
+            }
+
+            stream.synchronize().expect("sync");
+        }
+        eprintln!("  max residual across all cases: {:.3e}", max_residual);
+        assert!(max_residual < 1e-3, "ZHEEVD residual {:.3e} exceeds 1e-3 for near-singular matrix", max_residual);
+    }
 }
