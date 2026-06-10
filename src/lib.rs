@@ -7,6 +7,7 @@ pub mod device;
 #[doc(hidden)]
 pub mod eigensolver;
 pub mod ffi;
+pub mod spin_types;
 
 // Re-export test-only helpers for integration tests
 #[doc(hidden)]
@@ -65,6 +66,10 @@ pub mod scf_capture;
 pub use types::{
     Density, DensityUpsampled, EffectivePotential, Error, FinalResult, FineGridArray, KineticEnergies, KPoint,
     SmearingParams, SmearingScheme, WaveGridArray,
+};
+pub use spin_types::{
+    ElectronCounts, FermiEnergies, OccupationSet, PerSpinAugDensity, PerSpinBetaProjections, PerSpinDensity,
+    PerSpinEigenvalues, PerSpinPwCoefficients, SpinChannelData, SpinDensity,
 };
 pub use layout::{Cpu, ColumnDistributed, Layout, RowDistributed, WavefunctionSet};
 pub use device::{DeviceMapped, Gpu};
