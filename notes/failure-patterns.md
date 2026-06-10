@@ -1,5 +1,12 @@
 # Failure Patterns
 
+## 2026-06-10: beta-g-layout-transposition-cold-start-divergence
+**Root cause**: `beta_g` GPU→CPU download reshaped as row-major `(n_pw, ne)`, reading `beta[[G,n]] = data[G·ne + n]` instead of `data[n·n_pw + G]`. Since `ne=4 ≪ n_pw=60067`, every projector element landed at the wrong G-vector. Corrupted all downstream NL correction matrices.
+**Fix**: `src/eigensolver/davidson.rs:948` — reshape as `(ne, n_pw)` then transpose to `(n_pw, ne)`.
+**Verification**: Cold start energy diff vs CPU = 0.00033 eV (1.2e-5 Ha). SCF iterations: 31 vs 33.
+**Pattern**: data-layout — Fortran/C/GPU layout mismatch at a host/device boundary. GPU GEMM read correctly (column-major + commutative addition), host ndarray read wrong (row-major, different stride product). Warm start masked the bug because NL correction scales with residual magnitude (~1e-6 vs ~1 Ha).
+**Lesson**: Every GPU→CPU download + reshape must be verified with a concrete index pair trace. Warm-start tests are insufficient for catching bugs that scale with residual magnitude.
+
 ## 2026-05-20: spectral-bounds-not-root-cause-of-eigenvalue-errors
 **Root cause**: Spectral bounds were implicated as cause of eigenvalue errors, but bounds only affect convergence rate — the filter is a polynomial in H that preserves eigenvectors. Real cause was G-vector FFT index order + kinetic energy indexing (fixed in `5037e64`).
 **Fix**: `src/eigensolver/chebyshev.rs:246-283` — improved `compute_spectral_bounds` to use physically-grounded b_low on first iteration and `max_i Ritz_i` on subsequent iterations (matching CheFSI §5 step 11).
