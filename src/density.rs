@@ -85,6 +85,165 @@ fn find_chemical_potential(
     Ok(0.5 * (lo + hi))
 }
 
+/// CASTEP lower-bound bisection for FIXED-spin occupation search.
+///
+/// Finds the Fermi energy for a single spin channel such that:
+///   Σ_b erfc((ε_b - μ) / w) = n_spin_electrons
+///
+/// The returned `fermi_energy` is a **lower bound** (CASTEP convention).
+/// After convergence, occupations are computed at the found fermi level.
+///
+/// # Algorithm (CASTEP electronic.f90:8602-8880)
+/// 1. `lo = min(eigenvalues) - 4·width`, `hi = max(eigenvalues) + 4·width`
+/// 2. `delta_E = hi - lo`, `fermi = lo`
+/// 3. For 80 steps or until `delta_E <= 1e-12`:
+///    - `delta_E /= 2`, `trial = fermi + delta_E`
+///    - If `Σ erfc((e - trial)/width) <= n_spin_electrons`: `fermi = trial` (accept)
+/// 4. Compute occupations at `fermi` and return.
+pub fn find_fermi_fix(
+    eigenvalues: &[f64],
+    smearing: &SmearingParams,
+    n_spin_electrons: f64,
+) -> Result<(f64, Vec<f64>), Error> {
+    let width = smearing.width;
+    let emin = eigenvalues.iter().cloned().fold(f64::INFINITY, f64::min);
+    let emax = eigenvalues.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+
+    if eigenvalues.is_empty() || emax < emin {
+        return Err(Error::NotImplemented);
+    }
+
+    // Edge case: no electrons for this spin channel
+    if n_spin_electrons <= 0.0 {
+        let occupations = vec![0.0; eigenvalues.len()];
+        return Ok((f64::NEG_INFINITY, occupations));
+    }
+
+    // Edge case: all bands fully occupied (each erfc can contribute up to 2)
+    let max_possible = 2.0 * eigenvalues.len() as f64;
+    if n_spin_electrons >= max_possible {
+        let occupations = vec![2.0; eigenvalues.len()];
+        return Ok((f64::INFINITY, occupations));
+    }
+
+    let lo = emin - 4.0 * width;
+    let hi = emax + 4.0 * width;
+    let mut delta_E = hi - lo;
+    let mut fermi = lo;
+
+    for _ in 0..80 {
+        delta_E *= 0.5;
+        let trial = fermi + delta_E;
+        let total_occ: f64 = eigenvalues
+            .iter()
+            .map(|&e| libm::erfc((e - trial) / width))
+            .sum();
+        if total_occ <= n_spin_electrons {
+            fermi = trial;
+        }
+        if delta_E <= 1e-12 {
+            break;
+        }
+    }
+
+    let occupations: Vec<f64> = eigenvalues
+        .iter()
+        .map(|&e| libm::erfc((e - fermi) / width))
+        .collect();
+
+    Ok((fermi, occupations))
+}
+
+/// CASTEP lower-bound bisection for FREE-spin (shared Fermi energy).
+///
+/// Finds a SINGLE Fermi energy shared by both spin channels such that:
+///   Σ_b erfc((ε↑_b - μ) / w) + Σ_b erfc((ε↓_b - μ) / w) = n_electrons
+///
+/// Returns (fermi_energy, occ_up, occ_dn, net_spin).
+///
+/// # Algorithm (CASTEP electronic.f90:8910-9209)
+/// 1. `lo = min(ev_up ∪ ev_dn) - 4·width`, `hi = max(ev_up ∪ ev_dn) + 4·width`
+/// 2. Same lower-bound bisection as `find_fermi_fix`, but summing over BOTH spins.
+/// 3. After E_F found: compute occ_up, occ_dn at the shared fermi.
+/// 4. `net_spin = Σ occ_up - Σ occ_dn`
+/// 5. `fermi` is a lower bound. Both spin channels share the same `fermi` value.
+pub fn find_fermi_free(
+    ev_up: &[f64],
+    ev_dn: &[f64],
+    smearing: &SmearingParams,
+    n_electrons: f64,
+) -> Result<(f64, Vec<f64>, Vec<f64>, f64), Error> {
+    let width = smearing.width;
+
+    if ev_up.is_empty() || ev_dn.is_empty() {
+        return Err(Error::NotImplemented);
+    }
+
+    let emin_up = ev_up.iter().cloned().fold(f64::INFINITY, f64::min);
+    let emax_up = ev_up.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let emin_dn = ev_dn.iter().cloned().fold(f64::INFINITY, f64::min);
+    let emax_dn = ev_dn.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+
+    let emin = emin_up.min(emin_dn);
+    let emax = emax_up.max(emax_dn);
+
+    // Edge case: no electrons
+    if n_electrons <= 0.0 {
+        let occ_up = vec![0.0; ev_up.len()];
+        let occ_dn = vec![0.0; ev_dn.len()];
+        return Ok((f64::NEG_INFINITY, occ_up, occ_dn, 0.0));
+    }
+
+    // Edge case: all bands fully occupied
+    let max_possible = 2.0 * (ev_up.len() + ev_dn.len()) as f64;
+    if n_electrons >= max_possible {
+        let occ_up = vec![2.0; ev_up.len()];
+        let occ_dn = vec![2.0; ev_dn.len()];
+        return Ok((f64::INFINITY, occ_up, occ_dn, 0.0));
+    }
+
+    let lo = emin - 4.0 * width;
+    let hi = emax + 4.0 * width;
+    let mut delta_E = hi - lo;
+    let mut fermi = lo;
+
+    for _ in 0..80 {
+        delta_E *= 0.5;
+        let trial = fermi + delta_E;
+
+        let total_occ_up: f64 = ev_up
+            .iter()
+            .map(|&e| libm::erfc((e - trial) / width))
+            .sum();
+        let total_occ_dn: f64 = ev_dn
+            .iter()
+            .map(|&e| libm::erfc((e - trial) / width))
+            .sum();
+        let total_occ = total_occ_up + total_occ_dn;
+
+        if total_occ <= n_electrons {
+            fermi = trial;
+        }
+        if delta_E <= 1e-12 {
+            break;
+        }
+    }
+
+    // Compute occupations at the shared fermi energy
+    let occ_up: Vec<f64> = ev_up
+        .iter()
+        .map(|&e| libm::erfc((e - fermi) / width))
+        .collect();
+    let occ_dn: Vec<f64> = ev_dn
+        .iter()
+        .map(|&e| libm::erfc((e - fermi) / width))
+        .collect();
+
+    let net_spin: f64 = occ_up.iter().sum::<f64>() - occ_dn.iter().sum::<f64>();
+
+    Ok((fermi, occ_up, occ_dn, net_spin))
+}
+
 // ---------------------------------------------------------------------------
 // QSfCache: GPU-resident Q augmentation function cache
 // ---------------------------------------------------------------------------
