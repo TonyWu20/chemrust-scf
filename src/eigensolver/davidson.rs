@@ -1468,8 +1468,12 @@ pub(crate) unsafe fn davidson_diagonalise(
                 // super_hamiltonian. This D2H is therefore inherent to the split design
                 // and its cost is negligible: ~7 KB/transfer vs ~2 GB FFT+H per batch.
                 let h_init_cpu: Vec<CudaComplex> = stream.clone_dtoh(&h_init).map_err(Error::Cuda)?;
-                davidson_diag!("[davidson]     initial H_sub diag[0..3]: [{:.6}, {:.6}, {:.6}]",
-                    h_init_cpu[0].x, h_init_cpu[k + 1].x, h_init_cpu[2 * k + 2].x);
+                let diag_vals: Vec<String> = (0..k)
+                    .map(|i| format!("{:.6}", h_init_cpu[i * (k + 1)].x))
+                    .take(3)
+                    .collect();
+                davidson_diag!("[davidson]     initial H_sub diag[0..{}]: [{}]",
+                    diag_vals.len().min(k), diag_vals.join(", "));
 
                 // CPU dot-product cross-check (diagnostic-only): verify first column
                 // ⟨psi|H·psi⟩ against GPU ZGEMM result. Downloads two full n_pw columns
