@@ -36,8 +36,8 @@ pub fn capture_as_castep_bin<S: SpinPolicy>(
     n_electrons: f64,
 ) -> Option<CastepBin> {
     let nspins = S::nspins();
-    let n_bands = state.psi.n_bands;
-    let n_pw = state.psi.n_pw;
+    let n_bands = state.n_bands;
+    let n_pw = state.n_pw;
 
     // --- Version and metadata ---
     let version = Version { major: 6, minor: 110 };
@@ -80,7 +80,7 @@ pub fn capture_as_castep_bin<S: SpinPolicy>(
     let total_energy = state.total_energy.unwrap_or(0.0);
 
     // --- Occupations (recomputed — not stored on ScfIteration) ---
-    let (occupations, _chem_pot) = compute_occupations(&state.eigenvalues, &state.smearing, n_electrons)
+    let (occupations, _chem_pot) = compute_occupations(&state.eigenvalues[0], &state.smearing, n_electrons)
         .ok()?;
 
     // --- Band eigenvalues ---
@@ -88,14 +88,14 @@ pub fn capture_as_castep_bin<S: SpinPolicy>(
         kpoints: vec![KPointData {
             coords: state.k_point.coords,
             spins: vec![SpinChannel {
-                eigenvalues: state.eigenvalues.clone(),
+                eigenvalues: state.eigenvalues[0].clone(),
                 occupancies: occupations.0,
             }],
             kpoint_weight: 1.0,
         }],
         nbands_max: n_bands,
         nspins,
-        fermi_energy: state.fermi_energy.unwrap_or(0.0),
+        fermi_energy: state.fermi_energy[0],
     };
 
     // --- Fine grid dimensions ---
@@ -106,7 +106,8 @@ pub fn capture_as_castep_bin<S: SpinPolicy>(
 
     // --- Total density on fine grid ---
     // 1. Upsample smooth density from wave grid to fine grid
-    let rho_wave = state.density.as_wave_array();
+    let total_density = state.density.total();
+    let rho_wave = total_density.as_wave_array();
     let rho_wave_padded = {
         let mut arr = ndarray::Array3::<f64>::zeros(wave_grid_dims);
         let shape = rho_wave.shape();
@@ -127,8 +128,8 @@ pub fn capture_as_castep_bin<S: SpinPolicy>(
     )
     .ok()?;
 
-    // 2. Add augmentation density (if present)
-    let rho_total = match &state.density_aug_fine {
+    // 2. Add augmentation density (if present) — spin-0 channel
+    let rho_total = match state.density_aug_fine[0].as_ref() {
         Some(aug) => {
             rho_fine.as_real_array().to_owned() + aug.as_real_array()
         }
@@ -136,11 +137,11 @@ pub fn capture_as_castep_bin<S: SpinPolicy>(
     };
 
     // --- Wavefunction coefficients ---
-    // psi.data is band-major: `data[b * n_pw + g]` is coefficient g of band b.
+    // psi_cpu is band-major: `data[b * n_pw + g]` is coefficient g of band b.
     let bands: Vec<Vec<Complex64>> = (0..n_bands)
         .map(|b| {
             let start = b * n_pw;
-            state.psi.data[start..start + n_pw].to_vec()
+            state.psi_cpu[0][start..start + n_pw].to_vec()
         })
         .collect();
 

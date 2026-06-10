@@ -34,9 +34,15 @@ use std::sync::Once;
 use chemrust_hamiltonian_core::{
     CheckFile, GVectorGrid, PseudopotentialSet,
 };
+use std::sync::Arc;
+use cudarc::driver::CudaContext;
+use chemrust_hamiltonian_core::NonSpin;
 use chemrust_scf::{
-    ColumnDistributed, Density, KPoint, ScfIteration, SmearingParams, SmearingScheme,
-    WaveGridArray, WavefunctionSet, downsample_array_to_wave_grid, pw_coords_to_fft_indices,
+    ColumnDistributed, Density, KPoint, PerSpinDensity, PerSpinPwCoefficients,
+    PwCoefficients, ScfIteration, SmearingParams, SmearingScheme,
+    SpinChannelData, WaveGridArray, WavefunctionSet,
+    device::CudaComplex,
+    downsample_array_to_wave_grid, pw_coords_to_fft_indices,
 };
 
 /// Path to CASTEP H_dump fixture directory.
@@ -278,7 +284,22 @@ fn davidson_hdump_validation() {
             ref_eigs.get(105).copied().unwrap_or(f64::NAN),
         );
     }
-    let psi = WavefunctionSet::<ColumnDistributed>::new(flat_bands, n_bands, n_pw);
+    // Wrap in per-spin types (NonSpin: single channel)
+    let per_spin_density = PerSpinDensity(SpinChannelData::new::<NonSpin>(vec![density]));
+    let per_spin_psi_data = vec![flat_bands.clone()];
+    let psi_host = WavefunctionSet::<ColumnDistributed>::new(flat_bands, n_bands, n_pw);
+    // Upload psi to GPU for PerSpinPwCoefficients
+    let ctx = Arc::new(CudaContext::new(0).map_err(|e| {
+        format!("CudaContext::new failed: {e}")
+    }).unwrap());
+    let stream = ctx.default_stream();
+    let psi_flat: Vec<CudaComplex> = psi_host.data.iter()
+        .map(|c| CudaComplex { x: c.re, y: c.im })
+        .collect();
+    let psi_dev = stream.clone_htod(&psi_flat).unwrap();
+    let per_spin_psi = PerSpinPwCoefficients(SpinChannelData::new::<NonSpin>(
+        vec![PwCoefficients::new(psi_dev)],
+    ));
 
     let k_point = KPoint {
         coords: kpt.coords,
@@ -304,8 +325,9 @@ fn davidson_hdump_validation() {
         .pots(fx.pots.clone())
         .wave_grid(wave_grid)
         .fine_grid(fine_grid)
-        .density(density)
-        .psi(psi)
+        .density(per_spin_density)
+        .psi(per_spin_psi)
+        .psi_data(per_spin_psi_data)
         .pw_coords(pw_coords)
         .pw_fft_indices(pw_fft_indices)
         .k_point(k_point)

@@ -1,12 +1,16 @@
+use std::sync::Arc;
+
+use cudarc::driver::CudaContext;
 use ndarray::Array3;
 use num_complex::Complex64;
 
 use chemrust_hamiltonian_core::{
-    CellGeometry, GVectorGrid, PseudopotentialSet, RealLattice, RecipLattice,
+    CellGeometry, GVectorGrid, NonSpin, PseudopotentialSet, RealLattice, RecipLattice,
 };
 use chemrust_scf::{
-    Density, KPoint, ScfIteration, SmearingParams, SmearingScheme, WaveGridArray,
-    WavefunctionSet, ColumnDistributed, run_scf,
+    Density, KPoint, PerSpinDensity, PerSpinPwCoefficients, PwCoefficients,
+    ScfIteration, SmearingParams, SmearingScheme, SpinChannelData, WaveGridArray,
+    WavefunctionSet, ColumnDistributed, device::CudaComplex, run_scf,
 };
 
 /// A minimal 1-atom cubic cell at (0,0,0).
@@ -70,16 +74,34 @@ fn dummy_wavefunctions() -> WavefunctionSet<ColumnDistributed> {
     WavefunctionSet::new(vec![Complex64::ZERO; 4 * 27], 4, 27)
 }
 
+fn dummy_per_spin_density() -> PerSpinDensity {
+    PerSpinDensity(SpinChannelData::new::<NonSpin>(vec![dummy_density()]))
+}
+
+fn dummy_per_spin_psi() -> (PerSpinPwCoefficients, Vec<Vec<Complex64>>) {
+    let wfn = dummy_wavefunctions();
+    let psi_gpu = PerSpinPwCoefficients(SpinChannelData::new::<NonSpin>(
+        vec![PwCoefficients::new(
+            Arc::new(CudaContext::new(0).unwrap()).default_stream()
+                .alloc_zeros::<CudaComplex>(wfn.data.len()).unwrap()
+        )],
+    ));
+    let psi_data = vec![wfn.data];
+    (psi_gpu, psi_data)
+}
+
 #[test]
 #[ignore = "requires GPU; full validation is Group F"]
 fn backbone_compiles() {
+    let (psi, psi_data) = dummy_per_spin_psi();
     let state: ScfIteration = ScfIteration::builder()
         .cell(dummy_cell())
         .pots(PseudopotentialSet::new())
         .wave_grid(dummy_wave_grid())
         .fine_grid(dummy_fine_grid())
-        .density(dummy_density())
-        .psi(dummy_wavefunctions())
+        .density(dummy_per_spin_density())
+        .psi(psi)
+        .psi_data(psi_data)
         .pw_coords(
             (0..27)
                 .map(|i| {
