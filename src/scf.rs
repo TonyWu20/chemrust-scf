@@ -1261,6 +1261,10 @@ impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated, MixingOff> {
             })
             .collect();
 
+        #[cfg(feature = "scf_diag")]
+        eprintln!("[DensityCtor] net_spin={:.6} n_electrons={:.6} per_spin={:?}",
+            net_spin, n_electrons, n_electrons_per_spin);
+
         let ctx = Arc::new(CudaContext::new(0)?);
         let stream = ctx.default_stream();
         let kernels = CudaKernelSet::new(&ctx)?;
