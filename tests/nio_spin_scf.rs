@@ -398,16 +398,15 @@ pub fn build_spin_scf_state(fx: &NioSpinFixture) -> ScfIteration<SpinCollinear> 
         kpt_weights.len(),
     );
 
-    // Validate n_bands and n_pw are consistent across all kpts and spins.
+    // Validate n_bands consistent; n_pw varies per kpt (same energy cutoff,
+    // different G-vector counts at different k-points).
     let n_bands = wfc.kpt_data[0].bands.len();
-    let n_pw = wfc.kpt_data[0].nplw;
     for ikpt in 0..nkpts {
         let kpt_s0 = &wfc.kpt_data[ikpt];
         let kpt_s1 = &wfc.kpt_data[nkpts + ikpt];
         assert_eq!(kpt_s0.bands.len(), n_bands, "n_bands mismatch at kpt={ikpt} spin0");
         assert_eq!(kpt_s1.bands.len(), n_bands, "n_bands mismatch at kpt={ikpt} spin1");
-        assert_eq!(kpt_s0.nplw, n_pw, "n_pw mismatch at kpt={ikpt} spin0");
-        assert_eq!(kpt_s1.nplw, n_pw, "n_pw mismatch at kpt={ikpt} spin1");
+        // nplw may differ per kpt — same energy cutoff, different G-vector sphere.
     }
 
     // --- Collect per-kpt, per-spin wavefunctions ---
@@ -415,7 +414,6 @@ pub fn build_spin_scf_state(fx: &NioSpinFixture) -> ScfIteration<SpinCollinear> 
         cudarc::driver::CudaContext::new(0).expect("GPU required for warm-start test"),
     );
     let stream = ctx.default_stream();
-    let n_elements = n_bands * n_pw;
 
     use cudarc::driver::CudaSlice;
 
@@ -430,6 +428,10 @@ pub fn build_spin_scf_state(fx: &NioSpinFixture) -> ScfIteration<SpinCollinear> 
     for ikpt in 0..nkpts {
         let kpt_s0 = &wfc.kpt_data[ikpt];
         let kpt_s1 = &wfc.kpt_data[nkpts + ikpt];
+
+        // n_pw varies per kpt (same energy cutoff, different G-vector counts).
+        let n_pw_kpt = kpt_s0.nplw;
+        let n_elements = n_bands * n_pw_kpt;
 
         // GPU placeholders (overwritten by diagonalize_inner's H2D from psi_cpu)
         let gpu_s0: CudaSlice<chemrust_scf::device::CudaComplex> =
