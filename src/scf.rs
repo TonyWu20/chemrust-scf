@@ -1235,7 +1235,31 @@ impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated, MixingOff> {
                     * info.num_ions as f64
             })
             .sum();
-        let n_electrons_per_spin = n_electrons / nspins as f64;
+        // Per-spin electron counts from the CURRENT density's net spin.
+        // For SpinCollinear: n_up = 0.5*(N + net_spin), n_dn = 0.5*(N - net_spin).
+        // Using the density that's already stored (fixture or previous iteration)
+        // ensures the spin polarisation is preserved through density reconstruction.
+        // CASTEP electronic.f90:8742-8746: frac_elec(1)=0.5*(N+net_spin), frac_elec(2)=0.5*(N-net_spin).
+        let net_spin: f64 = if nspins == 2 {
+            let up_arr = self.density[0].as_wave_array();
+            let dn_arr = self.density[1].as_wave_array();
+            let n_grid = up_arr.len() as f64;
+            up_arr.iter().zip(dn_arr.iter())
+                .map(|(&u, &d)| u - d)
+                .sum::<f64>() / n_grid
+        } else {
+            0.0
+        };
+        let n_electrons_per_spin: Vec<f64> = (0..nspins)
+            .map(|ispin| {
+                if nspins == 2 {
+                    if ispin == 0 { 0.5 * (n_electrons + net_spin) }
+                    else          { 0.5 * (n_electrons - net_spin) }
+                } else {
+                    n_electrons
+                }
+            })
+            .collect();
 
         let ctx = Arc::new(CudaContext::new(0)?);
         let stream = ctx.default_stream();
@@ -1262,7 +1286,7 @@ impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated, MixingOff> {
                     self.eigenvalues[ispin].as_ref(), // &[Vec<f64>] — per-kpt eigenvalues
                     &kpt_weights,
                     &self.smearing,
-                    n_electrons_per_spin,
+                    n_electrons_per_spin[ispin],
                 )?;
 
             // Density accumulation across kpts (weighted sum)
@@ -1390,7 +1414,7 @@ impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated, MixingOff> {
                 eprintln!(
                     "[NewDensity] spin={} rho_sum={:.4e} rho_min={:.4e} rho_max={:.4e}  total_e(raw_conv=sum/N)={:.6}  [occ] Σ(w·occ)={:.4} target_n_e/spin={:.4} chem_pot={:.4} Ha",
                     ispin, rho_sum, rho_min, rho_max,
-                    total_e_raw_conv, occ_sum_diag, n_electrons_per_spin, chem_pot.0,
+                    total_e_raw_conv, occ_sum_diag, n_electrons_per_spin[ispin], chem_pot.0,
                 );
                 #[cfg(feature = "scf_diag")]
                 if let Some(ref aug) = total_aug {
