@@ -571,6 +571,99 @@ fn nio_warm_start_discriminator() {
     };
 
     // =====================================================================
+    // DIAGNOSTICS: print energy components before assertions
+    // =====================================================================
+    {
+        let e_xc = post_iter1.e_xc_value().unwrap_or(f64::NAN);
+        let e_h = post_iter1.e_hartree_value().unwrap_or(f64::NAN);
+        let rho_vxc = post_iter1.rho_vxc_value().unwrap_or(f64::NAN);
+        let ewald = post_iter1.ewald_value();
+        let per_spin_eigs = post_iter1.per_spin_eigenvalues();
+        let fermi = post_iter1.fermi_energies();
+
+        eprintln!("[DIAG] e_xc      = {:.8} Ha", e_xc);
+        eprintln!("[DIAG] e_hartree = {:.8} Ha", e_h);
+        eprintln!("[DIAG] rho_vxc   = {:.8} Ha", rho_vxc);
+        eprintln!("[DIAG] ewald     = {:.8} Ha", ewald);
+        eprintln!("[DIAG] E_F[0]    = {:.8} Ha", fermi[0]);
+        eprintln!("[DIAG] E_F[1]    = {:.8} Ha", fermi[1]);
+
+        // Per-kpt eigenvalue ranges for spin 0 (first 3 kpts)
+        let nkpts = per_spin_eigs[0].nkpts();
+        for ikpt in 0..nkpts.min(3) {
+            let eigs0 = &per_spin_eigs[0][ikpt];
+            let eigs1 = &per_spin_eigs[1][ikpt];
+            eprintln!("[DIAG] kpt={ikpt} spin0: eig[0]={:.8} eig[{}]={:.8}  n_pw={}",
+                eigs0.first().copied().unwrap_or(f64::NAN),
+                eigs0.len() - 1, eigs0.last().copied().unwrap_or(f64::NAN),
+                post_iter1.per_spin_density()[0].as_wave_array().len());
+            eprintln!("[DIAG] kpt={ikpt} spin1: eig[0]={:.8} eig[{}]={:.8}",
+                eigs1.first().copied().unwrap_or(f64::NAN),
+                eigs1.len() - 1, eigs1.last().copied().unwrap_or(f64::NAN));
+        }
+
+        // Compare against reference eigenvalues
+        let ref_eigs_spin0 = &fx.bands_eigenvalues_per_spin[0][0];
+        let ref_eigs_spin1 = &fx.bands_eigenvalues_per_spin[0][1];
+        let eigs0 = &per_spin_eigs[0][0];
+        let eigs1 = &per_spin_eigs[1][0];
+
+        let max_err0 = eigs0.iter().zip(ref_eigs_spin0.iter())
+            .map(|(&a, &b)| (a - b).abs()).fold(0.0, f64::max);
+        let max_err1 = eigs1.iter().zip(ref_eigs_spin1.iter())
+            .map(|(&a, &b)| (a - b).abs()).fold(0.0, f64::max);
+
+        eprintln!("[DIAG] kpt=0 max eig error: spin0={:.4e} Ha  spin1={:.4e} Ha", max_err0, max_err1);
+
+        // Reconstruct total energy manually for verification
+        let e_band_from_comps = post_iter1.total_energy().unwrap_or(0.0)
+            - e_xc + e_h - (rho_vxc - ewald);
+        // Actually: E_total = E_band - E_H + E_xc - rho_vxc + E_ewald
+        // So: E_band = E_total + E_H - E_xc + rho_vxc - E_ewald
+        let e_band = post_iter1.total_energy().unwrap_or(0.0) + e_h - e_xc + rho_vxc - ewald;
+        eprintln!("[DIAG] E_band (from E_total components) = {:.8} Ha", e_band);
+        eprintln!("[DIAG] check: E_total = E_band({:.8}) - E_H({:.8}) + E_xc({:.8}) - rho_vxc({:.8}) + E_ewald({:.8}) = {:.8} Ha",
+            e_band, e_h, e_xc, rho_vxc, ewald,
+            e_band - e_h + e_xc - rho_vxc + ewald);
+    }
+
+    // =====================================================================
+    // V1: eigenvalue comparison (run BEFORE V2 so we see it even on V2 fail)
+    // =====================================================================
+    {
+        let per_spin_eigs = post_iter1.per_spin_eigenvalues();
+        let ref_eigs_spin0 = &fx.bands_eigenvalues_per_spin[0][0];
+        let ref_eigs_spin1 = &fx.bands_eigenvalues_per_spin[0][1];
+        let eigs_spin0 = &per_spin_eigs[0][0];
+        let eigs_spin1 = &per_spin_eigs[1][0];
+
+        let max_err0: f64 = eigs_spin0.iter().zip(ref_eigs_spin0.iter())
+            .map(|(&a, &b)| (a - b).abs()).fold(0.0, f64::max);
+        let max_err1: f64 = eigs_spin1.iter().zip(ref_eigs_spin1.iter())
+            .map(|(&a, &b)| (a - b).abs()).fold(0.0, f64::max);
+
+        eprintln!("[V1] spin0: {} eigenvalues, ref[0]={:.8}, our[0]={:.8}, max|Δ|={:.4e} Ha",
+            eigs_spin0.len(), ref_eigs_spin0.first().copied().unwrap_or(f64::NAN),
+            eigs_spin0.first().copied().unwrap_or(f64::NAN), max_err0);
+        eprintln!("[V1] spin1: {} eigenvalues, ref[0]={:.8}, our[0]={:.8}, max|Δ|={:.4e} Ha",
+            eigs_spin1.len(), ref_eigs_spin1.first().copied().unwrap_or(f64::NAN),
+            eigs_spin1.first().copied().unwrap_or(f64::NAN), max_err1);
+
+        for ikpt in 0..per_spin_eigs[0].nkpts() {
+            let e0 = &per_spin_eigs[0][ikpt];
+            let r0 = &fx.bands_eigenvalues_per_spin[ikpt][0];
+            let me0 = e0.iter().zip(r0.iter()).map(|(&a,&b)| (a-b).abs()).fold(0.0, f64::max);
+            let e1 = &per_spin_eigs[1][ikpt];
+            let r1 = &fx.bands_eigenvalues_per_spin[ikpt][1];
+            let me1 = e1.iter().zip(r1.iter()).map(|(&a,&b)| (a-b).abs()).fold(0.0, f64::max);
+            eprintln!("[V1] kpt={ikpt}: max eig err spin0={:.4e} spin1={:.4e} Ha", me0, me1);
+        }
+
+        assert!(max_err0 < TOL_EPS_HA, "V1 FAILED (spin0): {:.4e} > {:.4e}", max_err0, TOL_EPS_HA);
+        assert!(max_err1 < TOL_EPS_HA, "V1 FAILED (spin1): {:.4e} > {:.4e}", max_err1, TOL_EPS_HA);
+    }
+
+    // =====================================================================
     // V2: Total energy comparison
     // =====================================================================
     let e_iter1_ha = post_iter1
