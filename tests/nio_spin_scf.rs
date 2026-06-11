@@ -626,7 +626,7 @@ fn nio_warm_start_discriminator() {
         // Manual E_band computation for spin=0 at kpt=0 (single-weight validation)
         let eigs0_k0 = &per_spin_eigs[0][0];
         let (occ0, chem0) = chemrust_scf::density::compute_occupations(
-            eigs0_k0, post_iter1.smearing_params(), n_up)
+            eigs0_k0, post_iter1.smearing_params(), n_up, 0.5)
             .unwrap();
         let e_band_k0_s0: f64 = eigs0_k0.iter().zip(occ0.0.iter())
             .map(|(&e, &f)| f * e).sum();
@@ -849,12 +849,14 @@ fn nio_warm_start_discriminator() {
         eigs_spin0,
         post_iter1.smearing_params(),
         n_electrons / 2.0 + 4.0, // n_up for NiO = 36
+        0.5, // occ_factor for SpinCollinear
     )
     .expect("compute_occupations spin0");
     let (occ_dn, chem_dn) = chemrust_scf::density::compute_occupations(
         eigs_spin1,
         post_iter1.smearing_params(),
         n_electrons / 2.0 - 4.0, // n_dn for NiO = 28
+        0.5, // occ_factor for SpinCollinear
     )
     .expect("compute_occupations spin1");
 

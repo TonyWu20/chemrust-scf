@@ -235,7 +235,7 @@ fn run_orthogonality_diagnostic(filter_mode: chemrust_scf::FilterMode, mode_name
         scheme: chemrust_scf::SmearingScheme::Gaussian,
     };
     let (occupations, chem_pot) =
-        chemrust_scf::density::compute_occupations(&fx.bands_eigenvalues, &smearing, n_electrons)
+        chemrust_scf::density::compute_occupations(&fx.bands_eigenvalues, &smearing, n_electrons, 1.0)
             .expect("compute_occupations from CASTEP eigenvalues");
     let occ_sum: f64 = occupations.0.iter().sum();
     println!(
@@ -570,7 +570,7 @@ fn diagnostic_2_residual_norms_after_chebyshev_filter() {
         scheme: chemrust_scf::SmearingScheme::Gaussian,
     };
     let (occupations, chem_pot) =
-        chemrust_scf::density::compute_occupations(&fx.bands_eigenvalues, &smearing, n_electrons)
+        chemrust_scf::density::compute_occupations(&fx.bands_eigenvalues, &smearing, n_electrons, 1.0)
             .expect("compute_occupations");
     let occ_sum: f64 = occupations.0.iter().sum();
     println!(
@@ -1104,6 +1104,7 @@ fn diagnostic_s_norm_baseline() {
             scheme: chemrust_scf::SmearingScheme::Gaussian,
         },
         n_electrons,
+        1.0,
     ).expect("compute_occupations");
 
     let wave_grid = chemrust_hamiltonian_core::GVectorGrid::new(
@@ -1329,7 +1330,7 @@ fn diagnostic_h_psi_differential() {
             width: 0.1 * chemrust_scf::EV_TO_HARTREE,
             electron_temperature: 0.1 * chemrust_scf::EV_TO_HARTREE,
             scheme: chemrust_scf::SmearingScheme::Gaussian,
-        }, n_electrons,
+        }, n_electrons, 1.0,
     ).expect("compute_occupations");
 
     let v_eff_for_d = chemrust_hamiltonian_core::EffectivePotential::from_inner(
@@ -1528,7 +1529,7 @@ fn diagnostic_3_outer_loop_convergence() {
         scheme: chemrust_scf::SmearingScheme::Gaussian,
     };
     let (occupations, chem_pot) =
-        chemrust_scf::density::compute_occupations(&fx.bands_eigenvalues, &smearing, n_electrons)
+        chemrust_scf::density::compute_occupations(&fx.bands_eigenvalues, &smearing, n_electrons, 1.0)
             .expect("compute_occupations");
     let occ_sum: f64 = occupations.0.iter().sum();
     println!(
@@ -1968,7 +1969,7 @@ fn diagnostic_h_psi_component_breakdown() {
             width: 0.1 * chemrust_scf::EV_TO_HARTREE,
             electron_temperature: 0.1 * chemrust_scf::EV_TO_HARTREE,
             scheme: chemrust_scf::SmearingScheme::Gaussian,
-        }, n_electrons,
+        }, n_electrons, 1.0,
     ).expect("compute_occupations");
 
     // Build VnlBatchData using REFERENCE V_eff (pot_fmt), not reconstructed

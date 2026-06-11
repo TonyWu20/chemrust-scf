@@ -35,21 +35,30 @@ use crate::types::{ChemicalPotential, Density, Error, Occupations, SmearingParam
 
 /// Compute occupation numbers via Gaussian smearing.
 ///
-/// occ_b = erfc((ε_b - μ) / w)
+/// occ_b = occ_factor · erfc((ε_b - μ) / w)
 ///
 /// The chemical potential μ satisfies Σ_b occ_b = N_electrons.
+///
+/// `occ_factor` accounts for spin degeneracy:
+/// - NonSpin (nspins=1): occ_factor = 1.0, range [0, 2], matches erfc directly.
+/// - SpinCollinear (nspins=2): occ_factor = 0.5, range [0, 1], matching CASTEP's
+///   `algor_integrated_broadening * real(2/nspins,dp)` formula.
+///
+/// CASTEP reference: algor.F90:2979 (algor_integrated_broadening = 0.5*erf(x)+0.5)
+/// electronic.f90:9421 (occ = algor_integrated_broadening * real(2/nspins)).
 pub fn compute_occupations(
     eigenvalues: &[f64],
     smearing: &SmearingParams,
     n_electrons: f64,
+    occ_factor: f64,
 ) -> Result<(Occupations, ChemicalPotential), Error> {
     match smearing.scheme {
         SmearingScheme::Gaussian => {
-            let mu = find_chemical_potential(eigenvalues, smearing.width, n_electrons)?;
+            let mu = find_chemical_potential(eigenvalues, smearing.width, n_electrons, occ_factor)?;
             let occ = Occupations(
                 eigenvalues
                     .iter()
-                    .map(|&e| libm::erfc((e - mu) / smearing.width))
+                    .map(|&e| occ_factor * libm::erfc((e - mu) / smearing.width))
                     .collect(),
             );
             Ok((occ, ChemicalPotential(mu)))
@@ -57,11 +66,12 @@ pub fn compute_occupations(
     }
 }
 
-/// Bisection search for μ such that Σ erfc((ε_b - μ) / w) = N_electrons.
+/// Bisection search for μ such that Σ occ_factor · erfc((ε_b - μ) / w) = N_electrons.
 fn find_chemical_potential(
     eigenvalues: &[f64],
     width: f64,
     n_electrons: f64,
+    occ_factor: f64,
 ) -> Result<f64, Error> {
     let emin = eigenvalues.iter().cloned().fold(f64::INFINITY, f64::min);
     let emax = eigenvalues.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
@@ -74,7 +84,7 @@ fn find_chemical_potential(
         let mid = 0.5 * (lo + hi);
         let sum: f64 = eigenvalues
             .iter()
-            .map(|&e| libm::erfc((e - mid) / width))
+            .map(|&e| occ_factor * libm::erfc((e - mid) / width))
             .sum();
         if sum > n_electrons {
             hi = mid;
@@ -86,7 +96,13 @@ fn find_chemical_potential(
 }
 
 /// Multi-kpt weighted occupation search: find μ such that
-/// Σ_k w_k Σ_b erfc((ε_{bk} - μ) / w) = N_electrons_per_spin.
+/// Σ_k w_k Σ_b occ_factor · erfc((ε_{bk} - μ) / w) = N_electrons_per_spin.
+///
+/// `occ_factor` accounts for spin degeneracy:
+/// - NonSpin (nspins=1): occ_factor = 1.0, effective range [0, 2]
+/// - SpinCollinear (nspins=2): occ_factor = 0.5, effective range [0, 1]
+///
+/// CASTEP reference: algor.F90:2979, electronic.f90:9421.
 ///
 /// `per_kpt_eigenvalues` is a slice where each element is the eigenvalue list
 /// for one k-point (length = n_bands each). `kpt_weights` must be the same
@@ -101,17 +117,18 @@ pub fn compute_occupations_weighted(
     kpt_weights: &[f64],
     smearing: &SmearingParams,
     n_electrons_per_spin: f64,
+    occ_factor: f64,
 ) -> Result<(Vec<Vec<f64>>, ChemicalPotential), Error> {
     match smearing.scheme {
         SmearingScheme::Gaussian => {
             // Flatten eigenvalues with weights for chemical potential search.
-            // For the bisection, we need Σ_k w_k Σ_b erfc((ε_{bk} - μ) / w).
-            // We precompute the weighted objective.
+            // For the bisection, we need Σ_k w_k Σ_b occ_factor · erfc((ε_{bk} - μ) / w).
             let mu = find_chemical_potential_weighted(
                 per_kpt_eigenvalues,
                 kpt_weights,
                 smearing.width,
                 n_electrons_per_spin,
+                occ_factor,
             )?;
 
             // Compute per-kpt occupations at the found μ
@@ -119,7 +136,7 @@ pub fn compute_occupations_weighted(
                 .iter()
                 .map(|eigs| {
                     eigs.iter()
-                        .map(|&e| libm::erfc((e - mu) / smearing.width))
+                        .map(|&e| occ_factor * libm::erfc((e - mu) / smearing.width))
                         .collect()
                 })
                 .collect();
@@ -129,12 +146,14 @@ pub fn compute_occupations_weighted(
     }
 }
 
-/// Bisection search for μ such that Σ_k w_k Σ_b erfc((ε_{bk} - μ) / w) = N.
+/// Bisection search for μ such that
+/// Σ_k w_k Σ_b occ_factor · erfc((ε_{bk} - μ) / w) = N.
 fn find_chemical_potential_weighted(
     per_kpt_eigenvalues: &[Vec<f64>],
     kpt_weights: &[f64],
     width: f64,
     n_electrons: f64,
+    occ_factor: f64,
 ) -> Result<f64, Error> {
     assert_eq!(
         per_kpt_eigenvalues.len(),
@@ -163,7 +182,7 @@ fn find_chemical_potential_weighted(
             .iter()
             .zip(kpt_weights.iter())
             .flat_map(|(eigs, &w)| {
-                eigs.iter().map(move |&e| w * libm::erfc((e - mid) / width))
+                eigs.iter().map(move |&e| w * occ_factor * libm::erfc((e - mid) / width))
             })
             .sum();
         if sum > n_electrons {
@@ -178,7 +197,7 @@ fn find_chemical_potential_weighted(
 /// CASTEP lower-bound bisection for FIXED-spin occupation search.
 ///
 /// Finds the Fermi energy for a single spin channel such that:
-///   Σ_b erfc((ε_b - μ) / w) = n_spin_electrons
+///   Σ_b occ_factor · erfc((ε_b - μ) / w) = n_spin_electrons
 ///
 /// The returned `fermi_energy` is a **lower bound** (CASTEP convention).
 /// After convergence, occupations are computed at the found fermi level.
@@ -188,12 +207,13 @@ fn find_chemical_potential_weighted(
 /// 2. `delta_E = hi - lo`, `fermi = lo`
 /// 3. For 80 steps or until `delta_E <= 1e-12`:
 ///    - `delta_E /= 2`, `trial = fermi + delta_E`
-///    - If `Σ erfc((e - trial)/width) <= n_spin_electrons`: `fermi = trial` (accept)
+///    - If `Σ occ_factor · erfc((e - trial)/width) <= n_spin_electrons`: `fermi = trial` (accept)
 /// 4. Compute occupations at `fermi` and return.
 pub fn find_fermi_fix(
     eigenvalues: &[f64],
     smearing: &SmearingParams,
     n_spin_electrons: f64,
+    occ_factor: f64,
 ) -> Result<(f64, Vec<f64>), Error> {
     let width = smearing.width;
     let emin = eigenvalues.iter().cloned().fold(f64::INFINITY, f64::min);
@@ -209,10 +229,11 @@ pub fn find_fermi_fix(
         return Ok((f64::NEG_INFINITY, occupations));
     }
 
-    // Edge case: all bands fully occupied (each erfc can contribute up to 2)
-    let max_possible = 2.0 * eigenvalues.len() as f64;
+    // Edge case: all bands fully occupied
+    // (each band can contribute up to 2 * occ_factor — 2 for NonSpin, 1 for SpinCollinear)
+    let max_possible = 2.0 * occ_factor * eigenvalues.len() as f64;
     if n_spin_electrons >= max_possible {
-        let occupations = vec![2.0; eigenvalues.len()];
+        let occupations = vec![2.0 * occ_factor; eigenvalues.len()];
         return Ok((f64::INFINITY, occupations));
     }
 
@@ -226,7 +247,7 @@ pub fn find_fermi_fix(
         let trial = fermi + delta_E;
         let total_occ: f64 = eigenvalues
             .iter()
-            .map(|&e| libm::erfc((e - trial) / width))
+            .map(|&e| occ_factor * libm::erfc((e - trial) / width))
             .sum();
         if total_occ <= n_spin_electrons {
             fermi = trial;
@@ -238,7 +259,7 @@ pub fn find_fermi_fix(
 
     let occupations: Vec<f64> = eigenvalues
         .iter()
-        .map(|&e| libm::erfc((e - fermi) / width))
+        .map(|&e| occ_factor * libm::erfc((e - fermi) / width))
         .collect();
 
     Ok((fermi, occupations))
@@ -247,7 +268,7 @@ pub fn find_fermi_fix(
 /// CASTEP lower-bound bisection for FREE-spin (shared Fermi energy).
 ///
 /// Finds a SINGLE Fermi energy shared by both spin channels such that:
-///   Σ_b erfc((ε↑_b - μ) / w) + Σ_b erfc((ε↓_b - μ) / w) = n_electrons
+///   Σ_b occ_factor · erfc((ε↑_b - μ) / w) + Σ_b occ_factor · erfc((ε↓_b - μ) / w) = n_electrons
 ///
 /// Returns (fermi_energy, occ_up, occ_dn, net_spin).
 ///
@@ -262,6 +283,7 @@ pub fn find_fermi_free(
     ev_dn: &[f64],
     smearing: &SmearingParams,
     n_electrons: f64,
+    occ_factor: f64,
 ) -> Result<(f64, Vec<f64>, Vec<f64>, f64), Error> {
     let width = smearing.width;
 
@@ -285,10 +307,10 @@ pub fn find_fermi_free(
     }
 
     // Edge case: all bands fully occupied
-    let max_possible = 2.0 * (ev_up.len() + ev_dn.len()) as f64;
+    let max_possible = 2.0 * occ_factor * (ev_up.len() + ev_dn.len()) as f64;
     if n_electrons >= max_possible {
-        let occ_up = vec![2.0; ev_up.len()];
-        let occ_dn = vec![2.0; ev_dn.len()];
+        let occ_up = vec![2.0 * occ_factor; ev_up.len()];
+        let occ_dn = vec![2.0 * occ_factor; ev_dn.len()];
         return Ok((f64::INFINITY, occ_up, occ_dn, 0.0));
     }
 
@@ -303,11 +325,11 @@ pub fn find_fermi_free(
 
         let total_occ_up: f64 = ev_up
             .iter()
-            .map(|&e| libm::erfc((e - trial) / width))
+            .map(|&e| occ_factor * libm::erfc((e - trial) / width))
             .sum();
         let total_occ_dn: f64 = ev_dn
             .iter()
-            .map(|&e| libm::erfc((e - trial) / width))
+            .map(|&e| occ_factor * libm::erfc((e - trial) / width))
             .sum();
         let total_occ = total_occ_up + total_occ_dn;
 
@@ -322,16 +344,49 @@ pub fn find_fermi_free(
     // Compute occupations at the shared fermi energy
     let occ_up: Vec<f64> = ev_up
         .iter()
-        .map(|&e| libm::erfc((e - fermi) / width))
+        .map(|&e| occ_factor * libm::erfc((e - fermi) / width))
         .collect();
     let occ_dn: Vec<f64> = ev_dn
         .iter()
-        .map(|&e| libm::erfc((e - fermi) / width))
+        .map(|&e| occ_factor * libm::erfc((e - fermi) / width))
         .collect();
 
     let net_spin: f64 = occ_up.iter().sum::<f64>() - occ_dn.iter().sum::<f64>();
 
     Ok((fermi, occ_up, occ_dn, net_spin))
+}
+
+// ---------------------------------------------------------------------------
+// Electronic entropy -TS (Mermin free energy correction)
+// ---------------------------------------------------------------------------
+
+/// Compute the electronic entropy contribution TS for the Mermin free energy.
+///
+/// For Gaussian smearing, CASTEP's formula (electronic.f90:9768-9784) gives:
+///   TS_spin = Σ_k w_k Σ_b exp(-((μ - ε_bk) / w)^2)
+///   TS = Σ_ns TS_spin · w / (nspins · √π)
+///
+/// The total energy is then: E_total = E_band - E_H + E_xc - ρV_xc + E_ewald - TS.
+///
+/// `per_kpt_eigenvalues` is a slice where each element is the eigenvalue list
+/// for one k-point (same format as `compute_occupations_weighted`).
+pub fn compute_entropy_ts(
+    per_kpt_eigenvalues: &[Vec<f64>],
+    kpt_weights: &[f64],
+    fermi_energy: f64,
+    width: f64,
+) -> f64 {
+    let mut spin_ts = 0.0;
+    for (ikpt, eigs) in per_kpt_eigenvalues.iter().enumerate() {
+        let wk = kpt_weights[ikpt];
+        let mut band_sum = 0.0;
+        for &e in eigs {
+            let x = (fermi_energy - e) / width;
+            band_sum += (-x * x).exp();
+        }
+        spin_ts += wk * band_sum;
+    }
+    spin_ts
 }
 
 // ---------------------------------------------------------------------------

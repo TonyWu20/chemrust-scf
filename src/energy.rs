@@ -258,7 +258,7 @@ fn ewald_reciprocal_space(
 /// # Formula
 ///
 /// ```text
-/// E_total = E_band - E_H + E_xc - ∫ρV_xc + E_ewald
+/// E_total = E_band - E_H + E_xc - ∫ρV_xc + E_ewald - TS
 /// ```
 ///
 /// Where:
@@ -267,6 +267,7 @@ fn ewald_reciprocal_space(
 /// - `E_xc` — exchange-correlation energy (from `VEffWithEnergy.e_xc`)
 /// - `∫ρV_xc = Σ_r ρ(r) V_xc(r) × dV` — double-counting correction (precomputed)
 /// - `E_ewald` — ion-ion electrostatic (Ewald) energy
+/// - `TS` — electronic entropy correction (Mermin free energy; subtracted)
 ///
 /// # Arguments
 ///
@@ -278,6 +279,7 @@ fn ewald_reciprocal_space(
 /// * `rho_vxc` — the integral ∫ρ V_xc dr (precomputed on the fine grid,
 ///   also from valence density).
 /// * `ewald` — Ewald ion–ion energy.
+/// * `ts` — electronic entropy term TS (CASTEP electronic.f90:3282-3283).
 #[allow(clippy::too_many_arguments)]
 pub fn assemble_total_energy(
     eigenvalues: &[f64],
@@ -286,6 +288,7 @@ pub fn assemble_total_energy(
     e_hartree: f64,
     rho_vxc: f64,
     ewald: f64,
+    ts: f64,
 ) -> f64 {
     let e_band: f64 = eigenvalues
         .iter()
@@ -293,7 +296,7 @@ pub fn assemble_total_energy(
         .map(|(&eps, &f)| f * eps)
         .sum();
 
-    e_band - e_hartree + e_xc - rho_vxc + ewald
+    e_band - e_hartree + e_xc - rho_vxc + ewald - ts
 }
 
 /// Assemble the KS-DFT total energy from pre-computed band energy.
@@ -303,16 +306,19 @@ pub fn assemble_total_energy(
 /// Useful when the band energy involves a kpt-weighted sum.
 ///
 /// ```text
-/// E_total = e_band - E_H + E_xc - ∫ρV_xc + E_ewald
+/// E_total = e_band - E_H + E_xc - ∫ρV_xc + E_ewald - TS
 /// ```
+///
+/// CASTEP reference: electronic.f90:3282-3283, 4531-4532.
 pub fn assemble_total_energy_from_band(
     e_band: f64,
     e_xc: f64,
     e_hartree: f64,
     rho_vxc: f64,
     ewald: f64,
+    ts: f64,
 ) -> f64 {
-    e_band - e_hartree + e_xc - rho_vxc + ewald
+    e_band - e_hartree + e_xc - rho_vxc + ewald - ts
 }
 
 // ---------------------------------------------------------------------------
@@ -367,9 +373,9 @@ mod tests {
     fn test_assemble_total_energy_basic() {
         let eigs = vec![-0.5, -0.3, 0.0, 0.2];
         let occs = vec![1.0, 1.0, 0.0, 0.0];
-        let e = assemble_total_energy(&eigs, &occs, -1.0, 0.5, 0.8, 0.2);
+        let e = assemble_total_energy(&eigs, &occs, -1.0, 0.5, 0.8, 0.2, 0.0);
         // E_band = -0.5*1 + -0.3*1 = -0.8
-        // e = -0.8 - 0.5 + (-1.0) - 0.8 + 0.2 = -2.9
+        // e = -0.8 - 0.5 + (-1.0) - 0.8 + 0.2 - 0.0 = -2.9
         let expected = -2.9;
         assert!(
             (e - expected).abs() < 1e-12,

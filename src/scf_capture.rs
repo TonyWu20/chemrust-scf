@@ -83,7 +83,7 @@ pub fn capture_as_castep_bin<S: SpinPolicy>(
     // --- Occupations (recomputed — not stored on ScfIteration) ---
     // Use kpt-0 eigenvalues for occupation computation (single-kpt path).
     let (occupations, _chem_pot) = if nkpts > 0 {
-        compute_occupations(&state.eigenvalues[0][0], &state.smearing, n_electrons)
+        compute_occupations(&state.eigenvalues[0][0], &state.smearing, n_electrons, 1.0)
             .ok()?
     } else {
         return None;
@@ -96,7 +96,7 @@ pub fn capture_as_castep_bin<S: SpinPolicy>(
             let kpt_coords = state.k_points[ikpt].coords;
             let kpt_weight = state.k_points[ikpt].weight;
             let eigs = &state.eigenvalues[0][ikpt];
-            let (occ, _) = compute_occupations(eigs, &state.smearing, n_electrons).ok()
+            let (occ, _) = compute_occupations(eigs, &state.smearing, n_electrons, 1.0).ok()
                 .unwrap_or_else(|| {
                     let occ = vec![0.0; eigs.len()];
                     (crate::types::Occupations(occ), crate::types::ChemicalPotential(0.0))

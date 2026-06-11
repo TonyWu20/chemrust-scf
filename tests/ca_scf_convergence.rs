@@ -529,7 +529,7 @@ fn density_decomp_matches_castep_f8_same_inputs() {
         scheme: chemrust_scf::SmearingScheme::Gaussian,
     };
     let (occupations, chem_pot) =
-        chemrust_scf::density::compute_occupations(eigenvalues, &smearing, n_electrons)
+        chemrust_scf::density::compute_occupations(eigenvalues, &smearing, n_electrons, 1.0)
             .expect("compute_occupations from CASTEP eigenvalues");
     let occ_sum: f64 = occupations.0.iter().sum();
     println!(
@@ -2754,7 +2754,7 @@ fn density_split_castep_psi_vs_our_psi() {
         scheme: chemrust_scf::SmearingScheme::Gaussian,
     };
     let (occ_castep, _) = chemrust_scf::density::compute_occupations(
-        &fx.bands_eigenvalues, &smearing, n_electrons,
+        &fx.bands_eigenvalues, &smearing, n_electrons, 1.0,
     ).expect("occ castep");
 
     // ---- Run iter-1 to get our ψ and density ----
@@ -2776,7 +2776,7 @@ fn density_split_castep_psi_vs_our_psi() {
 
     // Compute occupations from our eigenvalues
     let (occ_ours, _) = chemrust_scf::density::compute_occupations(
-        &eig_ours, &smearing, n_electrons,
+        &eig_ours, &smearing, n_electrons, 1.0,
     ).expect("occ ours");
 
     eprintln!("\n[SplitDiag] Occupation comparison (first 20 bands):");
@@ -3030,7 +3030,7 @@ fn iter1_drift_from_castep_state_is_bounded() {
         })
         .sum();
     let (occ, chem) = chemrust_scf::density::compute_occupations(
-        eigs, mixed.smearing_params(), n_electrons,
+        eigs, mixed.smearing_params(), n_electrons, 1.0,
     ).expect("compute_occupations");
     let e_band: f64 = eigs.iter().zip(occ.0.iter()).map(|(&e, &f)| f * e).sum();
 

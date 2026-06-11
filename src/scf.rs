@@ -1291,6 +1291,7 @@ impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated, MixingOff> {
                     &kpt_weights,
                     &self.smearing,
                     n_electrons_per_spin[ispin],
+                    1.0 / nspins as f64, // occ_factor: 1.0 for NonSpin, 0.5 for SpinCollinear
                 )?;
 
             // Density accumulation across kpts (weighted sum)
@@ -1792,6 +1793,7 @@ impl<S: SpinPolicy> ScfIteration<S, Mixed, MixingOff> {
                     &kpt_weights,
                     &self.smearing,
                     n_spin_electrons,
+                    1.0 / nspins as f64, // occ_factor: 1.0 for NonSpin, 0.5 for SpinCollinear
                 )?;
             self.fermi_energy[ispin] = chem_pot.0;
 
@@ -1819,12 +1821,27 @@ impl<S: SpinPolicy> ScfIteration<S, Mixed, MixingOff> {
         if let (Some(e_xc), Some(e_hartree), Some(rho_vxc)) =
             (self.e_xc, self.e_hartree, self.rho_vxc)
         {
+            // Compute electronic entropy correction -TS (Mermin free energy).
+            // CASTEP electronic.f90:9768-9784 (GAUSSIAN), applied at 3282-3283.
+            let sqrt_pi = std::f64::consts::PI.sqrt();
+            let mut ts_sum = 0.0;
+            for ispin in 0..nspins {
+                ts_sum += crate::density::compute_entropy_ts(
+                    self.eigenvalues[ispin].as_ref(),
+                    &kpt_weights,
+                    self.fermi_energy[ispin],
+                    self.smearing.width,
+                );
+            }
+            let ts = ts_sum * self.smearing.width / (nspins as f64 * sqrt_pi);
+
             let e_total = crate::energy::assemble_total_energy_from_band(
                 e_band,
                 e_xc,
                 e_hartree,
                 rho_vxc,
                 self.ewald,
+                ts,
             );
             self.total_energy = Some(e_total);
             self.energy_buffer.push(e_total);
