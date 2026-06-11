@@ -1726,6 +1726,12 @@ impl<S: SpinPolicy> ScfIteration<S, Mixed, MixingOff> {
             .collect();
         let nspins = S::nspins();
 
+        #[cfg(feature = "scf_diag")]
+        {
+            eprintln!("[check] nkpts={nkpts} kpt_weights={kpt_weights:?}");
+            eprintln!("[check] n_electrons={n_electrons} nspins={nspins}");
+        }
+
         // Per-spin electron counts from integrated spin density.
         // CASTEP electronic.f90:8742-8746: frac_elec(1)=0.5*(N+net_spin),
         // frac_elec(2)=0.5*(N-net_spin).
@@ -1739,6 +1745,10 @@ impl<S: SpinPolicy> ScfIteration<S, Mixed, MixingOff> {
         } else {
             0.0
         };
+
+        #[cfg(feature = "scf_diag")]
+        eprintln!("[check] net_spin={net_spin:.6} n_up={:.6} n_dn={:.6}",
+            0.5 * (n_electrons + net_spin), 0.5 * (n_electrons - net_spin));
 
         let mut e_band: f64 = 0.0;
         for ispin in 0..nspins {

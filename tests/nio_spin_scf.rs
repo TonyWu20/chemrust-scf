@@ -587,44 +587,75 @@ fn nio_warm_start_discriminator() {
         eprintln!("[DIAG] ewald     = {:.8} Ha", ewald);
         eprintln!("[DIAG] E_F[0]    = {:.8} Ha", fermi[0]);
         eprintln!("[DIAG] E_F[1]    = {:.8} Ha", fermi[1]);
+        eprintln!("[DIAG] n_spins   = {}", per_spin_eigs.nspins());
+        eprintln!("[DIAG] n_kpts    = {}", per_spin_eigs[0].nkpts());
 
-        // Per-kpt eigenvalue ranges for spin 0 (first 3 kpts)
-        let nkpts = per_spin_eigs[0].nkpts();
-        for ikpt in 0..nkpts.min(3) {
+        // Per-kpt eigenvalue ranges + weights
+        for ikpt in 0..per_spin_eigs[0].nkpts().min(4) {
             let eigs0 = &per_spin_eigs[0][ikpt];
             let eigs1 = &per_spin_eigs[1][ikpt];
-            eprintln!("[DIAG] kpt={ikpt} spin0: eig[0]={:.8} eig[{}]={:.8}  n_pw={}",
-                eigs0.first().copied().unwrap_or(f64::NAN),
-                eigs0.len() - 1, eigs0.last().copied().unwrap_or(f64::NAN),
-                post_iter1.per_spin_density()[0].as_wave_array().len());
-            eprintln!("[DIAG] kpt={ikpt} spin1: eig[0]={:.8} eig[{}]={:.8}",
-                eigs1.first().copied().unwrap_or(f64::NAN),
-                eigs1.len() - 1, eigs1.last().copied().unwrap_or(f64::NAN));
+            eprintln!("[DIAG] kpt={ikpt} spin0: n_bands={} eig[0]={:.8} eig[last]={:.8}",
+                eigs0.len(), eigs0.first().copied().unwrap_or(f64::NAN),
+                eigs0.last().copied().unwrap_or(f64::NAN));
+            eprintln!("[DIAG] kpt={ikpt} spin1: n_bands={} eig[0]={:.8} eig[last]={:.8}",
+                eigs1.len(), eigs1.first().copied().unwrap_or(f64::NAN),
+                eigs1.last().copied().unwrap_or(f64::NAN));
         }
 
-        // Compare against reference eigenvalues
-        let ref_eigs_spin0 = &fx.bands_eigenvalues_per_spin[0][0];
-        let ref_eigs_spin1 = &fx.bands_eigenvalues_per_spin[0][1];
-        let eigs0 = &per_spin_eigs[0][0];
-        let eigs1 = &per_spin_eigs[1][0];
+        // Reconstruct E_band manually
+        let n_electrons: f64 = post_iter1.cell_geometry().species_iter()
+            .map(|info| post_iter1.pseudopotentials().get(info.symbol)
+                .and_then(|p| p.ionic_charge()).unwrap_or(0.0) * info.num_ions as f64)
+            .sum();
+        let nkpts = per_spin_eigs[0].nkpts();
+        let kpt_weights_slice: Vec<f64> = (0..nkpts)
+            .map(|ikpt| {
+                // Access kpt weights via the test fixture
+                let dummy_val = 1.0 / nkpts as f64;
+                eprintln!("[DIAG] NEED KPT_WEIGHT for ikpt={ikpt} — using dummy {dummy_val}");
+                dummy_val
+            })
+            .collect();
 
-        let max_err0 = eigs0.iter().zip(ref_eigs_spin0.iter())
-            .map(|(&a, &b)| (a - b).abs()).fold(0.0, f64::max);
-        let max_err1 = eigs1.iter().zip(ref_eigs_spin1.iter())
-            .map(|(&a, &b)| (a - b).abs()).fold(0.0, f64::max);
+        eprintln!("[DIAG] n_electrons = {:.6}", n_electrons);
+        eprintln!("[DIAG] Smearing width = {:.6} Ha", post_iter1.smearing_params().width);
 
-        eprintln!("[DIAG] kpt=0 max eig error: spin0={:.4e} Ha  spin1={:.4e} Ha", max_err0, max_err1);
+        // Check kpt weights used in check()
+        let nkpts = per_spin_eigs[0].nkpts();
+        let check_weights: Vec<f64> = (0..nkpts).map(|_| {
+            // Can't access ScfIteration.k_points from test — access via fixture
+            0.0
+        }).collect();
+        eprintln!("[DIAG] nkpts={nkpts}, sum of fixture weights={:.6}",
+            kpt_weights_slice.iter().sum::<f64>());
 
-        // Reconstruct total energy manually for verification
-        let e_band_from_comps = post_iter1.total_energy().unwrap_or(0.0)
-            - e_xc + e_h - (rho_vxc - ewald);
-        // Actually: E_total = E_band - E_H + E_xc - rho_vxc + E_ewald
-        // So: E_band = E_total + E_H - E_xc + rho_vxc - E_ewald
-        let e_band = post_iter1.total_energy().unwrap_or(0.0) + e_h - e_xc + rho_vxc - ewald;
-        eprintln!("[DIAG] E_band (from E_total components) = {:.8} Ha", e_band);
-        eprintln!("[DIAG] check: E_total = E_band({:.8}) - E_H({:.8}) + E_xc({:.8}) - rho_vxc({:.8}) + E_ewald({:.8}) = {:.8} Ha",
-            e_band, e_h, e_xc, rho_vxc, ewald,
-            e_band - e_h + e_xc - rho_vxc + ewald);
+        // Compute net_spin from PerSpinDensity (matching check() logic)
+        let rho_up = post_iter1.per_spin_density()[0].as_wave_array();
+        let rho_dn = post_iter1.per_spin_density()[1].as_wave_array();
+        let n_grid = rho_up.len() as f64;
+        let net_spin: f64 = rho_up.iter().zip(rho_dn.iter())
+            .map(|(&u, &d)| u - d).sum::<f64>() / n_grid;
+        let n_up = 0.5 * (n_electrons + net_spin);
+        let n_dn = 0.5 * (n_electrons - net_spin);
+        eprintln!("[DIAG] net_spin={:.6}  n_up={:.6}  n_dn={:.6}", net_spin, n_up, n_dn);
+
+        // Manual E_band computation for spin=0 at kpt=0 (single-weight validation)
+        let eigs0_k0 = &per_spin_eigs[0][0];
+        let (occ0, chem0) = chemrust_scf::density::compute_occupations(
+            eigs0_k0, post_iter1.smearing_params(), n_up)
+            .unwrap();
+        let e_band_k0_s0: f64 = eigs0_k0.iter().zip(occ0.0.iter())
+            .map(|(&e, &f)| f * e).sum();
+        let occ_sum0: f64 = occ0.0.iter().sum();
+        eprintln!("[DIAG] kpt=0 spin0: simple occ with n_up={n_up}: E_band={:.8} Ha  Σocc={:.6}  chem_pot={:.8} Ha",
+            e_band_k0_s0, occ_sum0, chem0.0);
+        eprintln!("[DIAG] CASTEP ref: E_band ~= E_kin+E_nl+E_loc ≈ -51.25 Ha");
+        eprintln!("[DIAG] Our XC correction (E_xc - rho_vxc): {:.8} Ha", e_xc - rho_vxc);
+        eprintln!("[DIAG] Missing: E_nonCoulomb ≈ +19.59 Ha, -TS ≈ 0 Ha");
+        eprintln!("[DIAG] Corrected E_total: {:.8} Ha + 19.59 = {:.8} Ha (castep={:.8})",
+            post_iter1.total_energy().unwrap_or(0.0),
+            post_iter1.total_energy().unwrap_or(0.0) + 19.59,
+            REFERENCE_ENERGY_EV / chemrust_scf::HARTREE_TO_EV);
     }
 
     // =====================================================================
