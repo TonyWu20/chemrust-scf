@@ -375,26 +375,12 @@ pub fn build_spin_scf_state(fx: &NioSpinFixture) -> ScfIteration<SpinCollinear> 
         wfc.kpt_data.len()
     );
 
-    // Parse k-point weights from the .bands file header.
-    // Each "K-point N kx ky kz weight" line has the weight as the last field.
-    let kpt_weights: Vec<f64> = {
-        let bands_text = std::fs::read_to_string(
-            format!("{}/NiO.bands", std::env::var("NIO_SPIN_FIXTURE_DIR")
-                .unwrap_or_else(|_| NIO_SPIN_DIR.to_string()))
-        ).expect("cannot read NiO.bands for weights");
-        bands_text
-            .lines()
-            .filter(|l| l.trim().starts_with("K-point"))
-            .filter_map(|l| {
-                let parts: Vec<&str> = l.trim().split_whitespace().collect();
-                parts.last()?.parse::<f64>().ok()
-            })
-            .collect()
-    };
+    // K-point weights from the .castep_bin file (parsed from CELL%KPOINTS_LIST).
+    let kpt_weights = fx.bin.kpoint_weights.clone();
     assert_eq!(
         kpt_weights.len(),
         nkpts,
-        "parsed {} kpt weights, expected {nkpts}",
+        ".castep_bin has {} kpt weights, expected {nkpts} from .check",
         kpt_weights.len(),
     );
 
@@ -620,14 +606,12 @@ fn nio_warm_start_discriminator() {
         eprintln!("[DIAG] n_electrons = {:.6}", n_electrons);
         eprintln!("[DIAG] Smearing width = {:.6} Ha", post_iter1.smearing_params().width);
 
-        // Check kpt weights used in check()
+        // Verify kpt weights from fixture match what check() uses
         let nkpts = per_spin_eigs[0].nkpts();
-        let check_weights: Vec<f64> = (0..nkpts).map(|_| {
-            // Can't access ScfIteration.k_points from test — access via fixture
-            0.0
-        }).collect();
-        eprintln!("[DIAG] nkpts={nkpts}, sum of fixture weights={:.6}",
-            kpt_weights_slice.iter().sum::<f64>());
+        eprintln!("[DIAG] nkpts={nkpts}, weights from .castep_bin: {:?}",
+            &fx.bin.kpoint_weights);
+        eprintln!("[DIAG] sum of weights={:.6} (should be 1.0)",
+            fx.bin.kpoint_weights.iter().sum::<f64>());
 
         // Compute net_spin from PerSpinDensity (matching check() logic)
         let rho_up = post_iter1.per_spin_density()[0].as_wave_array();
