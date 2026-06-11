@@ -1716,37 +1716,71 @@ impl<S: SpinPolicy> ScfIteration<S, Mixed, MixingOff> {
                     * info.num_ions as f64
             })
             .sum();
-        // Use spin-0 eigenvalues across all kpts for energy assembly.
-        // For SpinCollinear, per-spin handling is deferred to a future phase.
+        // Compute per-spin occupation-weighted band energy.
+        // NonSpin: single channel, total n_electrons (unchanged).
+        // SpinCollinear: two channels, per-spin electron counts from
+        // net_spin = ∫(ρ_up − ρ_down).
         let nkpts = self.nkpts;
         let kpt_weights: Vec<f64> = (0..nkpts)
             .map(|ikpt| self.k_points[ikpt].weight)
             .collect();
-        let (occupations_all_kpts, chem_pot) =
-            crate::density::compute_occupations_weighted(
-                self.eigenvalues[0].as_ref(), // &[Vec<f64>] — per-kpt eigenvalues
-                &kpt_weights,
-                &self.smearing,
-                n_electrons,
-            )?;
-        self.fermi_energy[0] = chem_pot.0;
+        let nspins = S::nspins();
+
+        // Per-spin electron counts from integrated spin density.
+        // CASTEP electronic.f90:8742-8746: frac_elec(1)=0.5*(N+net_spin),
+        // frac_elec(2)=0.5*(N-net_spin).
+        let net_spin: f64 = if nspins == 2 {
+            let up_arr = self.density[0].as_wave_array();
+            let dn_arr = self.density[1].as_wave_array();
+            let n_grid = up_arr.len() as f64;
+            up_arr.iter().zip(dn_arr.iter())
+                .map(|(&u, &d)| u - d)
+                .sum::<f64>() / n_grid
+        } else {
+            0.0
+        };
+
+        let mut e_band: f64 = 0.0;
+        for ispin in 0..nspins {
+            let n_spin_electrons = if nspins == 2 {
+                if ispin == 0 { 0.5 * (n_electrons + net_spin) }
+                else          { 0.5 * (n_electrons - net_spin) }
+            } else {
+                n_electrons
+            };
+            let (occupations_all_kpts, chem_pot) =
+                crate::density::compute_occupations_weighted(
+                    self.eigenvalues[ispin].as_ref(),
+                    &kpt_weights,
+                    &self.smearing,
+                    n_spin_electrons,
+                )?;
+            self.fermi_energy[ispin] = chem_pot.0;
+
+            // 2. Total energy assembly (if energy components are available)
+            if let (Some(e_xc), Some(e_hartree), Some(rho_vxc)) =
+                (self.e_xc, self.e_hartree, self.rho_vxc)
+            {
+                // Kpt-weighted band energy per spin: Σ_k w_k Σ_b f_{bk} ε_{bk}
+                let e_band_spin: f64 = self.eigenvalues[ispin]
+                    .iter()
+                    .zip(kpt_weights.iter())
+                    .zip(occupations_all_kpts.iter())
+                    .map(|((eigs, &w), occs)| {
+                        w * eigs.iter()
+                            .zip(occs.iter())
+                            .map(|(&eps, &f)| f * eps)
+                            .sum::<f64>()
+                    })
+                    .sum();
+                e_band += e_band_spin;
+            }
+        }
 
         // 2. Total energy assembly (if energy components are available)
         if let (Some(e_xc), Some(e_hartree), Some(rho_vxc)) =
             (self.e_xc, self.e_hartree, self.rho_vxc)
         {
-            // Compute kpt-weighted band energy: Σ_k w_k Σ_b f_{bk} ε_{bk}
-            let e_band: f64 = self.eigenvalues[0]
-                .iter()
-                .zip(kpt_weights.iter())
-                .zip(occupations_all_kpts.iter())
-                .map(|((eigs, &w), occs)| {
-                    w * eigs.iter()
-                        .zip(occs.iter())
-                        .map(|(&eps, &f)| f * eps)
-                        .sum::<f64>()
-                })
-                .sum();
             let e_total = crate::energy::assemble_total_energy_from_band(
                 e_band,
                 e_xc,
