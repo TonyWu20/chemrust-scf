@@ -71,7 +71,9 @@ struct ChemrustHandle {
     blas: BlasHandle,
     solver: SolverHandle,
     kernels: CudaKernelSet,
-    ngx: i32, ngy: i32, ngz: i32,
+    ngx: i32, ngy: i32, ngz: i32,           // FINE grid
+    ngx_std: i32, ngy_std: i32, ngz_std: i32, // STANDARD grid
+    max_n_pw: usize,
     nspins: usize,
     kpts: Vec<KptData>,
     /// Cached GPU copies of V_eff per spin for skip-upload optimization.
@@ -84,7 +86,8 @@ struct ChemrustHandle {
     /// (where they are not).
     pots: PseudopotentialSet,
     cell: CellGeometry,
-    wave_grid: GVectorGrid,
+    wave_grid: GVectorGrid,  // STANDARD grid — matches CASTEP's internal FFT grid
+    fine_grid: GVectorGrid,  // FINE grid — for V_eff downsampling only
 }
 
 // ---- Init ------------------------------------------------------------------
@@ -97,13 +100,16 @@ pub unsafe extern "C" fn chemrust_eigensolve_init(
     nkpts: c_int, num_pw_per_kpt: *const c_int, gvec_all_kpt: *const c_double,
     pw_grid_idx: *const c_int,
     kpt_coords: *const c_double,
-    ngx: c_int, ngy: c_int, ngz: c_int, nspins: c_int,
+    ngx: c_int, ngy: c_int, ngz: c_int,
+    ngx_std: c_int, ngy_std: c_int, ngz_std: c_int,
+    nspins: c_int,
     handle_out: *mut *mut c_void,
 ) -> c_int {
     if handle_out.is_null() { return CHEM_EIG_NULL_HANDLE; }
     let h = match init_inner(num_species, species_symbols, species_pots,
         real_lattice, recip_lattice, num_ions, ion_species, ion_positions,
-        nkpts, num_pw_per_kpt, gvec_all_kpt, pw_grid_idx, kpt_coords, ngx, ngy, ngz, nspins)
+        nkpts, num_pw_per_kpt, gvec_all_kpt, pw_grid_idx, kpt_coords,
+        ngx, ngy, ngz, ngx_std, ngy_std, ngz_std, nspins)
     {
         Ok(h) => h,
         Err(code) => return code,
@@ -119,7 +125,9 @@ fn init_inner(
     nkpts: c_int, num_pw_per_kpt: *const c_int, gvec_all_kpt: *const c_double,
     pw_grid_idx: *const c_int,
     kpt_coords: *const c_double,
-    ngx: c_int, ngy: c_int, ngz: c_int, nspins: c_int,
+    ngx: c_int, ngy: c_int, ngz: c_int,
+    ngx_std: c_int, ngy_std: c_int, ngz_std: c_int,
+    nspins: c_int,
 ) -> Result<*mut ChemrustHandle, c_int> {
     let ctx: Arc<CudaContext> = CudaContext::new(0).map_err(|e| { eprintln!("[chemrust] init: CudaContext failed: {e}"); CHEM_EIG_CUDA_ERROR })?;
     let stream = ctx.default_stream();
@@ -173,7 +181,11 @@ fn init_inner(
     let _gv = unsafe { std::slice::from_raw_parts(gvec_all_kpt as *const f64, 3*maxpw*nk) };
     let gidx = unsafe { std::slice::from_raw_parts(pw_grid_idx as *const i32, maxpw*nk) };
 
-    let wg = GVectorGrid::new(ngx as usize, ngy as usize, ngz as usize, RecipLattice::from_inner(rcip));
+    // wave_grid uses STANDARD grid dims — matches CASTEP's internal FFT grid
+    // after pot_interpolate downsamples V_eff from fine to standard grid.
+    let wave_grid = GVectorGrid::new(ngx_std as usize, ngy_std as usize, ngz_std as usize, RecipLattice::from_inner(rcip));
+    // fine_grid uses FINE grid dims — for receiving/downsampling CASTEP's real_fine_pot.
+    let fine_grid = GVectorGrid::new(ngx as usize, ngy as usize, ngz as usize, RecipLattice::from_inner(rcip));
 
     let nspins_u = nspins as usize;
 
@@ -196,10 +208,13 @@ fn init_inner(
         // Cartesian→Miller conversion which gives wrong results for the
         // first few PWs (where Cartesian components are near-zero but the
         // grid index correctly encodes a non-Gamma grid point).
+        // CASTEP's pw_grid_index is encoded on the STANDARD grid with
+        // strides [1, ngx_std, ngx_std*ngy_std] (ix-innermost).
+        // Decode with standard grid dimensions for correct Miller indices.
         let mut pw_coords = Vec::with_capacity(n_pw);
         for ipw in 0..n_pw {
             let idx_1based = gidx[ik*maxpw + ipw];
-            pw_coords.push(fft_idx_to_coord(idx_1based, ngx, ngy, ngz));
+            pw_coords.push(fft_idx_to_coord(idx_1based, ngx_std, ngy_std, ngz_std));
         }
 
         // Diagnostic: compare our pw_coords→Cartesian vs CASTEP's gvec
@@ -248,12 +263,13 @@ fn init_inner(
     let cell_clone = cell.clone();
     Ok(Box::into_raw(Box::new(ChemrustHandle {
         ctx, stream, blas, solver, kernels,
-        ngx, ngy, ngz, nspins: nspins_u, kpts,
+        ngx, ngy, ngz, ngx_std, ngy_std, ngz_std, max_n_pw: maxpw, nspins: nspins_u, kpts,
         v_eff_cached: (0..nspins_u).map(|_| None).collect(),
         v_eff_norm: vec![0.0; nspins_u],
         pots: pots_clone,
         cell: cell_clone,
-        wave_grid: wg,
+        wave_grid,
+        fine_grid,
     })))
 }
 
@@ -306,8 +322,21 @@ unsafe fn step_inner(
     if isp >= h.nspins { return Err(CHEM_EIG_CUDA_ERROR); }
     let n_pw = npw as usize;
     let n_bands = nbands as usize;
-    let gs = (h.ngx * h.ngy * h.ngz) as usize;
+    // Use STANDARD grid for FFT — matches CASTEP's internal convention after
+    // pot_interpolate downsamples V_eff from fine to standard grid.
+    let gs = (h.ngx_std * h.ngy_std * h.ngz_std) as usize;
     let n_bands_i32 = n_bands as i32;
+    // cuFFT C2C inverse does NOT divide by N_grid (confirmed by the
+    // round-trip identity test at device/fft.rs:262-283, which requires
+    // explicit division by N to recover identity).  Both forward and
+    // inverse transforms are unnormalized, so the full round-trip
+    // IFFT → V_eff·pointwise → FFT introduces a factor of N_grid.
+    // inv_ntotal compensates: FFT[V_eff · IFFT[ψ]](G) = N_grid · V_loc(G),
+    // and multiplying by 1/N_grid recovers the correct V_loc contribution.
+    // This matches the pattern used in the integration test
+    // (hamiltonian.rs:752), standalone SCF (scf.rs), and Chebyshev solver.
+    // N.B. gs uses STANDARD grid = ngx_std * ngy_std * ngz_std, matching
+    // the FFT plan dimensions on the standard grid.
     let inv_ntotal = 1.0 / gs as f64;
     let kd = &mut h.kpts[ik];
 
@@ -335,10 +364,16 @@ unsafe fn step_inner(
             ke_castep[0], ke_rust.0[0]);
     }
 
-    // Upload psi
-    let psi_host: Vec<num_complex::Complex64> = unsafe {
-        std::slice::from_raw_parts(psi_data as *const CudaComplex, n_pw * n_bands)
-    }.iter().map(|c| num_complex::Complex64::new(c.x, c.y)).collect();
+    // Upload psi.  CASTEP stores wvfn%coeffs(:,:,nk,ns) with leading dimension
+    // max_n_pw (global max plane-wave count across all k-points), not n_pw
+    // (this k-point's count).  Stride by max_n_pw to read each band correctly.
+    let max_n_pw = h.max_n_pw;
+    let raw_psi = unsafe { std::slice::from_raw_parts(psi_data as *const CudaComplex, max_n_pw * n_bands) };
+    let mut psi_host: Vec<num_complex::Complex64> = Vec::with_capacity(n_pw * n_bands);
+    for b in 0..n_bands {
+        let start = b * max_n_pw;
+        psi_host.extend(raw_psi[start..start + n_pw].iter().map(|c| num_complex::Complex64::new(c.x, c.y)));
+    }
 
     // ---- FFI boundary diagnostic: dump raw ψ[0] coefficients ----
     // Compare against standalone test values to detect phase / layout mismatches.
@@ -383,18 +418,19 @@ unsafe fn step_inner(
             psi_b25[4].re, psi_b25[4].im,
         );
     }
-    // Verify psi data at FFI boundary for mid-band (band 104 0-based)
+    // Verify psi data at FFI boundary for mid-band
     // BEFORE any processing by WavefunctionSet/Gpu::from_host
-    {
-        let psi_band104 = &psi_host[104 * n_pw..105 * n_pw];
-        let l2sq: f64 = psi_band104.iter().map(|c| c.norm_sqr()).sum();
-        eprintln!("[Diag-FFI-raw] band 104 (0-based): L2²={:.6e} first5=[({:+.6e},{:+.6e}), ({:+.6e},{:+.6e}), ({:+.6e},{:+.6e}), ({:+.6e},{:+.6e}), ({:+.6e},{:+.6e})]",
+    if n_bands > 1 {
+        let mid = n_bands / 2;
+        let psi_mid = &psi_host[mid * n_pw..(mid + 1) * n_pw];
+        let l2sq: f64 = psi_mid.iter().map(|c| c.norm_sqr()).sum();
+        eprintln!("[Diag-FFI-raw] band {mid} (0-based, mid-band): L2²={:.6e} first5=[({:+.6e},{:+.6e}), ({:+.6e},{:+.6e}), ({:+.6e},{:+.6e}), ({:+.6e},{:+.6e}), ({:+.6e},{:+.6e})]",
             l2sq,
-            psi_band104[0].re, psi_band104[0].im,
-            psi_band104[1].re, psi_band104[1].im,
-            psi_band104[2].re, psi_band104[2].im,
-            psi_band104[3].re, psi_band104[3].im,
-            psi_band104[4].re, psi_band104[4].im,
+            psi_mid[0].re, psi_mid[0].im,
+            psi_mid[1].re, psi_mid[1].im,
+            psi_mid[2].re, psi_mid[2].im,
+            psi_mid[3].re, psi_mid[3].im,
+            psi_mid[4].re, psi_mid[4].im,
         );
     }
 
@@ -403,9 +439,14 @@ unsafe fn step_inner(
     // because CASTEP doesn't pass wavefunctions at init time.
     if kd.vnl[isp].is_none() {
         let mut pcie = PcieAccount::default();
-        kd.vnl[isp] = Some(VnlBatchData::precompute(
-            &kd.pw_coords, &h.pots, &h.cell, &h.wave_grid, &kd.k_point,
-            &psi_host, n_bands, n_pw, None, None,
+        // Use precompute_with_d_override with fine_grid for D-screening.
+        // CASTEP's nlpot_calculate_d (nlpot.f90:352) uses poten%real_fine_pot
+        // (fine grid), forward FFT on fine grid normalized by 1/N_fine, and Q(G)
+        // on fine half-grid.  Passing Some(&h.fine_grid) builds a fine-grid
+        // screening cache that matches CASTEP's convention.
+        kd.vnl[isp] = Some(VnlBatchData::precompute_with_d_override(
+            &kd.pw_coords, &h.pots, &h.cell, &h.wave_grid, Some(&h.fine_grid), &kd.k_point,
+            &psi_host, n_bands, n_pw, None, None, None,
             &h.stream, &mut pcie, &h.blas, &h.kernels, &h.solver,
         ).map_err(|e| { eprintln!("[chemrust] VnlBatchData init failed: {e}"); CHEM_EIG_CUDA_ERROR })?);
     }
@@ -414,96 +455,93 @@ unsafe fn step_inner(
     let psi_gpu = Gpu::from_host(&wfn, &h.stream).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
 
     // Upload V_eff
-    // CASTEP's real_fine_pot is Fortran-ordered (x fastest). unflatten_f64
-    // now expects Fortran order so the GPU upload via flatten_f64 produces
-    // the correct x-fastest layout that cuFFT expects.
-    let ve_host: Vec<f64> = unsafe { std::slice::from_raw_parts(v_eff_data, gs) }.to_vec();
+    // CASTEP's real_fine_pot is on the FINE grid, Fortran-ordered (x fastest).
+    // CASTEP internally calls pot_interpolate → basis_real_fine_to_std_grid to
+    // downsample V_eff from fine to standard grid before Hamiltonian application.
+    // We replicate that downsampling here so the eigensolver operates on the
+    // same standard-grid V_eff that CASTEP uses internally.
+    let gs_fine = (h.ngx * h.ngy * h.ngz) as usize;
+    let ve_host: Vec<f64> = unsafe { std::slice::from_raw_parts(v_eff_data, gs_fine) }.to_vec();
     let ve_norm: f64 = ve_host.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
 
     #[cfg(feature = "scf_diag")]
     {
         let ve_min = ve_host.iter().fold(f64::INFINITY, |a, &b| a.min(b));
         let ve_max = ve_host.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
-        let ve_mean = ve_host.iter().sum::<f64>() / gs as f64;
-        eprintln!("[Diag-Veff] ngx={} ngy={} ngz={} gs={} ve_min={:.6e} ve_max={:.6e} ve_mean={:.6e}",
-            h.ngx, h.ngy, h.ngz, gs, ve_min, ve_max, ve_mean);
+        let ve_mean = ve_host.iter().sum::<f64>() / gs_fine as f64;
+        eprintln!("[Diag-Veff] ngx={} ngy={} ngz={} gs_fine={} ve_min={:.6e} ve_max={:.6e} ve_mean={:.6e}",
+            h.ngx, h.ngy, h.ngz, gs_fine, ve_min, ve_max, ve_mean);
         eprintln!("[Diag-Veff] first 5 raw: {:.6e} {:.6e} {:.6e} {:.6e} {:.6e}",
             ve_host[0], ve_host[1], ve_host[2], ve_host[3], ve_host[4]);
     }
 
-    // V_eff GPU caching: skip H2D transfer if V_eff unchanged since last step.
-    // Uses max-norm for cheap change detection (threshold 1e-8 Ha).
-    let cache_reuse = h.v_eff_cached[isp].as_ref().is_some_and(|_| (ve_norm - h.v_eff_norm[isp]).abs() < 1e-8);
+    // V_eff GPU caching: DISABLED.
+    // ve_norm is max(|V_eff|) on the FINE grid, dominated by frozen-core
+    // pseudopotentials near nuclei (~8.55 Ha).  Valence charge redistribution
+    // changes V_eff shape but leaves the fine-grid maximum essentially unchanged
+    // (< 1e-8 Ha between SCF iterations).  This causes false cache HITs that
+    // feed stale V_eff to the eigensolver, creating a growing density-potential
+    // inconsistency that triggers catastrophic eigenvalue divergence at SCF
+    // iteration 3.  The H2D transfer of V_eff (~1M doubles) is negligible
+    // compared to the eigensolver cost.
+    let cache_reuse = false;
 
-    // CASTEP passes V_eff as ix-innermost flat array (Fortran column-major).
-    // cuFFT with plan (ngx, ngy, ngz) expects n[rank-1]=ngz innermost (z-fastest),
-    // matching the scatter formula iz + ngz*(iy + ngy*ix).  Transpose x↔z axes
-    // so V_eff data lands at the grid positions cuFFT and the scatter/gather
-    // kernels expect.  See scf.rs:598-608 for the identical standalone logic.
-    let ngx_u = h.ngx as usize;
-    let ngy_u = h.ngy as usize;
-    let ngz_u = h.ngz as usize;
-    let arr_ix_fast = crate::device::unflatten_f64(ve_host, &[ngx_u, ngy_u, ngz_u]);
+    // Downsample V_eff from fine grid to standard (wave) grid.
+    // arr_ix_fast has shape [ngx, ngy, ngz] with arr[[ix, iy, iz]] = V_fine(ix, iy, iz).
+    let ngx_f = h.ngx as usize;
+    let ngy_f = h.ngy as usize;
+    let ngz_f = h.ngz as usize;
+    let arr_ix_fast = crate::device::unflatten_f64(ve_host, &[ngx_f, ngy_f, ngz_f]);
+
+    // Downsample: FFT on fine grid → truncate high G → IFFT on wave grid.
+    let veff_wave = crate::downsample_array_to_wave_grid(
+        &arr_ix_fast, &h.fine_grid, &h.wave_grid,
+    ).map_err(|e| { eprintln!("[chemrust] V_eff downsampling failed: {e}"); CHEM_EIG_CUDA_ERROR })?;
+    // veff_wave is EffectivePotential(FineGridArray(wave_arr)) on the wave grid.
+    // The Array3 inside has shape (ngz_std, ngy_std, ngx_std) — see the
+    // downsample function which creates the output as Array3::zeros((ngz, ngy, ngx)).
+    {
+        let ve_w_min = veff_wave.as_fine_array().iter().fold(f64::INFINITY, |a, &b| a.min(b));
+        let ve_w_max = veff_wave.as_fine_array().iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
+        let wave_shape = veff_wave.as_fine_array().shape();
+        eprintln!("[chemrust-Veff] downsampled fine→wave: ve_min={:.6e} ve_max={:.6e} wave_shape=({},{},{}) gs_fine={} gs_wave={}",
+            ve_w_min, ve_w_max, wave_shape[0], wave_shape[1], wave_shape[2], gs_fine, gs);
+    }
+
+    // Transpose V_eff to iz-innermost layout for cuFFT/scatter/gather.
+    // The downsampled array is ix-innermost in memory (C order with x fastest).
+    // cuFFT expects iz-innermost even on the standard grid, so we transpose.
+    let wave_arr = veff_wave.as_fine_array();
+    let ngx_s = h.ngx_std as usize;
+    let ngy_s = h.ngy_std as usize;
+    let ngz_s = h.ngz_std as usize;
     let arr_iz_fast = ndarray::Array3::from_shape_fn(
-        (ngz_u, ngy_u, ngx_u),
-        |(iz, iy, ix)| arr_ix_fast[[ix, iy, iz]]
+        (ngz_s, ngy_s, ngx_s),
+        |(iz, iy, ix)| wave_arr[[ix, iy, iz]],
     );
-    let veff = EffectivePotential(FineGridArray(arr_iz_fast));
+    let veff_wave_iz = EffectivePotential(FineGridArray(arr_iz_fast));
+
+    #[cfg(feature = "scf_diag")]
+    {
+        let ve_w_min = veff_wave.as_fine_array().iter().fold(f64::INFINITY, |a, &b| a.min(b));
+        let ve_w_max = veff_wave.as_fine_array().iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
+        eprintln!("[Diag-Veff] downsampled to wave grid: ve_min={:.6e} ve_max={:.6e} wave_grid=({},{},{})",
+            ve_w_min, ve_w_max, ngx_s, ngy_s, ngz_s);
+    }
+
     let v_eff_gpu = if cache_reuse {
         if cfg!(feature = "scf_diag") { eprintln!("[chemrust] V_eff cache HIT norm={:.6e}", ve_norm); }
-        // TODO(phase-5 deferred): Pre-allocate a persistent scratch buffer in
-        // ChemrustHandle to avoid per-HIT alloc_zeros + memcpy_dtod below.
-        // Currently each HIT allocates a fresh GPU buffer and copies from cache,
-        // which is wasteful for every SCF iteration after the first.
         let mut slice: CudaSlice<f64> = h.stream.alloc_zeros::<f64>(gs).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
         h.stream.memcpy_dtod(h.v_eff_cached[isp].as_ref().unwrap(), &mut slice).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
         Gpu::<EffectivePotential> {
             slice,
-            shape: vec![ngz_u, ngy_u, ngx_u],
+            shape: vec![ngz_s, ngy_s, ngx_s],
             ctx: h.ctx.clone(),
             _marker: std::marker::PhantomData,
         }
     } else {
         if cfg!(feature = "scf_diag") { eprintln!("[chemrust] V_eff cache MISS norm={:.6e} prev={:.6e}", ve_norm, h.v_eff_norm[isp]); }
-        // Verify round-trip: flatten transposed array and compare against
-        // raw CASTEP data after applying the same x↔z transpose.
-        #[cfg(feature = "scf_diag")]
-        {
-            let ve_raw = unsafe { std::slice::from_raw_parts(v_eff_data, gs) };
-            let ve_rt: Vec<f64> = crate::device::flatten_f64(veff.0.as_array());
-            // After transpose, ve_rt has z-innermost layout. Reconstruct the
-            // expected values from the raw ix-innermost data by transposing.
-            let mut rt_err = 0.0f64;
-            for iz in 0..ngz_u.min(2) {
-                for iy in 0..ngy_u.min(2) {
-                    for ix in 0..ngx_u.min(3) {
-                        // Transposed flat index: iz + ngz*iy + ngz*ngy*ix
-                        let idx_t = iz + ngz_u * (iy + ngy_u * ix);
-                        // Original flat index: ix + ngx*iy + ngx*ngy*iz
-                        let idx_o = ix + ngx_u * (iy + ngy_u * iz);
-                        let d = (ve_rt[idx_t] - ve_raw[idx_o]).abs();
-                        rt_err = rt_err.max(d);
-                    }
-                }
-            }
-            eprintln!("[Diag-Veff] round-trip max error after x↔z transpose: {:.3e}", rt_err);
-        }
-        let vg = Gpu::from_host(&veff, &h.stream).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
-        // Verify GPU upload: read back and compare against host transposed data
-        #[cfg(feature = "scf_diag")]
-        {
-            let ve_rt: Vec<f64> = crate::device::flatten_f64(veff.0.as_array());
-            let ve_gpu_back: Vec<f64> = h.stream.clone_dtoh(vg.as_device_slice())
-                .map_err(|_| CHEM_EIG_CUDA_ERROR)?;
-            let mut gpu_err = 0.0f64;
-            for i in 0..gs.min(10) {
-                let d = (ve_gpu_back[i] - ve_rt[i]).abs();
-                gpu_err = gpu_err.max(d);
-            }
-            eprintln!("[Diag-Veff] GPU upload verified: max error (first 10): {:.3e}", gpu_err);
-            eprintln!("[Diag-Veff] GPU first 5: {:.6e} {:.6e} {:.6e} {:.6e} {:.6e}",
-                ve_gpu_back[0], ve_gpu_back[1], ve_gpu_back[2], ve_gpu_back[3], ve_gpu_back[4]);
-        }
+        let vg = Gpu::from_host(&veff_wave_iz, &h.stream).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
         // Update cache: preserve GPU copy for next SCF step
         if h.v_eff_cached[isp].is_none() {
             let mut cache = h.stream.alloc_zeros::<f64>(gs).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
@@ -516,31 +554,33 @@ unsafe fn step_inner(
         vg
     };
 
-    // Re-screen D matrices using the ORIGINAL (ix-innermost) V_eff.
-    // D-screening computes ∫Q·V_eff at ion positions — it needs the
-    // physical (x,y,z) grid layout, not the transposed FFT layout.
-    let veff_original = EffectivePotential(FineGridArray(arr_ix_fast.clone()));
-    kd.vnl[isp].as_mut().unwrap().rescreen_d(veff_original.as_fine_array(), &h.stream, &h.kernels, &h.blas)
+    // Re-screen D matrices using FINE-grid V_eff, matching CASTEP.
+    // CASTEP's nlpot_calculate_d (nlpot.f90:352) uses poten%real_fine_pot
+    // (fine grid), forward FFT on fine grid with 1/N_fine normalization, and
+    // Q(G) on fine half-grid.  The fine-grid screening cache was built above
+    // via precompute_with_d_override.  Pass the raw fine-grid V_eff in its
+    // original ix-innermost layout for D-screening.
+    kd.vnl[isp].as_mut().unwrap().rescreen_d(&arr_ix_fast, &h.stream, &h.kernels, &h.blas)
         .map_err(|e| { eprintln!("[chemrust] D re-screen failed: {e}"); CHEM_EIG_CUDA_ERROR })?;
 
-    // Upload FFT index.  CASTEP passes 1-based Fortran grid indices with
-    // ix-innermost flat layout:  idx = 1 + ix + ngx*iy + ngx*ngy*iz.
-    // The Rust scatter/gather kernels and cuFFT expect iz-innermost layout
-    // (matching pw_coords_to_fft_indices):  idx = iz + ngz*(iy + ngy*ix).
-    // Convert 1→0 based AND transpose x↔z in one pass.
-    let ngx_i = h.ngx;
-    let ngy_i = h.ngy;
-    let ngz_i = h.ngz;
+    // Upload FFT index.  CASTEP passes 1-based Fortran grid indices encoded
+    // on the STANDARD grid (ngx_std × ngy_std × ngz_std): idx = 1 + ix + ngx_std*iy + ngx_std*ngy_std*iz.
+    // Our FFT plan is now on the STANDARD grid to match CASTEP's V_eff after
+    // pot_interpolate downsamples from fine to standard.  Decode the standard-grid
+    // position and re-encode with iz-innermost layout for cuFFT on the standard grid.
+    let ngx_s = h.ngx_std;
+    let ngy_s = h.ngy_std;
+    let ngz_s = h.ngz_std;
     let fft_idx: Vec<i32> = unsafe { std::slice::from_raw_parts(fft_idx_data as *const c_int, n_pw) }
         .iter()
         .map(|&idx_1based| {
-            // Decode CASTEP's ix-innermost grid position (0-based)
+            // Decode CASTEP's ix-innermost STANDARD-grid position (0-based)
             let idx0 = (idx_1based - 1).max(0);
-            let ix = idx0 % ngx_i;
-            let iy = (idx0 / ngx_i) % ngy_i;
-            let iz = idx0 / (ngx_i * ngy_i);
-            // Re-encode with iz-innermost layout for cuFFT/scatter/gather
-            iz + ngz_i * (iy + ngy_i * ix)
+            let ix = idx0 % ngx_s;
+            let iy = (idx0 / ngx_s) % ngy_s;
+            let iz = idx0 / (ngx_s * ngy_s);
+            // Re-encode with iz-innermost layout on STANDARD grid (no scaling needed)
+            iz + ngz_s * (iy + ngy_s * ix)
         })
         .collect();
     debug_assert!(
@@ -565,7 +605,7 @@ unsafe fn step_inner(
     let kinetic_dev = KineticPreconditioner::new(kinetic_raw);
 
     let fft_plan = BatchedFftPlan3d::plan_batched_c2c(
-        h.ngx, h.ngy, h.ngz, n_bands_i32, stream.clone(),
+        h.ngx_std, h.ngy_std, h.ngz_std, n_bands_i32, stream.clone(),
     ).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
 
     // Davidion requires grid buffer for Hamiltonian application
@@ -668,11 +708,19 @@ unsafe fn step_inner(
     let hpsi_host: Vec<CudaComplex> = stream.clone_dtoh(&*hpsi_new)
         .map_err(|_| CHEM_EIG_CUDA_ERROR)?;
 
+    // Write back with max_n_pw stride — CASTEP's wvfn%coeffs(:,:,nk,ns) has
+    // leading dimension max_plane_waves, not this k-point's n_pw.
+    let raw_psi_out = unsafe { std::slice::from_raw_parts_mut(psi_data, max_n_pw * n_bands) };
+    for b in 0..n_bands {
+        let start = b * max_n_pw;
+        raw_psi_out[start..start + n_pw].copy_from_slice(&psi_host_out[b * n_pw..(b + 1) * n_pw]);
+    }
+    let raw_hpsi_out = unsafe { std::slice::from_raw_parts_mut(hpsi_out, max_n_pw * n_bands) };
+    for b in 0..n_bands {
+        let start = b * max_n_pw;
+        raw_hpsi_out[start..start + n_pw].copy_from_slice(&hpsi_host[b * n_pw..(b + 1) * n_pw]);
+    }
     unsafe {
-        std::slice::from_raw_parts_mut(psi_data, n_pw * n_bands)
-            .copy_from_slice(&psi_host_out);
-        std::slice::from_raw_parts_mut(hpsi_out, n_pw * n_bands)
-            .copy_from_slice(&hpsi_host);
         std::slice::from_raw_parts_mut(eigenvalues_ptr, n_bands)
             .copy_from_slice(&davidson_result.eigenvalues);
     }

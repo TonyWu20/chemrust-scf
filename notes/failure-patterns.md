@@ -1,5 +1,49 @@
 # Failure Patterns
 
+## 2026-06-13: V_eff cache staleness + D-screening grid mismatch — NiO cold-start divergence
+
+**Root cause (primary)**: `cache_reuse` check at `src/ffi.rs` used `|max(|V_eff|) - prev| < 1e-8 Ha`
+on the fine grid. The fine-grid maximum is dominated by frozen-core pseudopotentials at
+nuclei (~−8.55 Ha for Ni) and changes by <1e-8 Ha between SCF iterations even though
+valence charge redistribution significantly changes V_eff shape in bonding regions.
+After iter 1, `cache_reuse` was always true — the eigensolver solved with iter-1's
+stale V_eff for all subsequent iterations while CASTEP built new density from the
+resulting eigenstates and computed correct new V_eff that Rust never saw. Temporal
+signature: iter 1 looks reasonable (cache MISS, current V_eff), iter 2 shows eigenvalue
+drift (cache HIT, stale V_eff), iter 3 triggers catastrophic divergence (accumulated
+density-potential inconsistency → "no empty bands" warning → runaway energy gains).
+
+**Root cause (secondary)**: D-matrix screening (`rescreen_d`) used wave-grid V_eff +
+wave-grid Q(G) instead of CASTEP's fine-grid V_eff + fine-grid Q(G). CASTEP's
+`nlpot_calculate_d` (nlpot.f90:352) uses `poten%real_fine_pot` directly (fine grid),
+forward FFT on the fine grid normalized by 1/N_fine, and Q(G) on the fine half-grid.
+Our code passed `None` as fine_grid to `VnlBatchData::precompute` (no fine-grid
+screening cache), then passed downsampled wave-grid V_eff to `rescreen_d`. The comment
+at `src/ffi.rs:546-548` claiming CASTEP uses standard-grid V_eff for D-screening was
+**factually wrong** — CASTEP never calls `pot_interpolate` before `nlpot_calculate_d`.
+
+**Fix (primary)**: `src/ffi.rs:469-470` — disable V_eff GPU cache: `cache_reuse = false`.
+The H2D cost of V_eff (~1M doubles) is negligible compared to eigensolver cost.
+
+**Fix (secondary)**: `src/ffi.rs:434-438` — use `precompute_with_d_override` with
+`Some(&h.fine_grid)` to build fine-grid screening cache. `src/ffi.rs:538-543` —
+pass fine-grid `&arr_ix_fast` to `rescreen_d` instead of downsampled wave-grid V_eff.
+
+**Fix (tertiary)**: `src/ffi.rs` — use standard-grid `GVectorGrid` for FFT operations.
+Downsample V_eff from fine to standard grid via `downsample_array_to_wave_grid`.
+
+**Verification**: NiO non-spin FFI cold-start converged (10 SCF iterations,
+final energy −7160.23 eV). `nio_two_iter_cascade_check` continues to pass.
+
+**Pattern**: `cache-staleness-from-frozen-core-norm` — a change-detection heuristic
+based on a global aggregate of a multi-scale field fails when the aggregate is
+dominated by features that don't change between iterations. The heuristic must
+operate on the portion of the data that actually changes.
+
+**Pattern**: `comment-drift-from-castep-source` — a wrong comment about what grid
+CASTEP uses for a computation steers subsequent fixes in the wrong direction.
+Always verify comments against actual CASTEP source during audits.
+
 ## 2026-06-10: beta-g-layout-transposition-cold-start-divergence
 **Root cause**: `beta_g` GPU→CPU download reshaped as row-major `(n_pw, ne)`, reading `beta[[G,n]] = data[G·ne + n]` instead of `data[n·n_pw + G]`. Since `ne=4 ≪ n_pw=60067`, every projector element landed at the wrong G-vector. Corrupted all downstream NL correction matrices.
 **Fix**: `src/eigensolver/davidson.rs:948` — reshape as `(ne, n_pw)` then transpose to `(n_pw, ne)`.
