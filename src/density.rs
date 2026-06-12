@@ -239,12 +239,12 @@ pub fn find_fermi_fix(
 
     let lo = emin - 4.0 * width;
     let hi = emax + 4.0 * width;
-    let mut delta_E = hi - lo;
+    let mut delta_e = hi - lo;
     let mut fermi = lo;
 
     for _ in 0..80 {
-        delta_E *= 0.5;
-        let trial = fermi + delta_E;
+        delta_e *= 0.5;
+        let trial = fermi + delta_e;
         let total_occ: f64 = eigenvalues
             .iter()
             .map(|&e| occ_factor * libm::erfc((e - trial) / width))
@@ -252,7 +252,7 @@ pub fn find_fermi_fix(
         if total_occ <= n_spin_electrons {
             fermi = trial;
         }
-        if delta_E <= 1e-12 {
+        if delta_e <= 1e-12 {
             break;
         }
     }
@@ -316,12 +316,12 @@ pub fn find_fermi_free(
 
     let lo = emin - 4.0 * width;
     let hi = emax + 4.0 * width;
-    let mut delta_E = hi - lo;
+    let mut delta_e = hi - lo;
     let mut fermi = lo;
 
     for _ in 0..80 {
-        delta_E *= 0.5;
-        let trial = fermi + delta_E;
+        delta_e *= 0.5;
+        let trial = fermi + delta_e;
 
         let total_occ_up: f64 = ev_up
             .iter()
@@ -336,7 +336,7 @@ pub fn find_fermi_free(
         if total_occ <= n_electrons {
             fermi = trial;
         }
-        if delta_E <= 1e-12 {
+        if delta_e <= 1e-12 {
             break;
         }
     }

@@ -822,8 +822,12 @@ mod hpsi_integration {
             crate::eigensolver::davidson_types::KineticPreconditioner::new(d)
         };
 
-        // Test bands: one from each block range
-        let test_bands = [0usize, 25, 50, 75, 104, 105, 130, 159];
+        // Test bands: spread across the full band range
+        let n_bands_total = kpt.bands.len();
+        let test_bands: Vec<usize> = {
+            let n_test = 8usize.min(n_bands_total);
+            (0..n_test).map(|i| i * n_bands_total / n_test).collect()
+        };
         let n_test = test_bands.len();
 
         // Build FFT plan with correct batch count

@@ -18,9 +18,8 @@ use crate::eigensolver::davidson_types::compute_kinetic_energies;
 use crate::eigensolver::kernels::CudaKernelSet;
 #[cfg(feature = "chebyshev")]
 use crate::eigensolver::chebyshev::{FilterMode, chebyshev_filter};
-use crate::eigensolver::davidson::davidson_diagonalise;
 use crate::eigensolver::preconditioner::TpaPreconditioner;
-use crate::eigensolver::davidson_types::{KineticPreconditioner, PwCoefficients};
+use crate::eigensolver::davidson_types::PwCoefficients;
 #[cfg(any(test, feature = "scf_diag"))]
 use crate::eigensolver::davidson::{DavidsonDiagnostic, DAVIDSON_LAST_DIAG};
 #[cfg(feature = "chebyshev")]
@@ -32,7 +31,7 @@ use crate::layout::{ColumnDistributed, Cpu, WavefunctionSet};
 use crate::mixing::{DensityHistory, Kerker, MixingOff, MixingPhase, Pulay};
 use crate::density::{QSfCache, build_q_sf_cache};
 use crate::types::{
-    Density, EffectivePotential, Error, FinalResult, FineGridArray, KPoint,
+    ChemicalPotential, Density, EffectivePotential, Error, FinalResult, FineGridArray, KPoint,
     SmearingParams,
 };
 use crate::spin_types::{
@@ -40,6 +39,7 @@ use crate::spin_types::{
     PerSpinDensity, PerSpinEigenvalues, PerSpinPwCoefficients, SpinChannelData,
 };
 use crate::energy::HARTREE_TO_EV;
+use crate::pipeline;
 
 // ---------------------------------------------------------------------------
 // Mixing phase runtime dispatch
@@ -190,6 +190,8 @@ pub struct ScfIteration<
     pub(crate) last_davidson_diagnostics: Option<DavidsonDiagnostic>,
     /// Current SCF iteration number (1-indexed). Updated by run_scf before diagonalize.
     pub(crate) scf_iter: usize,
+    /// True when spin freed (shared Fermi energy for both spins).
+    pub(crate) spin_freed: bool,
 
     _phase: PhantomData<State>,
 }
@@ -249,7 +251,7 @@ impl<S: SpinPolicy> ScfIteration<S, Initialized, MixingOff> {
                 (0..nspins).map(|_| KptDataSet::new(vec![Vec::new(); nkpts], nkpts)).collect()
             )),
             v_eff: None,
-            history: DensityHistory::new(),
+            history: DensityHistory::new(S::nspins()),
             previous_density,
             next_mixing: MixingPhaseKind::Off,
             e_xc: None,
@@ -267,6 +269,7 @@ impl<S: SpinPolicy> ScfIteration<S, Initialized, MixingOff> {
             #[cfg(any(test, feature = "scf_diag"))]
             last_davidson_diagnostics: None,
             scf_iter: 0,
+            spin_freed: false,
             _phase: PhantomData,
         }
     }
@@ -313,6 +316,7 @@ impl<S: SpinPolicy, Phase: ScfPhase, M: MixingPhase> ScfIteration<S, Phase, M> {
             #[cfg(any(test, feature = "scf_diag"))]
             last_davidson_diagnostics: self.last_davidson_diagnostics,
             scf_iter: self.scf_iter,
+            spin_freed: self.spin_freed,
             _phase: PhantomData,
         }
     }
@@ -394,6 +398,7 @@ pub trait BuildVEffWithEnergy: BuildVEff {
         rho: &chemrust_hamiltonian_core::Density,
         spin: Option<&chemrust_hamiltonian_core::Density>,
         rho_aug_fine: Option<&chemrust_hamiltonian_core::fft::RealGrid<f64>>,
+        rho_aug_spin: Option<&chemrust_hamiltonian_core::fft::RealGrid<f64>>,
         wave_grid: &GVectorGrid, fine_grid: &GVectorGrid,
     ) -> Result<(Self::VEff, f64, f64, f64), chemrust_hamiltonian_core::Error>;
 }
@@ -404,6 +409,7 @@ impl BuildVEffWithEnergy for NonSpin {
         rho: &chemrust_hamiltonian_core::Density,
         _spin: Option<&chemrust_hamiltonian_core::Density>,
         rho_aug_fine: Option<&chemrust_hamiltonian_core::fft::RealGrid<f64>>,
+        _rho_aug_spin: Option<&chemrust_hamiltonian_core::fft::RealGrid<f64>>,
         wave_grid: &GVectorGrid, fine_grid: &GVectorGrid,
     ) -> Result<(chemrust_hamiltonian_core::EffectivePotential, f64, f64, f64), chemrust_hamiltonian_core::Error> {
         use chemrust_hamiltonian_core::{nlcc, poisson, upsample_density_to_fine_grid, xc, Density as CoreDensity};
@@ -455,6 +461,7 @@ impl BuildVEffWithEnergy for SpinCollinear {
         rho: &chemrust_hamiltonian_core::Density,
         spin: Option<&chemrust_hamiltonian_core::Density>,
         rho_aug_fine: Option<&chemrust_hamiltonian_core::fft::RealGrid<f64>>,
+        rho_aug_spin: Option<&chemrust_hamiltonian_core::fft::RealGrid<f64>>,
         wave_grid: &GVectorGrid, fine_grid: &GVectorGrid,
     ) -> Result<(Self::VEff, f64, f64, f64), chemrust_hamiltonian_core::Error> {
         use chemrust_hamiltonian_core::{
@@ -482,15 +489,25 @@ impl BuildVEffWithEnergy for SpinCollinear {
                     detail: "upsample spin density failed".into(),
                 })?;
 
-        // 3. Add augmentation (spin-independent for Phase 7): only to total density.
-        let (rho_total_fine, rho_spin_fine) = match rho_aug_fine {
-            Some(aug) => (
+        // 3. Add augmentation: total ρ += Q_rho_sum, spin ρ += Q_rho_sum_sp.
+        //    CASTEP density.f90:1148-1149 — ion_augmentation_charge produces
+        //    separate total and spin augmentation contributions.
+        let (rho_total_fine, rho_spin_fine) = match (rho_aug_fine, rho_aug_spin) {
+            (Some(aug_total), Some(aug_spin)) => (
                 chemrust_hamiltonian_core::fft::RealGrid::from_inner(
-                    rho_total_fine_pw.as_real_array() + aug.as_real_array(),
+                    rho_total_fine_pw.as_real_array() + aug_total.as_real_array(),
+                ),
+                chemrust_hamiltonian_core::fft::RealGrid::from_inner(
+                    rho_spin_fine_pw.as_real_array() + aug_spin.as_real_array(),
+                ),
+            ),
+            (Some(aug_total), None) => (
+                chemrust_hamiltonian_core::fft::RealGrid::from_inner(
+                    rho_total_fine_pw.as_real_array() + aug_total.as_real_array(),
                 ),
                 rho_spin_fine_pw,
             ),
-            None => (rho_total_fine_pw, rho_spin_fine_pw),
+            _ => (rho_total_fine_pw, rho_spin_fine_pw),
         };
 
         // 4. Assemble V_eff via VEffBuilder (returns up/down effective potentials).
@@ -616,11 +633,28 @@ impl<S: SpinPolicy + BuildVEffWithEnergy> ScfIteration<S, Initialized, MixingOff
         } else {
             None
         };
-        let density_aug = self.density_aug_fine[0].as_ref();
+        // Per-spin augmentation: CASTEP density.f90:1148-1149 adds
+        // Q_rho_sum (total) to charge and Q_rho_sum_sp (spin) to spin density.
+        // aug_up/dn = kpt-weighted augmentation per spin from beta_psi.
+        let (aug_total, aug_spin) = if S::nspins() == 2 {
+            match (self.density_aug_fine[0].as_ref(), self.density_aug_fine[1].as_ref()) {
+                (Some(a0), Some(a1)) => (
+                    Some(chemrust_hamiltonian_core::fft::RealGrid::from_inner(
+                        a0.as_real_array().to_owned() + a1.as_real_array())),
+                    Some(chemrust_hamiltonian_core::fft::RealGrid::from_inner(
+                        a0.as_real_array().to_owned() - a1.as_real_array())),
+                ),
+                (Some(a0), None) => (Some(a0.clone()), None),
+                _ => (None, None),
+            }
+        } else {
+            (self.density_aug_fine[0].as_ref().cloned(), None)
+        };
         let (v_eff, e_xc, e_hartree, rho_vxc) = S::build_v_eff_with_energy_impl(
             &self.cell, &self.pots, &core_rho,
             spin_arg.as_ref(),
-            density_aug,
+            aug_total.as_ref(),
+            aug_spin.as_ref(),
             &self.wave_grid, &self.fine_grid,
         )
         .map_err(|_| Error::NotImplemented)?;
@@ -754,31 +788,11 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
             let v_eff_spin = S::v_eff_for_spin(v_eff_ref, ispin);
             let v_eff_arr = v_eff_spin.as_real_grid().as_real_array();
 
-            // 2. V_eff downsampling per spin
-            let v_eff_wave = downsample_array_to_wave_grid(v_eff_arr, &self.fine_grid, &self.wave_grid)?;
-            let (_min_veff, _max_veff) = {
-                let arr = v_eff_wave.as_fine_array();
-                let min = arr.iter().cloned().fold(f64::INFINITY, f64::min);
-                let max = arr.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-                (min, max)
-            };
-
-            // 3. V_eff GPU upload — outside kpt loop (same V_eff for all kpts of this spin)
-            let v_eff_arr_down = v_eff_wave.as_fine_array();
-            let v_eff_fortran = ndarray::Array3::from_shape_fn(
-                (ngz, ngy, ngx),
-                |(iz, iy, ix)| v_eff_arr_down[[ix, iy, iz]]
-            );
-            let v_eff_wave_gpu = EffectivePotential::from_inner(
-                FineGridArray::from_inner(v_eff_fortran)
-            );
-            let v_eff_gpu = Gpu::from_host_with(&v_eff_wave_gpu, &stream, &mut pcie)?;
-            let v_eff_slice = v_eff_gpu.as_device_slice();
-
-            // V_eff for D-matrix construction (shared across kpts of this spin)
-            let v_eff_for_d = chemrust_hamiltonian_core::EffectivePotential::from_inner(
-                chemrust_hamiltonian_core::fft::RealGrid::from_inner(v_eff_wave.as_fine_array().clone()),
-            );
+            // 2. V_eff preparation (downsample + GPU upload), per spin
+            let veff = pipeline::v_eff_prepare(v_eff_arr, &self.fine_grid, &self.wave_grid, &stream, &mut pcie)?;
+            let v_eff_slice = &veff.gpu_slice;
+            let grid_size_usize = veff.grid_size;
+            let (_min_veff, _max_veff) = { let arr = v_eff_arr; (arr.iter().cloned().fold(f64::INFINITY, f64::min), arr.iter().cloned().fold(f64::NEG_INFINITY, f64::max)) };
 
             // Diagnostic (spin-0 only, kpt-0 only)
             if ispin == 0 && nkpts > 0 {
@@ -819,37 +833,31 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
             for ikpt in 0..nkpts {
                 let pw_coords_kpt = &self.pw_coords[ikpt];
                 let n_pw_kpt = pw_coords_kpt.len();
-                let kpt = &self.k_points[ikpt];
+                let kpoint = &self.k_points[ikpt];
 
-                // 4. Kinetic energies (per kpt)
+                // 4. Upload kinetic energies & FFT index map to GPU (per kpt)
                 let kinetic_cpu = compute_kinetic_energies(
                     pw_coords_kpt,
                     self.wave_grid.recip_lattice(),
-                    kpt.coords,
+                    kpoint.coords,
                 );
-                let kinetic_dev: CudaSlice<f64> = stream
-                    .clone_htod(&kinetic_cpu.0)
-                    .map_err(Error::Cuda)?;
-                let kinetic_precond = KineticPreconditioner::new(kinetic_dev);
-                pcie.h2d_bytes += kinetic_cpu.0.len() * std::mem::size_of::<f64>();
-
-                // 5. Upload PW-to-FFT index map to GPU (per kpt)
-                let fft_idx_dev: CudaSlice<i32> = stream
-                    .clone_htod(&self.pw_fft_indices[ikpt])
-                    .map_err(Error::Cuda)?;
-                pcie.h2d_bytes += self.pw_fft_indices[ikpt].len() * std::mem::size_of::<i32>();
+                let kpt = pipeline::kpt_gpu_upload(&kinetic_cpu.0, &self.pw_fft_indices[ikpt], &stream, &mut pcie)?;
 
                 // 6. V_NL precomputation per (spin,kpt) — D-matrices are per-(kpt,spin).
                 //    CASTEP hamiltonian.f90:1013
                 let psi_host = self.psi_cpu[ispin][ikpt].clone();
-                let vnl_data = VnlBatchData::precompute_with_d_override(
+                let mut vnl_data = VnlBatchData::precompute_with_d_override(
                     pw_coords_kpt, &self.pots, &self.cell,
-                    &self.wave_grid, kpt,
+                    &self.wave_grid, Some(&self.fine_grid), kpoint,
                     &psi_host, n_bands, n_pw_kpt, occupations,
-                    Some(&v_eff_for_d),
+                    None,
                     d_override_per_ion,
                     &stream, &mut pcie, &blas, &kernels, &solver,
                 )?;
+
+                if d_override_per_ion.is_none() {
+                    vnl_data.rescreen_d(v_eff_arr, &stream, &kernels, &blas)?;
+                }
 
                 // 7. H2D psi for this (spin,kpt)
                 let psi_wfn = WavefunctionSet::<ColumnDistributed>::new(psi_host, n_bands, n_pw_kpt);
@@ -863,27 +871,12 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
                 if eigensolver_method == "davidson" {
                     // --- Davidson diagonalization ---
                     let result = unsafe {
-                        davidson_diagonalise()
-                            .psi_init(&psi_pw)
-                            .v_eff_dev(v_eff_slice)
-                            .kinetic_dev(&kinetic_precond)
-                            .fft_idx_dev(&fft_idx_dev)
-                            .vnl_data(&vnl_data)
-                            .n_pw(n_pw_kpt)
-                            .n_bands(n_bands)
-                            .grid_size(grid_size_usize)
-                            .inv_ntotal(inv_ntotal)
-                            .fft_plan(&fft_plan)
-                            .tol_abs(1e-8)
-                            .max_outer_iter(30)
-                            .min_outer_iter(0)
-                            .blas(&blas)
-                            .solver(&solver)
-                            .kernels(&kernels)
-                            .tpa_preconditioner(&tpa_precond)
-                            .stream(&stream)
-                            .ctx(&ctx)
-                            .call()?
+                        pipeline::run_davidson(
+                            &psi_pw, v_eff_slice, &kpt.kinetic_precond, &kpt.fft_idx_dev,
+                            &vnl_data, n_pw_kpt, n_bands, grid_size_usize, inv_ntotal, &fft_plan,
+                            &blas, &solver, &kernels, &tpa_precond, &stream, &ctx,
+                            30, false,  // max_outer_iter=30, gamma_point=false
+                        )?
                     };
 
                     // Wrap psi_out CudaSlice for D2H
@@ -933,9 +926,9 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
                         let _eig: Option<&[f64]> = None;
                         let (psi_filtered_row, hpsi_row) = chebyshev_filter(
                             &psi_gpu, &v_eff_gpu, &self.pots,
-                            &self.wave_grid, kpt, &self.cell,
+                            &self.wave_grid, kpoint, &self.cell,
                             pw_coords_kpt,
-                            &vnl_data, &fft_idx_dev, _min_veff, _max_veff,
+                            &vnl_data, &kpt.fft_idx_dev, _min_veff, _max_veff,
                             &kernels, &mut pcie, _eig, _ndeg, &blas, &solver, &stream, &ctx,
                             filter_mode,
                             None,
@@ -1280,19 +1273,50 @@ impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated, MixingOff> {
         // CASTEP density.f90:2179-2187
         // For multi-kpt: occupations are found with kpt weights, then density is
         // accumulated as ρ_spin = Σ_k w_k * ρ_k(ψ_k, occ_k).
+
+        // Pre-compute spin_freed occupations (shared Fermi level for both spins).
+        let spin_freed_occs: Option<(Vec<Vec<Vec<f64>>>, f64)> = if self.spin_freed && nspins == 2 {
+            let mut ev_up = Vec::new();
+            let mut ev_dn = Vec::new();
+            for ikpt in 0..nkpts {
+                ev_up.extend_from_slice(&self.eigenvalues[0][ikpt]);
+                ev_dn.extend_from_slice(&self.eigenvalues[1][ikpt]);
+            }
+            let (shared_fermi, occ_up_all, occ_dn_all, _net_spin) =
+                crate::density::find_fermi_free(
+                    &ev_up, &ev_dn, &self.smearing, n_electrons,
+                    1.0 / nspins as f64,
+                )?;
+            // Split back per-kpt
+            let n_bands = self.n_bands;
+            let mut occ_up_kpts = Vec::with_capacity(nkpts);
+            let mut occ_dn_kpts = Vec::with_capacity(nkpts);
+            for ikpt in 0..nkpts {
+                let s = ikpt * n_bands;
+                occ_up_kpts.push(occ_up_all[s..s + n_bands].to_vec());
+                occ_dn_kpts.push(occ_dn_all[s..s + n_bands].to_vec());
+            }
+            Some((vec![occ_up_kpts, occ_dn_kpts], shared_fermi))
+        } else {
+            None
+        };
+
         for ispin in 0..nspins {
             // Multi-kpt occupation search: collect eigenvalues across all kpts with kpt weights
             let kpt_weights: Vec<f64> = (0..nkpts)
                 .map(|ikpt| self.k_points[ikpt].weight)
                 .collect();
-            let (occupations_all_kpts, chem_pot) =
+            let (occupations_all_kpts, chem_pot) = if let Some((ref occs_data, fermi_val)) = spin_freed_occs {
+                (occs_data[ispin].clone(), ChemicalPotential(fermi_val))
+            } else {
                 crate::density::compute_occupations_weighted(
                     self.eigenvalues[ispin].as_ref(), // &[Vec<f64>] — per-kpt eigenvalues
                     &kpt_weights,
                     &self.smearing,
                     n_electrons_per_spin[ispin],
                     1.0 / nspins as f64, // occ_factor: 1.0 for NonSpin, 0.5 for SpinCollinear
-                )?;
+                )?
+            };
 
             // Density accumulation across kpts (weighted sum)
             let mut total_density: Option<Density> = None;
@@ -1504,6 +1528,7 @@ impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated, MixingOff> {
             #[cfg(any(test, feature = "scf_diag"))]
             last_davidson_diagnostics: None,
             scf_iter: self.scf_iter,
+            spin_freed: self.spin_freed,
             _phase: PhantomData,
         })
     }
@@ -1549,6 +1574,7 @@ impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated, MixingOff> {
             #[cfg(any(test, feature = "scf_diag"))]
             last_davidson_diagnostics: None,
             scf_iter: self.scf_iter,
+            spin_freed: self.spin_freed,
             _phase: PhantomData,
         })
     }
@@ -1566,13 +1592,15 @@ impl<S: SpinPolicy> ScfIteration<S, DensityUpdated<MixingOff>, MixingOff> {
     /// Mix with phase `Off`: pass-through, no active mixing.
     #[allow(unused_mut)]
     pub fn mix(mut self) -> ScfIteration<S, Mixed, MixingOff> {
-        // Mix each spin channel separately (currently total density for all channels).
         let nspins = S::nspins();
-        let total = self.density.total();
-        let (mixed, prev) = self.history.mix(total);
+        let mut densities = Vec::with_capacity(nspins);
+        let mut prev_densities = Vec::with_capacity(nspins);
+        for ispin in 0..nspins {
+            let (mixed, prev) = self.history.mix(self.density[ispin].clone(), ispin);
+            densities.push(mixed);
+            prev_densities.push(prev);
+        }
         let history_off = self.history.into_off();
-        let densities: Vec<Density> = (0..nspins).map(|_| mixed.clone()).collect();
-        let prev_densities: Vec<Density> = (0..nspins).map(|_| prev.clone()).collect();
         ScfIteration {
             cell: self.cell,
             pots: self.pots,
@@ -1606,6 +1634,7 @@ impl<S: SpinPolicy> ScfIteration<S, DensityUpdated<MixingOff>, MixingOff> {
             #[cfg(any(test, feature = "scf_diag"))]
             last_davidson_diagnostics: self.last_davidson_diagnostics,
             scf_iter: self.scf_iter,
+            spin_freed: self.spin_freed,
             _phase: PhantomData,
         }
     }
@@ -1615,11 +1644,14 @@ impl<S: SpinPolicy> ScfIteration<S, DensityUpdated<Kerker>, Kerker> {
     /// Mix with Kerker preconditioning.
     pub fn mix(mut self) -> ScfIteration<S, Mixed, MixingOff> {
         let nspins = S::nspins();
-        let total = self.density.total();
-        let (mixed, prev) = self.history.mix(total);
+        let mut densities = Vec::with_capacity(nspins);
+        let mut prev_densities = Vec::with_capacity(nspins);
+        for ispin in 0..nspins {
+            let (mixed, prev) = self.history.mix(self.density[ispin].clone(), ispin);
+            densities.push(mixed);
+            prev_densities.push(prev);
+        }
         let history_off = self.history.into_off();
-        let densities: Vec<Density> = (0..nspins).map(|_| mixed.clone()).collect();
-        let prev_densities: Vec<Density> = (0..nspins).map(|_| prev.clone()).collect();
         ScfIteration {
             cell: self.cell,
             pots: self.pots,
@@ -1653,6 +1685,7 @@ impl<S: SpinPolicy> ScfIteration<S, DensityUpdated<Kerker>, Kerker> {
             #[cfg(any(test, feature = "scf_diag"))]
             last_davidson_diagnostics: self.last_davidson_diagnostics,
             scf_iter: self.scf_iter,
+            spin_freed: self.spin_freed,
             _phase: PhantomData,
         }
     }
@@ -1662,11 +1695,14 @@ impl<S: SpinPolicy> ScfIteration<S, DensityUpdated<Pulay>, Pulay> {
     /// Mix with Pulay / DIIS.
     pub fn mix(mut self) -> ScfIteration<S, Mixed, MixingOff> {
         let nspins = S::nspins();
-        let total = self.density.total();
-        let (mixed, prev) = self.history.mix(total);
+        let mut densities = Vec::with_capacity(nspins);
+        let mut prev_densities = Vec::with_capacity(nspins);
+        for ispin in 0..nspins {
+            let (mixed, prev) = self.history.mix(self.density[ispin].clone(), ispin);
+            densities.push(mixed);
+            prev_densities.push(prev);
+        }
         let history_off = self.history.into_off();
-        let densities: Vec<Density> = (0..nspins).map(|_| mixed.clone()).collect();
-        let prev_densities: Vec<Density> = (0..nspins).map(|_| prev.clone()).collect();
         ScfIteration {
             cell: self.cell,
             pots: self.pots,
@@ -1700,6 +1736,7 @@ impl<S: SpinPolicy> ScfIteration<S, DensityUpdated<Pulay>, Pulay> {
             #[cfg(any(test, feature = "scf_diag"))]
             last_davidson_diagnostics: self.last_davidson_diagnostics,
             scf_iter: self.scf_iter,
+            spin_freed: self.spin_freed,
             _phase: PhantomData,
         }
     }
@@ -1779,6 +1816,32 @@ impl<S: SpinPolicy> ScfIteration<S, Mixed, MixingOff> {
         eprintln!("[check] net_spin={net_spin:.6} n_up={:.6} n_dn={:.6}",
             0.5 * (n_electrons + net_spin), 0.5 * (n_electrons - net_spin));
 
+        // Pre-compute spin_freed occupations for check() when spin is freed.
+        let spin_freed_occs: Option<(Vec<Vec<Vec<f64>>>, f64)> = if self.spin_freed && nspins == 2 {
+            let mut ev_up = Vec::new();
+            let mut ev_dn = Vec::new();
+            for ikpt in 0..nkpts {
+                ev_up.extend_from_slice(&self.eigenvalues[0][ikpt]);
+                ev_dn.extend_from_slice(&self.eigenvalues[1][ikpt]);
+            }
+            let (shared_fermi, occ_up_all, occ_dn_all, _net_spin) =
+                crate::density::find_fermi_free(
+                    &ev_up, &ev_dn, &self.smearing, n_electrons,
+                    1.0 / nspins as f64,
+                )?;
+            let n_bands = self.n_bands;
+            let mut occ_up_kpts = Vec::with_capacity(nkpts);
+            let mut occ_dn_kpts = Vec::with_capacity(nkpts);
+            for ikpt in 0..nkpts {
+                let s = ikpt * n_bands;
+                occ_up_kpts.push(occ_up_all[s..s + n_bands].to_vec());
+                occ_dn_kpts.push(occ_dn_all[s..s + n_bands].to_vec());
+            }
+            Some((vec![occ_up_kpts, occ_dn_kpts], shared_fermi))
+        } else {
+            None
+        };
+
         let mut e_band: f64 = 0.0;
         for ispin in 0..nspins {
             let n_spin_electrons = if nspins == 2 {
@@ -1787,18 +1850,21 @@ impl<S: SpinPolicy> ScfIteration<S, Mixed, MixingOff> {
             } else {
                 n_electrons
             };
-            let (occupations_all_kpts, chem_pot) =
+            let (occupations_all_kpts, chem_pot) = if let Some((ref occs_data, fermi_val)) = spin_freed_occs {
+                (occs_data[ispin].clone(), ChemicalPotential(fermi_val))
+            } else {
                 crate::density::compute_occupations_weighted(
                     self.eigenvalues[ispin].as_ref(),
                     &kpt_weights,
                     &self.smearing,
                     n_spin_electrons,
                     1.0 / nspins as f64, // occ_factor: 1.0 for NonSpin, 0.5 for SpinCollinear
-                )?;
+                )?
+            };
             self.fermi_energy[ispin] = chem_pot.0;
 
             // 2. Total energy assembly (if energy components are available)
-            if let (Some(e_xc), Some(e_hartree), Some(rho_vxc)) =
+            if let (Some(_e_xc), Some(_e_hartree), Some(_rho_vxc)) =
                 (self.e_xc, self.e_hartree, self.rho_vxc)
             {
                 // Kpt-weighted band energy per spin: Σ_k w_k Σ_b f_{bk} ε_{bk}
@@ -1948,6 +2014,16 @@ pub fn run_scf<S: SpinPolicy + BuildVEff>(
     let mut state = state;
     loop {
         state.scf_iter += 1;
+        if state.smearing.spin_fix >= 0 && !state.spin_freed {
+            if state.scf_iter as i32 >= state.smearing.spin_fix {
+                state.spin_freed = true;
+                eprintln!("[chemrust] spin_fix iterations done -- freeing spin (iter {})", state.scf_iter);
+            }
+            if state.scf_iter as i32 == state.smearing.spin_fix {
+                state.history = crate::mixing::DensityHistory::new(S::nspins());
+                state.next_mixing = MixingPhaseKind::Off;
+            }
+        }
         state = {
             let v_eff = state.build_v_eff()?;
             let wfn = v_eff.diagonalize(ndeg, None)?;
@@ -2066,6 +2142,16 @@ pub fn run_scf_with_energy_gated<S: SpinPolicy + BuildVEffWithEnergy>(
     let mut iter1_soft_fraction: Option<f64> = None;
     loop {
         state.scf_iter += 1;
+        if state.smearing.spin_fix >= 0 && !state.spin_freed {
+            if state.scf_iter as i32 >= state.smearing.spin_fix {
+                state.spin_freed = true;
+                eprintln!("[chemrust] spin_fix iterations done -- freeing spin (iter {})", state.scf_iter);
+            }
+            if state.scf_iter as i32 == state.smearing.spin_fix {
+                state.history = crate::mixing::DensityHistory::new(S::nspins());
+                state.next_mixing = MixingPhaseKind::Off;
+            }
+        }
         state = {
             let v_eff = state.build_v_eff_with_energy()?;
 
@@ -2657,6 +2743,7 @@ mod tests {
                 width: 0.1,
                 electron_temperature: 0.0,
                 scheme: SmearingScheme::Gaussian,
+                spin_fix: 10,
             },
             n_bands,
             max_n_pw: n_pw,
@@ -2672,7 +2759,7 @@ mod tests {
                 vec![KptDataSet::new(vec![vec![-0.3, -0.2]], 1)],
             )),
             v_eff: None,
-            history: DensityHistory::new(),
+            history: DensityHistory::new(1),
             previous_density: PerSpinDensity(SpinChannelData::new::<NonSpin>(vec![previous_density])),
             next_mixing: MixingPhaseKind::Off,
             e_xc: None,
@@ -2689,6 +2776,7 @@ mod tests {
             density_aug_fine: PerSpinAugDensity(SpinChannelData::new::<NonSpin>(vec![None])),
             last_davidson_diagnostics: None,
             scf_iter: 0,
+            spin_freed: false,
             _phase: PhantomData,
         };
 
@@ -2720,6 +2808,7 @@ mod tests {
                 width: 0.1,
                 electron_temperature: 0.0,
                 scheme: SmearingScheme::Gaussian,
+                spin_fix: 10,
             },
             n_bands,
             max_n_pw: n_pw,
@@ -2739,7 +2828,7 @@ mod tests {
                 vec![KptDataSet::new(vec![vec![-0.3, -0.2]], 1)],
             )),
             v_eff: None,
-            history: DensityHistory::new(),
+            history: DensityHistory::new(1),
             previous_density: PerSpinDensity(SpinChannelData::new::<NonSpin>(vec![
                 Density::from_inner(WaveGridArray::from_inner(
                     Array3::<f64>::from_elem(shape, 2.0),
@@ -2760,6 +2849,7 @@ mod tests {
             density_aug_fine: PerSpinAugDensity(SpinChannelData::new::<NonSpin>(vec![None])),
             last_davidson_diagnostics: None,
             scf_iter: 0,
+            spin_freed: false,
             _phase: PhantomData,
         }
     }

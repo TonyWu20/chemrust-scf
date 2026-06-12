@@ -29,7 +29,7 @@
 
 use std::sync::Arc;
 
-use cudarc::driver::{CudaSlice, CudaStream, DevicePtr};
+use cudarc::driver::{CudaSlice, CudaStream};
 
 use crate::device::blas::{op, BlasHandle, ZgemmConfig};
 use crate::device::CudaComplex;

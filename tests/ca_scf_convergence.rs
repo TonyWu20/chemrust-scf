@@ -527,6 +527,7 @@ fn density_decomp_matches_castep_f8_same_inputs() {
         width: 0.1 * chemrust_scf::EV_TO_HARTREE,
         electron_temperature: 0.1 * chemrust_scf::EV_TO_HARTREE,
         scheme: chemrust_scf::SmearingScheme::Gaussian,
+        spin_fix: 10,
     };
     let (occupations, chem_pot) =
         chemrust_scf::density::compute_occupations(eigenvalues, &smearing, n_electrons, 1.0)
@@ -2752,6 +2753,7 @@ fn density_split_castep_psi_vs_our_psi() {
         width: 0.1 * chemrust_scf::EV_TO_HARTREE,
         electron_temperature: 0.1 * chemrust_scf::EV_TO_HARTREE,
         scheme: chemrust_scf::SmearingScheme::Gaussian,
+        spin_fix: 10,
     };
     let (occ_castep, _) = chemrust_scf::density::compute_occupations(
         &fx.bands_eigenvalues, &smearing, n_electrons, 1.0,

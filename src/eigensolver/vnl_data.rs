@@ -40,6 +40,9 @@ pub struct VnlBatchData {
     /// GPU screening cache (Q matrices + structure factors), built once at init
     /// and reused for D-matrix re-screening every SCF step with the current V_eff.
     pub screening_cache: Option<WaveScreeningCache>,
+    /// GPU screening cache on the fine grid, built once at init and used for
+    /// D-matrix re-screening with fine-grid V_eff (via rescreen_d).
+    pub screening_cache_fine: Option<WaveScreeningCache>,
     /// Concatenated β-projectors: n_pw × n_total_expanded (col-major).
     pub b_concat: CudaSlice<CudaComplex>,
     /// LU factor (P·L·U) of M = Q⁻¹ + B^H·B (n_total_expanded × n_total_expanded).
@@ -125,7 +128,7 @@ impl VnlBatchData {
         solver: &SolverHandle,
     ) -> Result<Self, Error> {
         Self::precompute_with_d_override(
-            pw_coords, pots, cell, wave_grid, k_point,
+            pw_coords, pots, cell, wave_grid, None, k_point,
             psi_data, n_bands, n_pw, _occupations, v_eff_wave,
             None,
             stream, pcie, blas, kernels, solver,
@@ -150,6 +153,7 @@ impl VnlBatchData {
         pots: &chemrust_hamiltonian_core::PseudopotentialSet,
         cell: &chemrust_hamiltonian_core::CellGeometry,
         wave_grid: &chemrust_hamiltonian_core::GVectorGrid,
+        fine_grid: Option<&chemrust_hamiltonian_core::GVectorGrid>,
         k_point: &KPoint,
         psi_data: &[Complex64],
         n_bands: usize,
@@ -205,6 +209,14 @@ impl VnlBatchData {
         // so it is available for D-matrix re-screening every SCF step.
         let screening_cache: Option<WaveScreeningCache> =
             Some(build_wave_screening_cache(pots, cell, wave_grid, stream, pcie)?);
+
+        // Build fine-grid screening cache when a fine grid is provided (FFI path).
+        // rescreen_d uses this to avoid grid-mismatch truncation when processing
+        // fine-grid V_eff that has more FFT points than the wave grid.
+        let screening_cache_fine: Option<WaveScreeningCache> = match fine_grid {
+            Some(fg) => Some(build_wave_screening_cache(pots, cell, fg, stream, pcie)?),
+            None => None,
+        };
 
         // Upload V_eff_fft to GPU (Fortran order via .t().iter()).
         let v_eff_fft_dev: Option<CudaSlice<CudaComplex>> = match &v_eff_fft {
@@ -475,6 +487,7 @@ impl VnlBatchData {
             entries,
             screening_h2d_bytes,
             screening_cache,
+            screening_cache_fine,
             b_concat,
             lu_m: lu_m_dev,
             lu_ipiv: lu_ipiv_dev,
@@ -493,12 +506,22 @@ impl VnlBatchData {
         kernels: &CudaKernelSet,
         blas: &crate::device::blas::BlasHandle,
     ) -> Result<(), Error> {
-        let cache = match &self.screening_cache {
-            Some(c) => c,
-            None => return Ok(()),
+        // Determine cache and grid: use fine-grid cache when available
+        // (rescreen_d is called with fine-grid V_eff from CASTEP/FFI path),
+        // otherwise fall back to wave-grid cache (pure Rust SCF path).
+        let n_grid;
+        let use_cache;
+        if let Some(ref fine_cache) = self.screening_cache_fine {
+            let [ngz_f, ngy_f, ngx_f] = fine_cache.wave_grid;
+            n_grid = ngz_f * ngy_f * ngx_f;
+            use_cache = fine_cache;
+        } else if let Some(ref c) = self.screening_cache {
+            let [ngz, ngy, ngx] = c.wave_grid;
+            n_grid = ngz * ngy * ngx;
+            use_cache = c;
+        } else {
+            return Ok(());
         };
-        let [ngz, ngy, ngx] = cache.wave_grid;
-        let n_wave_grid = ngz * ngy * ngx;
 
         // FFT V_eff real → reciprocal on CPU.
         let real_grid = chemrust_hamiltonian_core::fft::RealGrid::from_inner(v_eff_real.clone());
@@ -515,14 +538,14 @@ impl VnlBatchData {
 
         // Re-screen each ion.
         for (ion_idx, entry) in self.entries.iter_mut().enumerate() {
-            let species_idx = cache.ion_species[ion_idx];
+            let species_idx = use_cache.ion_species[ion_idx];
             let d_screened = screen_d_gpu(
-                cache,
+                use_cache,
                 &v_eff_fft_dev,
                 ion_idx,
                 species_idx,
                 &entry.d0_expanded,
-                n_wave_grid,
+                n_grid,
                 kernels,
                 blas,
                 stream,

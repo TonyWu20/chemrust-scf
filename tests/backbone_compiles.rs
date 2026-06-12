@@ -131,6 +131,7 @@ fn backbone_compiles() {
             width: 0.01,
             electron_temperature: 0.01,
             scheme: SmearingScheme::Gaussian,
+            spin_fix: 10,
         })
         .max_history(4)
         .build();

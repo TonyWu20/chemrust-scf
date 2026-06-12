@@ -1185,11 +1185,6 @@ pub(crate) unsafe fn davidson_diagonalise(
                 eigenvalues[0],
                 eigenvalues[n_bands - 1]
             );
-            // Verify per-band Rayleigh quotients match CASTEP reference
-            if n_bands > 110 {
-                eprintln!("[Diag-Rayleigh] band 104: Re⟨ψ|Hψ⟩={:.6}  band 105: {:.6}  band 106: {:.6}",
-                    eigenvalues[104], eigenvalues[105], eigenvalues[106]);
-            }
         }
 
         // ---- Save Rayleigh eigenvalues before full subspace diagonalization ----
@@ -1250,11 +1245,6 @@ pub(crate) unsafe fn davidson_diagonalise(
             eigenvalues[0],
                 eigenvalues[n_bands - 1]
             );
-        // Verify mid-band eigenvalues match CASTEP reference post-ZHEEVD
-        if n_bands > 110 {
-            eprintln!("[Diag-ZHEEVD] post full diag: eig[104]={:.6} eig[105]={:.6} eig[106]={:.6}",
-                eigenvalues[104], eigenvalues[105], eigenvalues[106]);
-        }
 
         // ---- D1: S-norm diagnostic after A1 full-subspace ZHEGVD ----
         // Verify that rotated eigenvectors maintain ⟨psi|S|psi⟩ ≈ 1.
@@ -2353,7 +2343,7 @@ unsafe fn diagonalise_subspace(
     /// Use real symmetric DSYEVD for gamma-point (hamiltonian.f90:480-481).
     /// Matches CASTEP `algor_diagonalise(..., 'S')`.  Default: false (ZHEEVD).
     #[builder(default = false)]
-    gamma_point: bool,
+    _gamma_point: bool,
     /// Optional: pre-built H_sub matrix (k×k, column-major, GPU-resident).
     /// When provided, the psi^H·hpsi GEMM is skipped and this matrix is
     /// copied into a working buffer for ZHEEVD.  The caller's buffer is NOT
@@ -2488,17 +2478,14 @@ unsafe fn diagonalise_subspace(
     // For gamma-point (super_wvfn%have_gamma, hamiltonian.f90:480-481),
     // CASTEP calls algor_diagonalise(..., 'S') → DSYEV (real symmetric).
     // For non-gamma, CASTEP calls algor_diagonalise(..., 'H') → ZHEEV.
-    // We match both paths faithfully.
-    if gamma_point {
-        // Gamma-point: H_sub is purely real, should use DSYEVD.
-        // TODO: dsyevd was removed from SolverHandle during chemrust-scf
-        // refactoring.  Re-add it before enabling gamma-point support.
-        return Err(Error::RayleighRitzFailed {
-            info: -1, // NYI
-        });
-    }
+    //
+    // We use ZHEEVD for both cases: real-symmetric matrices are a special
+    // case of complex Hermitian, and ZHEEVD handles them correctly — the
+    // eigenvalues are real and eigenvector imaginary parts are ~machine zero.
+    // The nblock adjustment at §block-sizing still respects gamma_point to
+    // avoid odd block sizes that cause DSYEVD parity issues (historical).
 
-    // ---- Non-gamma: ZHEEVD path (complex Hermitian, default) ----
+    // ---- ZHEEVD path (complex Hermitian, gamma + non-gamma) ----
     // No overlap matrix needed because the superspace is S-orthonormal
     // (ψ_block is S-orthogonal to lower bands and S-orthonormal among
     // themselves, so S_sub = I implicitly).
@@ -2838,7 +2825,7 @@ pub(crate) unsafe fn s_orthonormalise(
         {
             let diag_host: Vec<CudaComplex> =
                 blas.stream().clone_dtoh(&s_overlap_gpu).map_err(Error::Cuda)?;
-            let n = ncol;
+            let _n = ncol;
             let s00 = diag_host[0].x;
             // Independent ZDOTC: ⟨search_0 | S·search_0⟩ directly
             let (s_ptr, _) = search_dev.device_ptr(stream);

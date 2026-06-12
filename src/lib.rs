@@ -7,6 +7,7 @@ pub mod device;
 #[doc(hidden)]
 pub mod eigensolver;
 pub mod ffi;
+pub mod pipeline;
 pub mod spin_types;
 
 // Re-export test-only helpers for integration tests

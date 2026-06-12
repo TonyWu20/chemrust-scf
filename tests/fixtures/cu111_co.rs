@@ -211,6 +211,7 @@ pub fn build_scf_state(fx: &Cu111CoFixture) -> ScfIteration {
         width: 0.1 * chemrust_scf::EV_TO_HARTREE,
         electron_temperature: 0.1 * chemrust_scf::EV_TO_HARTREE,
         scheme: SmearingScheme::Gaussian,
+        spin_fix: 10,
     };
 
     ScfIteration::builder()

@@ -10,8 +10,7 @@ use std::sync::Arc;
 use cudarc::cusolver::result::CusolverError;
 use cudarc::cusolver::safe::DnHandle;
 use cudarc::cusolver::sys::{
-    self as sys, cublasFillMode_t, cublasOperation_t, cusolverEigMode_t,
-    cusolverEigType_t,
+    self as sys, cublasFillMode_t, cublasOperation_t, cusolverEigMode_t, cusolverEigType_t,
 };
 use cudarc::driver::{result::DriverError, CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
 use thiserror::Error;

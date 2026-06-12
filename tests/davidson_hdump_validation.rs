@@ -313,6 +313,7 @@ fn davidson_hdump_validation() {
         width: 0.1 * EV_TO_HARTREE,
         electron_temperature: 0.1 * EV_TO_HARTREE,
         scheme: SmearingScheme::Gaussian,
+        spin_fix: 10,
     };
 
     // Clone before moving into builder (needed for CPU V_loc diagnostic below)

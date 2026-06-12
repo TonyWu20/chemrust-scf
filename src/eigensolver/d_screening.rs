@@ -30,6 +30,7 @@ use crate::types::Error;
 // ---------------------------------------------------------------------------
 
 /// Q_nm(G) for one species on the wave grid, lower-triangle pairs only.
+#[derive(Clone)]
 pub struct WaveQSpeciesEntry {
     /// Flattened Q_nm(G): [n_lower_pairs × n_wave_grid], pair-major, grid-minor.
     pub q_nm: CudaSlice<CudaComplex>,
@@ -42,6 +43,7 @@ pub struct WaveQSpeciesEntry {
 }
 
 /// Structure factor exp(-iG·R_I) for one ion on the wave grid.
+#[derive(Clone)]
 pub struct WaveSfEntry {
     pub sf: CudaSlice<CudaComplex>,
 }
@@ -51,6 +53,7 @@ pub struct WaveSfEntry {
 /// Built fresh inside VnlBatchData::precompute, replacing the old
 /// HashMap<String, Option<QOnGrid>> local cache with a GPU-resident
 /// data structure.
+#[derive(Clone)]
 pub struct WaveScreeningCache {
     pub species_entries: Vec<Option<WaveQSpeciesEntry>>,
     pub ion_sf: Vec<WaveSfEntry>,

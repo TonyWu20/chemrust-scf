@@ -233,6 +233,7 @@ fn run_orthogonality_diagnostic(filter_mode: chemrust_scf::FilterMode, mode_name
         width: 0.1 * chemrust_scf::EV_TO_HARTREE,
         electron_temperature: 0.1 * chemrust_scf::EV_TO_HARTREE,
         scheme: chemrust_scf::SmearingScheme::Gaussian,
+        spin_fix: 10,
     };
     let (occupations, chem_pot) =
         chemrust_scf::density::compute_occupations(&fx.bands_eigenvalues, &smearing, n_electrons, 1.0)
@@ -568,6 +569,7 @@ fn diagnostic_2_residual_norms_after_chebyshev_filter() {
         width: 0.1 * chemrust_scf::EV_TO_HARTREE,
         electron_temperature: 0.1 * chemrust_scf::EV_TO_HARTREE,
         scheme: chemrust_scf::SmearingScheme::Gaussian,
+        spin_fix: 10,
     };
     let (occupations, chem_pot) =
         chemrust_scf::density::compute_occupations(&fx.bands_eigenvalues, &smearing, n_electrons, 1.0)
@@ -1102,6 +1104,7 @@ fn diagnostic_s_norm_baseline() {
             width: 0.1 * chemrust_scf::EV_TO_HARTREE,
             electron_temperature: 0.1 * chemrust_scf::EV_TO_HARTREE,
             scheme: chemrust_scf::SmearingScheme::Gaussian,
+            spin_fix: 10,
         },
         n_electrons,
         1.0,
@@ -1330,6 +1333,7 @@ fn diagnostic_h_psi_differential() {
             width: 0.1 * chemrust_scf::EV_TO_HARTREE,
             electron_temperature: 0.1 * chemrust_scf::EV_TO_HARTREE,
             scheme: chemrust_scf::SmearingScheme::Gaussian,
+            spin_fix: 10,
         }, n_electrons, 1.0,
     ).expect("compute_occupations");
 
@@ -1527,6 +1531,7 @@ fn diagnostic_3_outer_loop_convergence() {
         width: 0.1 * chemrust_scf::EV_TO_HARTREE,
         electron_temperature: 0.1 * chemrust_scf::EV_TO_HARTREE,
         scheme: chemrust_scf::SmearingScheme::Gaussian,
+        spin_fix: 10,
     };
     let (occupations, chem_pot) =
         chemrust_scf::density::compute_occupations(&fx.bands_eigenvalues, &smearing, n_electrons, 1.0)
@@ -1969,6 +1974,7 @@ fn diagnostic_h_psi_component_breakdown() {
             width: 0.1 * chemrust_scf::EV_TO_HARTREE,
             electron_temperature: 0.1 * chemrust_scf::EV_TO_HARTREE,
             scheme: chemrust_scf::SmearingScheme::Gaussian,
+            spin_fix: 10,
         }, n_electrons, 1.0,
     ).expect("compute_occupations");
 

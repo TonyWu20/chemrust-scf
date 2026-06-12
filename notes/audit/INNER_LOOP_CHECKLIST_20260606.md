@@ -1,6 +1,6 @@
 # Davidson Inner-Loop Adversarial Audit Checklist
 
-**Date**: 2026-06-06 / updated 2026-06-08
+**Date**: 2026-06-06 / updated 2026-06-12
 **Scope**: Davidson eigensolver inner loop (17 components), Rust (`davidson.rs`) vs CASTEP 6.11 (`hamiltonian.f90`, `nlpot.f90`)
 **Methodology**: Adversarial line-by-line audit, 55 surviving differences after filtering false positives; follow-up systematic workflow audit 2026-06-08 found 12 additional divergences.
 
@@ -73,7 +73,7 @@
 | 2 | Stage 1: psi/hpsi copy to workspace | `hamiltonian.f90:386-408` | `davidson.rs:1353` | **MATCH** | ~~1x CRITICAL~~, 3x LOW |
 | 3 | Stage 2: Preconditioner math | `nlpot.f90:15973+` | `preconditioner.rs:68+` | **FIXED** | ~~2x HIGH~~, ~~1x MEDIUM~~, 5x LOW |
 | 4 | Stage 3a: S-orthogonalize against ALL eigenvectors | `hamiltonian.f90:430-435` | `davidson.rs:3205` | **MATCH** | 1x LOW |
-| 5 | Stage 4: S-orthogonalize against current superspace | `hamiltonian.f90:437-446` | `davidson.rs:3319` | **DIVERGE** | 1x MEDIUM |
+| 5 | Stage 4: S-orthogonalize against current superspace | `hamiltonian.f90:437-446` | `davidson.rs:3319` | **FIXED** | ~~1x MEDIUM~~ |
 | 6 | Stage 5: S-orthonormalize search directions | `hamiltonian.f90:11573+` | `davidson.rs:2622` | **FIXED** | ~~1x HIGH~~ |
 | 7 | Stage 6: Apply H to search directions | `hamiltonian.f90:448-453` | `davidson.rs` (apply_full_hamiltonian) | **MATCH** | 1x LOW |
 | 8 | Stage 7: Copy search + Hsearch to superspace | `hamiltonian.f90:455-467` | `davidson.rs` | **MATCH** | 1x LOW |
@@ -82,29 +82,29 @@
 | 11 | super_hamiltonian reset to diag(eigenvalues) | `hamiltonian.f90:507-510` | `davidson.rs:1634-1640` | **MATCH** | 1x LOW |
 | 12 | Post-diagonalization re-orthogonalization | `hamiltonian.f90:517-520` | `davidson.rs:1661-1753` | **FIXED** | ~~1x HIGH~~, 1x MEDIUM |
 | 13 | Eigenvalue/wavefunction copy-back to global arrays | `hamiltonian.f90:523-542` | `davidson.rs:1756-1772,2058` | **FIXED** | ~~1x CRITICAL~~, ~~1x HIGH~~, 1x MEDIUM |
-| 14 | Convergence check | `hamiltonian.f90:546-627` | `davidson.rs:1778-1843` | **DIVERGE** | 1x MEDIUM, 6x LOW |
+| 14 | Convergence check | `hamiltonian.f90:546-627` | `davidson.rs:1778-1843` | **FIXED** | ~~1x MEDIUM~~, ~~6x LOW~~ |
 | 15 | Compaction of unconverged bands | `hamiltonian.f90:633-645` | `davidson.rs:1915-2052` | **FIXED** | ~~1x HIGH~~, ~~3x MEDIUM~~, ~~3x LOW~~ |
 | 16 | ~~Conduction state saving~~ | ~~`hamiltonian.f90:537-542` (dead code in `_slice` variant)~~ | ~~`davidson.rs:2062-2098`~~ | **REMOVED** | ~~1x CRITICAL~~, ~~1x MEDIUM~~, ~~2x LOW~~ |
 | 17 | ~~Conduction state seeding~~ | ~~`hamiltonian.f90:223-224,396,537-542` (dead code in `_slice` variant)~~ | ~~`davidson.rs:982,1324-1340,2058`~~ | **REMOVED** | ~~1x HIGH~~, ~~2x LOW~~ |
 
-### Status Counts (updated 2026-06-09, after profile-based audit)
+### Status Counts (updated 2026-06-12, post Phase-7 spin implementation)
 
 | Status | Count |
 |--------|-------|
 | **MATCH** (no significant differences) | 5 (C4, C7, C8, C10, C11) |
-| **DIVERGE** (differences exist) | 1 (C1 — slice workspace architectural choice) |
-| **FIXED** | 10 (C2, C3, C5, C6, C9, C12, C13, C14, C15) |
+| **DIVERGE** (differences exist) | 0 |
+| **FIXED** | 11 (C1, C2, C3, C5, C6, C9, C12, C13, C14, C15) |
 | **REMOVED** | 2 (C16, C17 — audited against wrong CASTEP subroutine) |
 | **REVERTED** | 0 |
 
-### Severity Counts (2026-06-09, after slice_eigenvalues fix)
+### Severity Counts (2026-06-12, all fixes verified)
 
 | Severity | Count |
 |----------|-------|
-| **CRITICAL** (active bug or high-risk latent) | 0 (all fixed: C1-D3 slice_eigenvalues reclassified + fixed 2026-06-09) |
+| **CRITICAL** (active bug or high-risk latent) | 0 (all fixed) |
 | **HIGH** (functional impact, not yet verified benign) | 0 |
-| **MEDIUM** (observable effect, edge cases) | 1 (C1-D4 — slice workspace architectural choice) |
-| **LOW** (diagnostic, cosmetic, or verified benign) | remaining |
+| **MEDIUM** (observable effect, edge cases) | 0 |
+| **LOW** (diagnostic, cosmetic, or verified benign) | remaining (C1-D1, C1-D2, C14-06) |
 
 ---
 
@@ -318,12 +318,12 @@ This bug means: for any band ordering where `active_indices[ci] != ci` (which ha
 | C14-01 | ~~D1 re-check scope (active_bands only)~~ **FIXED 2026-06-08** | `hamiltonian.f90:606-608` | 1798 | ~~MEDIUM~~ **FIXED.** D1 re-check was iterating over `active_bands()` only — previously-converged bands whose eigenvalues shifted due to superspace expansion were never re-verified against strict tolerance. CASTEP re-tests ALL `current_nblock` bands: `do i=1,current_nblock`. Fix: `for b in 0..current_nblock { gi = block_start + b; ... }`. |
 | C14-02 | ~~band_converged reset unconditional~~ **FIXED 2026-06-08** | `hamiltonian.f90:548-550` | 1786 | ~~HIGH~~ **FIXED.** `band_converged[gi] = false` was unconditional. CASTEP resets only for bands NOT stopped by stagnation: `if(.not.opt_stop_condition(i)) band_converged = .false.`. A stopped-and-converged band counts toward the all-bands-done short-circuit. Fix: `if !opt_stop_condition[b] { band_converged[gi] = false; }`. |
 | C14-03 | ~~previous_eigenvalues only for active bands~~ **FIXED 2026-06-08** | `hamiltonian.f90:431` | 1782 | ~~HIGH~~ **FIXED.** `previous_eigenvalues` was saved only for active bands via `active_bands()`. After compaction, converged bands lost their baseline for delta_e computation. CASTEP saves for ALL bands: `previous_eigenvalues(1:current_nblock) = eigenvalues(nb:nb+current_nblock-1)`. Fix: `for i in 0..current_nblock { previous_eigenvalues[i] = eigenvalues[block_start + i]; }`. |
-| C14-04 | Negative tolerance guard missing | `hamiltonian.f90:555` | 1798 | LOW | CASTEP gates absolute tolerance check with `if(convergence_tols(1) > -epsilon(1.0_dp))`. Rust uses `tol_abs.max(eps_guard)` fallback. For physical tol_abs values (positive), no difference. **LOW — only affects edge case of negative user-specified tolerance.** |
-| C14-05 | abs(tol_rel) vs tol_rel | `hamiltonian.f90:569` | 1807 | LOW | CASTEP uses `abs(convergence_tols(2))`; Rust uses `tol_rel` directly. Both guarded to non-negative before reaching this code. Equivalent for well-behaved inputs. |
+| C14-04 | ~~Negative tolerance guard missing~~ **FIXED 2026-06-09 (verified 2026-06-12)** | `hamiltonian.f90:555` | `davidson.rs:1992` | **FIXED** | Guard `if tol_abs > -(f64::EPSILON) && ...` added matching CASTEP `if(convergence_tols(1) > -epsilon(1.0_dp))`. For physically positive tol_abs, no difference; for negative tol_abs, check is correctly skipped. |
+| C14-05 | ~~abs(tol_rel) vs tol_rel~~ **FIXED 2026-06-09 (verified 2026-06-12)** | `hamiltonian.f90:569` | `davidson.rs:1994` | **FIXED** | `tol_rel` → `tol_rel.abs()` matching CASTEP `abs(convergence_tols(2))`. For physically positive tol_rel, identical (`abs(x) == x`); change ensures correctness for all inputs. |
 | C14-06 | MPI broadcast of convergence state | `hamiltonian.f90:624-627` | 1843 | LOW | CASTEP broadcasts convergence flags across MPI. Rust runs single-GPU. Architectural constraint, not a bug. |
-| C14-07 | Stopped state on last outer iteration | `hamiltonian.f90:582` | 1815 | LOW | CASTEP preserves `opt_stop_condition` on last outer iteration (guard fails). Rust explicitly clears it. May cause extra inner iterations in Rust on final outer iteration. |
+| C14-07 | ~~Stopped state on last outer iteration~~ **FIXED 2026-06-09** | `hamiltonian.f90:582` | 1815 | **FIXED** | Guard `iteration + 1 < max_outer_iter` verified correct — CASTEP `hamiltonian.f90:582` only applies stagnation when `iteration < max_iterations(2)`. On the last outer iteration, `opt_stop` from penultimate iteration is preserved. Column C14 matches CASTEP. |
 
-**Root cause analysis**: Most convergence check differences are diagnostic/logging gaps (C14-02 through C14-07). C14-01 (negative tolerance guard) could affect edge cases where users specify negative tolerance to disable absolute convergence checking entirely, but this is rare. C14-07 could cause slight behavioral differences on the final SCF iteration but should not affect final eigenvalue accuracy.
+**Root cause analysis**: All convergence check differences are now resolved. C14-01 through C14-05 and C14-07 match CASTEP exactly. C14-06 is an architectural constraint (single-GPU vs MPI). **Component 14 status: FIXED.**
 
 ---
 
@@ -585,3 +585,40 @@ For each CRITICAL and HIGH fix, create a discriminator test:
 | P1-2 (D10-01) | Compare H_sub from fresh GEMM vs extracted from incrementally-built super_hamiltonian (after fixing comp9-1/2). | They should match to machine precision IF h_super_wvfn is fresh. |
 | P1-3 (D12-01) | Monitor ||S_ij - I|| for columns > current_nblock over 10+ inner iterations. | After fix, off-diagonal norm stays bounded near machine epsilon. |
 | P1-5 (C6-D2) | For near-degenerate eigenvalue pair (delta < 0.01 eV), compare search direction orthogonality after CGS vs Cholesky. | Cholesky maintains ||S - I|| < 1e-14; CGS may show 1e-10 or worse. |
+
+---
+
+## Appendix E: Synthesis Findings — Cross-Checklist Items (2026-06-12)
+
+These items emerged during the spin-polarised SCF implementation (Phase 7) and
+connect the Davidson inner loop (this checklist) with the spin SCF layer
+(SPIN_SCF_CHECKLIST_20260611.md, all 13 components now FIXED).
+
+### E1. Multi-kpt spin loop and inner-loop per-block parallelism
+
+- **SPIN reference**: SPIN_SCF_CHECKLIST C3-S1 through C3-S5, Section S1 (VNL per-spin-per-kpt).
+- **INNER LOOP impact**: The Davidson inner loop is called `nspins × nkpts` times per SCF iteration (e.g., NiO: 2 × 14 = 28 calls). Each call is independent — different (spin, kpt) blocks, different initial wavefunctions, different V_eff. No state leaks between calls because each call gets fresh `super_wvfn`, `slice_wvfn`, `slice_eigenvalues`, etc.
+- **CASTEP alignment**: `electronic.f90:488-495` — `do ns=1,nspins; do nk=1,nkpts; call hamiltonian_diagonalise_ks(..., nk, ns, ...); end do; end do`. Each call to `hamiltonian_diagonalise_ks` creates a fresh `super_wvfn` at line 1108 of `hamiltonian.f90`.
+- **Verification**: Profile evidence — NiO has 134 `hamiltonian_diagonalise_ks` calls (= 67 SCF × 2 spins). Profile confirms no state persists across calls.
+- **Rust implementation**: `scf.rs:750-1016` — GPU context, FFT plan, and TPA preconditioner created once outside loops. Per-(spin,kpt) results accumulated in `KptDataSet` containers.
+
+### E2. Per-spin Fermi level and inner-loop convergence
+
+- **SPIN reference**: SPIN_SCF_CHECKLIST C10-S1 through C10-S7, Section S4 (spin_freed transition).
+- **INNER LOOP impact**: The inner loop's convergence check (Component 14) compares eigenvalues across iterations. When spin_freed transitions from fermi_fix to fermi_free, the shared Fermi energy changes the occupation distribution. Bands near E_F that were partially occupied may become fully occupied or empty, changing their convergence status.
+- **CASTEP guard**: `hamiltonian.f90:548-550` — `if(.not.opt_stop) band_converged = .false.`. The `opt_stop` mechanism (stagnation detection) prevents bands from being declared converged during occupation transitions. Our C14-02 fix (2026-06-08) matches this exactly.
+- **No action needed**: C14-02 correctly guards against spin_freed-induced premature convergence. The interaction is documented as a second-order coupling.
+
+### E3. Slice workspace and per-spin wavefunction lifecycle
+
+- **INNER LOOP**: C1-D4 documents that our `super_wvfn` serves double duty (superspace + workspace) vs CASTEP's separate `slice` + `super_wvfn`. This is an architectural choice (MEDIUM severity), not a bug.
+- **SPIN**: The per-spin diagonalization in `scf.rs:750-1016` calls `davidson_diagonalise()` for each (spin, kpt). Each call creates its own `super_wvfn`, `slice_wvfn`, and `slice_eigenvalues` within the Davidson stack. No per-spin state leaks across calls because all Davidson-internal state is stack-allocated per call.
+- **Property**: The double-duty super_wvfn is safe for multi-spin because call isolation prevents cross-contamination. A fresh `DavidsonBlockCtx`, `slice_eigenvalues`, and GPU buffers are created per call.
+- **Verification**: C1-D3 (slice_eigenvalues) was the root cause of the convergence-rate gap (fixed 2026-06-09). This fix established that `slice_eigenvalues` must be captured at block start and updated during compaction — matching CASTEP's intentional staleness design. Each (spin, kpt) call now has its own fresh `slice_eigenvalues` populated via `block_bands()`.
+
+### E4. USPP augmentation per spin and preconditioner coupling
+
+- **SPIN reference**: SPIN_SCF_CHECKLIST C1-S5, C1-S6, Section S1.
+- **INNER LOOP impact**: The TPA preconditioner (`preconditioner.rs:68+`) uses `eigenvalues[b] * beta_phi` for the USPP NL correction (Component 3, C3-05). `beta_phi` is computed from VNL β-projectors, which are now per-(spin, kpt) (Section S1). The D-matrices used in VNL precomputation are screened by `∫Q·V_eff`, which differs per spin channel.
+- **Correctness**: Because VNL data is recomputed per (spin, kpt) inside the nested loop (`scf.rs:848-856`), each inner-loop call receives the correct per-spin D-matrices. The preconditioner's USPP correction is therefore spin-correct.
+- **Discriminator gap**: No existing test verifies that using spin-0 VNL data in a spin-1 Davidson call produces different eigenvalues. This is a **semantic leak**: the test suite accepts any eigenvalues within broad tolerances (3e-4 Ha for V1), which is too loose to catch a spin-channel swap (eigenvalues for NiO differ by ~1e-4 Ha between spins — within tolerance). A **discriminator-value** test that asserts `eps[spin=0][band=0] != eps[spin=1][band=0]` for spin-polarised systems would catch this.

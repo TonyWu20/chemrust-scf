@@ -25,6 +25,7 @@ use chemrust_scf::{
     PerSpinPwCoefficients, PwCoefficients, ScfIteration, SmearingParams, SmearingScheme,
     SpinChannelData, WaveGridArray, Density,
 };
+use ndarray::ShapeBuilder;
 
 // ---------------------------------------------------------------------------
 // Constants — reference values from CASTEP output
@@ -284,6 +285,7 @@ pub fn build_spin_scf_state(fx: &NioSpinFixture) -> ScfIteration<SpinCollinear> 
         width: 0.1 * chemrust_scf::EV_TO_HARTREE,
         electron_temperature: 0.1 * chemrust_scf::EV_TO_HARTREE,
         scheme: SmearingScheme::Gaussian,
+        spin_fix: 10,
     };
 
     ScfIteration::<SpinCollinear>::builder()
@@ -406,4 +408,88 @@ fn nio_warm_start_discriminator() {
         REFERENCE_ENERGY_EV / chemrust_scf::HARTREE_TO_EV);
 
     eprintln!("=== Warm-start discriminator: ALL CHECKS PASSED ===");
+}
+
+// ===========================================================================
+// Cold-start discriminator — SCF from paramagnetic initial guess
+// ===========================================================================
+
+/// Build a SpinCollinear ScfIteration from a paramagnetic initial guess
+/// (uniform density + zero spin, randomized psi) using the same cell,
+/// pseudopotentials, and k-point grid as the warm-start fixture.
+/// This isolates the standalone SCF convergence path from the FFI boundary.
+// ===========================================================================
+// 2-iteration cascade check — fast discriminator (no full SCF convergence)
+// ===========================================================================
+
+/// Run TWO SCF iterations from the converged state and assert eigenvalues
+/// don't cascade.  If eigenvalues diverge by more than 1 Ha between iter-1
+/// and iter-2, the SCF path has a cascade bug (e.g., stale D-matrices,
+/// incorrect V_eff augmentation, or mixing contamination).
+///
+/// This is much faster than a full cold-start SCF (~2 min vs ~20 min).
+#[test]
+#[ignore = "requires GPU"]
+fn nio_two_iter_cascade_check() {
+    if !gpu_available() {
+        eprintln!("SKIP: no GPU available");
+        return;
+    }
+
+    let fx = fixture();
+    let state = build_spin_scf_state(fx);
+
+    // --- Iter 1: build V_eff, diagonalize, construct density, mix, check ---
+    let v_eff = state.build_v_eff_with_energy().expect("build_v_eff_with_energy iter 1");
+    let diag = v_eff.diagonalize(4, None).expect("diagonalize iter 1");
+    let dens = diag.construct_density_off().expect("construct_density iter 1");
+    let mixed = dens.mix();
+    let iter2_state = match mixed.check(1e-8).expect("check iter 1") {
+        chemrust_scf::CheckOutcome::Converged(_) => panic!("iter-1 converged early"),
+        chemrust_scf::CheckOutcome::NotConverged { state, .. } => state,
+    };
+
+    // Snapshot eigenvalues and energy before consuming iter2_state
+    let eigs_iter1: Vec<Vec<Vec<f64>>> = {
+        let pe = iter2_state.per_spin_eigenvalues();
+        (0..pe.nspins()).map(|ispin|
+            (0..pe[ispin].nkpts()).map(|ikpt| pe[ispin][ikpt].clone()).collect()
+        ).collect()
+    };
+    let e_ha_1 = iter2_state.total_energy().expect("total_energy iter 1");
+
+    // --- Iter 2: same pipeline ---
+    let v_eff2 = iter2_state.build_v_eff_with_energy().expect("build_v_eff_with_energy iter 2");
+    let diag2 = v_eff2.diagonalize(4, None).expect("diagonalize iter 2");
+    let dens2 = diag2.construct_density_off().expect("construct_density iter 2");
+    let mixed2 = dens2.mix();
+    let iter3_state = match mixed2.check(1e-8).expect("check iter 2") {
+        chemrust_scf::CheckOutcome::Converged(_) => panic!("iter-2 converged early"),
+        chemrust_scf::CheckOutcome::NotConverged { state, .. } => state,
+    };
+
+    let eigs_iter2 = iter3_state.per_spin_eigenvalues();
+
+    // --- Cascade check: max |Δ| between iter-1 and iter-2 eigenvalues ---
+    let cascade_gate_ha = 1.0; // 1 Ha drift = cascade
+    for ikpt in 0..eigs_iter1[0].len() {
+        for ispin in 0..2 {
+            let e1 = &eigs_iter1[ispin][ikpt];
+            let e2 = &eigs_iter2[ispin][ikpt];
+            let max_delta = e1.iter().zip(e2.iter())
+                .map(|(&a, &b)| (a - b).abs())
+                .fold(0.0, f64::max);
+            eprintln!("[Cascade] kpt={ikpt} spin={ispin} max|Δ_eig| = {:.4e} Ha", max_delta);
+            assert!(max_delta < cascade_gate_ha,
+                "[Cascade] FAIL kpt={ikpt} spin={ispin}: eigenvalue drift {:.4e} Ha > gate {:.4} Ha",
+                max_delta, cascade_gate_ha);
+        }
+    }
+
+    // Also check total energy drift
+    let e_ha_2 = iter3_state.total_energy().expect("total_energy iter 2");
+    let drift_ha = (e_ha_2 - e_ha_1).abs();
+    eprintln!("[Cascade] total energy: iter1={:.6} iter2={:.6} |Δ|={:.4e} Ha", e_ha_1, e_ha_2, drift_ha);
+
+    eprintln!("=== 2-iteration cascade check: PASSED ===");
 }

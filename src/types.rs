@@ -225,6 +225,9 @@ pub struct SmearingParams {
     pub electron_temperature: f64,
     /// Smearing scheme (default: Gaussian).
     pub scheme: SmearingScheme,
+    /// CASTEP spin_fix: number of iterations with fixed per-spin Fermi energy.
+    /// Default: 10. 0 = always free, <0 = never free.
+    pub spin_fix: i32,
 }
 
 /// Output of a converged SCF calculation.

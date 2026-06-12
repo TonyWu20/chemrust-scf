@@ -65,19 +65,22 @@ pub struct DensityHistory<M: MixingPhase> {
     pub(crate) kerker: Option<KerkerPreconditioner>,
     /// Compiled CUDA kernels for GPU element-wise ops. Created lazily.
     pub(crate) kernels: Option<MixingCudaKernels>,
-    /// Reciprocal-space density from the previous iteration's mixing output.
-    /// `None` on the first Kerker/Pulay call (pass-through).
-    pub(crate) current_density_in: Option<ReciprocalDensity>,
-    // ── DIIS delta history (GPU-resident complex) ──
-    /// Δn_i = n_in_i - n_in_{i-1}, ordered oldest to newest.
-    delta_n_history: Vec<CudaSlice<CudaComplex>>,
-    /// ΔR_i = R_i - R_{i-1}, ordered oldest to newest.
-    delta_r_history: Vec<CudaSlice<CudaComplex>>,
-    /// Previous residual R_{t-1} (GPU), for computing next ΔR.
-    prev_res: Option<CudaSlice<CudaComplex>>,
-    /// Previous n_in_{t-1} (GPU), for computing next Δn.
+    /// Number of spin channels (1 for NonSpin, 2 for SpinCollinear).
+    nspins: usize,
+    /// Reciprocal-space density from the previous iteration's mixing output,
+    /// per spin channel.  `None` on the first Kerker/Pulay call (pass-through).
+    /// CASTEP dm.f90 stores per-spin density history independently.
+    pub(crate) current_density_in: Vec<Option<ReciprocalDensity>>,
+    // ── DIIS delta history (GPU-resident complex), per spin ──
+    /// Δn_i = n_in_i - n_in_{i-1}, ordered oldest to newest, per spin.
+    delta_n_history: Vec<Vec<CudaSlice<CudaComplex>>>,
+    /// ΔR_i = R_i - R_{i-1}, ordered oldest to newest, per spin.
+    delta_r_history: Vec<Vec<CudaSlice<CudaComplex>>>,
+    /// Previous residual R_{t-1} (GPU), for computing next ΔR, per spin.
+    prev_res: Vec<Option<CudaSlice<CudaComplex>>>,
+    /// Previous n_in_{t-1} (GPU), for computing next Δn, per spin.
     /// Saved before updating `current_density_in`.
-    prev_n_in: Option<CudaSlice<CudaComplex>>,
+    prev_n_in: Vec<Option<CudaSlice<CudaComplex>>>,
     _marker: PhantomData<M>,
 }
 
@@ -271,21 +274,31 @@ impl DensityHistory<MixingOff> {
     /// Create a new density history in the `Off` phase.
     ///
     /// No GPU resources are allocated until the first transition to `Kerker`.
-    pub fn new() -> Self {
+    ///
+    /// `nspins`: number of spin channels (1 for NonSpin, 2 for SpinCollinear).
+    /// Per-spin state (current_density_in, DIIS history) is allocated so that
+    /// mixing each spin channel independently does not cross-contaminate
+    /// (CASTEP dm.f90 stores per-spin density history independently).
+    pub fn new(nspins: usize) -> Self {
+        let per_spin = || Vec::with_capacity(DIIS_MAX_HISTORY);
         Self {
             kerker: None,
             kernels: None,
-            current_density_in: None,
-            delta_n_history: Vec::with_capacity(DIIS_MAX_HISTORY),
-            delta_r_history: Vec::with_capacity(DIIS_MAX_HISTORY),
-            prev_res: None,
-            prev_n_in: None,
+            nspins,
+            current_density_in: (0..nspins).map(|_| None).collect(),
+            delta_n_history: (0..nspins).map(|_| per_spin()).collect(),
+            delta_r_history: (0..nspins).map(|_| per_spin()).collect(),
+            prev_res: (0..nspins).map(|_| None).collect(),
+            prev_n_in: (0..nspins).map(|_| None).collect(),
             _marker: PhantomData,
         }
     }
 
     /// Pass-through mixing: density unchanged, snapshot = clone.
-    pub fn mix(&mut self, density: Density) -> (Density, Density) {
+    ///
+    /// `ispin`: spin channel index (0-based).  Not used by MixingOff (pass-through),
+    /// but accepted for API uniformity with Kerker/Pulay.
+    pub fn mix(&mut self, density: Density, _ispin: usize) -> (Density, Density) {
         let snapshot = density.clone();
         (density, snapshot)
     }
@@ -316,6 +329,7 @@ impl DensityHistory<MixingOff> {
         Ok(DensityHistory {
             kerker: self.kerker,
             kernels: self.kernels,
+            nspins: self.nspins,
             current_density_in: self.current_density_in,
             delta_n_history: self.delta_n_history,
             delta_r_history: self.delta_r_history,
@@ -328,7 +342,7 @@ impl DensityHistory<MixingOff> {
 
 impl Default for DensityHistory<MixingOff> {
     fn default() -> Self {
-        Self::new()
+        Self::new(1)
     }
 }
 
@@ -346,6 +360,7 @@ impl<M: MixingPhase> DensityHistory<M> {
         DensityHistory {
             kerker: self.kerker,
             kernels: self.kernels,
+            nspins: self.nspins,
             current_density_in: self.current_density_in,
             delta_n_history: self.delta_n_history,
             delta_r_history: self.delta_r_history,
@@ -370,7 +385,10 @@ impl DensityHistory<Kerker> {
     /// 5. C2C inverse FFT back → mixed real-space density
     ///
     /// Returns `(mixed_density, input_snapshot)`.
-    pub fn mix(&mut self, density: Density) -> (Density, Density) {
+    /// `ispin`: spin channel index (0-based).  Per-spin state is stored and
+    /// retrieved independently — mixing spin 0 does not affect spin 1's history.
+    pub fn mix(&mut self, density: Density, ispin: usize) -> (Density, Density) {
+        debug_assert!(ispin < self.nspins, "ispin {ispin} >= nspins {}", self.nspins);
         let shape = self
             .kerker
             .as_ref()
@@ -404,8 +422,8 @@ impl DensityHistory<Kerker> {
             c2c_forward_inplace(&fft_plan, &mut n_out_dev).expect("C2C forward");
         }
 
-        // ── Take previous density, if any ──
-        let prev_recip = self.current_density_in.take();
+        // ── Take previous density for THIS SPIN, if any ──
+        let prev_recip = self.current_density_in[ispin].take();
 
         let (mut mixed_recip_dev, input_snapshot) = match prev_recip {
             Some(prev) => {
@@ -448,7 +466,7 @@ impl DensityHistory<Kerker> {
                 }
                 .expect("cpx_full_update n_in + K*R");
 
-                // ── Store mixed reciprocal as current_density_in ──
+                // ── Store mixed reciprocal as current_density_in[ispin] ──
                 let recip_copy = stream
                     .clone_htod(
                         &stream
@@ -456,14 +474,14 @@ impl DensityHistory<Kerker> {
                             .expect("D2H result for storage"),
                     )
                     .expect("H2D result for storage");
-                self.current_density_in =
+                self.current_density_in[ispin] =
                     Some(ReciprocalDensity::new(recip_copy, [ngz, ngy, ngx]));
 
                 (result_dev, density)
             }
             None => {
-                // First call: store n_out as current_density_in, pass through
-                self.current_density_in =
+                // First call for this spin: store n_out, pass through
+                self.current_density_in[ispin] =
                     Some(ReciprocalDensity::new(n_out_dev, [ngz, ngy, ngx]));
                 // Return the original density unchanged
                 return (density.clone(), density);
@@ -495,14 +513,16 @@ impl DensityHistory<Kerker> {
     /// this transition will treat the current `current_density_in` as the
     /// initial state for residual history.
     pub fn into_pulay(self) -> DensityHistory<Pulay> {
+        let per_spin = || Vec::with_capacity(DIIS_MAX_HISTORY);
         DensityHistory {
             kerker: self.kerker,
             kernels: self.kernels,
+            nspins: self.nspins,
             current_density_in: self.current_density_in,
-            delta_n_history: Vec::with_capacity(DIIS_MAX_HISTORY),
-            delta_r_history: Vec::with_capacity(DIIS_MAX_HISTORY),
-            prev_res: None,
-            prev_n_in: None,
+            delta_n_history: (0..self.nspins).map(|_| per_spin()).collect(),
+            delta_r_history: (0..self.nspins).map(|_| per_spin()).collect(),
+            prev_res: (0..self.nspins).map(|_| None).collect(),
+            prev_n_in: (0..self.nspins).map(|_| None).collect(),
             _marker: PhantomData,
         }
     }
@@ -532,7 +552,11 @@ impl DensityHistory<Pulay> {
     ///           + K(G)·[R_current + Σc_i·ΔR_i]
     ///
     /// Returns `(mixed_density, input_snapshot)`.
-    pub fn mix(&mut self, density: Density) -> (Density, Density) {
+    /// `ispin`: spin channel index (0-based).  Per-spin DIIS history is stored
+    /// and retrieved independently — mixing spin 0 does not affect spin 1's
+    /// delta vectors or residual history.
+    pub fn mix(&mut self, density: Density, ispin: usize) -> (Density, Density) {
+        debug_assert!(ispin < self.nspins, "ispin {ispin} >= nspins {}", self.nspins);
         let shape = self
             .kerker
             .as_ref()
@@ -564,8 +588,8 @@ impl DensityHistory<Pulay> {
             c2c_forward_inplace(&fft_plan, &mut n_out_dev).expect("C2C forward");
         }
 
-        // ── 2. Take previous density ──
-        let prev_recip = self.current_density_in.take();
+        // ── 2. Take previous density for THIS SPIN ──
+        let prev_recip = self.current_density_in[ispin].take();
 
         let (mut mixed_recip_dev, input_snapshot) = match prev_recip {
             Some(prev) => {
@@ -585,9 +609,9 @@ impl DensityHistory<Pulay> {
                 }
                 .expect("cpx_sub R = n_out - n_in");
 
-                // ---- 3. Push deltas to history, if we have previous values ----
-                let old_prev_res = self.prev_res.take();
-                let old_prev_n_in = self.prev_n_in.take();
+                // ---- 3. Push deltas to history per-spin ----
+                let old_prev_res = self.prev_res[ispin].take();
+                let old_prev_n_in = self.prev_n_in[ispin].take();
 
                 if let Some(prev_res_dev) = old_prev_res {
                     // ΔR = R_current - R_{t-1}  (GPU)
@@ -621,16 +645,16 @@ impl DensityHistory<Pulay> {
                     }
                     // If old_prev_n_in is None (should not happen), Δn stays zero
 
-                    // Push deltas to history (Vec with automatic eviction)
-                    if self.delta_n_history.len() >= DIIS_MAX_HISTORY {
-                        self.delta_n_history.remove(0);
-                        self.delta_r_history.remove(0);
+                    // Push deltas to history (Vec with automatic eviction), per-spin
+                    if self.delta_n_history[ispin].len() >= DIIS_MAX_HISTORY {
+                        self.delta_n_history[ispin].remove(0);
+                        self.delta_r_history[ispin].remove(0);
                     }
-                    self.delta_n_history.push(delta_n_tmp);
-                    self.delta_r_history.push(delta_r_tmp);
+                    self.delta_n_history[ispin].push(delta_n_tmp);
+                    self.delta_r_history[ispin].push(delta_r_tmp);
                 }
 
-                // ---- 4. Save R_current and n_in_current as prev_{res,n_in} ----
+                // ---- 4. Save R_current and n_in_current as prev_{res,n_in} per-spin ----
                 let new_prev_res: CudaSlice<CudaComplex> = stream
                     .clone_htod(
                         &stream
@@ -638,7 +662,7 @@ impl DensityHistory<Pulay> {
                             .expect("D2H prev_res for storage"),
                     )
                     .expect("H2D prev_res");
-                self.prev_res = Some(new_prev_res);
+                self.prev_res[ispin] = Some(new_prev_res);
 
                 let new_prev_n_in: CudaSlice<CudaComplex> = stream
                     .clone_htod(
@@ -647,13 +671,13 @@ impl DensityHistory<Pulay> {
                             .expect("D2H prev_n_in for storage"),
                     )
                     .expect("H2D prev_n_in");
-                self.prev_n_in = Some(new_prev_n_in);
+                self.prev_n_in[ispin] = Some(new_prev_n_in);
 
-                // ---- 5. Build and solve DIIS system (CPU) ----
-                let n_history = self.delta_r_history.len();
+                // ---- 5. Build and solve DIIS system (CPU) per-spin ----
+                let n_history = self.delta_r_history[ispin].len();
                 let (c_coeff, fallback) = if n_history > 0 {
                     build_and_solve_diis(
-                        &self.delta_r_history,
+                        &self.delta_r_history[ispin],
                         &r_dev,
                         n_real as i32,
                         blas,
@@ -675,12 +699,12 @@ impl DensityHistory<Pulay> {
                     let mut sum_delta_n: CudaSlice<CudaComplex> =
                         stream.alloc_zeros(n_real).expect("alloc sum Δn");
 
-                    // Σc_i·ΔR_i  and  Σc_i·Δn_i  via cuBLAS Zaxpy
+                    // Σc_i·ΔR_i  and  Σc_i·Δn_i  via cuBLAS Zaxpy, per-spin
                     for (i, &ci) in c_coeff.iter().enumerate() {
                         let alpha = CudaComplex { x: ci, y: 0.0 };
-                        blas.axpy_c64(n_i32, alpha, &self.delta_r_history[i], 1, &mut sum_delta_r, 1)
+                        blas.axpy_c64(n_i32, alpha, &self.delta_r_history[ispin][i], 1, &mut sum_delta_r, 1)
                             .expect("axpy sum_delta_r");
-                        blas.axpy_c64(n_i32, alpha, &self.delta_n_history[i], 1, &mut sum_delta_n, 1)
+                        blas.axpy_c64(n_i32, alpha, &self.delta_n_history[ispin][i], 1, &mut sum_delta_n, 1)
                             .expect("axpy sum_delta_n");
                     }
 
@@ -726,7 +750,7 @@ impl DensityHistory<Pulay> {
                     result_dev
                 };
 
-                // ---- Store mixed reciprocal as current_density_in ----
+                // ---- Store mixed reciprocal as current_density_in[ispin] ----
                 let recip_copy = stream
                     .clone_htod(
                         &stream
@@ -734,14 +758,14 @@ impl DensityHistory<Pulay> {
                             .expect("D2H result for storage"),
                     )
                     .expect("H2D result for storage");
-                self.current_density_in =
+                self.current_density_in[ispin] =
                     Some(ReciprocalDensity::new(recip_copy, [ngz, ngy, ngx]));
 
                 (result_dev, density)
             }
             None => {
-                // No previous density: pass through
-                self.current_density_in =
+                // No previous density for this spin: pass through
+                self.current_density_in[ispin] =
                     Some(ReciprocalDensity::new(n_out_dev, [ngz, ngy, ngx]));
                 return (density.clone(), density);
             }
