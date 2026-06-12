@@ -444,6 +444,8 @@ unsafe fn step_inner(
         // (fine grid), forward FFT on fine grid normalized by 1/N_fine, and Q(G)
         // on fine half-grid.  Passing Some(&h.fine_grid) builds a fine-grid
         // screening cache that matches CASTEP's convention.
+        // Empirically: fine-grid D-screening gives iter-2 spin-polarised energy
+        // (-7160.63 eV) close to reference (-7160.23 eV); wave-grid gives -7187 eV.
         kd.vnl[isp] = Some(VnlBatchData::precompute_with_d_override(
             &kd.pw_coords, &h.pots, &h.cell, &h.wave_grid, Some(&h.fine_grid), &kd.k_point,
             &psi_host, n_bands, n_pw, None, None, None,
