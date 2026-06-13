@@ -212,21 +212,88 @@ pub enum SmearingScheme {
     // Future: FermiDirac, MethfesselPaxton, MarzariVanderbilt.
 }
 
+/// Smearing width with explicit unit, following the same pattern as
+/// `castep_cell_io::CutOffEnergy`.  Carries an `Option<EnergyUnit>` so the
+/// unit is preserved through parsing and serialization.
+///
+/// Internally, all computations use Hartree.  Call `.to_ha()` to convert.
+///
+/// Example:
+/// ```ignore
+/// let w = SmearingWidth::ev(0.1);          // 0.1 eV
+/// let w = SmearingWidth::ha(0.003675);     // same in Hartree
+/// assert!((w.to_ha() - 0.003675).abs() < 1e-8);
+/// ```
+#[derive(Debug, Clone, Copy)]
+pub struct SmearingWidth {
+    /// Value in the units specified by `unit`.
+    pub value: f64,
+    /// Energy unit (None = Hartree, default for internal use).
+    pub unit: Option<castep_cell_io::units::EnergyUnit>,
+}
+
+impl SmearingWidth {
+    /// CASTEP default smearing width: 0.1 eV.
+    pub const fn ev(value: f64) -> Self {
+        Self { value, unit: Some(castep_cell_io::units::EnergyUnit::ElectronVolt) }
+    }
+
+    /// Smearing width in Hartree (no unit marker).
+    pub const fn ha(value: f64) -> Self {
+        Self { value, unit: Some(castep_cell_io::units::EnergyUnit::Hartree) }
+    }
+
+    /// Convert to Hartree for internal computation.
+    pub fn to_ha(self) -> f64 {
+        match self.unit {
+            None | Some(castep_cell_io::units::EnergyUnit::Hartree) => self.value,
+            Some(castep_cell_io::units::EnergyUnit::ElectronVolt) => {
+                self.value * crate::energy::EV_TO_HARTREE
+            }
+            Some(other) => {
+                // Fallback: assume the value is already in Hartree and warn.
+                tracing::warn!(
+                    "SmearingWidth with unhandled unit {other:?}; treating as Hartree. \
+                     Only Hartree and ElectronVolt are supported for smearing width."
+                );
+                self.value
+            }
+        }
+    }
+}
+
+impl Default for SmearingWidth {
+    /// CASTEP default: 0.1 eV (parameters.f90:1778).
+    fn default() -> Self {
+        Self::ev(0.1)
+    }
+}
+
 /// Smearing parameters for occupation-number smearing.
 ///
 /// CASTEP uses Gaussian smearing by default. The smearing width is
 /// `SMEARING_WIDTH` in the `.param` file (default 0.1 eV for CASTEP).
 /// Convert eV to Hartree: divide by 27.2114.
-#[derive(Debug, Clone, Copy)]
+///
+/// Builder: `SmearingParams::builder()` starts from CASTEP defaults.
+/// Override per-fixture: `SmearingParams::builder().spin_fix(6).build()`.
+#[derive(Debug, Clone, Copy, bon::Builder)]
 pub struct SmearingParams {
-    /// Smearing width in Hartree.
-    pub width: f64,
-    /// Electron temperature kT in Hartree.
+    /// Smearing width.  CASTEP default: 0.1 eV.
+    #[builder(default)]
+    pub width: SmearingWidth,
+    /// Electron temperature kT in Hartree (internal unit, no unit marker).
+    #[builder(default = 0.1 * crate::energy::EV_TO_HARTREE)]
     pub electron_temperature: f64,
-    /// Smearing scheme (default: Gaussian).
+    /// Smearing scheme (CASTEP default: Gaussian).
+    #[builder(default)]
     pub scheme: SmearingScheme,
-    /// CASTEP spin_fix: number of iterations with fixed per-spin Fermi energy.
-    /// Default: 10. 0 = always free, <0 = never free.
+    /// CASTEP spin_fix: SCF cycle (1-based) at which spin is freed.
+    /// CASTEP default: 10 (parameters.f90:1778).
+    /// CASTEP frees at scf_cycle == spin_fix (1-based); our 0-based
+    /// scf_iter equivalent is scf_iter >= spin_fix - 1.
+    /// Override per-fixture, e.g. NiO .param has `spin_fix : 6`.
+    #[builder(default = 10i32)]
     pub spin_fix: i32,
 }
 

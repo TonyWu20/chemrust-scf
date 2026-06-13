@@ -1,15 +1,94 @@
 # SCF Spin-Polarised Adversarial Audit Checklist
 
-**Date**: 2026-06-11 / updated 2026-06-12
+**Date**: 2026-06-11 / updated 2026-06-12 / **CRITICAL UPDATE 2026-06-13**
 **Scope**: SCF loop spin-polarisation (13 components), Rust (`scf.rs`, `ffi.rs`, `density.rs`, `energy.rs`, `spin_types.rs`) vs CASTEP 6.11 (`electronic.f90`, `density.f90`, `locpot.f90`, `xc_gga.f90`, `hamiltonian.f90`)
-**Methodology**: Adversarial line-by-line audit; CASTEP profile evidence (NiO `NiO.0001.profile`: 67 SCF × 2 spins = 134 `hamiltonian_diagonalise_ks` calls); CASTEP source read for each component (2026-06-11 workflow). **Update 2026-06-12:** All 13 components implemented (TASK-1 through TASK-16), multi-kpt NiO discriminator test passing.
+**Methodology**: Adversarial line-by-line audit; CASTEP profile evidence (NiO `NiO.0001.profile`: 67 SCF x 2 spins = 134 `hamiltonian_diagonalise_ks` calls); CASTEP source read for each component (2026-06-11 workflow). **Update 2026-06-12:** All 13 components implemented (TASK-1 through TASK-16), multi-kpt NiO discriminator test passing. **Update 2026-06-13:** Post-mortem analysis after cold-start divergence discovery at iter 16; reclassification of warm-start-only verifications.
 
-**Pre-populated from adversarial audit (2026-06-11 workflow: `wf_10b795ec-dbd`):**
-- CLAIM-1 (density storage): PARTIALLY CORRECT — CASTEP stores `den%charge(:)` + `den%spin(:)` as separate 1D arrays, not `density(:,:,ns)` — **resolved: PerSpinDensity stores ρ_up + ρ_down, derives ρ_total and ρ_spin**
-- CLAIM-6 (occupation search): PARTIALLY CORRECT — `fermi_free` uses ONE shared Fermi energy, NOT per-spin independent — **confirmed by implementation**
-- CLAIM-9 (USPP augmentation): PARTIALLY CORRECT — `Q_nm` is spin-independent but `rho_ij` carries spin dimension → augmentation IS spin-dependent — **confirmed; augmentation is per-spin, stored in PerSpinAugDensity**
+## 0. Post-Mortem: Cold-Start Divergence at Iter 16
 
----
+### 0.1 Symptom
+
+- **NiO spin-polarised FFI cold-start** diverges at SCF iteration 16 (commit `69b3bc4`).
+- **NiO non-spin FFI cold-start** converges in 10 iterations (commit `e4e02f9`).
+- **NiO spin-polarised warm-start** (converged density + wavefunctions from CASTEP) passes all discriminator criteria V1-V7 (TASK-16).
+- **NiO spin-polarised 2-iteration cascade check** (`nio_two_iter_cascade_check`) passes (commit `851a31b`).
+
+The divergence is specific to **cold-start spin-polarised multi-iteration SCF**: the warm-start test (1 iteration from converged density) and cascade check (2 iterations from converged density) both pass, but the cold-start path fails at iteration 16 because intermediate SCF states differ from converged states in ways the warm-start discriminator never exercises.
+
+### 0.2 Why Warm-Start Tests Are Insufficient
+
+The warm-start test loads a converged CASTEP density and wavefunctions, runs ONE SCF iteration, and then asserts eigenvalues, energy, and Fermi energies match reference values. This establishes that the **single-iteration operator action H[ρ_converged] produces correct eigenvalues**. It does NOT test:
+
+1. **Iterative stability**: Do eigenvalues remain bounded across 15+ cold-start iterations?
+2. **Occupation search accuracy**: Is the `spin_fixed`→`spin_freed` transition correctly placed for the current SCF state?
+3. **Spin density mixing fidelity**: Does the per-spin mixing reproduce CASTEP's spin density trajectory when starting from paramagnetic guess?
+4. **Density-potential self-consistency drift**: Do small errors in density construction compound across iterations?
+
+Previous bugs masked by warm-start-only tests (per failure-patterns.md):
+- **Beta-g layout transposition** (2026-06-10): row-major/column-major mismatch scaled with residual magnitude ~1e-6 for warm-start, ~1 Ha for cold-start.
+- **V_eff cache staleness** (2026-06-13): fine-grid V_eff max dominated by frozen cores, cache reuse always true, cold-start solved with stale V_eff after iter 1.
+
+**Lesson**: Every spin-polarised checklist item currently marked FIXED with only warm-start evidence is **WARM-START-VERIFIED**, not FIXED. Cold-start multi-iteration evidence is required for full reclassification.
+
+### 0.3 Reclassification of Checklist Statuses
+
+| Component | Old Status | New Status | Why |
+|-----------|-----------|------------|-----|
+| C1 (ScfIteration fields) | FIXED | **WARM-START-VERIFIED** | Field types compile and single-iteration test passes. No multi-iteration cold-start evidence. |
+| C2 (into_phase copy) | FIXED | **WARM-START-VERIFIED** | Compiler-enforced type safety. Field copy correctness across 15+ iterations not tested beyond `nio_two_iter_cascade_check` (2 iterations). |
+| C3 (diagonalize_inner spin loop) | FIXED | **WARM-START-VERIFIED** | Spin+kpt nested loop matches CASTEP structure. But VNL D-matrix recomputation per (spin,kpt) — correctness of per-iteration VNL data across cold-start not verified (see S1 cross-check). |
+| C4 (BuildVEff paramagnetic) | FIXED | **WARM-START-VERIFIED** | Zero-spin fallback correct for iter-0. After iter-1, density has spin → BuildVEffWithEnergy path exercised. The paramagnetic path is iter-0 only; multi-iteration correctness depends on C5. |
+| C5 (BuildVEffWithEnergy) | FIXED | **WARM-START-VERIFIED** | Warm-start V1-V2 pass. Cold-start V_eff assembly from non-converged density not tested beyond 2 iterations. |
+| C6 (density construction) | FIXED | **WARM-START-VERIFIED** | Per-spin, per-kpt construction compiles and single-iter V1 passes. Cold-start per-spin density from cold-start eigenvalues not tested beyond 2 iterations. |
+| C7 (construct_density_*) | FIXED | **WARM-START-VERIFIED** | Type changes correct. Manual struct copies in kerker/pulay paths are maintenance risk (D5). |
+| C8 (mix) | FIXED | **DIVERGE (C8-S3 DEFERRED)** | Per-spin mixing loop correct. BUT `spin_density_mixing_amplitude=2.0` from NiO `.param` is NOT implemented (C8-S3 DEFERRED). Spin density mixed with same amplitude as charge density. Over 16 cold-start iterations, different mixing amplitude → different spin density trajectory → divergence. **This is a candidate root cause.** |
+| C9 (check/energy) | FIXED | **WARM-START-VERIFIED** | Energy formula correct for warm-start. Cold-start energy tracking and convergence window across 16 iterations not tested. |
+| C10 (occupation search) | FIXED | **WARM-START-VERIFIED** | fermi_fix/fermi_free distinction correct for single-iter warm-start. Cold-start `spin_fix` value may not match NiO fixture's runtime value (5). Default `SmearingParams.spin_fix=10` in test code vs CASTEP runtime `spin_fix=5` from profile. For iterations 6-10, wrong occupation strategy used. **Candidate root cause.** |
+| C11 (FFI init) | FIXED | **WARM-START-VERIFIED** | nspins parameter correct. Per-spin V_eff cache works for warm-start (single spin per call). Cold-start verifies 32 calls (16 iter x 2 spins) — V_eff change detection per-spin, cache_reuse=false. |
+| C12 (FFI step) | FIXED | **WARM-START-VERIFIED** | ispin parameter correct. Per-spin cache indexing verified for single call. Multi-iteration cache correctness not tested beyond warm-start. |
+| C13 (run_scf bounds) | FIXED | **WARM-START-VERIFIED** | SpinCollinear trait impls compile. Not exercised in FFI cold-start path (CASTEP drives the SCF loop, Rust only sees diagonalize calls). |
+
+### 0.4 New Status: WARM-START-VERIFIED
+
+A new status tier between FIXED and DEFERRED:
+
+- **FIXED**: Verified against CASTEP source AND confirmed correct in multi-iteration cold-start SCF (or proven invariant across cold-start states).
+- **WARM-START-VERIFIED**: Verified against CASTEP source AND confirmed correct in single-iteration warm-start from converged state. Multi-iteration cold-start behavior **not yet tested**. At risk of being correct for the converged state but wrong for intermediate states.
+- **DIVERGE**: Known difference from CASTEP. Needs implementation.
+- **DEFERRED**: Planned but not blocking.
+- **MISSING**: Entire component absent.
+
+### 0.5 Gap Analysis: Missing Components for Multi-Iteration Stability
+
+These components were NOT covered by the original 13-component audit because they only manifest across multiple cold-start iterations:
+
+| ID | Missing Component | CASTEP Source | Why It Matters for Cold-Start |
+|----|-------------------|---------------|-------------------------------|
+| **G1** | Per-spin mixing parameters (amplitude, g-vector) | NiO `.param`: `spin_density_mixing_amplitude=2.0`, `spin_density_mixing_g_vector=1.5` vs charge `mix_charge_amp=0.5` | Mixing spin with charge amplitude (0.5) instead of spin amplitude (2.0) produces 4x slower spin density evolution. Over 16 iterations, this means the spin density is far from its self-consistent value at the iteration where CASTEP's spin density would have converged. Wrong spin density → wrong V_eff_up vs V_eff_dn → wrong eigenvalues → wrong occupations → cascade. |
+| **G2** | `spin_fix` value from `.param` or `.castep_bin` | CASTEP `electronic.f90:516-518`: `if(scf_cycle == spin_fix)` transition | Default `SmearingParams.spin_fix=10` in test code. NiO CPU profile shows `spin_fix=5` at runtime (5 calls to `electronic_find_fermi_fix`). For cold-start, iterations 6-10 use `fermi_fix` in Rust but `fermi_free` in CASTEP. Wrong occupation strategy → wrong electron counts per spin → wrong density. |
+| **G3** | Per-spin density change metric for mixing | CASTEP `dm_mix_density_pulay` — residual norm computed for `charge(:)` and `spin(:)` independently | Our mixing tracks per-spin densities but uses same Pulay history parameters for both channels. Different convergence rates for charge vs spin not accounted for. |
+| **G4** | Multi-kpt OccupationSet | C6 (known simplification, deferred D3) | `OccupationSet` stores only kpt-0 occupations. Across 14 kpts and 16 iterations, lost per-kpt occupancy information means convergence check cannot verify multi-kpt occupation consistency. |
+| **G5** | E_nonCoulomb computation from PseudopotentialSet | `energy.f90:4205`: computed from local PP parts | Currently hardcoded constant. Not a root cause of eigenvalue divergence but means total energy convergence criterion is approximate. |
+| **G6** | Per-iteration diagnostic tracking | N/A (diagnostic) | No tracking of: spin density evolution per SCF iter, V_eff_up vs V_eff_dn max difference per iter, occupation distribution change per iter, band energy per spin per iter. Without these, divergence at iter 16 cannot be characterized beyond "it diverges." |
+
+### 0.6 New Verification Criteria for Multi-Iteration Stability
+
+Add to Section 9 (Verification Matrix):
+
+| # | Criterion | Fixture Anchor | Tolerance | Why This Tests Cold-Start |
+|---|-----------|---------------|-----------|---------------------------|
+| **V11** | 16-iteration cold-start eigenvalues remain bounded | NiO CPU reference: band range [-1.0, +0.2] Ha | max eigenvalue > -10 Ha, min eigenvalue < +5 Ha | Catches eigenvalue explosion/divergence before it's catastrophic |
+| **V12** | Spin density trajectory over 6-16 iters matches CASTEP | CASTEP per-SCF-iter spin density dumps (F8 format) | RMS residual < 0.1 e-/Bohr^3 after spin_freed transition | Verifies mixing amplitude correctness |
+| **V13** | Occupation sums N_up + N_dn = N_total at every iter | CASTEP constraint: N_total = 64 for NiO | |N_up + N_down - 64| < 1e-6 | Catches Fermi search bugs that lose electrons |
+| **V14** | `spin_freed` flag matches CASTEP transition point | NiO profile: 5 `fermi_fix` calls → `spin_fix=5` | Exact match of transition iteration | Catches wrong spin_fix value |
+| **V15** | Per-spin band energy drift per iteration < 0.5 Ha for first 10 iters | CASTEP energy trajectory from cold-start | Monotonically decreasing after iter 5 | Catches V_eff assembly accumulation errors |
+| **V16** | No "no empty bands" warning | CASTEP behavior: empty bands exist at all iters | Warning count = 0 | This warning is the immediate precursor to divergence (per NiO failure pattern) |
+
+### 0.7 Correction of Claims
+
+Nothing in the original checklist is WRONG in an absolute sense — the claims describe verified code structure, CASTEP-faithful algorithms, and passing warm-start tests. The **reclassification** to WARM-START-VERIFIED reflects the gap between structural correctness and cold-start multi-iteration correctness, not an error in the original audit.
+
+**Correction**: The original checklist (line 351) states "All 16 tasks (TASK-1 through TASK-16) implemented. NiO warm-start discriminator test passes all V1-V6 criteria." This is true. The statement is NOT equivalent to "cold-start spin-polarised SCF converges," and the original checklist does not claim convergence. The reclassification makes this distinction explicit.
 
 ## Fix History
 
@@ -27,6 +106,9 @@
 | 2026-06-12 | **E_nonCoulomb correction identified** | C5-S5 (new) | CASTEP `energy.f90:4205` adds a constant `E_nonCoulomb` term from pseudopotential local parts. For NiO: +533.14 eV. Our `ewald_energy()` does not include this. Added as constant `E_NON_COULOMB_HA` in the discriminator test. TODO: compute from `PseudopotentialSet` in `chemrust-hamiltonian-core`. |
 | 2026-06-12 | **Kpt weights from .castep_bin** | C6 (supplemental) | For multi-kpt systems, kpt weights must come from `.castep_bin` (`CastepBin.kpoint_weights`) rather than parsed from `.bands` (which lacks weight data). The `.castep_bin` file stores weights in the `KpointWeights` record. Confirmed against NiO fixture: 14 kpts with standard Monkhorst-Pack weights. |
 | 2026-06-12 | **OccupationSet stores only kpt-0** | C6 (known simplification) | `OccupationSet` currently stores `occupations_all_kpts[0].clone()` — only the first k-point's occupations. This is a known simplification: the actual multi-kpt weighted occupations are used correctly in density construction (lines 1337-1358 of `scf.rs`), but the stored `OccupationSet` loses per-kpt information. Deferred: per-kpt `OccupationSet` generalisation. |
+| 2026-06-13 | **V_eff GPU cache disabled (cold-start divergence fix, non-spin)** | ffI.rs:489 | `cache_reuse = false` permanently. Fixes V_eff cache staleness from frozen-core-dominated fine-grid max check. Non-spin FFI cold-start now converges (10 iters, -7160.23 eV). Applied to both spin channels. |
+| 2026-06-13 | **D-screening fine-grid fix (cold-start divergence fix, non-spin)** | ffI.rs:434-543 | D-matrix screening now uses fine-grid V_eff + fine-grid Q(G) matching CASTEP `nlpot_calculate_d` (nlpot.f90:352). Previously used wave-grid V_eff + wave-grid Q(G). Fix applied to all spin channels. |
+| 2026-06-13 | **Pipeline unification: spin-polarised cold-start fix** | src/pipeline.rs | Created shared pipeline functions (`v_eff_prepare`, `kpt_gpu_upload`, `run_davidson`). Both FFI and standalone SCF paths now use fine-grid `rescreen_d` for D-matrix screening. Spin-polarised FFI cold-start converges (20 iters, ΔE = 2.08e-5 Ha vs CPU). |
 
 ---
 
@@ -34,213 +116,161 @@
 
 | # | Component | CASTEP Source | Rust Source | Status | Severity Spread |
 |---|-----------|---------------|-------------|--------|-----------------|
-| 1 | `ScfIteration` struct — per-spin fields | `electronic.f90:483-532` (wvfn, eigenvalues, density types) | `scf.rs:106-180`, `spin_types.rs` | **FIXED** — TASK-1,2,3 | ~~1× CRITICAL~~, ~~6× HIGH~~ |
-| 2 | `into_phase()` — state transition copy | — (architectural) | `scf.rs:284-321` | **FIXED** — TASK-4 | ~~6× HIGH~~ |
-| 3 | Spin loop in `diagonalize_inner` | `electronic.f90:488-495` | `scf.rs:750-1016` | **FIXED** — TASK-6, multi-kpt | ~~1× CRITICAL~~, ~~3× HIGH~~ |
-| 4 | `BuildVEff` for `SpinCollinear` (paramagnetic) | `locpot.f90:301` (V_eff per-spin assembly) | `scf.rs:369-391` | **FIXED** — TASK-5 | ~~2× HIGH~~ |
-| 5 | `BuildVEffWithEnergy` for `SpinCollinear` | `electronic_prepare_H` → `locpot_calculate` | `scf.rs:456-567` | **FIXED** — TASK-9,10 | ~~1× CRITICAL~~, ~~3× HIGH~~ |
-| 6 | `compute_density_from_wavefunctions` | `density.f90:2126-2195` (per-spin loop → charge+spin) | `scf.rs:1219-1484` | **FIXED** — TASK-7,13 | ~~1× CRITICAL~~, ~~3× HIGH~~ |
-| 7 | `construct_density_off/kerker/pulay` | density mixing pipeline | `scf.rs:1488-1591` | **FIXED** — TASK-7 | ~~3× MEDIUM~~ |
-| 8 | `mix()` — density mixing | `dm_mix_density` | `scf.rs:1597-1770` | **FIXED** — TASK-8 | ~~2× MEDIUM~~ |
-| 9 | `check()` — convergence | `electronic_check_occupancies` | `scf.rs:1780-2010` | **FIXED** — TASK-7, multi-kpt energy | ~~2× MEDIUM~~ |
-| 10 | Occupation search (`compute_occupations`) | `electronic.f90:8602-9209` (fermi_fix + fermi_free) | `density.rs` | **FIXED** — TASK-11,12 | ~~1× CRITICAL~~, ~~4× HIGH~~ |
-| 11 | FFI `chemrust_eigensolve_init` | `chemrust_eigensolve.f90` | `ffi.rs` | **FIXED** — TASK-14 | ~~1× HIGH~~, ~~2× MEDIUM~~ |
-| 12 | FFI `chemrust_eigensolve_step` | `electronic.f90:511-529` | `ffi.rs` | **FIXED** — TASK-15 | ~~1× HIGH~~, ~~2× MEDIUM~~ |
-| 13 | `run_scf` / `run_scf_with_energy` | `electronic_minimisation` | `scf.rs:1548-1656` | **FIXED** — TASK-10 | ~~1× HIGH~~, ~~1× MEDIUM~~ |
+| 1 | `ScfIteration` struct — per-spin fields | `electronic.f90:483-532` (wvfn, eigenvalues, density types) | `scf.rs:106-180`, `spin_types.rs` | **WARM-START-VERIFIED** (was FIXED) | ~~1x CRITICAL~~, ~~6x HIGH~~ |
+| 2 | `into_phase()` — state transition copy | — (architectural) | `scf.rs:284-321` | **WARM-START-VERIFIED** (was FIXED) | ~~6x HIGH~~ |
+| 3 | Spin loop in `diagonalize_inner` | `electronic.f90:488-495` | `scf.rs:750-1016` | **WARM-START-VERIFIED** (was FIXED) | ~~1x CRITICAL~~, ~~3x HIGH~~ |
+| 4 | `BuildVEff` for `SpinCollinear` (paramagnetic) | `locpot.f90:301` (V_eff per-spin assembly) | `scf.rs:369-391` | **WARM-START-VERIFIED** (was FIXED) | ~~2x HIGH~~ |
+| 5 | `BuildVEffWithEnergy` for `SpinCollinear` | `electronic_prepare_H` → `locpot_calculate` | `scf.rs:456-567` | **WARM-START-VERIFIED** (was FIXED) | ~~1x CRITICAL~~, ~~3x HIGH~~ |
+| 6 | `compute_density_from_wavefunctions` | `density.f90:2126-2195` (per-spin loop → charge+spin) | `scf.rs:1219-1484` | **WARM-START-VERIFIED** (was FIXED) | ~~1x CRITICAL~~, ~~3x HIGH~~ |
+| 7 | `construct_density_off/kerker/pulay` | density mixing pipeline | `scf.rs:1488-1591` | **WARM-START-VERIFIED** (was FIXED) | ~~3x MEDIUM~~ |
+| 8 | `mix()` — density mixing | `dm_mix_density` | `scf.rs:1597-1770` | **DIVERGE — C8-S3: spin_density_mixing_amplitude not implemented** | ~~2x MEDIUM~~ |
+| 9 | `check()` — convergence | `electronic_check_occupancies` | `scf.rs:1780-2010` | **WARM-START-VERIFIED** (was FIXED) | ~~2x MEDIUM~~ |
+| 10 | Occupation search (`compute_occupations`) | `electronic.f90:8602-9209` (fermi_fix + fermi_free) | `density.rs` | **WARM-START-VERIFIED** (was FIXED) | ~~1x CRITICAL~~, ~~4x HIGH~~ |
+| 11 | FFI `chemrust_eigensolve_init` | `chemrust_eigensolve.f90` | `ffi.rs` | **WARM-START-VERIFIED** (was FIXED) | ~~1x HIGH~~, ~~2x MEDIUM~~ |
+| 12 | FFI `chemrust_eigensolve_step` | `electronic.f90:511-529` | `ffi.rs` | **WARM-START-VERIFIED** (was FIXED) | ~~1x HIGH~~, ~~2x MEDIUM~~ |
+| 13 | `run_scf` / `run_scf_with_energy` | `electronic_minimisation` | `scf.rs:1548-1656` | **WARM-START-VERIFIED** (was FIXED) | ~~1x HIGH~~, ~~1x MEDIUM~~ |
 
 ### Status Counts
 
 | Status | Count |
 |--------|-------|
 | **MATCH** (no significant differences) | 0 |
-| **DIVERGE** (differences requiring implementation) | 0 (all resolved) |
+| **DIVERGE** (differences requiring implementation) | 1 (C8: spin_density_mixing_amplitude) |
 | **MISSING** (entire component absent) | 0 |
-| **FIXED** | 13 |
+| **WARM-START-VERIFIED** | 12 |
+| **FIXED** (multi-iteration verified) | 0 |
 
 ### Severity Counts
 
 | Severity | Count |
 |----------|-------|
-| **CRITICAL** (wrong physics if not addressed) | 0 (all 5 fixed) |
-| **HIGH** (functional gap, blocks spin support) | 0 (all 32 fixed) |
-| **MEDIUM** (observable effect, edge cases) | 0 (all 13 fixed) |
+| **CRITICAL** (wrong physics if not addressed) | 0 (all 5 mitigated in warm-start, unverified in cold-start) |
+| **HIGH** (functional gap, blocks spin support) | 0 (all 32 mitigated in warm-start, unverified in cold-start) |
+| **MEDIUM** (observable effect, edge cases) | 1 (C8-S3: spin density mixing amplitude — active divergence contributor) |
 | **LOW** (diagnostic, cosmetic, or verified benign) | 1 (C13-S3: `scf_iter` already existed, no change needed) |
 
 ---
 
 ## 2. Surviving Differences — Detailed Analysis
 
-### Component 1: `ScfIteration` Struct — Per-Spin Fields (**FIXED 2026-06-11 — TASK-1,2,3**)
+### Component 1: `ScfIteration` Struct — Per-Spin Fields (**WARM-START-VERIFIED**)
 
 | ID | Description | CASTEP | Rust Line | Severity | Root Cause |
 |----|-------------|--------|-----------|----------|------------|
-| C1-S1 | `density: Density` — single-spin, no `PerSpinDensity` → `density: PerSpinDensity` | `density.f90:30-37`: `electron_density` stores `charge(:)` + `spin(:)` separately | `spin_types.rs:70-85` | **FIXED** | `PerSpinDensity` stores `SpinChannelData<Density>` (ρ_up and ρ_down). Derives `total()` = ρ_up + ρ_down, `spin()` = ρ_up − ρ_down. |
-| C1-S2 | `psi: WavefunctionSet<ColumnDistributed>` — single channel → `psi: PerSpinPwCoefficients` | `electronic.f90:492`: `wvfn%coeffs(:,:,nk,ns)` — spin is outermost dimension | `scf.rs:135` | **FIXED** | `PerSpinPwCoefficients(SpinChannelData<KptDataSet<PwCoefficients>>)`. Per-spin, per-kpt GPU-resident wavefunctions. |
-| C1-S3 | `eigenvalues: Vec<f64>` — single channel → `eigenvalues: PerSpinEigenvalues` | `electronic.f90:492`: `eigenvalues(:,nk,ns)` — spin is outermost dimension | `scf.rs:139` | **FIXED** | `PerSpinEigenvalues(SpinChannelData<KptDataSet<Vec<f64>>>)`. Per-spin, per-kpt eigenvalues. |
-| C1-S4 | `previous_density: Density` — single-track → `previous_density: PerSpinDensity` | — | `scf.rs:144` | **FIXED** | `PerSpinDensity` stores per-spin previous densities for mixing history. |
-| C1-S5 | `beta_psi_per_ion: Option<Vec<...>>` — single channel → `beta_psi_per_ion: PerSpinBetaProjections` | `ion.f90:7544-7577`: per-spin β·ψ projections | `scf.rs:175` | **FIXED** | `PerSpinBetaProjections(SpinChannelData<KptDataSet<Option<Vec<CudaSlice<CudaComplex>>>>>)`. |
-| C1-S6 | `density_aug_fine: Option<RealGrid<f64>>` — single channel → `density_aug_fine: PerSpinAugDensity` | `density.f90:1121-1149`: separate `Q_rho_sum` + `Q_rho_sum_sp` | `scf.rs:185` | **FIXED** | `PerSpinAugDensity(SpinChannelData<Vec<Option<RealGrid>>>)` stores per-spin augmentation on fine grid. |
-| C1-S7 | `fermi_energy: Option<f64>` — single value → `fermi_energy: FermiEnergies` | `electronic.f90:9180`: `fermi_energy(2) = fermi_energy(1)` — per-spin array | `scf.rs:168` | **FIXED** | `FermiEnergies(Vec<f64>)` — per-spin Fermi energies. Initialised to `[0.0; nspins]`. |
+| C1-S1 | `density: Density` — single-spin, no `PerSpinDensity` → `density: PerSpinDensity` | `density.f90:30-37`: `electron_density` stores `charge(:)` + `spin(:)` separately | `spin_types.rs:70-85` | **WARM-START-VERIFIED** | `PerSpinDensity` stores `SpinChannelData<Density>` (ρ_up and ρ_down). Derives `total()` = ρ_up + ρ_down, `spin()` = ρ_up − ρ_down. |
+| C1-S2 | `psi: WavefunctionSet<ColumnDistributed>` — single channel → `psi: PerSpinPwCoefficients` | `electronic.f90:492`: `wvfn%coeffs(:,:,nk,ns)` — spin is outermost dimension | `scf.rs:135` | **WARM-START-VERIFIED** | `PerSpinPwCoefficients(SpinChannelData<KptDataSet<PwCoefficients>>)`. Per-spin, per-kpt GPU-resident wavefunctions. |
+| C1-S3 | `eigenvalues: Vec<f64>` — single channel → `eigenvalues: PerSpinEigenvalues` | `electronic.f90:492`: `eigenvalues(:,nk,ns)` — spin is outermost dimension | `scf.rs:139` | **WARM-START-VERIFIED** | `PerSpinEigenvalues(SpinChannelData<KptDataSet<Vec<f64>>>)`. Per-spin, per-kpt eigenvalues. |
+| C1-S4 | `previous_density: Density` — single-track → `previous_density: PerSpinDensity` | — | `scf.rs:144` | **WARM-START-VERIFIED** | `PerSpinDensity` stores per-spin previous densities for mixing history. |
+| C1-S5 | `beta_psi_per_ion: Option<Vec<...>>` — single channel → `beta_psi_per_ion: PerSpinBetaProjections` | `ion.f90:7544-7577`: per-spin β·ψ projections | `scf.rs:175` | **WARM-START-VERIFIED** | `PerSpinBetaProjections(SpinChannelData<KptDataSet<Option<Vec<CudaSlice<CudaComplex>>>>>)`. |
+| C1-S6 | `density_aug_fine: Option<RealGrid<f64>>` — single channel → `density_aug_fine: PerSpinAugDensity` | `density.f90:1121-1149`: separate `Q_rho_sum` + `Q_rho_sum_sp` | `scf.rs:185` | **WARM-START-VERIFIED** | `PerSpinAugDensity(SpinChannelData<Vec<Option<RealGrid>>>)` stores per-spin augmentation on fine grid. |
+| C1-S7 | `fermi_energy: Option<f64>` — single value → `fermi_energy: FermiEnergies` | `electronic.f90:9180`: `fermi_energy(2) = fermi_energy(1)` — per-spin array | `scf.rs:168` | **WARM-START-VERIFIED** | `FermiEnergies(Vec<f64>)` — per-spin Fermi energies. Initialised to `[0.0; nspins]`. |
 
-**Root cause analysis**: All 7 fields with spin dimension were wrapped in `SpinChannelData<T>` or replaced with named per-spin newtypes. `KptDataSet<T>` provides per-kpt storage within each spin channel, avoiding `Vec<Vec<T>>` (anti-pattern). See `spin_types.rs` for full definitions. **FIXED by TASK-1 (`spin_types.rs`), TASK-2 (newtype wrappers), TASK-3 (`ScfIteration` field replacement).**
-
----
-
-### Component 2: `into_phase()` — State Transition Copy (**FIXED 2026-06-11 — TASK-4**)
+### Component 2: `into_phase()` — State Transition Copy (**WARM-START-VERIFIED**)
 
 | ID | Description | CASTEP | Rust Line | Severity | Root Cause |
 |----|-------------|--------|-----------|----------|------------|
-| C2-S1 | Field-by-field copy: 6 per-spin fields not copied | — | `scf.rs:272-274,277,286,288` | **HIGH** | `into_phase()` copies 22 fields with struct-literal syntax. After C1-S1 through C1-S6, the field types change (e.g. `Density` → `PerSpinDensity`), but the struct-literal copy syntax is the same — the compiler enforces correctness for type changes. No explicit copy logic needed. |
-| C2-S2 | `v_eff: Option<S::VEff>` — already generic, no change | — | `scf.rs:275` | **LOW** | `S::VEff` already encodes spin-channel potentials via `SpinPolicy`. For `SpinCollinear`, `VEff = (EffectivePotential, EffectivePotential)`. No change needed. |
+| C2-S1 | Field-by-field copy: 6 per-spin fields not copied | — | `scf.rs:272-274,277,286,288` | **WARM-START-VERIFIED** | `into_phase()` copies 22 fields with struct-literal syntax. Compiler enforces correctness for type changes. |
+| C2-S2 | `v_eff: Option<S::VEff>` — already generic, no change | — | `scf.rs:275` | **LOW** | `S::VEff` already encodes spin-channel potentials via `SpinPolicy`. |
 | C2-S3 | Non-mutable fields unchanged | — | `scf.rs:263-271` | **LOW** | `cell`, `pots`, `wave_grid`, `fine_grid`, `k_point`, `smearing`, `pw_coords`, `pw_fft_indices` — geometry-static, no spin dimension. |
 
-**Root cause analysis**: `into_phase()` is structurally correct — it copies all fields with struct-literal syntax. The compiler enforces correctness: `SpinChannelData<T>` vs `T` are different types; no silent coercion. `into_phase()` updated with all new field types (line 284-321 of `scf.rs`). **FIXED — TASK-4: compiler-driven field copy update.**
-
----
-
-### Component 3: Spin Loop in `diagonalize_inner` (**FIXED 2026-06-11/12 — TASK-6, multi-kpt**)
+### Component 3: Spin Loop in `diagonalize_inner` (**WARM-START-VERIFIED**)
 
 | ID | Description | CASTEP | Rust Line | Severity | Root Cause |
 |----|-------------|--------|-----------|----------|------------|
-| C3-S1 | **Hardcoded spin index 0**: `S::v_eff_for_spin(v_eff_ref, 0)` → `for ispin in 0..nspins` | `electronic.f90:488`: `do ns=1,wvfn%nspins` | `scf.rs:750` | **FIXED** | Spin outer + kpt inner nested loop matches CASTEP `electronic.f90:488-495` exactly. |
-| C3-S2 | Single `psi` upload to GPU → per-spin-per-kpt psi upload | `electronic.f90:492`: per-spin slice `coeffs(:,:,nk,ns)` | `scf.rs:859-864` | **FIXED** | `psi_cpu[ispin][ikpt]` uploaded separately for each (spin, kpt). |
-| C3-S3 | Single eigenvalue output → `PerSpinEigenvalues` per-spin per-kpt | `electronic.f90:492`: per-spin `eigenvalues(:,nk,ns)` | `scf.rs:1001-1003` | **FIXED** | `next.eigenvalues[ispin] = KptDataSet::new(spin_eig_kpts, nkpts)`. |
-| C3-S4 | VNL data precomputed once (not per-spin) → per-(spin,kpt) inside nested loop | `hamiltonian.f90:1013`: `nlpot_prepare_precon` receives `nk, ns` | `scf.rs:848-856` | **FIXED** | `VnlBatchData::precompute_with_d_override()` called per (spin, kpt) with `&v_eff_for_d` (per-spin). |
-| C3-S5 | Single `beta_psi_gpu` output → per-spin-per-kpt via `KptDataSet` | Per-ion β·ψ differs per spin | `scf.rs:903-924,1005` | **FIXED** | Beta-psi recomputed per (spin, kpt), stored in `PerSpinBetaProjections`. |
+| C3-S1 | **Hardcoded spin index 0**: `S::v_eff_for_spin(v_eff_ref, 0)` → `for ispin in 0..nspins` | `electronic.f90:488`: `do ns=1,wvfn%nspins` | `scf.rs:750` | **WARM-START-VERIFIED** | Spin outer + kpt inner nested loop matches CASTEP `electronic.f90:488-495` exactly. |
+| C3-S2 | Single `psi` upload to GPU → per-spin-per-kpt psi upload | `electronic.f90:492`: per-spin slice `coeffs(:,:,nk,ns)` | `scf.rs:859-864` | **WARM-START-VERIFIED** | `psi_cpu[ispin][ikpt]` uploaded separately for each (spin, kpt). |
+| C3-S3 | Single eigenvalue output → `PerSpinEigenvalues` per-spin per-kpt | `electronic.f90:492`: per-spin `eigenvalues(:,nk,ns)` | `scf.rs:1001-1003` | **WARM-START-VERIFIED** | `next.eigenvalues[ispin] = KptDataSet::new(spin_eig_kpts, nkpts)`. |
+| C3-S4 | VNL data precomputed once (not per-spin) → per-(spin,kpt) inside nested loop | `hamiltonian.f90:1013`: `nlpot_prepare_precon` receives `nk, ns` | `scf.rs:848-856` | **WARM-START-VERIFIED** | `VnlBatchData::precompute_with_d_override()` called per (spin, kpt) with `&v_eff_for_d` (per-spin). |
+| C3-S5 | Single `beta_psi_gpu` output → per-spin-per-kpt via `KptDataSet` | Per-ion β·ψ differs per spin | `scf.rs:903-924,1005` | **WARM-START-VERIFIED** | Beta-psi recomputed per (spin, kpt), stored in `PerSpinBetaProjections`. |
 
-**Root cause analysis**: The entire `diagonalize_inner` body (V_eff extraction through Davidson call through D2H and β·ψ recomputation) is wrapped in `for ispin in 0..nspins` (outer) with `for ikpt in 0..nkpts` (inner). VNL data now recomputed per (spin, kpt) — CASTEP `hamiltonian.f90:1013` passes `nk, ns` as explicit parameters because D-matrix screening uses `∫Q·V_eff` which differs per spin channel. GPU context, FFT plan, and TPA preconditioner created once outside both loops. V_eff downsampled and uploaded per-spin (once per spin, shared across kpts). **FIXED — TASK-6: spin+kpt nested loop matching CASTEP electronic.f90:488-495.**
-
----
-
-### Component 4: `BuildVEff` for `SpinCollinear` (Paramagnetic Guess) (**FIXED 2026-06-11 — TASK-5**)
+### Component 4: `BuildVEff` for `SpinCollinear` (Paramagnetic Guess) (**WARM-START-VERIFIED**)
 
 | ID | Description | CASTEP | Rust Line | Severity | Root Cause |
 |----|-------------|--------|-----------|----------|------------|
-| C4-S1 | Zero spin density paramagnetic guess → zero_spin fallback implemented | `locpot.f90:278`: xc_calculate_potential receives `rho` + `sprho` from density | `scf.rs:376-387` | **FIXED** | `build_v_eff_impl` for `SpinCollinear` accepts `spin: Option<&Density>`. When `None` (iter-0 guess), creates zero spin density as fallback. |
-| C4-S2 | `assemble_on_fine_grid` with `&zero_spin` — no energy return | `electronic_prepare_H` returns energy via `pot_calc_energy_real` | `scf.rs:347-348` | **FIXED** | Energy from `build_v_eff_with_energy` (Component 5). `build_v_eff` (no-energy) is a separate path. |
-| C4-S3 | Return type `(EffectivePotential, EffectivePotential)` — not newtyped | `pot.f90:76`: `real_fine_pot(:,ns)` — 2D array indexed by spin | `scf.rs:375` | **LOW** | Tuple return is valid Rust encoding. `SpinPolicy::VEff` associated type handles per-spin dispatch. |
+| C4-S1 | Zero spin density paramagnetic guess → zero_spin fallback implemented | `locpot.f90:278`: xc_calculate_potential receives `rho` + `sprho` from density | `scf.rs:376-387` | **WARM-START-VERIFIED** | `build_v_eff_impl` for `SpinCollinear` accepts `spin: Option<&Density>`. When `None` (iter-0 guess), creates zero spin density as fallback. |
+| C4-S2 | `assemble_on_fine_grid` with `&zero_spin` — no energy return | `electronic_prepare_H` returns energy via `pot_calc_energy_real` | `scf.rs:347-348` | **WARM-START-VERIFIED** | Energy from `build_v_eff_with_energy` (Component 5). |
+| C4-S3 | Return type `(EffectivePotential, EffectivePotential)` — not newtyped | `pot.f90:76`: `real_fine_pot(:,ns)` — 2D array indexed by spin | `scf.rs:375` | **LOW** | Tuple return is valid Rust encoding. |
 
-**Root cause analysis**: The paramagnetic guess is correct for the initial SCF iteration. CASTEP itself starts with a paramagnetic guess (zero spin density) and only develops spin polarisation through the SCF cycle. `build_v_eff_impl` for `SpinCollinear` now accepts `spin: Option<&Density>` with zero fallback. **FIXED — TASK-5: SpinCollinear BuildVEff impl.**
-
----
-
-### Component 5: `BuildVEffWithEnergy` for `SpinCollinear` — **FIXED 2026-06-11 (TASK-9,10)**
+### Component 5: `BuildVEffWithEnergy` for `SpinCollinear` — **WARM-START-VERIFIED**
 
 | ID | Description | CASTEP | Rust Line | Severity | Root Cause |
 |----|-------------|--------|-----------|----------|------------|
-| C5-S1 | **No `BuildVEffWithEnergy` impl for `SpinCollinear`** → implemented | `electronic_prepare_H` → `locpot_calculate`: assembles V_eff from ρ_total + ρ_spin, computes E_H + E_xc | `scf.rs:456-567` | **FIXED** | Full implementation: upsample both ρ_total and ρ_spin to fine grid, add augmentation, assemble V_eff via `VEffBuilder::<SpinCollinear>::with_density()`, compute E_H, E_xc, ρV_xc. |
-| C5-S2 | Energy integral convention: `1/N_grid` vs `Ω/N_grid` | `xc.f90:565`: `1/n_grid` convention | `scf.rs:541-542` | **FIXED** | `d_v = 1.0 / n_grid` — matches CASTEP convention for all energy integrals. |
-| C5-S3 | XC energy: `compute_pbe_xc_spin` vs `compute_pbe_xc` | `xc.f90:516-523`: spin-dependent XC evaluation | `scf.rs:532-537` | **FIXED** | Calls `compute_pbe_xc_spin(rho_total_core, rho_spin_fine, ...)` returning `PbeXcSpinResult { v_xc_up, v_xc_dn, energy }`. |
-| C5-S4 | `∫ρV_xc = Σ(ρ_up·V_xc_up + ρ_down·V_xc_dn) / N_grid` | CASTEP `pot_calc_energy_real`: per-spin ∫ρV_xc sum | `scf.rs:556-563` | **FIXED** | Two-channel sum implemented. Not `rho_total * vxc_avg` — correct per-spin formula. |
-| C5-S5 | Upstream change needed in chemrust-hamiltonian-core | `Built::assemble()` returns `(V_up, V_dn)` only, no energy | `band_structure.rs:406-431` | **DEFERRED** | SCF layer calls `compute_pbe_xc_spin` directly (matching NonSpin path). XC called once for potential (`assemble()`) and once for energy — deferred optimisation. |
+| C5-S1 | **No `BuildVEffWithEnergy` impl for `SpinCollinear`** → implemented | `electronic_prepare_H` → `locpot_calculate`: assembles V_eff from ρ_total + ρ_spin, computes E_H + E_xc | `scf.rs:456-567` | **WARM-START-VERIFIED** | Full implementation: upsample both ρ_total and ρ_spin to fine grid, add augmentation, assemble V_eff via `VEffBuilder::<SpinCollinear>::with_density()`, compute E_H, E_xc, ρV_xc. |
+| C5-S2 | Energy integral convention: `1/N_grid` vs `Ω/N_grid` | `xc.f90:565`: `1/n_grid` convention | `scf.rs:541-542` | **WARM-START-VERIFIED** | `d_v = 1.0 / n_grid` — matches CASTEP convention. |
+| C5-S3 | XC energy: `compute_pbe_xc_spin` vs `compute_pbe_xc` | `xc.f90:516-523`: spin-dependent XC evaluation | `scf.rs:532-537` | **WARM-START-VERIFIED** | Calls `compute_pbe_xc_spin(rho_total_core, rho_spin_fine, ...)`. |
+| C5-S4 | `∫ρV_xc = Σ(ρ_up·V_xc_up + ρ_down·V_xc_dn) / N_grid` | CASTEP `pot_calc_energy_real`: per-spin ∫ρV_xc sum | `scf.rs:556-563` | **WARM-START-VERIFIED** | Two-channel sum implemented. |
+| C5-S5 | Upstream change needed in chemrust-hamiltonian-core | `Built::assemble()` returns `(V_up, V_dn)` only, no energy | `band_structure.rs:406-431` | **DEFERRED** | SCF layer calls `compute_pbe_xc_spin` directly (matching NonSpin path). |
 
-**Root cause analysis**: Largest single missing piece is now implemented. `build_v_eff_with_energy_impl` for `SpinCollinear` at `scf.rs:456-567` up samples total + spin density to fine grid, adds augmentation (ρ_aug to total only), assembles V_eff via `VEffBuilder::<SpinCollinear>::with_density(rho_total, Some(rho_spin)).assemble()`, recomputes `compute_pbe_xc_spin` for energy components, and sums per-spin `∫ρV_xc`. Convention: `d_v = 1/N_grid` matching CASTEP `xc_gga`. **FIXED — TASK-9 (impl) + TASK-10 (trait generalisation).**
-
----
-
-### Component 6: `compute_density_from_wavefunctions` (**FIXED 2026-06-11/12 — TASK-7,13**)
+### Component 6: `compute_density_from_wavefunctions` (**WARM-START-VERIFIED**)
 
 | ID | Description | CASTEP | Rust Line | Severity | Root Cause |
 |----|-------------|--------|-----------|----------|------------|
-| C6-S1 | **Single-spin density construction**: `construct_density_gpu()` called once → per-spin loop with kpt-weighted accumulation | `density.f90:2126-2164`: per-spin loop `do ns=1,nspins`; also multi-kpt weighted sum at `density.f90:2179-2187` | `scf.rs:1315-1476` | **FIXED** | Per-spin loop: `for ispin in 0..nspins` with inner `for ikpt in 0..nkpts`. Each (spin,kpt) density weighted by `w_k` and accumulated. |
-| C6-S2 | Single `Density` return — no `PerSpinDensity` → returns `(PerSpinDensity, PerSpinAugDensity, OccupationSet, FermiEnergies)` | `density.f90:2179-2187`: `den%charge = up+down`, `den%spin = up−down` | `scf.rs:1478-1481` | **FIXED** | `PerSpinDensity(SpinChannelData::<S>(densities))` wraps per-spin densities. `total()` and `spin()` derive from stored ρ_up/ρ_dn. |
-| C6-S3 | Single-channel occupation search → per-spin with spin_freed transition | `electronic.f90:488-495`: per-spin eigenvalues → per-spin occupations | `scf.rs:1288-1330` | **FIXED** | `spin_freed_occs` pre-computed for fermi_free. Per-spin loop uses `compute_occupations_weighted()` with kpt weights. |
-| C6-S4 | Single-channel augmentation → per-spin augmentation density | `ion.f90:7544-7577`: per-spin β·ψ → per-spin rho_ij | `scf.rs:1361-1433` | **FIXED** | Per-spin `beta_psi_per_ion[ispin][ikpt]` used. Augmentation density accumulated with kpt weights. Phase 7 scope: augmentation is spin-independent (Q_nm has no spin dimension), but stored per-spin for future use. |
+| C6-S1 | **Single-spin density construction**: `construct_density_gpu()` called once → per-spin loop with kpt-weighted accumulation | `density.f90:2126-2164`: per-spin loop `do ns=1,nspins`; also multi-kpt weighted sum at `density.f90:2179-2187` | `scf.rs:1315-1476` | **WARM-START-VERIFIED** | Per-spin loop: `for ispin in 0..nspins` with inner `for ikpt in 0..nkpts`. Each (spin,kpt) density weighted by `w_k` and accumulated. |
+| C6-S2 | Single `Density` return — no `PerSpinDensity` → returns `(PerSpinDensity, PerSpinAugDensity, OccupationSet, FermiEnergies)` | `density.f90:2179-2187`: `den%charge = up+down`, `den%spin = up−down` | `scf.rs:1478-1481` | **WARM-START-VERIFIED** | `PerSpinDensity(SpinChannelData::<S>(densities))` wraps per-spin densities. |
+| C6-S3 | Single-channel occupation search → per-spin with spin_freed transition | `electronic.f90:488-495`: per-spin eigenvalues → per-spin occupations | `scf.rs:1288-1330` | **WARM-START-VERIFIED** | `spin_freed_occs` pre-computed for fermi_free. Per-spin loop uses `compute_occupations_weighted()` with kpt weights. |
+| C6-S4 | Single-channel augmentation → per-spin augmentation density | `ion.f90:7544-7577`: per-spin β·ψ → per-spin rho_ij | `scf.rs:1361-1433` | **WARM-START-VERIFIED** | Per-spin `beta_psi_per_ion[ispin][ikpt]` used. Augmentation density accumulated with kpt weights. |
 | C6-S5 | Density convention unchanged | `density.f90:2181-2187`: same convention | `scf.rs:1053` | **LOW** | Convention unchanged — ρ_up and ρ_down stored in raw ρ×Ω units. |
 
-**Root cause analysis**: Density construction now loops per-spin and per-kpt. Each (spin,kpt) density is weighted by `w_k` and accumulated. Occupations computed per-spin with spin_freed transition logic. Augmentation density per-spin with kpt-weighted accumulation. CASTEP `density.f90:2179-2187` formula for combining |ψ_up|² and |ψ_down|² into charge/spin is satisfied by our `PerSpinDensity::total()` and `::spin()` methods. **FIXED — TASK-7 (per-spin density construction) + TASK-13 (multi-kpt accumulation).**
-
----
-
-### Component 7: `construct_density_off/kerker/pulay` (**FIXED 2026-06-11 — TASK-7**)
+### Component 7: `construct_density_off/kerker/pulay` (**WARM-START-VERIFIED**)
 
 | ID | Description | CASTEP | Rust Line | Severity | Root Cause |
 |----|-------------|--------|-----------|----------|------------|
-| C7-S1 | `construct_density_off`: `new_density: Density` → `PerSpinDensity` | `density.f90`: stores both charge and spin | `scf.rs:1491` | **FIXED** | `next.density = new_density` where `new_density: PerSpinDensity`. |
-| C7-S2 | `construct_density_kerker`: same type change | — | `scf.rs:1521` | **FIXED** | Field `density: new_density` in manual struct literal (Kerker uses manual field copy instead of `into_phase()`). |
-| C7-S3 | `construct_density_pulay`: same type change | — | `scf.rs:1567` | **FIXED** | Same as Kerker — manual struct literal with `PerSpinDensity`. |
+| C7-S1 | `construct_density_off`: `new_density: Density` → `PerSpinDensity` | `density.f90`: stores both charge and spin | `scf.rs:1491` | **WARM-START-VERIFIED** | `next.density = new_density` where `new_density: PerSpinDensity`. |
+| C7-S2 | `construct_density_kerker`: same type change | — | `scf.rs:1521` | **WARM-START-VERIFIED** | Field `density: new_density` in manual struct literal. |
+| C7-S3 | `construct_density_pulay`: same type change | — | `scf.rs:1567` | **WARM-START-VERIFIED** | Same as Kerker — manual struct literal with `PerSpinDensity`. |
 
-**Root cause analysis**: Thin wrappers around `compute_density_from_wavefunctions()` with different mixing-phase transitions. Purely mechanical: `Density` → `PerSpinDensity`. Note: `construct_density_kerker` and `construct_density_pulay` use manual struct literal syntax instead of `into_phase()` — this is a maintenance concern (not a bug) because adding fields to `ScfIteration` requires updating these manual copies. **FIXED — TASK-7.**
-
----
-
-### Component 8: `mix()` — Density Mixing (**FIXED 2026-06-11 — TASK-8**)
+### Component 8: `mix()` — Density Mixing (**DIVERGE — C8-S3**)
 
 | ID | Description | CASTEP | Rust Line | Severity | Root Cause |
 |----|-------------|--------|-----------|----------|------------|
-| C8-S1 | Mixing operates on single `Density` → per-spin mixing loop | `dm_mix_density`: mixes `charge(:)` + `spin(:)` independently | `scf.rs:1606-1613` | **FIXED** | `for ispin in 0..nspins { let (mixed, prev) = self.history.mix(self.density[ispin].clone()); }` — mixes each spin channel independently. |
-| C8-S2 | `previous_density` tracks single `Density` → per-spin `PerSpinDensity` | — | `scf.rs:1612` | **FIXED** | Each spin channel gets its own `prev` density tracked in `DensityHistory`. |
-| C8-S3 | Kerker/Pulay mixing of spin density | NiO `.param`: `spin_density_mixing_amplitude=2.0` | — | **DEFERRED** | Mixes ρ_up and ρ_down with same mixing parameters as charge density. Separate per-spin mixing parameters deferred for future phase. |
+| C8-S1 | Mixing operates on single `Density` → per-spin mixing loop | `dm_mix_density`: mixes `charge(:)` + `spin(:)` independently | `scf.rs:1606-1613` | **WARM-START-VERIFIED** | `for ispin in 0..nspins { let (mixed, prev) = self.history.mix(self.density[ispin].clone()); }` — mixes each spin channel independently. |
+| C8-S2 | `previous_density` tracks single `Density` → per-spin `PerSpinDensity` | — | `scf.rs:1612` | **WARM-START-VERIFIED** | Each spin channel gets its own `prev` density tracked in `DensityHistory`. |
+| C8-S3 | Kerker/Pulay mixing of spin density | NiO `.param`: `spin_density_mixing_amplitude=2.0`, `spin_density_mixing_g_vector=1.5` A^-1 | — | **DIVERGE — CANDIDATE ROOT CAUSE** | Mixes ρ_up and ρ_down with **same mixing amplitude as charge density** (0.5). CASTEP uses **separate `spin_density_mixing_amplitude=2.0`** for spin channels. Over 16 iterations, wrong spin mixing amplitude produces incorrect spin density trajectory — spin density converges 4x slower (0.5 vs 2.0), meaning at iter 16 the spin density is far from self-consistent. Wrong spin density → wrong V_eff_up vs V_eff_dn → wrong eigenvalues → wrong occupations → cascade divergence. **This is the primary hypothesis for iter-16 divergence per the checklist gap analysis. Priority: P0 (MUST-FIX).** |
 
-**Root cause analysis**: `mix()` now loops per-spin: each `self.density[ispin]` is mixed independently through `self.history.mix()`, producing per-spin mixed and previous densities stored in `PerSpinDensity`. CASTEP mixes `charge(:)` and `spin(:)` independently — our per-spin mixing is equivalent. **FIXED — TASK-8.**
-
----
-
-### Component 9: `check()` — Convergence Check (**FIXED 2026-06-12 — multi-kpt energy formula**)
+### Component 9: `check()` — Convergence Check (**WARM-START-VERIFIED**)
 
 | ID | Description | CASTEP | Rust Line | Severity | Root Cause |
 |----|-------------|--------|-----------|----------|------------|
-| C9-S1 | Convergence criteria use single `eigenvalues` and single `Density` → per-spin band energy + multi-kpt weights | `electronic_check_occupancies`: checks total energy convergence | `scf.rs:1856-1895` | **FIXED** | Per-spin loop computes `e_band_spin = Σ_k w_k Σ_b f_{bk} ε_{bk}`, summed for total band energy. Energy assembly: `assemble_total_energy_from_band(e_band, e_xc, e_hartree, rho_vxc, ewald, TS)`. |
-| C9-S2 | Fermi energy stored as single `Option<f64>` → `FermiEnergies` | `electronic.f90`: per-spin Fermi energies | `scf.rs:1875` | **FIXED** | `self.fermi_energy[ispin] = chem_pot.0` for each spin. Entropy correction `-TS` computed per-spin: `Σ_spin Σ_k w_k g(ε_{bk}, E_F^{spin}, σ)`. |
+| C9-S1 | Convergence criteria use single `eigenvalues` and single `Density` → per-spin band energy + multi-kpt weights | `electronic_check_occupancies`: checks total energy convergence | `scf.rs:1856-1895` | **WARM-START-VERIFIED** | Per-spin loop computes `e_band_spin = Σ_k w_k Σ_b f_{bk} ε_{bk}`, summed for total band energy. |
+| C9-S2 | Fermi energy stored as single `Option<f64>` → `FermiEnergies` | `electronic.f90`: per-spin Fermi energies | `scf.rs:1875` | **WARM-START-VERIFIED** | `self.fermi_energy[ispin] = chem_pot.0` for each spin. Entropy correction `-TS` computed per-spin. |
 
-**Root cause analysis**: `check()` now computes per-spin band energies with kpt weights, per-spin occupations with spin_freed transition, per-spin entropy corrections, and assembles total energy via `assemble_total_energy_from_band()`. Energy convergence check (window-based) and density RMS change use `PerSpinDensity::total()`. All energy components feed from per-spin contributions. **FIXED — multi-kpt per-spin check() energy formula.**
-
----
-
-### Component 10: Occupation Search (**FIXED 2026-06-11 — TASK-11,12**)
+### Component 10: Occupation Search (**WARM-START-VERIFIED**)
 
 | ID | Description | CASTEP | Rust Line | Severity | Root Cause |
 |----|-------------|--------|-----------|----------|------------|
-| C10-S1 | **No `fermi_fix` / `fermi_free` distinction** → implemented | `electronic.f90:516-518`: `if(scf_cycle == spin_fix) call fermi_fix else call fermi_free` | `density.rs` (find_fermi_fix, find_fermi_free) | **FIXED** | Two distinct functions: `find_fermi_fix(eig, n_spin, smearing)` — per-spin independent bisection; `find_fermi_free(eig_up, eig_dn, n_total, smearing)` — shared E_F search. Transition controlled by `spin_freed` flag. |
-| C10-S2 | Single electron count from total valence → per-spin from density net_spin | `electronic.f90:8742-8746`: `frac_elec(1) = 0.5*(N+net_spin)`, `frac_elec(2) = 0.5*(N-net_spin)` | `scf.rs:1246-1266, scf.rs:1857-1864` | **FIXED** | `net_spin = ∫(ρ_up − ρ_down) / N_grid` from CURRENT density. `n_up = 0.5*(N+net_spin)`, `n_dn = 0.5*(N-net_spin)`. Both `compute_density_from_wavefunctions` and `check()` use this formula. |
-| C10-S3 | Single bisection search → per-spin independent bisection for fermi_fix | `electronic.f90:8757`: `do ns=1,nspins` for fermi_fix | `density.rs` (compute_occupations_weighted) | **FIXED** | `find_fermi_fix(eigenvalues[ispin], n_spin_electrons, smearing)` called per spin with kpt-weighted bisection. |
-| C10-S4 | No shared Fermi energy search → `find_fermi_free` implemented | `electronic.f90:9094-9106`: one bisection integrating both spins | `density.rs` (find_fermi_free) | **FIXED** | `find_fermi_free(ev_up, ev_dn, n_total, smearing, occ_factor)` — single bisection integrating both spin channels. Returns `(E_F, occ_up, occ_dn, net_spin)`. |
-| C10-S5 | No `net_spin` computation in fermi_free → `intent(out)` from occupancies | `electronic.f90:9183-9209`: net_spin = Σocc_up − Σocc_dn after shared E_F | `density.rs` (find_fermi_free return) | **FIXED** | `find_fermi_free` returns `net_spin` computed from the resulting occupancies (not from .cell). |
-| C10-S6 | No `spin_fix` parameter or transition logic → `spin_freed` flag | `electronic.f90:516-518`, NiO `.param`: `spin_fix=6` | `scf.rs:194` | **FIXED** | `SmearingParams.spin_fix` (default 10, matches NiO fixture). `ScfIteration.spin_freed: bool` set when `scf_iter > spin_fix`. Checked in `compute_density_from_wavefunctions` and `check()`. |
-| C10-S7 | Smearing formula: Gaussian only — NiO default is Gaussian | `algor.F90:2929`: 5 schemes | `density.rs` | **LOW** | Gaussian smearing using `erfc`-based occupancy. NiO uses Gaussian with 0.1 eV width. Sufficient for Phase 7. |
+| C10-S1 | **No `fermi_fix` / `fermi_free` distinction** → implemented | `electronic.f90:516-518`: `if(scf_cycle == spin_fix) call fermi_fix else call fermi_free` | `density.rs` (find_fermi_fix, find_fermi_free) | **WARM-START-VERIFIED** | Two distinct functions. Transition controlled by `spin_freed` flag. |
+| C10-S2 | Single electron count from total valence → per-spin from density net_spin | `electronic.f90:8742-8746`: `frac_elec(1) = 0.5*(N+net_spin)`, `frac_elec(2) = 0.5*(N-net_spin)` | `scf.rs:1246-1266, scf.rs:1857-1864` | **WARM-START-VERIFIED** | `net_spin = ∫(ρ_up − ρ_down) / N_grid` from CURRENT density. |
+| C10-S3 | Single bisection search → per-spin independent bisection for fermi_fix | `electronic.f90:8757`: `do ns=1,nspins` for fermi_fix | `density.rs` (compute_occupations_weighted) | **WARM-START-VERIFIED** | `find_fermi_fix(eigenvalues[ispin], n_spin_electrons, smearing)` called per spin. |
+| C10-S4 | No shared Fermi energy search → `find_fermi_free` implemented | `electronic.f90:9094-9106`: one bisection integrating both spins | `density.rs` (find_fermi_free) | **WARM-START-VERIFIED** | `find_fermi_free(ev_up, ev_dn, n_total, smearing, occ_factor)`. |
+| C10-S5 | No `net_spin` computation in fermi_free → `intent(out)` from occupancies | `electronic.f90:9183-9209`: net_spin = Σocc_up − Σocc_dn after shared E_F | `density.rs` (find_fermi_free return) | **WARM-START-VERIFIED** | `find_fermi_free` returns `net_spin` computed from the resulting occupancies. |
+| C10-S6 | No `spin_fix` parameter or transition logic → `spin_freed` flag | `electronic.f90:516-518`, NiO `.param`: `spin_fix=6` (runtime value = 5 per profile) | `scf.rs:194` | **WARM-START-VERIFIED — POTENTIAL DIVERGENCE** | `SmearingParams.spin_fix` (default 10 in test code, vs CASTEP runtime 5). For cold-start iterations 6-10, Rust uses `fermi_fix` while CASTEP uses `fermi_free`. Different occupation strategy → different electron counts → different density → cascade. **Candidate root cause. Priority: P1.** |
+| C10-S7 | Smearing formula: Gaussian only — NiO default is Gaussian | `algor.F90:2929`: 5 schemes | `density.rs` | **LOW** | Gaussian smearing using `erfc`-based occupancy. NiO uses Gaussian with 0.1 eV width. |
 
-**Root cause analysis**: Both CASTEP occupation search strategies are now implemented:
-- **fermi_fix** (`find_fermi_fix`): Independent per-spin bisection. Electron counts from current density's integrated net_spin matching CASTEP `electronic.f90:8742-8746`.
-- **fermi_free** (`find_fermi_free`): One shared Fermi energy via bisection integrating both channels, net_spin computed from occupancies. Transition via `spin_freed` flag, set in `run_scf` when `scf_iter > smearing.spin_fix`.
-**FIXED — TASK-11 (fermi_fix/free functions) + TASK-12 (kpt-weighted integration).**
-
----
-
-### Component 11: FFI `chemrust_eigensolve_init` (**FIXED 2026-06-11 — TASK-14**)
+### Component 11: FFI `chemrust_eigensolve_init` (**WARM-START-VERIFIED**)
 
 | ID | Description | CASTEP | Rust Line | Severity | Root Cause |
 |----|-------------|--------|-----------|----------|------------|
-| C11-S1 | **No `nspins` parameter** → `nspins: c_int` added | `chemrust_eigensolve.f90:134`: passes `nspins` from `wvfn%nspins` | `ffi.rs` (init signature) | **FIXED** | `nspins: c_int` param received, stored as `nspins: usize` in `ChemrustHandle`. |
-| C11-S2 | Per-k-point `VnlBatchData` not per-spin → `vnl: Vec<Option<VnlBatchData>>` per-spin | — | `ffi.rs` (KptData struct) | **FIXED** | `KptData.vnl: (0..nspins).map(|_| None).collect()` — capacity `nspins`. Populated per-spin inside `step_inner`. |
-| C11-S3 | V_eff cache single-entry → per-spin `Vec<Option<CudaSlice<f64>>>` | — | `ffi.rs` (ChemrustHandle) | **FIXED** | `v_eff_cached: vec![None; nspins]`, `v_eff_norm: vec![0.0; nspins]` — per-spin GPU buffers for change detection. |
+| C11-S1 | **No `nspins` parameter** → `nspins: c_int` added | `chemrust_eigensolve.f90:134`: passes `nspins` from `wvfn%nspins` | `ffi.rs` (init signature) | **WARM-START-VERIFIED** | `nspins: c_int` param received, stored as `nspins: usize` in `ChemrustHandle`. |
+| C11-S2 | Per-k-point `VnlBatchData` not per-spin → `vnl: Vec<Option<VnlBatchData>>` per-spin | — | `ffi.rs` (KptData struct) | **WARM-START-VERIFIED** | `KptData.vnl: (0..nspins).map(|_| None).collect()` — capacity `nspins`. |
+| C11-S3 | V_eff cache single-entry → per-spin `Vec<Option<CudaSlice<f64>>>` | — | `ffi.rs` (ChemrustHandle) | **WARM-START-VERIFIED** | `v_eff_cached: vec![None; nspins]`, `v_eff_norm: vec![0.0; nspins]`. |
 
-**Root cause analysis**: `chemrust_eigensolve_init` now accepts `nspins: c_int` and allocates all spin-major data structures. Fortran side passes `wvfn%nspins`. **FIXED — TASK-14.**
-
----
-
-### Component 12: FFI `chemrust_eigensolve_step` (**FIXED 2026-06-11 — TASK-15**)
+### Component 12: FFI `chemrust_eigensolve_step` (**WARM-START-VERIFIED**)
 
 | ID | Description | CASTEP | Rust Line | Severity | Root Cause |
 |----|-------------|--------|-----------|----------|------------|
-| C12-S1 | **No `ispin` parameter** → `ispin: c_int` added | `electronic.f90:522`: passes per-spin slice `real_fine_pot(:,ns)` | `ffi.rs` (step signature) | **FIXED** | `ispin: c_int` param received, converted to 0-based: `let isp = ispin as usize`. Guard: `if isp >= h.nspins { return Err(...) }`. |
-| C12-S2 | V_eff upload reads single cache entry → per-spin cache `h.v_eff_cached[isp]` | — | `ffi.rs` (step_inner) | **FIXED** | `h.v_eff_cached[isp]` and `h.v_eff_norm[isp]` for per-spin V_eff change detection. |
-| C12-S3 | VNL lookup single-entry → `kd.vnl[isp]` per-spin | — | `ffi.rs` (step_inner) | **FIXED** | VNL data indexed per-spin: `kd.vnl[isp]`. Populated during `step_inner` from per-spin `vnl_data`. |
-| C12-S4 | Fortran 1-based → Rust 0-based: `ispin = ns - 1` in Fortran wrapper | `electronic.f90:488`: `ns=1,wvfn%nspins` | CASTEP `chemrust_eigensolve.f90` | **FIXED** | Fortran wrapper converts: `ispin = ns - 1` before calling `chemrust_eigensolve_step`. |
-| C12-S5 | Data arrays already per-spin at Fortran boundary | `electronic.f90:523`: `coeffs(:,:,nk,ns)` — Fortran slices single channel | — | **LOW** | Fortran caller already slices `coeffs(:,:,nk,ns)` — Rust receives single-channel data. |
+| C12-S1 | **No `ispin` parameter** → `ispin: c_int` added | `electronic.f90:522`: passes per-spin slice `real_fine_pot(:,ns)` | `ffi.rs` (step signature) | **WARM-START-VERIFIED** | `ispin: c_int` param received, converted to 0-based. |
+| C12-S2 | V_eff upload reads single cache entry → per-spin cache `h.v_eff_cached[isp]` | — | `ffi.rs` (step_inner) | **WARM-START-VERIFIED** | Per-spin V_eff change detection. `cache_reuse=false` always (2026-06-13 fix). |
+| C12-S3 | VNL lookup single-entry → `kd.vnl[isp]` per-spin | — | `ffi.rs` (step_inner) | **WARM-START-VERIFIED** | VNL data indexed per-spin: `kd.vnl[isp]`. |
+| C12-S4 | Fortran 1-based → Rust 0-based: `ispin = ns - 1` in Fortran wrapper | `electronic.f90:488`: `ns=1,wvfn%nspins` | CASTEP `chemrust_eigensolve.f90` | **WARM-START-VERIFIED** | Fortran wrapper converts: `ispin = ns - 1` before calling `chemrust_eigensolve_step`. |
+| C12-S5 | Data arrays already per-spin at Fortran boundary | `electronic.f90:523`: `coeffs(:,:,nk,ns)` — Fortran slices single channel | — | **LOW** | Fortran caller already slices `coeffs(:,:,nk,ns)`. |
 
-**Root cause analysis**: `chemrust_eigensolve_step` accepts `ispin: c_int`, converted to 0-based with bounds check. Per-spin V_eff cache and VNL data indexed by `isp`. CASTEP already slices array data to current spin channel; Rust uses `isp` only for internal cache lookups. **FIXED — TASK-15.**
-
----
-
-### Component 13: `run_scf` / `run_scf_with_energy` / `run_scf_with_energy_gated` (**FIXED 2026-06-11 — TASK-10**)
+### Component 13: `run_scf` / `run_scf_with_energy` / `run_scf_with_energy_gated` (**WARM-START-VERIFIED**)
 
 | ID | Description | CASTEP | Rust Line | Severity | Root Cause |
 |----|-------------|--------|-----------|----------|------------|
-| C13-S1 | **`S: SpinPolicy + BuildVEff` bound — NonSpin only in practice** → `SpinCollinear` now implements all traits | `electronic_minimisation`: generic over nspins | `scf.rs:1548` | **FIXED** | `SpinCollinear` implements `BuildVEff`, `BuildVEffWithEnergy`. `run_scf_with_energy::<SpinCollinear>()` compiles. |
-| C13-S2 | Energy tracking uses single `total_energy: Option<f64>` | — | `scf.rs:166` | **LOW** | Total energy is spin-independent scalar sum. Already correct — only the computation (Component 5) needed update. |
-| C13-S3 | `scf_iter` counter used for spin_fix transition → `spin_freed` flag set in `run_scf` | `electronic.f90:516-518` | `scf.rs:194` | **FIXED** | `state.spin_freed = scf_iter > smearing.spin_fix` set in `run_scf_with_energy` before diagonalize. `spin_freed` consulted by `compute_density_from_wavefunctions` and `check()`. |
-
-**Root cause analysis**: High-level SCF loop drivers are generic over `S: SpinPolicy` — the type system handles per-spin dispatch. `SpinCollinear` now implements all required traits (`BuildVEff`, `BuildVEffWithEnergy`), making `run_scf_with_energy::<SpinCollinear>()` compile. The `spin_freed` flag controls the fermi_fix → fermi_free transition in density construction and convergence check. **FIXED — TASK-10 (trait generalisation).**
+| C13-S1 | **`S: SpinPolicy + BuildVEff` bound — NonSpin only in practice** → `SpinCollinear` now implements all traits | `electronic_minimisation`: generic over nspins | `scf.rs:1548` | **WARM-START-VERIFIED** | `SpinCollinear` implements `BuildVEff`, `BuildVEffWithEnergy`. |
+| C13-S2 | Energy tracking uses single `total_energy: Option<f64>` | — | `scf.rs:166` | **LOW** | Total energy is spin-independent scalar sum. |
+| C13-S3 | `scf_iter` counter used for spin_fix transition → `spin_freed` flag set in `run_scf` | `electronic.f90:516-518` | `scf.rs:194` | **WARM-START-VERIFIED** | `state.spin_freed = scf_iter > smearing.spin_fix`. See C10-S6 for spin_fix value concern. |
 
 ---
 
@@ -347,72 +377,59 @@ These items emerged during spin-polarised implementation (2026-06-12) and affect
 
 ## 6. Recommended Fix Priority Order
 
-### All items: **COMPLETED (2026-06-12)**
+### Priority 0: Cold-Start Divergence — MUST FIX
 
-All 16 tasks (TASK-1 through TASK-16) implemented. NiO warm-start discriminator test passes all V1-V6 criteria.
+These items are believed to contribute to the iter-16 cold-start divergence. Fix order follows expected impact.
+
+| Rank | ID | Description | Estimated Effort | Rationale |
+|------|----|-------------|-----------------|-----------|
+| **P0-1** | C8-S3 (gap G1) | Implement per-spin mixing parameters (`spin_density_mixing_amplitude=2.0`, `spin_density_mixing_g_vector`) matched to NiO `.param` | 2-4 hours | Primary candidate: mixing spin with charge amplitude (0.5) instead of spin amplitude (2.0) produces 4x slower spin density evolution. Wrong spin density at iter 16 → wrong V_eff_up vs V_eff_dn → cascade. |
+| **P0-2** | C10-S6 (gap G2) | Set `spin_fix` from CASTEP input (`.param` or `NiO.castep_bin`) instead of hardcoded default 10. NiO runtime value is 5. | 1 hour | Wrong occupation strategy for iterations 6-10. Compound effect with G1: wrong occupations + wrong spin density = strongly wrong V_eff. |
+| **P0-3** | INNER_LOOP C1-davidson-compaction | Fix Davidson compaction eigenvalue index mapping bug (MUST-FIX per memory/davidson-compaction-index-bug.md) | 4-8 hours | Corrupts eigenvalue index mapping in inner loop. Benign for warm-start (small residuals, few inner iterations), catastrophic for cold-start (large residuals, many inner iterations, index corruption compounds). |
+
+### Priority 1: Diagnostic Infrastructure — VERIFY BEFORE FIXING
+
+| Rank | ID | Description | Estimated Effort | Rationale |
+|------|----|-------------|-----------------|-----------|
+| **P1-1** | G6 (diagnostic) | Implement per-iteration diagnostic tracking: spin density evolution, V_eff_up vs V_eff_dn max difference, occupation distribution, band energy per spin | 3-5 hours | Without these, the iter-16 divergence cannot be characterized beyond "it diverges." Must implement BEFORE applying P0 fixes to confirm the fix changes divergence behavior as predicted. |
+| **P1-2** | G6 (cold-start test) | Write `nio_cold_start_discriminator` test mirroring warm-start pattern but starting from paramagnetic guess | 4-6 hours | The test that should have caught the divergence. Must run 16+ iterations, track eigenvalues, energy, spin density, and occupation sums at each iter. |
+
+### Priority 2: Multi-Iteration Verification — CONFIRM FIXES
+
+| Rank | ID | Description | Estimated Effort | Rationale |
+|------|----|-------------|-----------------|-----------|
+| **P2-1** | V11-V16 | Implement all cold-start verification criteria from Section 0.6 | 3-5 hours | Confirms P0 fixes resolve divergence and no regressions introduced. |
+| **P2-2** | C8, C10 | Re-verify occupation search and mixing after P0 fixes with cold-start NiO fixture | 2-3 hours | Reclassify from WARM-START-VERIFIED to FIXED when cold-start passes. |
 
 ### Deferred Items
 
 | Rank | ID | Description | Status |
 |------|----|-------------|--------|
 | **D1** | C5-S5 | Optimise XC calls: `compute_pbe_xc_spin` called twice (once in `assemble()`, once for energy in SCF layer) | Deferred |
-| **D2** | C8-S3 | Per-spin mixing parameters (`spin_density_mixing_amplitude`, `spin_density_mixing_g_vector`) | Deferred |
+| **D2** | C8-S3 (per-spin Pulay history) | Per-spin Pulay history parameters (currently shared across spin channels within the same `DensityHistory`) | Deferred |
 | **D3** | C6 (OccSet) | Generalise `OccupationSet` for per-kpt storage (currently stores kpt-0 only) | Deferred |
 | **D4** | S3 (E_nonCoulomb) | Compute `E_nonCoulomb` from `PseudopotentialSet` in `chemrust-hamiltonian-core` | Deferred |
 | **D5** | C7 (manual copies) | Refactor `construct_density_kerker` and `construct_density_pulay` to use `into_phase()` | Deferred |
 | **D6** | C4-S3 | newtype per-spin V_eff tuple → `SpinChannelData<EffectivePotential>` | Deferred |
-
-### Priority 0: Foundation — Block All Other Work
-
-| Rank | ID | Description | Fix | Estimated Effort |
-|------|----|-------------|-----|-----------------|
-| **P0-1** | C1-all | ~~Add `SpinChannelData<T>` + per-spin newtypes~~ **DONE** | TASK-1, TASK-2 | |
-| **P0-2** | C1-S1–S7 | ~~Replace single-spin fields in `ScfIteration`~~ **DONE** | TASK-3 | |
-| **P0-3** | C2-all | ~~Update `into_phase()` for new field types~~ **DONE** | TASK-4 | |
-
-### Priority 1: Spin Loop — Make SCF Work for SpinCollinear
-
-| Rank | ID | Description | Fix | Estimated Effort |
-|------|----|-------------|-----|-----------------|
-| **P1-1** | C3-S1–S5 | ~~Wrap `diagonalize_inner` in spin loop~~ **DONE** | TASK-6 | |
-| **P1-2** | C6-S1–S4 | ~~Per-spin density construction + combine~~ **DONE** | TASK-7, TASK-13 | |
-| **P1-3** | C5-S1–S5 | ~~Implement `BuildVEffWithEnergy` for `SpinCollinear`~~ **DONE** | TASK-9, TASK-10 | |
-| **P1-4** | C10-S1–S7 | ~~Occupation search: fermi_fix + fermi_free~~ **DONE** | TASK-11, TASK-12 | |
-
-### Priority 2: FFI — Wire Spin Through Fortran Boundary
-
-| Rank | ID | Description | Fix | Estimated Effort |
-|------|----|-------------|-----|-----------------|
-| **P2-1** | C11-S1–S3 | ~~Add `nspins` to init, allocate per-spin caches~~ **DONE** | TASK-14 | |
-| **P2-2** | C12-S1–S5 | ~~Add `ispin` to step, per-spin cache indexing~~ **DONE** | TASK-15 | |
-
-### Priority 3: Polish — Mixing, Convergence, Integration Test
-
-| Rank | ID | Description | Fix | Estimated Effort |
-|------|----|-------------|-----|-----------------|
-| **P3-1** | C7, C8 | ~~Per-spin density mixing + construct_density_* methods~~ **DONE** | TASK-8 | |
-| **P3-2** | C9 | ~~Convergence check with per-spin data~~ **DONE** | TASK-7 (includes) | |
-| **P3-3** | C13 | ~~Generalise `run_scf` bounds~~ **DONE** | TASK-10 (includes) | |
-| **P3-4** | Integration | ~~NiO discriminator test~~ **DONE** | TASK-16 | |
+| **D7** | G3 (per-spin residual norms) | Per-spin density change metric for independent charge/spin mixing convergence tracking | Deferred |
 
 ---
 
 ## 7. Cascading Dependency Chains
 
 ```
-P0-1 (SpinChannelData<T>)
-  └── P0-2 (ScfIteration fields)
-        └── P0-3 (into_phase)
-              ├── P1-1 (diagonalize_inner spin loop)
-              │     └── P1-2 (density construction) ─── P1-3 (V_eff energy)
-              │           └── P1-4 (occupation search)
-              ├── P2-1 (FFI init)
-              │     └── P2-2 (FFI step)
-              └── P3-1 (mixing)
-                    └── P3-2 (convergence)
-```
+P0-3 (Davidson compaction fix — blocks cold-start correctness)
+  └── P1-1 (diagnostic infrastructure)
+        └── P1-2 (cold-start discriminator test)
 
-Every path goes through `SpinChannelData<T>`. No parallel work possible before P0 is complete.
+P0-1 (spin_density_mixing_amplitude)
+  └── P0-2 (spin_fix value)
+        └── P2-1 (cold-start verification)
+
+P0-1 + P0-2 together expected to resolve iter-16 divergence.
+P0-3 expected to improve cold-start eigenvalue quality across all iterations.
+P1-1 required to CONFIRM any fix works, not just empirically test.
+```
 
 ---
 
@@ -435,6 +452,8 @@ From `NiO.0001.profile` (2026-06-10, 2952 lines):
 
 Total SCF iterations: 67 (converged). `spin_fix` = 5 (CASTEP default, though NiO `.param` specifies 6 — the profile suggests 5 was used at runtime).
 
+**NiO `.param` reference**: `spin_density_mixing_amplitude: 2.0`, `spin_density_mixing_g_vector: 1.5 1/A` (from NiO `.castep` line 109509-109512). These differ from `mix_charge_amp: 0.5` and `mix_charge_g_vector: 1.5 1/A`. Our code applies charge mixing parameters to all spin channels — gap G1 (C8-S3).
+
 ---
 
 ## 9. Verification Matrix
@@ -443,14 +462,25 @@ Total SCF iterations: 67 (converged). `spin_fix` = 5 (CASTEP default, though NiO
 |---|-----------|---------------|-----------|---------------------|
 | V1 | `diagonalize_inner` calls Davidson twice per SCF iter for SpinCollinear | Profile: 134 calls | Exact (compiler-enforced) | ∞ (doesn't compile otherwise) |
 | V2 | `V_eff_up ≠ V_eff_dn` for spin-polarised density | Self-consistency | | Qualitative |
-| V3 | Per-spin eigenvalues match `.bands` | NiO.bands:12,75 | 1×10⁻⁴ Ha | ~1000× |
-| V4 | Total energy matches CASTEP | NiO.castep:774418 (−7160.230577732 eV) | 1×10⁻⁶ Ha | ~1000× |
-| V5 | Integrated spin density: 2∫ρ_spin = −0.0619641 | NiO.castep:774415 | 1×10⁻⁴ rel | ~100× |
-| V6 | Fermi energies: 0.152664 Ha both spins | NiO.bands:5 | 1×10⁻⁴ Ha | ~100× |
-| V7 | Occupations: N_up ≈ 36.00, N_dn ≈ 28.00 | NiO.bands:3 | ±0.01 | ~1000× |
+| V3 | Per-spin eigenvalues match `.bands` | NiO.bands:12,75 | 1x10^-4 Ha | ~1000x |
+| V4 | Total energy matches CASTEP | NiO.castep:774418 (-7160.230577732 eV) | 1x10^-6 Ha | ~1000x |
+| V5 | Integrated spin density: 2∫ρ_spin = -0.0619641 | NiO.castep:774415 | 1x10^-4 rel | ~100x |
+| V6 | Fermi energies: 0.152664 Ha both spins | NiO.bands:5 | 1x10^-4 Ha | ~100x |
+| V7 | Occupations: N_up ≈ 36.00, N_dn ≈ 28.00 | NiO.bands:3 | ±0.01 | ~1000x |
 | V8 | NonSpin regression: existing tests pass | Cu111_CO fixture | Identical results | Regression guard |
 | V9 | FFI init accepts nspins, step accepts ispin | Compiler | Compiles + CASTEP builds | |
-| V10 | No `Vec<Vec<T>>` in public API touching per-spin data | grep | 0 occurrences | Style |
+| V10 | No `Vec<Vec<T>>` in public API touching per-spin data | rg | 0 occurrences | Style |
+
+### New: Multi-Iteration Cold-Start Verification
+
+| # | Criterion | Fixture Anchor | Tolerance | Why This Tests Cold-Start |
+|---|-----------|---------------|-----------|---------------------------|
+| **V11** | 16-iteration cold-start eigenvalues remain bounded | NiO CPU reference: band range [-1.0, +0.2] Ha | max eigenvalue > -10 Ha, min eigenvalue < +5 Ha | Catches eigenvalue explosion/divergence before it's catastrophic |
+| **V12** | Spin density trajectory over 6-16 iters matches CASTEP | CASTEP per-SCF-iter spin density dumps (F8 format) | RMS residual < 0.1 e-/Bohr^3 after spin_freed transition | Verifies mixing amplitude correctness |
+| **V13** | Occupation sums N_up + N_dn = N_total at every iter | CASTEP constraint: N_total = 64 for NiO | \|N_up + N_down - 64\| < 1e-6 | Catches Fermi search bugs that lose electrons |
+| **V14** | `spin_freed` flag matches CASTEP transition point | NiO profile: 5 `fermi_fix` calls -> `spin_fix=5` | Exact match of transition iteration | Catches wrong spin_fix value |
+| **V15** | Per-spin band energy drift per iteration < 0.5 Ha for first 10 iters | CASTEP energy trajectory from cold-start | Monotonically decreasing after iter 5 | Catches V_eff assembly accumulation errors |
+| **V16** | No "no empty bands" warning | CASTEP behavior: empty bands exist at all iters | Warning count = 0 | This warning is the immediate precursor to divergence (per NiO failure pattern) |
 
 ---
 
@@ -480,11 +510,11 @@ Applied during implementation:
 | `electronic.f90` | 16027-16034 | Second spin loop: `hamiltonian_diagonalise` call site |
 | `density.f90` | 30-37 | `electron_density` type: `charge(:)` + `spin(:)` |
 | `density.f90` | 1120-1168 | `density_augment`: spin-dependent augmentation |
-| `density.f90` | 2120-2195 | `density_calculate_soft_wvfn_real`: per-spin |ψ|² → charge/spin |
+| `density.f90` | 2120-2195 | `density_calculate_soft_wvfn_real`: per-spin |ψ|^2 -> charge/spin |
 | `locpot.f90` | 74-422 | `locpot_calculate`: V_H + V_locps + V_xc per spin |
-| `xc_gga.f90` | 516-523 | XC potential: total + spin density → V_xc_up, V_xc_dn |
+| `xc_gga.f90` | 516-523 | XC potential: total + spin density -> V_xc_up, V_xc_dn |
 | `hamiltonian.f90` | 723 | `hamiltonian_diagonalise_ks` signature: `nk, ns` as scalars |
-| `hamiltonian.f90` | 1013 | `nlpot_prepare_precon` signature: `nk, ns` → per-spin D-matrices |
+| `hamiltonian.f90` | 1013 | `nlpot_prepare_precon` signature: `nk, ns` -> per-spin D-matrices |
 | `ion.f90` | 7544-7577 | Spin dimension in ion augmentation matrices |
 | `pot.f90` | 76 | `real_fine_pot(:,ns)` — 2D V_eff storage indexed by spin |
 | `chemrust_eigensolve.f90` | 134 | FFI init: `nspins` from `wvfn%nspins` |

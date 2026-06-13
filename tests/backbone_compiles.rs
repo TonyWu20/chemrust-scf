@@ -128,7 +128,7 @@ fn backbone_compiles() {
         .pw_fft_indices(KptDataSet::new(vec![pw_fft_indices], 1))
         .k_points(KptDataSet::new(vec![KPoint::default()], 1))
         .smearing(SmearingParams {
-            width: 0.01,
+            width: chemrust_scf::SmearingWidth::ha(0.01),
             electron_temperature: 0.01,
             scheme: SmearingScheme::Gaussian,
             spin_fix: 10,

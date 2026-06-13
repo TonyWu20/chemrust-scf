@@ -54,11 +54,11 @@ pub fn compute_occupations(
 ) -> Result<(Occupations, ChemicalPotential), Error> {
     match smearing.scheme {
         SmearingScheme::Gaussian => {
-            let mu = find_chemical_potential(eigenvalues, smearing.width, n_electrons, occ_factor)?;
+            let mu = find_chemical_potential(eigenvalues, smearing.width.to_ha(), n_electrons, occ_factor)?;
             let occ = Occupations(
                 eigenvalues
                     .iter()
-                    .map(|&e| occ_factor * libm::erfc((e - mu) / smearing.width))
+                    .map(|&e| occ_factor * libm::erfc((e - mu) / smearing.width.to_ha()))
                     .collect(),
             );
             Ok((occ, ChemicalPotential(mu)))
@@ -126,7 +126,7 @@ pub fn compute_occupations_weighted(
             let mu = find_chemical_potential_weighted(
                 per_kpt_eigenvalues,
                 kpt_weights,
-                smearing.width,
+                smearing.width.to_ha(),
                 n_electrons_per_spin,
                 occ_factor,
             )?;
@@ -136,7 +136,7 @@ pub fn compute_occupations_weighted(
                 .iter()
                 .map(|eigs| {
                     eigs.iter()
-                        .map(|&e| occ_factor * libm::erfc((e - mu) / smearing.width))
+                        .map(|&e| occ_factor * libm::erfc((e - mu) / smearing.width.to_ha()))
                         .collect()
                 })
                 .collect();
@@ -215,7 +215,7 @@ pub fn find_fermi_fix(
     n_spin_electrons: f64,
     occ_factor: f64,
 ) -> Result<(f64, Vec<f64>), Error> {
-    let width = smearing.width;
+    let width = smearing.width.to_ha();
     let emin = eigenvalues.iter().cloned().fold(f64::INFINITY, f64::min);
     let emax = eigenvalues.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
 
@@ -285,7 +285,7 @@ pub fn find_fermi_free(
     n_electrons: f64,
     occ_factor: f64,
 ) -> Result<(f64, Vec<f64>, Vec<f64>, f64), Error> {
-    let width = smearing.width;
+    let width = smearing.width.to_ha();
 
     if ev_up.is_empty() || ev_dn.is_empty() {
         return Err(Error::NotImplemented);

@@ -67,6 +67,14 @@ pub struct DensityHistory<M: MixingPhase> {
     pub(crate) kernels: Option<MixingCudaKernels>,
     /// Number of spin channels (1 for NonSpin, 2 for SpinCollinear).
     nspins: usize,
+    /// Mixing amplitude per spin channel.
+    /// CASTEP uses separate amplitudes for charge (default 0.5) and spin
+    /// (default 2.0, per NiO .param: spin_density_mixing_amplitude=2.0).
+    /// Since our code mixes per-spin densities (ρ_up, ρ_dn) independently
+    /// rather than charge+spin, the per-spin amplitude approximates
+    /// (amp_charge + amp_spin)/2 for each channel.
+    /// Reference: CASTEP dm_sub_mix.f90:434 (amp_c, amp_s).
+    pub(crate) mixing_amplitude: Vec<f64>,
     /// Reciprocal-space density from the previous iteration's mixing output,
     /// per spin channel.  `None` on the first Kerker/Pulay call (pass-through).
     /// CASTEP dm.f90 stores per-spin density history independently.
@@ -280,11 +288,25 @@ impl DensityHistory<MixingOff> {
     /// mixing each spin channel independently does not cross-contaminate
     /// (CASTEP dm.f90 stores per-spin density history independently).
     pub fn new(nspins: usize) -> Self {
+        // Default: charge mixing amplitude 0.5 for all spin channels.
+        // Override with set_mixing_amplitude() for spin-polarised systems
+        // where CASTEP uses spin_density_mixing_amplitude=2.0.
+        Self::with_amplitude(nspins, 0.5)
+    }
+
+    /// Create a DensityHistory with a specific per-spin mixing amplitude.
+    ///
+    /// CASTEP uses `mix_charge_amp=0.5` for charge density and
+    /// `spin_density_mixing_amplitude=2.0` for spin density.
+    /// Since our code mixes per-spin densities (ρ_up, ρ_down) independently,
+    /// pass `spin_density_mixing_amplitude` from CASTEP .param here.
+    pub fn with_amplitude(nspins: usize, amp: f64) -> Self {
         let per_spin = || Vec::with_capacity(DIIS_MAX_HISTORY);
         Self {
             kerker: None,
             kernels: None,
             nspins,
+            mixing_amplitude: vec![amp; nspins],
             current_density_in: (0..nspins).map(|_| None).collect(),
             delta_n_history: (0..nspins).map(|_| per_spin()).collect(),
             delta_r_history: (0..nspins).map(|_| per_spin()).collect(),
@@ -330,6 +352,7 @@ impl DensityHistory<MixingOff> {
             kerker: self.kerker,
             kernels: self.kernels,
             nspins: self.nspins,
+            mixing_amplitude: self.mixing_amplitude,
             current_density_in: self.current_density_in,
             delta_n_history: self.delta_n_history,
             delta_r_history: self.delta_r_history,
@@ -361,6 +384,7 @@ impl<M: MixingPhase> DensityHistory<M> {
             kerker: self.kerker,
             kernels: self.kernels,
             nspins: self.nspins,
+            mixing_amplitude: self.mixing_amplitude,
             current_density_in: self.current_density_in,
             delta_n_history: self.delta_n_history,
             delta_r_history: self.delta_r_history,
@@ -443,10 +467,11 @@ impl DensityHistory<Kerker> {
                 }
                 .expect("cpx_sub R = n_out - n_in");
 
-                // result = n_in + K·R  (GPU — cpx_full_update with zero deltas)
+                // result = n_in + amp * K·R  (GPU — cpx_full_update with zero deltas)
                 let mut result_dev: CudaSlice<CudaComplex> =
                     stream.alloc_zeros(n_real).expect("alloc result");
                 let kerker_dev = self.kerker.as_ref().unwrap().as_device_slice();
+                let amp = self.mixing_amplitude[ispin];
 
                 // Zero buffer for the unused sum_delta_r / sum_delta_n terms
                 let zero_dev: CudaSlice<CudaComplex> =
@@ -462,9 +487,10 @@ impl DensityHistory<Kerker> {
                         .arg(&zero_dev)
                         .arg(&zero_dev)
                         .arg(&n_i32)
+                        .arg(&amp)
                         .launch(LaunchConfig::for_num_elems(n_real as u32))
                 }
-                .expect("cpx_full_update n_in + K*R");
+                .expect("cpx_full_update n_in + amp*K*R");
 
                 // ── Store mixed reciprocal as current_density_in[ispin] ──
                 let recip_copy = stream
@@ -518,6 +544,7 @@ impl DensityHistory<Kerker> {
             kerker: self.kerker,
             kernels: self.kernels,
             nspins: self.nspins,
+            mixing_amplitude: self.mixing_amplitude,
             current_density_in: self.current_density_in,
             delta_n_history: (0..self.nspins).map(|_| per_spin()).collect(),
             delta_r_history: (0..self.nspins).map(|_| per_spin()).collect(),
@@ -533,6 +560,22 @@ impl DensityHistory<Kerker> {
 // ===========================================================================
 
 impl DensityHistory<Pulay> {
+    /// Set the mixing amplitude for a specific spin channel.
+    ///
+    /// CASTEP uses separate amplitudes: charge mixing amplitude (default 0.5)
+    /// and spin density mixing amplitude (e.g., 2.0 for NiO, per
+    /// `spin_density_mixing_amplitude` in .param).  Since our code mixes
+    /// per-spin densities independently rather than charge+spin, the per-spin
+    /// amplitude should approximate (amp_charge + amp_spin)/2 ≈ 1.25 for
+    /// magnetic systems.
+    ///
+    /// Reference: CASTEP NiO .castep lines "charge density mixing amplitude:
+    /// 0.5000" and "spin density mixing amplitude: 2.000".
+    pub fn set_mixing_amplitude(&mut self, ispin: usize, amp: f64) {
+        assert!(ispin < self.nspins, "ispin {ispin} >= nspins {}", self.nspins);
+        self.mixing_amplitude[ispin] = amp;
+    }
+
     /// Mix density using Pulay/DIIS with up to 7 history entries — fully
     /// GPU-resident except for the tiny (≤7×7) linear solve on CPU.
     ///
@@ -708,9 +751,10 @@ impl DensityHistory<Pulay> {
                             .expect("axpy sum_delta_n");
                     }
 
-                    // result = n_in + sum_delta_n + K·(R_current + sum_delta_r)
+                    // result = n_in + amp * (sum_delta_n + K·(R_current + sum_delta_r))
                     let mut result_dev: CudaSlice<CudaComplex> =
                         stream.alloc_zeros(n_real).expect("alloc result");
+                    let amp = self.mixing_amplitude[ispin];
                     unsafe {
                         stream
                             .launch_builder(&kernels.cpx_full_update)
@@ -721,16 +765,18 @@ impl DensityHistory<Pulay> {
                             .arg(&sum_delta_r)
                             .arg(&sum_delta_n)
                             .arg(&n_i32)
+                            .arg(&amp)
                             .launch(LaunchConfig::for_num_elems(n_real as u32))
                     }
                     .expect("cpx_full_update DIIS n_new");
                     result_dev
                 } else {
-                    // ---- Kerker fallback: n_new = n_in + K·R ----
+                    // ---- Kerker fallback: n_new = n_in + amp * K·R ----
                     let zero_dev: CudaSlice<CudaComplex> =
                         stream.alloc_zeros(n_real).expect("alloc zero");
                     let mut result_dev: CudaSlice<CudaComplex> =
                         stream.alloc_zeros(n_real).expect("alloc result");
+                    let amp_fb = self.mixing_amplitude[ispin];
                     unsafe {
                         stream
                             .launch_builder(&kernels.cpx_full_update)
@@ -741,9 +787,10 @@ impl DensityHistory<Pulay> {
                             .arg(&zero_dev)
                             .arg(&zero_dev)
                             .arg(&n_i32)
+                            .arg(&amp_fb)
                             .launch(LaunchConfig::for_num_elems(n_real as u32))
                     }
-                    .expect("cpx_full_update Kerker fallback");
+                    .expect("cpx_full_update Kerker fallback n_in + amp*K*R");
 
                     // If no history exists yet, also store R_current as prev_res
                     // (already done above)

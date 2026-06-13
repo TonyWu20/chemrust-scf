@@ -32,7 +32,8 @@ extern \"C\" __global__ void cpx_full_update(
     const double2* r_curr,
     const double2* sum_delta_r,
     const double2* sum_delta_n,
-    int n
+    int n,
+    double amp
 ) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     int stride = blockDim.x * gridDim.x;
@@ -40,8 +41,8 @@ extern \"C\" __global__ void cpx_full_update(
         double r_plus_x = r_curr[i].x + sum_delta_r[i].x;
         double r_plus_y = r_curr[i].y + sum_delta_r[i].y;
         double k = kerker[i];
-        dst[i].x = n_in[i].x + k * r_plus_x + sum_delta_n[i].x;
-        dst[i].y = n_in[i].y + k * r_plus_y + sum_delta_n[i].y;
+        dst[i].x = n_in[i].x + amp * (k * r_plus_x + sum_delta_n[i].x);
+        dst[i].y = n_in[i].y + amp * (k * r_plus_y + sum_delta_n[i].y);
     }
 }
 

@@ -251,7 +251,14 @@ impl<S: SpinPolicy> ScfIteration<S, Initialized, MixingOff> {
                 (0..nspins).map(|_| KptDataSet::new(vec![Vec::new(); nkpts], nkpts)).collect()
             )),
             v_eff: None,
-            history: DensityHistory::new(S::nspins()),
+            history: {
+                // CASTEP uses spin_density_mixing_amplitude=2.0 for magnetic
+                // systems (separate from mix_charge_amp=0.5).  Our per-spin
+                // density mixing approximates this by applying the spin mixing
+                // amplitude to each spin channel independently.
+                let amp = if S::nspins() > 1 { 2.0 } else { 0.5 };
+                DensityHistory::with_amplitude(S::nspins(), amp)
+            },
             previous_density,
             next_mixing: MixingPhaseKind::Off,
             e_xc: None,
@@ -1896,10 +1903,10 @@ impl<S: SpinPolicy> ScfIteration<S, Mixed, MixingOff> {
                     self.eigenvalues[ispin].as_ref(),
                     &kpt_weights,
                     self.fermi_energy[ispin],
-                    self.smearing.width,
+                    self.smearing.width.to_ha(),
                 );
             }
-            let ts = ts_sum * self.smearing.width / (nspins as f64 * sqrt_pi);
+            let ts = ts_sum * self.smearing.width.to_ha() / (nspins as f64 * sqrt_pi);
 
             let e_total = crate::energy::assemble_total_energy_from_band(
                 e_band,
@@ -2014,13 +2021,17 @@ pub fn run_scf<S: SpinPolicy + BuildVEff>(
     let mut state = state;
     loop {
         state.scf_iter += 1;
+        // CASTEP electronic.f90:516-518 — spin freed at scf_cycle == spin_fix
+        // where scf_cycle is 1-based.  Our scf_iter is 0-based, so the
+        // transition point is scf_iter == spin_fix - 1.
         if state.smearing.spin_fix >= 0 && !state.spin_freed {
-            if state.scf_iter as i32 >= state.smearing.spin_fix {
+            if state.scf_iter as i32 >= state.smearing.spin_fix - 1 {
                 state.spin_freed = true;
                 eprintln!("[chemrust] spin_fix iterations done -- freeing spin (iter {})", state.scf_iter);
             }
-            if state.scf_iter as i32 == state.smearing.spin_fix {
-                state.history = crate::mixing::DensityHistory::new(S::nspins());
+            if state.scf_iter as i32 == state.smearing.spin_fix - 1 {
+                let amp = if S::nspins() > 1 { 2.0 } else { 0.5 };
+                state.history = crate::mixing::DensityHistory::with_amplitude(S::nspins(), amp);
                 state.next_mixing = MixingPhaseKind::Off;
             }
         }
@@ -2142,13 +2153,17 @@ pub fn run_scf_with_energy_gated<S: SpinPolicy + BuildVEffWithEnergy>(
     let mut iter1_soft_fraction: Option<f64> = None;
     loop {
         state.scf_iter += 1;
+        // CASTEP electronic.f90:516-518 — spin freed at scf_cycle == spin_fix
+        // where scf_cycle is 1-based.  Our scf_iter is 0-based, so the
+        // transition point is scf_iter == spin_fix - 1.
         if state.smearing.spin_fix >= 0 && !state.spin_freed {
-            if state.scf_iter as i32 >= state.smearing.spin_fix {
+            if state.scf_iter as i32 >= state.smearing.spin_fix - 1 {
                 state.spin_freed = true;
                 eprintln!("[chemrust] spin_fix iterations done -- freeing spin (iter {})", state.scf_iter);
             }
-            if state.scf_iter as i32 == state.smearing.spin_fix {
-                state.history = crate::mixing::DensityHistory::new(S::nspins());
+            if state.scf_iter as i32 == state.smearing.spin_fix - 1 {
+                let amp = if S::nspins() > 1 { 2.0 } else { 0.5 };
+                state.history = crate::mixing::DensityHistory::with_amplitude(S::nspins(), amp);
                 state.next_mixing = MixingPhaseKind::Off;
             }
         }
@@ -2739,12 +2754,7 @@ mod tests {
             wave_grid: dummy_grid(),
             fine_grid: dummy_grid(),
             k_points: KptDataSet::new(vec![KPoint::default()], 1),
-            smearing: SmearingParams {
-                width: 0.1,
-                electron_temperature: 0.0,
-                scheme: SmearingScheme::Gaussian,
-                spin_fix: 10,
-            },
+            smearing: SmearingParams::builder().build(),
             n_bands,
             max_n_pw: n_pw,
             nkpts: 1,
@@ -2804,12 +2814,7 @@ mod tests {
             wave_grid: dummy_grid(),
             fine_grid: dummy_grid(),
             k_points: KptDataSet::new(vec![KPoint::default()], 1),
-            smearing: SmearingParams {
-                width: 0.1,
-                electron_temperature: 0.0,
-                scheme: SmearingScheme::Gaussian,
-                spin_fix: 10,
-            },
+            smearing: SmearingParams::builder().build(),
             n_bands,
             max_n_pw: n_pw,
             nkpts: 1,

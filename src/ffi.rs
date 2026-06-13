@@ -727,6 +727,19 @@ unsafe fn step_inner(
             .copy_from_slice(&davidson_result.eigenvalues);
     }
 
+    // Diagnostic: print the returned eigenvalues for the first and last bands
+    #[cfg(feature = "scf_diag")]
+    {
+        if n_bands > 0 {
+            let ev = &davidson_result.eigenvalues;
+            eprintln!(
+                "[chemrust-eig-return] ispin={} ikpt={} n_bands={} ev[0]={:.10e} ev[mid]={:.10e} ev[last]={:.10e} n_locked={}/{}",
+                isp, ik, n_bands, ev[0], ev[n_bands/2], ev[n_bands-1],
+                davidson_result.n_locked, n_bands,
+            );
+        }
+    }
+
     // Set converged flag: true if all bands locked (residual below tolerance)
     let all_converged = davidson_result.n_locked >= n_bands;
     unsafe { *converged = all_converged as c_int; };

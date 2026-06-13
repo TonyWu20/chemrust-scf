@@ -310,7 +310,7 @@ fn davidson_hdump_validation() {
 
     // Smearing: Gaussian, 0.1 eV (CASTEP default).
     let smearing = SmearingParams {
-        width: 0.1 * EV_TO_HARTREE,
+        width: chemrust_scf::SmearingWidth::ev(0.1),
         electron_temperature: 0.1 * EV_TO_HARTREE,
         scheme: SmearingScheme::Gaussian,
         spin_fix: 10,

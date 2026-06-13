@@ -66,7 +66,7 @@ pub mod scf_capture;
 
 pub use types::{
     Density, DensityUpsampled, EffectivePotential, Error, FinalResult, FineGridArray, KineticEnergies, KPoint,
-    SmearingParams, SmearingScheme, WaveGridArray,
+    SmearingParams, SmearingScheme, SmearingWidth, WaveGridArray,
 };
 pub use spin_types::{
     ElectronCounts, FermiEnergies, KptDataSet, OccupationSet, PerSpinAugDensity, PerSpinBetaProjections,

@@ -281,12 +281,9 @@ pub fn build_spin_scf_state(fx: &NioSpinFixture) -> ScfIteration<SpinCollinear> 
         KptDataSet::new(psi_data_s1, nkpts),
     ]);
 
-    let smearing = SmearingParams {
-        width: 0.1 * chemrust_scf::EV_TO_HARTREE,
-        electron_temperature: 0.1 * chemrust_scf::EV_TO_HARTREE,
-        scheme: SmearingScheme::Gaussian,
-        spin_fix: 10,
-    };
+    // NiO .param: spin_fix=6 → 5 fermi_fix calls (matching CASTEP profile).  All other
+    // parameters at CASTEP defaults (Gaussian, 0.1 eV width, from parameters.f90:1778).
+    let smearing = SmearingParams::builder().spin_fix(6).build();
 
     ScfIteration::<SpinCollinear>::builder()
         .cell(cell).pots(pots)
