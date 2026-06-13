@@ -6,7 +6,7 @@ use std::ffi::{c_char, c_void, CStr};
 use std::os::raw::{c_double, c_int};
 use std::sync::Arc;
 
-use chemrust_hamiltonian_core::{CellGeometry, GVectorGrid, Pseudopotential, PseudopotentialSet, RealLattice, RecipLattice};
+use chemrust_hamiltonian_core::{CellGeometry, GVectorGrid, PseudopotentialSet, RealLattice, RecipLattice};
 use cudarc::driver::{CudaContext, CudaSlice, CudaStream};
 
 use crate::device::blas::BlasHandle;
@@ -64,6 +64,11 @@ struct KptData {
     /// Shared spin-independent VNL state per k-point, built on first
     /// step_inner call and reused by subsequent spin calls.
     shared_vnl: Option<Arc<KptSharedVnl>>,
+    /// Cached batched C2C FFT plan for this k-point.  Created lazily on first
+    /// step_inner call; reused across spins and SCF iterations.  Parameters
+    /// (ngx_std, ngy_std, ngz_std, n_bands) are geometry-static and identical
+    /// across spin channels in collinear calculations.
+    fft_plan: Option<BatchedFftPlan3d>,
 }
 
 // ---- Opaque handle ---------------------------------------------------------
@@ -260,6 +265,7 @@ fn init_inner(
         kpts.push(KptData {
             vnl: (0..nspins_u).map(|_| None).collect(),
             shared_vnl: None,
+            fft_plan: None,
             kpoint_frac: kf,
             k_point: kpt,
             pw_coords,
@@ -622,9 +628,14 @@ unsafe fn step_inner(
     let kinetic_raw: CudaSlice<f64> = stream.clone_htod(&ke_castep).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
     let kinetic_dev = KineticPreconditioner::new(kinetic_raw);
 
-    let fft_plan = BatchedFftPlan3d::plan_batched_c2c(
-        h.ngx_std, h.ngy_std, h.ngz_std, n_bands_i32, stream.clone(),
-    ).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
+    // Cache FFT plan per kpt — parameters (ngx_std, ngy_std, ngz_std, n_bands)
+    // are geometry-static and identical across spin channels in collinear spin.
+    if kd.fft_plan.is_none() {
+        kd.fft_plan = Some(BatchedFftPlan3d::plan_batched_c2c(
+            h.ngx_std, h.ngy_std, h.ngz_std, n_bands_i32, stream.clone(),
+        ).map_err(|_| CHEM_EIG_CUDA_ERROR)?);
+    }
+    let fft_plan = kd.fft_plan.as_ref().unwrap();
 
     // Davidion requires grid buffer for Hamiltonian application
     let mut grid_buf: CudaSlice<CudaComplex> = stream.alloc_zeros(n_bands * gs)
