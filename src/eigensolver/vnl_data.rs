@@ -16,30 +16,42 @@ use crate::device::CudaComplex;
 use crate::types::{Error, KPoint};
 
 // ---------------------------------------------------------------------------
-// KptSharedVnl — spin-independent data shared across spin channels per k-point
+// HandleSharedVnl — kpt-independent data shared across ALL kpts and spins
 // ---------------------------------------------------------------------------
 
-/// Spin-independent VNL data, stored in `Arc<KptSharedVnl>` and shared across
-/// spin channels. Built on the first `step_inner` or `diagonalize_inner` call
-/// for each k-point; subsequent spin calls clone the Arc and reuse the GPU
-/// slices (shallow CudaSlice clone, no VRAM cost).
-pub struct KptSharedVnl {
-    /// GPU screening cache (Q(G) + structure factors), used for D-matrix
-    /// re-screening every SCF step with the current V_eff.
+/// K-point-INDEPENDENT V_NL data shared across ALL k-points and ALL spin
+/// channels.  Built once at init / first SCF iteration.
+///
+/// Screening caches (Q(G) + structure factors) depend only on pseudopotentials
+/// and grid geometry — not on k-point or V_eff.  Per-ion Q and D0 matrices
+/// similarly depend only on the pseudopotential.  Lifting these to the handle
+/// level avoids duplicating them per k-point (e.g. 14× for 14-kpt NiO).
+pub struct HandleSharedVnl {
     pub screening_cache: WaveScreeningCache,
-    /// GPU screening cache on the fine grid, for D-matrix re-screening with
-    /// fine-grid V_eff (via rescreen_d).
     pub screening_cache_fine: Option<WaveScreeningCache>,
-    /// Per-ion β(G+k) projector arrays on GPU. Index `[ion_idx]` for each ion.
-    pub per_ion_beta_g: Vec<CudaSlice<CudaComplex>>,
     /// Per-ion USPP Q augmentation matrices on GPU (n_expanded × n_expanded).
     pub per_ion_q: Vec<CudaSlice<CudaComplex>>,
-    /// Per-ion unscreened D0 matrices (CPU, cheap to clone).
+    /// Per-ion unscreened D0 matrices (CPU).
     pub per_ion_d0_expanded: Vec<Vec<f64>>,
     /// Per-ion expanded projector count.
     pub per_ion_n_expanded: Vec<i32>,
-    /// H2D bytes uploaded for GPU D-matrix screening (from the fresh build).
+    /// H2D bytes from the fresh build.
     pub screening_h2d_bytes: usize,
+}
+
+// ---------------------------------------------------------------------------
+// KptSharedVnl — per-kpt data shared across spin channels
+// ---------------------------------------------------------------------------
+
+/// Per-KPOINT V_NL data shared across spin channels.
+///
+/// Owns per-ion β(G+k) projector arrays (kpt-dependent via G+k) and holds an
+/// Arc to the handle-level kpt-independent state.
+pub struct KptSharedVnl {
+    /// Per-ion β(G+k) projector arrays on GPU. Index `[ion_idx]`.
+    pub per_ion_beta_g: Vec<CudaSlice<CudaComplex>>,
+    /// Kpt-independent shared state (screening caches, Q, D0).
+    pub handle: Arc<HandleSharedVnl>,
 }
 
 #[doc(hidden)]
@@ -65,7 +77,7 @@ pub struct VnlBatchData {
 /// Mirrors [`build_d0_expanded`] but reads from `aug.q_aug()` instead of
 /// `aug.d_zero()`. The Q matrix is used by Rayleigh-Ritz to build the
 /// correct S-overlap for the generalized eigenvalue problem.
-fn build_q_expanded(aug: &dyn HasAugmentationData) -> Vec<f64> {
+pub fn build_q_expanded(aug: &dyn HasAugmentationData) -> Vec<f64> {
     let projs = aug.projectors();
     let n_exp = expanded_projector_count(projs);
     if n_exp == 0 || projs.is_empty() {
@@ -115,6 +127,55 @@ fn build_q_expanded(aug: &dyn HasAugmentationData) -> Vec<f64> {
     q
 }
 
+/// Build kpt-independent shared VNL state (screening caches + per-ion Q/D0).
+///
+/// Call once per run (not per kpt).  The returned Arc is shared across all
+/// k-points and spin channels via `HandleSharedVnl`.
+pub fn build_handle_shared_vnl(
+    pots: &chemrust_hamiltonian_core::PseudopotentialSet,
+    cell: &chemrust_hamiltonian_core::CellGeometry,
+    wave_grid: &chemrust_hamiltonian_core::GVectorGrid,
+    fine_grid: Option<&chemrust_hamiltonian_core::GVectorGrid>,
+    stream: &Arc<CudaStream>,
+    pcie: &mut PcieAccount,
+) -> Result<Arc<HandleSharedVnl>, Error> {
+    let sc = build_wave_screening_cache(pots, cell, wave_grid, stream, pcie)?;
+    let sc_fine = match fine_grid {
+        Some(fg) => Some(build_wave_screening_cache(pots, cell, fg, stream, pcie)?),
+        None => None,
+    };
+    let mut per_ion_q = Vec::new();
+    let mut per_ion_d0 = Vec::new();
+    let mut per_ion_ne = Vec::new();
+    for ion_idx in 0..cell.num_ions {
+        let species_idx = cell.ion_species[ion_idx];
+        let symbol = &cell.species_symbols[species_idx];
+        if let Some(pot) = pots.get(symbol) {
+            if let Pseudopotential::Usp(aug) = pot {
+                let n_exp = expanded_projector_count(aug.projectors()) as i32;
+                let q_cpu = build_q_expanded(aug);
+                let q_flat: Vec<CudaComplex> = q_cpu.iter()
+                    .map(|&q| CudaComplex { x: q, y: 0.0 }).collect();
+                let q_dev = stream.clone_htod(&q_flat).map_err(Error::Cuda)?;
+                pcie.h2d_bytes += q_flat.len() * std::mem::size_of::<CudaComplex>();
+                let d0 = build_d0_expanded(aug);
+                let d0_flat: Vec<f64> = d0.iter().cloned().collect();
+                per_ion_q.push(q_dev);
+                per_ion_d0.push(d0_flat);
+                per_ion_ne.push(n_exp);
+            }
+        }
+    }
+    Ok(Arc::new(HandleSharedVnl {
+        screening_cache: sc,
+        screening_cache_fine: sc_fine,
+        per_ion_q,
+        per_ion_d0_expanded: per_ion_d0,
+        per_ion_n_expanded: per_ion_ne,
+        screening_h2d_bytes: pcie.h2d_bytes,
+    }))
+}
+
 impl VnlBatchData {
     #[allow(clippy::too_many_arguments)]
     pub fn precompute(
@@ -136,7 +197,9 @@ impl VnlBatchData {
         Self::precompute_with_d_override(
             pw_coords, pots, cell, wave_grid, None, k_point,
             psi_data, n_bands, n_pw, _occupations, v_eff_wave,
-            None, None,
+            None,      // d_override
+            None,      // shared
+            None,      // handle_shared — test path, builds fresh
             stream, pcie, blas, kernels,
         )
     }
@@ -174,6 +237,10 @@ impl VnlBatchData {
         v_eff_wave: Option<&chemrust_hamiltonian_core::EffectivePotential>,
         d_override: Option<&[Option<Vec<f64>>]>,
         shared: Option<Arc<KptSharedVnl>>,
+        // When `Some`, screening caches and per-ion Q/D0 are taken from the
+        // handle instead of being built fresh.  Must be provided when `shared`
+        // is `None` (first kpt build); ignored when `shared` is `Some`.
+        handle_shared: Option<Arc<HandleSharedVnl>>,
         stream: &Arc<CudaStream>,
         pcie: &mut PcieAccount,
         blas: &crate::device::blas::BlasHandle,
@@ -213,22 +280,29 @@ impl VnlBatchData {
         // -----------------------------------------------------------------------
         // Build or reuse the shared spin-independent state
         // -----------------------------------------------------------------------
+        // Screening caches are kpt-independent — prefer handle, fall back to
+        // fresh build (backward compat for callers that don't have a handle).
         let (screening_cache, screening_cache_fine, screening_h2d_bytes) = match shared {
             Some(ref shared_arc) => {
-                // Reuse screening caches from the shared Arc (no new H2D).
-                (shared_arc.screening_cache.clone(), shared_arc.screening_cache_fine.clone(), 0)
+                // Reuse from shared KptSharedVnl (which delegates to HandleSharedVnl).
+                (shared_arc.handle.screening_cache.clone(),
+                 shared_arc.handle.screening_cache_fine.clone(), 0)
             }
-            None => {
-                let pcie_before_screening = pcie.h2d_bytes;
-
-                let sc = build_wave_screening_cache(pots, cell, wave_grid, stream, pcie)?;
-                let sc_fine = match fine_grid {
-                    Some(fg) => Some(build_wave_screening_cache(pots, cell, fg, stream, pcie)?),
-                    None => None,
+            None => match handle_shared {
+                Some(ref h) => {
+                    (h.screening_cache.clone(), h.screening_cache_fine.clone(), 0)
+                }
+                None => {
+                    let pcie_before_screening = pcie.h2d_bytes;
+                    let sc = build_wave_screening_cache(pots, cell, wave_grid, stream, pcie)?;
+                    let sc_fine = match fine_grid {
+                        Some(fg) => Some(build_wave_screening_cache(pots, cell, fg, stream, pcie)?),
+                        None => None,
                 };
                 let h2d = pcie.h2d_bytes - pcie_before_screening;
 
                 (sc, sc_fine, h2d)
+                }
             }
         };
 
@@ -266,18 +340,21 @@ impl VnlBatchData {
 
             // Spin-independent per-ion data: beta_g, q_matrix, d0_expanded, n_expanded.
             // Either built fresh or cloned from the shared Arc.
+            // Spin-independent per-ion data: beta_g (kpt-dependent), q/d0 (kpt-independent).
+            // When `shared` is Some, reuse from existing KptSharedVnl.
+            // When `shared` is None but `handle_shared` is Some, use handle for q/d0
+            // and build fresh beta_g.
             let (beta_dev, q_dev, d0_expanded, n_expanded) = match shared {
                 Some(ref shared_arc) => {
-                    // Both `entries` and `shared_arc.per_ion_*` vectors are built
-                    // by the same per-ion loop, filtered identically (skip non-USPP).
                     debug_assert!(
                         entries.len() < shared_arc.per_ion_beta_g.len(),
                         "shared per_ion vectors out of sync with entries"
                     );
+                    let handle = &shared_arc.handle;
                     let bg = shared_arc.per_ion_beta_g[entries.len()].clone();
-                    let qm = shared_arc.per_ion_q[entries.len()].clone();
-                    let d0 = shared_arc.per_ion_d0_expanded[entries.len()].clone();
-                    let ne = shared_arc.per_ion_n_expanded[entries.len()];
+                    let qm = handle.per_ion_q[entries.len()].clone();
+                    let d0 = handle.per_ion_d0_expanded[entries.len()].clone();
+                    let ne = handle.per_ion_n_expanded[entries.len()];
                     (bg, qm, d0, ne)
                 }
                 None => {
@@ -289,25 +366,38 @@ impl VnlBatchData {
                     let n_expanded = beta_g.shape()[0] as i32;
                     let d0_expanded = build_d0_expanded(aug);
 
-                    // Upload beta_g to GPU
+                    // Upload beta_g to GPU (always kpt-dependent).
                     let beta_flat: Vec<CudaComplex> =
                         beta_g.iter().map(|&c| crate::device::complex_to_cuda(c)).collect();
                     let beta_dev = stream.clone_htod(&beta_flat).map_err(Error::Cuda)?;
                     pcie.h2d_bytes += beta_flat.len() * std::mem::size_of::<CudaComplex>();
 
-                    // Build and upload Q matrix
-                    let q_cpu = build_q_expanded(aug);
-                    let q_flat: Vec<CudaComplex> =
-                        q_cpu.iter().map(|&q| CudaComplex { x: q, y: 0.0 }).collect();
-                    let q_dev = stream.clone_htod(&q_flat).map_err(Error::Cuda)?;
-                    pcie.h2d_bytes += q_flat.len() * std::mem::size_of::<CudaComplex>();
+                    // Q and D0 are kpt-independent — take from handle if available.
+                    let (q_dev, d0_flat) = match handle_shared {
+                        Some(ref h) => {
+                            let qm = h.per_ion_q[entries.len()].clone();
+                            let d0 = h.per_ion_d0_expanded[entries.len()].clone();
+                            (qm, d0)
+                        }
+                        None => {
+                            let q_cpu = build_q_expanded(aug);
+                            let q_flat: Vec<CudaComplex> =
+                                q_cpu.iter().map(|&q| CudaComplex { x: q, y: 0.0 }).collect();
+                            let q_dev = stream.clone_htod(&q_flat).map_err(Error::Cuda)?;
+                            pcie.h2d_bytes += q_flat.len() * std::mem::size_of::<CudaComplex>();
+                            let d0_flat: Vec<f64> = d0_expanded.iter().cloned().collect();
+                            (q_dev, d0_flat)
+                        }
+                    };
 
-                    // Collect for KptSharedVnl
+                    // Collect for KptSharedVnl / HandleSharedVnl.
                     per_ion_beta_g.push(beta_dev.clone());
-                    per_ion_q.push(q_dev.clone());
-                    let d0_flat: Vec<f64> = d0_expanded.iter().cloned().collect();
-                    per_ion_d0_expanded.push(d0_flat.clone());
-                    per_ion_n_expanded.push(n_expanded);
+                    if handle_shared.is_none() {
+                        // Fresh build: collect Q and D0 for HandleSharedVnl construction.
+                        per_ion_q.push(q_dev.clone());
+                        per_ion_d0_expanded.push(d0_flat.clone());
+                        per_ion_n_expanded.push(n_expanded);
+                    }
 
                     (beta_dev, q_dev, d0_flat, n_expanded)
                 }
@@ -399,18 +489,29 @@ impl VnlBatchData {
 
         // -----------------------------------------------------------------------
         // Construct the shared Arc (or clone the existing one)
-        // -----------------------------------------------------------------------
+        // Build or reuse KptSharedVnl.
         let shared_arc = match shared {
             Some(ref arc) => arc.clone(),
-            None => Arc::new(KptSharedVnl {
-                screening_cache,
-                screening_cache_fine,
-                per_ion_beta_g,
-                per_ion_q,
-                per_ion_d0_expanded,
-                per_ion_n_expanded,
-                screening_h2d_bytes,
-            }),
+            None => {
+                let handle = match handle_shared {
+                    Some(ref h) => h.clone(),
+                    None => {
+                        // Backward compat: build HandleSharedVnl from fresh data.
+                        Arc::new(HandleSharedVnl {
+                            screening_cache,
+                            screening_cache_fine,
+                            per_ion_q,
+                            per_ion_d0_expanded,
+                            per_ion_n_expanded,
+                            screening_h2d_bytes,
+                        })
+                    }
+                };
+                Arc::new(KptSharedVnl {
+                    per_ion_beta_g,
+                    handle,
+                })
+            }
         };
 
         Ok(VnlBatchData {
@@ -435,14 +536,14 @@ impl VnlBatchData {
         // otherwise fall back to wave-grid cache (pure Rust SCF path).
         let n_grid;
         let use_cache;
-        if let Some(ref fine_cache) = self.shared.screening_cache_fine {
+        if let Some(ref fine_cache) = self.shared.handle.screening_cache_fine {
             let [ngz_f, ngy_f, ngx_f] = fine_cache.wave_grid;
             n_grid = ngz_f * ngy_f * ngx_f;
             use_cache = fine_cache;
         } else {
-            let [ngz, ngy, ngx] = self.shared.screening_cache.wave_grid;
+            let [ngz, ngy, ngx] = self.shared.handle.screening_cache.wave_grid;
             n_grid = ngz * ngy * ngx;
-            use_cache = &self.shared.screening_cache;
+            use_cache = &self.shared.handle.screening_cache;
         };
 
         // FFT V_eff real → reciprocal on CPU.

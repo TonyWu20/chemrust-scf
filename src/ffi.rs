@@ -6,7 +6,7 @@ use std::ffi::{c_char, c_void, CStr};
 use std::os::raw::{c_double, c_int};
 use std::sync::Arc;
 
-use chemrust_hamiltonian_core::{CellGeometry, GVectorGrid, PseudopotentialSet, RealLattice, RecipLattice};
+use chemrust_hamiltonian_core::{CellGeometry, GVectorGrid, Pseudopotential, PseudopotentialSet, RealLattice, RecipLattice};
 use cudarc::driver::{CudaContext, CudaSlice, CudaStream};
 
 use crate::device::blas::BlasHandle;
@@ -19,7 +19,7 @@ use crate::eigensolver::davidson_types::{KineticPreconditioner, PwCoefficients};
 use crate::eigensolver::hamiltonian::apply_full_hamiltonian;
 use crate::eigensolver::kernels::CudaKernelSet;
 use crate::eigensolver::preconditioner::TpaPreconditioner;
-use crate::eigensolver::vnl_data::{KptSharedVnl, VnlBatchData};
+use crate::eigensolver::vnl_data::{build_handle_shared_vnl, HandleSharedVnl, KptSharedVnl, VnlBatchData};
 use crate::layout::{ColumnDistributed, WavefunctionSet};
 use crate::types::{EffectivePotential, FineGridArray, KPoint};
 
@@ -83,6 +83,9 @@ struct ChemrustHandle {
     v_eff_cached: Vec<Option<CudaSlice<f64>>>,
     /// Max-norm of the cached V_eff per spin, used for change detection.
     v_eff_norm: Vec<f64>,
+    /// Kpt-independent V_NL shared state (screening caches, Q, D0).  Built once
+    /// at init, shared via Arc across all k-points and spin channels.
+    handle_shared_vnl: Option<Arc<HandleSharedVnl>>,
     /// Shared across k-points: pseudopotentials, cell geometry, wave grid.
     /// Stored here so that VnlBatchData can be created in step_inner
     /// (where real psi/n_bands are available) instead of init_inner
@@ -263,6 +266,11 @@ fn init_inner(
         });
     }
 
+    let handle_shared_vnl = build_handle_shared_vnl(
+        &pots, &cell, &wave_grid, Some(&fine_grid),
+        &stream, &mut PcieAccount::default(),
+    ).map_err(|e| { eprintln!("[chemrust] HandleSharedVnl build failed: {e}"); CHEM_EIG_CUDA_ERROR })?;
+
     let pots_clone = pots.clone();
     let cell_clone = cell.clone();
     Ok(Box::into_raw(Box::new(ChemrustHandle {
@@ -270,6 +278,7 @@ fn init_inner(
         ngx, ngy, ngz, ngx_std, ngy_std, ngz_std, max_n_pw: maxpw, nspins: nspins_u, kpts,
         v_eff_cached: (0..nspins_u).map(|_| None).collect(),
         v_eff_norm: vec![0.0; nspins_u],
+        handle_shared_vnl: Some(handle_shared_vnl),
         pots: pots_clone,
         cell: cell_clone,
         wave_grid,
@@ -454,6 +463,7 @@ unsafe fn step_inner(
         kd.vnl[isp] = Some(VnlBatchData::precompute_with_d_override(
             &kd.pw_coords, &h.pots, &h.cell, &h.wave_grid, Some(&h.fine_grid), &kd.k_point,
             &psi_host, n_bands, n_pw, None, None, None, shared_for_this_spin,
+            h.handle_shared_vnl.clone(),
             &h.stream, &mut pcie, &h.blas, &h.kernels,
         ).map_err(|e| { eprintln!("[chemrust] VnlBatchData init failed: {e}"); CHEM_EIG_CUDA_ERROR })?);
         kd.shared_vnl = Some(kd.vnl[isp].as_ref().unwrap().shared.clone());

@@ -1012,7 +1012,7 @@ pub unsafe fn apply_preconditioner(
                 // --- C: max norms — .iter() vs [n,b] double-loop ---
                 let mut max_bpp_iter = 0.0f64;
                 for v in beta_phi_precon_arr.iter() { let a = v.norm(); if a > max_bpp_iter { max_bpp_iter = a; } }
-                let max_bps_iter = beta_phi_psi_arr.iter().map(|c| c.norm()).fold(0.0f64, f64::max);
+                let _max_bps_iter = beta_phi_psi_arr.iter().map(|c| c.norm()).fold(0.0f64, f64::max);
                 let mut max_bpp_idx = 0.0f64;
                 let mut max_bps_idx = 0.0f64;
                 for b in 0..n_bands {

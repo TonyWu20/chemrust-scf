@@ -26,7 +26,7 @@ use crate::eigensolver::davidson::{DavidsonDiagnostic, DAVIDSON_LAST_DIAG};
 use crate::eigensolver::rayleigh_ritz::rayleigh_ritz;
 #[cfg(all(any(test, feature = "scf_diag"), feature = "chebyshev"))]
 use crate::eigensolver::rayleigh_ritz::rayleigh_ritz_with_matrices;
-use crate::eigensolver::vnl_data::{KptSharedVnl, VnlBatchData};
+use crate::eigensolver::vnl_data::{build_handle_shared_vnl, HandleSharedVnl, KptSharedVnl, VnlBatchData};
 use crate::layout::{ColumnDistributed, Cpu, WavefunctionSet};
 use crate::mixing::{DensityHistory, Kerker, MixingOff, MixingPhase, Pulay};
 use crate::density::{QSfCache, build_q_sf_cache};
@@ -786,6 +786,9 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
         //
         // Shared VNL cache: spin-0 builds KptSharedVnl per kpt; spin-1 reuses.
         let mut shared_vnl_cache: Vec<Option<Arc<KptSharedVnl>>> = vec![None; nkpts];
+        // Kpt-independent shared state (screening caches, Q, D0).  Built lazily
+        // on first use — depends only on pots/cell/grid, which are geometry-static.
+        let mut handle_shared: Option<Arc<HandleSharedVnl>> = None;
         // -----------------------------------------------------------------------
         for ispin in 0..nspins {
             // Initialize per-kpt result accumulators for this spin
@@ -856,6 +859,13 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
                 // 6. V_NL precomputation per (spin,kpt) — D-matrices are per-(kpt,spin).
                 //    CASTEP hamiltonian.f90:1013
                 let psi_host = self.psi_cpu[ispin][ikpt].clone();
+                // Build kpt-independent HandleSharedVnl lazily on first use.
+                if handle_shared.is_none() {
+                    handle_shared = Some(build_handle_shared_vnl(
+                        &self.pots, &self.cell, &self.wave_grid, Some(&self.fine_grid),
+                        &stream, &mut pcie,
+                    )?);
+                }
                 // Share spin-independent VNL data across spin channels:
                 // spin-0 builds KptSharedVnl fresh; spin-1 reuses it.
                 let shared_vnl = shared_vnl_cache[ikpt].clone();
@@ -865,6 +875,7 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
                     &psi_host, n_bands, n_pw_kpt, occupations,
                     None,
                     d_override_per_ion, shared_vnl,
+                    handle_shared.clone(),
                     &stream, &mut pcie, &blas, &kernels,
                 )?;
                 shared_vnl_cache[ikpt] = Some(vnl_data.shared.clone());
