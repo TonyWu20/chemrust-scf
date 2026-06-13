@@ -726,7 +726,6 @@ fn s_inv_baseline_post_typo_fix() {
         &mut pcie,
         &blas,
         &kernels,
-        &solver,
     )
     .expect("VnlBatchData::precompute");
 
@@ -818,7 +817,6 @@ fn s_inv_s_identity_test() {
         &mut pcie,
         &blas,
         &kernels,
-        &solver,
     )
     .expect("VnlBatchData::precompute");
 

@@ -9,16 +9,38 @@ use crate::eigensolver::kernels::CudaKernelSet;
 use chemrust_hamiltonian_core::pseudopotential::HasAugmentationData;
 use chemrust_hamiltonian_core::Pseudopotential;
 use cudarc::driver::{CudaSlice, CudaStream};
-use faer::linalg::solvers::{DenseSolveCore, Llt};
-use faer::mat::Mat;
-use faer::Side;
 use num_complex::Complex64;
 
-use crate::device::blas::{self, ZgemmConfig};
 use crate::device::pcie::PcieAccount;
-use crate::device::solver::SolverHandle;
 use crate::device::CudaComplex;
 use crate::types::{Error, KPoint};
+
+// ---------------------------------------------------------------------------
+// KptSharedVnl — spin-independent data shared across spin channels per k-point
+// ---------------------------------------------------------------------------
+
+/// Spin-independent VNL data, stored in `Arc<KptSharedVnl>` and shared across
+/// spin channels. Built on the first `step_inner` or `diagonalize_inner` call
+/// for each k-point; subsequent spin calls clone the Arc and reuse the GPU
+/// slices (shallow CudaSlice clone, no VRAM cost).
+pub struct KptSharedVnl {
+    /// GPU screening cache (Q(G) + structure factors), used for D-matrix
+    /// re-screening every SCF step with the current V_eff.
+    pub screening_cache: WaveScreeningCache,
+    /// GPU screening cache on the fine grid, for D-matrix re-screening with
+    /// fine-grid V_eff (via rescreen_d).
+    pub screening_cache_fine: Option<WaveScreeningCache>,
+    /// Per-ion β(G+k) projector arrays on GPU. Index `[ion_idx]` for each ion.
+    pub per_ion_beta_g: Vec<CudaSlice<CudaComplex>>,
+    /// Per-ion USPP Q augmentation matrices on GPU (n_expanded × n_expanded).
+    pub per_ion_q: Vec<CudaSlice<CudaComplex>>,
+    /// Per-ion unscreened D0 matrices (CPU, cheap to clone).
+    pub per_ion_d0_expanded: Vec<Vec<f64>>,
+    /// Per-ion expanded projector count.
+    pub per_ion_n_expanded: Vec<i32>,
+    /// H2D bytes uploaded for GPU D-matrix screening (from the fresh build).
+    pub screening_h2d_bytes: usize,
+}
 
 #[doc(hidden)]
 pub struct VnlIonData {
@@ -31,26 +53,11 @@ pub struct VnlIonData {
     pub n_expanded: i32,
 }
 
-/// GPU-resident batch V_NL data with metadata for PCI-E tracking.
+/// GPU-resident batch V_NL data with shared spin-independent state via Arc.
 pub struct VnlBatchData {
     pub entries: Vec<VnlIonData>,
-    /// H2D bytes uploaded for GPU D-matrix screening (V_eff FFT + Q cache + SF).
-    /// Used by the PCI-E accounting assertion in the hot path.
-    pub screening_h2d_bytes: usize,
-    /// GPU screening cache (Q matrices + structure factors), built once at init
-    /// and reused for D-matrix re-screening every SCF step with the current V_eff.
-    pub screening_cache: Option<WaveScreeningCache>,
-    /// GPU screening cache on the fine grid, built once at init and used for
-    /// D-matrix re-screening with fine-grid V_eff (via rescreen_d).
-    pub screening_cache_fine: Option<WaveScreeningCache>,
-    /// Concatenated β-projectors: n_pw × n_total_expanded (col-major).
-    pub b_concat: CudaSlice<CudaComplex>,
-    /// LU factor (P·L·U) of M = Q⁻¹ + B^H·B (n_total_expanded × n_total_expanded).
-    pub lu_m: CudaSlice<CudaComplex>,
-    /// Pivot indices from LU factorisation (Fortran 1-based).
-    pub lu_ipiv: CudaSlice<i32>,
-    /// Sum of all per-ion n_expanded values.
-    pub n_total_expanded: i32,
+    /// Spin-independent shared state (screening caches, beta_g, Q, D0).
+    pub shared: Arc<KptSharedVnl>,
 }
 
 /// Build the expanded USPP Q augmentation matrix (n_expanded × n_expanded).
@@ -125,13 +132,12 @@ impl VnlBatchData {
         pcie: &mut PcieAccount,
         blas: &crate::device::blas::BlasHandle,
         kernels: &CudaKernelSet,
-        solver: &SolverHandle,
     ) -> Result<Self, Error> {
         Self::precompute_with_d_override(
             pw_coords, pots, cell, wave_grid, None, k_point,
             psi_data, n_bands, n_pw, _occupations, v_eff_wave,
-            None,
-            stream, pcie, blas, kernels, solver,
+            None, None,
+            stream, pcie, blas, kernels,
         )
     }
 
@@ -147,6 +153,12 @@ impl VnlBatchData {
     /// our computed screened D for ion `i`; when `None`, the per-ion D
     /// is computed normally from V_eff. Passing `None` for the outer
     /// `Option` is equivalent to calling [`precompute`].
+    ///
+    /// `shared`: optional `Arc<KptSharedVnl>` to reuse spin-independent data
+    /// across spin channels. When `Some`, screening caches, beta_g, and Q
+    /// matrices are cloned from the shared Arc (shallow CudaSlice clone, no
+    /// VRAM cost). When `None`, everything is built fresh and a new
+    /// `KptSharedVnl` is stored in the returned `VnlBatchData.shared`.
     #[allow(clippy::too_many_arguments)]
     pub fn precompute_with_d_override(
         pw_coords: &[[i32; 3]],
@@ -161,11 +173,11 @@ impl VnlBatchData {
         _occupations: Option<&[f64]>,
         v_eff_wave: Option<&chemrust_hamiltonian_core::EffectivePotential>,
         d_override: Option<&[Option<Vec<f64>>]>,
+        shared: Option<Arc<KptSharedVnl>>,
         stream: &Arc<CudaStream>,
         pcie: &mut PcieAccount,
         blas: &crate::device::blas::BlasHandle,
         kernels: &CudaKernelSet,
-        solver: &SolverHandle,
     ) -> Result<Self, Error> {
         let kf = k_point.coords;
         let recip = cell.recip_lattice.as_array();
@@ -189,10 +201,6 @@ impl VnlBatchData {
         };
 
         let mut entries = Vec::new();
-        // Collectors for the global Woodbury assembly (after the per-ion loop).
-        let mut per_ion_q: Vec<Vec<f64>> = Vec::new();
-        let mut per_ion_beta_flat: Vec<Vec<CudaComplex>> = Vec::new();
-        let mut per_ion_ne: Vec<usize> = Vec::new();
 
         // FFT V_eff once (CPU) → upload to GPU for D-matrix screening.
         let v_eff_fft = v_eff_wave.and_then(|v_eff| {
@@ -202,20 +210,26 @@ impl VnlBatchData {
         let [ngz, ngy, ngx] = wave_grid.grid();
         let n_wave_grid = ngz * ngy * ngx;
 
-        // Snapshot pcie before screening-related H2D so we can report the budget.
-        let pcie_before_screening = pcie.h2d_bytes;
+        // -----------------------------------------------------------------------
+        // Build or reuse the shared spin-independent state
+        // -----------------------------------------------------------------------
+        let (screening_cache, screening_cache_fine, screening_h2d_bytes) = match shared {
+            Some(ref shared_arc) => {
+                // Reuse screening caches from the shared Arc (no new H2D).
+                (shared_arc.screening_cache.clone(), shared_arc.screening_cache_fine.clone(), 0)
+            }
+            None => {
+                let pcie_before_screening = pcie.h2d_bytes;
 
-        // Build GPU screening cache (Q arrays + structure factors). Always built
-        // so it is available for D-matrix re-screening every SCF step.
-        let screening_cache: Option<WaveScreeningCache> =
-            Some(build_wave_screening_cache(pots, cell, wave_grid, stream, pcie)?);
+                let sc = build_wave_screening_cache(pots, cell, wave_grid, stream, pcie)?;
+                let sc_fine = match fine_grid {
+                    Some(fg) => Some(build_wave_screening_cache(pots, cell, fg, stream, pcie)?),
+                    None => None,
+                };
+                let h2d = pcie.h2d_bytes - pcie_before_screening;
 
-        // Build fine-grid screening cache when a fine grid is provided (FFI path).
-        // rescreen_d uses this to avoid grid-mismatch truncation when processing
-        // fine-grid V_eff that has more FFT points than the wave grid.
-        let screening_cache_fine: Option<WaveScreeningCache> = match fine_grid {
-            Some(fg) => Some(build_wave_screening_cache(pots, cell, fg, stream, pcie)?),
-            None => None,
+                (sc, sc_fine, h2d)
+            }
         };
 
         // Upload V_eff_fft to GPU (Fortran order via .t().iter()).
@@ -233,7 +247,11 @@ impl VnlBatchData {
             None => None,
         };
 
-        let screening_h2d_bytes: usize = pcie.h2d_bytes - pcie_before_screening;
+        // Collectors for the shared Arc (populated only in fresh-build path).
+        let mut per_ion_beta_g: Vec<CudaSlice<CudaComplex>> = Vec::new();
+        let mut per_ion_q: Vec<CudaSlice<CudaComplex>> = Vec::new();
+        let mut per_ion_d0_expanded: Vec<Vec<f64>> = Vec::new();
+        let mut per_ion_n_expanded: Vec<i32> = Vec::new();
 
         for ion_idx in 0..cell.num_ions {
             let species_idx = cell.ion_species[ion_idx];
@@ -245,11 +263,55 @@ impl VnlBatchData {
                 Pseudopotential::Usp(d) => d,
                 _ => continue,
             };
-            let gmax_pp = pot.gmax();
-            let beta_g = compute_beta_g(&wave_block, aug, cell, ion_idx, wave_grid, gmax_pp, k_cart)
-                .map_err(|_| Error::Nvrtc(format!("compute_beta_g failed for ion {ion_idx}")))?;
-            let d0_expanded = build_d0_expanded(aug);
-            let n_expanded = beta_g.shape()[0] as i32;
+
+            // Spin-independent per-ion data: beta_g, q_matrix, d0_expanded, n_expanded.
+            // Either built fresh or cloned from the shared Arc.
+            let (beta_dev, q_dev, d0_expanded, n_expanded) = match shared {
+                Some(ref shared_arc) => {
+                    // Both `entries` and `shared_arc.per_ion_*` vectors are built
+                    // by the same per-ion loop, filtered identically (skip non-USPP).
+                    debug_assert!(
+                        entries.len() < shared_arc.per_ion_beta_g.len(),
+                        "shared per_ion vectors out of sync with entries"
+                    );
+                    let bg = shared_arc.per_ion_beta_g[entries.len()].clone();
+                    let qm = shared_arc.per_ion_q[entries.len()].clone();
+                    let d0 = shared_arc.per_ion_d0_expanded[entries.len()].clone();
+                    let ne = shared_arc.per_ion_n_expanded[entries.len()];
+                    (bg, qm, d0, ne)
+                }
+                None => {
+                    let beta_g = compute_beta_g(
+                        &wave_block, aug, cell, ion_idx, wave_grid, pot.gmax(), k_cart,
+                    ).map_err(|_| Error::Nvrtc(
+                        format!("compute_beta_g failed for ion {ion_idx}")
+                    ))?;
+                    let n_expanded = beta_g.shape()[0] as i32;
+                    let d0_expanded = build_d0_expanded(aug);
+
+                    // Upload beta_g to GPU
+                    let beta_flat: Vec<CudaComplex> =
+                        beta_g.iter().map(|&c| crate::device::complex_to_cuda(c)).collect();
+                    let beta_dev = stream.clone_htod(&beta_flat).map_err(Error::Cuda)?;
+                    pcie.h2d_bytes += beta_flat.len() * std::mem::size_of::<CudaComplex>();
+
+                    // Build and upload Q matrix
+                    let q_cpu = build_q_expanded(aug);
+                    let q_flat: Vec<CudaComplex> =
+                        q_cpu.iter().map(|&q| CudaComplex { x: q, y: 0.0 }).collect();
+                    let q_dev = stream.clone_htod(&q_flat).map_err(Error::Cuda)?;
+                    pcie.h2d_bytes += q_flat.len() * std::mem::size_of::<CudaComplex>();
+
+                    // Collect for KptSharedVnl
+                    per_ion_beta_g.push(beta_dev.clone());
+                    per_ion_q.push(q_dev.clone());
+                    let d0_flat: Vec<f64> = d0_expanded.iter().cloned().collect();
+                    per_ion_d0_expanded.push(d0_flat.clone());
+                    per_ion_n_expanded.push(n_expanded);
+
+                    (beta_dev, q_dev, d0_flat, n_expanded)
+                }
+            };
 
             // Compute screened D matrix: D = D0 + (1/N)·Re(Σ_G V_eff(G)·exp(+iG·R)·conj(Q_nm(G)))
             // GPU path via screen_d_gpu; CPU reference is compute_screened_d_from_fft.
@@ -258,6 +320,10 @@ impl VnlBatchData {
             // our computed D_screened with externally-supplied values (e.g. parsed
             // from CASTEP's `D_band_debug.dat`) to discriminate whether the SCF
             // cascade is D-driven or eigensolver-rotation-driven.
+            //
+            // Note: d0_expanded is Vec<f64> in both paths (shared clone or fresh
+            // after flattening build_d0_expanded's Array2). We reconstruct Array2
+            // for the fallback arm to match screen_d_gpu's return type.
             let d_screened = match d_override.and_then(|o| o.get(ion_idx).and_then(|d| d.as_ref())) {
                 Some(d_inj) => {
                     let n_exp = n_expanded as usize;
@@ -272,25 +338,24 @@ impl VnlBatchData {
                             "d_override reshape failed for ion {ion_idx}: {e}"
                         )))?
                 }
-                None => match (&screening_cache, &v_eff_fft_dev) {
-                    (Some(cache), Some(fft_dev)) => {
-                        let d0_flat: Vec<f64> = d0_expanded.iter().cloned().collect();
-                        screen_d_gpu(
-                            cache, fft_dev, ion_idx, species_idx,
-                            &d0_flat, n_wave_grid,
-                            kernels, blas, stream,
-                        )?
+                None => match v_eff_fft_dev.as_ref() {
+                    Some(fft_dev) => screen_d_gpu(
+                        &screening_cache, fft_dev, ion_idx, species_idx,
+                        &d0_expanded, n_wave_grid,
+                        kernels, blas, stream,
+                    )?,
+                    None => {
+                        // No V_eff available: construct Array2 from flat Vec<f64>
+                        let ne = (d0_expanded.len() as f64).sqrt() as usize;
+                        ndarray::Array2::from_shape_vec((ne, ne), d0_expanded.clone())
+                            .map_err(|e| Error::Nvrtc(format!(
+                                "d0 reshape failed for ion {ion_idx}: {e}"
+                            )))?
                     }
-                    _ => d0_expanded.clone(),
                 },
             };
 
             // Diagnostic: report D magnitudes per ion to catch screening explosions.
-            // NOTE: when V_eff is unavailable at init time (cold-start), this prints
-            // bare unscreened d0 values — the d_screen_amax == d0_amax you see here
-            // is from the fallback d0_expanded.clone().  The actual screened D is
-            // computed later in rescreen_d() when V_eff is available, and the values
-            // here are NOT what the Davidson solver uses.
             #[cfg(feature = "scf_diag")]
             {
                 let d_min = d_screened.iter().cloned().fold(f64::INFINITY, f64::min);
@@ -307,191 +372,50 @@ impl VnlBatchData {
             // Diag: β-projector L2 norms per ion/projector
             #[cfg(feature = "scf_diag")]
             {
-                let n_g = beta_g.nrows();
-                let np = beta_g.ncols();
-                let mut beta_norms: Vec<f64> = Vec::with_capacity(np);
-                for n in 0..np {
-                    let mut nrm2 = 0.0f64;
-                    for g in 0..n_g {
-                        let v = beta_g[[g, n]];
-                        nrm2 += v.re * v.re + v.im * v.im;
-                    }
-                    beta_norms.push(nrm2.sqrt());
+                // Beta norms diagnostic — skipped in shared path since we
+                // don't have the CPU-side beta_g matrix available.
+                if shared.is_none() {
+                    let n_g = n_pw; // approximate
+                    let np = n_expanded as usize;
+                    eprintln!(
+                        "[Diag-beta] ion={ion_idx:2} sym={symbol} ne={np}:  \
+                         n_wave_grid={n_g}",
+                    );
                 }
-                let min_bn = beta_norms.iter().cloned().fold(f64::INFINITY, f64::min);
-                let max_bn = beta_norms.iter().cloned().fold(0.0f64, f64::max);
-                eprintln!(
-                    "[Diag-beta] ion={ion_idx:2} sym={symbol} ne={np}:  \
-                     |beta| min={min_bn:.4e} max={max_bn:.4e}  n_wave_grid={n_g}",
-                );
             }
 
-            let beta_flat: Vec<CudaComplex> =
-                beta_g.iter().map(|&c| crate::device::complex_to_cuda(c)).collect();
             let d_flat: Vec<CudaComplex> =
                 d_screened.iter().map(|&d| CudaComplex { x: d, y: 0.0 }).collect();
-
-            let beta_dev = stream.clone_htod(&beta_flat).map_err(Error::Cuda)?;
             let d_dev = stream.clone_htod(&d_flat).map_err(Error::Cuda)?;
-            pcie.h2d_bytes += (beta_flat.len() + d_flat.len()) * std::mem::size_of::<CudaComplex>();
 
-            // Build and upload the expanded Q augmentation matrix (same indexing
-            // convention as D0, read from aug.q_aug()).
-            let q_cpu = build_q_expanded(aug);
-            let q_flat: Vec<CudaComplex> =
-                q_cpu.iter().map(|&q| CudaComplex { x: q, y: 0.0 }).collect();
-            let q_dev = stream.clone_htod(&q_flat).map_err(Error::Cuda)?;
-            pcie.h2d_bytes += q_flat.len() * std::mem::size_of::<CudaComplex>();
-
-            // Precompute Woodbury components for global S^{-1} assembly.
-            // Q (real, block-diagonal) saved for global Cholesky inversion;
-            // beta saved for B^H·B Gram (ZGEMM on GPU, preserves cross-ion imag).
-            let ne = n_expanded as usize;
-
-            // Save per-ion Q matrix for global Woodbury assembly.
-            // (Q is block-diagonal across ions; we build the full global
-            // block-diagonal Q below and invert it in one Cholesky pass,
-            // matching CASTEP nlpot_prepare_Sinv_full lines 11166-11193.)
-            per_ion_q.push(q_cpu);
-            let beta_this_ion = beta_flat.clone();
-            per_ion_beta_flat.push(beta_this_ion);
-            per_ion_ne.push(ne);
-
-            let d0_flat: Vec<f64> = d0_expanded.iter().cloned().collect();
             entries.push(VnlIonData {
                 beta_g: beta_dev,
                 d_matrix: d_dev,
-                d0_expanded: d0_flat,
+                d0_expanded,
                 q_matrix: q_dev,
                 n_expanded,
             });
         }
+
         // -----------------------------------------------------------------------
-        // Global Woodbury assembly (after per-ion loop)
+        // Construct the shared Arc (or clone the existing one)
         // -----------------------------------------------------------------------
-        let n_total_expanded: i32 = per_ion_ne.iter().map(|&ne| ne as i32).sum();
-
-        // 1. Build global block-diagonal Q matrix (real, n_expanded per ion).
-        //    CASTEP nlpot_prepare_Sinv_full lines 11166-11193: Q is block-diagonal
-        //    with `ps_q(m,n,nsp)` entries multiplied by `mixture_weight` (≈1.0).
-        //    We assemble the full matrix and invert it globally in one Cholesky pass.
-        let nte = n_total_expanded as usize;
-        let mut q_global = vec![0.0_f64; nte * nte];
-        {
-            let mut offset = 0;
-            for (ion_idx, &ne) in per_ion_ne.iter().enumerate() {
-                let q = &per_ion_q[ion_idx];
-                for i in 0..ne {
-                    for j in 0..ne {
-                        q_global[(offset + i) * nte + (offset + j)] = q[i * ne + j];
-                    }
-                }
-                offset += ne;
-            }
-        }
-
-        // 2. Invert Q globally via Cholesky (faer), matching CASTEP's
-        //    `invert_q_matrix` from preconditioner.rs with TINY = 1e-14.
-        //    Rows/cols with |diag| ≤ TINY are zeroed (pseudo-inverse for
-        //    singular Q channels; cf. nlpot.f90:13920-13932).
-        const Q_TINY: f64 = 1e-14;
-        let nonsingular: Vec<usize> =
-            (0..nte).filter(|&i| q_global[i * nte + i].abs() > Q_TINY).collect();
-        let mut q_inv_global = vec![0.0_f64; nte * nte];
-        let m = nonsingular.len();
-        if m > 0 {
-            let mut sub_q = Mat::<f64>::zeros(m, m);
-            for (ki, &i) in nonsingular.iter().enumerate() {
-                for (kj, &j) in nonsingular.iter().enumerate() {
-                    sub_q[(ki, kj)] = q_global[i * nte + j];
-                }
-            }
-            if let Ok(llt) = Llt::new(sub_q.as_ref(), Side::Lower) {
-                let sub_inv = llt.inverse();
-                for (ki, &i) in nonsingular.iter().enumerate() {
-                    for (kj, &j) in nonsingular.iter().enumerate() {
-                        q_inv_global[i * nte + j] = sub_inv[(ki, kj)];
-                    }
-                }
-            }
-            // If Cholesky fails (not SPD), leave singular rows/cols zeroed
-            // (safe fallback — the LU below handles the resulting M).
-        }
-
-        // 3. Concatenate B: shape n_pw × n_total_expanded (col-major).
-        let mut b_concat_cpu: Vec<CudaComplex> = Vec::with_capacity(n_pw * nte);
-        for (ion_idx, _ne) in per_ion_ne.iter().enumerate() {
-            let beta_flat = &per_ion_beta_flat[ion_idx];
-            b_concat_cpu.extend_from_slice(beta_flat);
-        }
-        let b_concat = stream.clone_htod(&b_concat_cpu).map_err(Error::Cuda)?;
-        pcie.h2d_bytes += b_concat_cpu.len() * std::mem::size_of::<CudaComplex>();
-
-        // 4. Compute B^H·B on GPU, keep full complex (cross-ion blocks have
-        //    non-zero imaginary parts from structure-factor phase differences).
-        let mut bh_b_dev: CudaSlice<CudaComplex> =
-            stream.alloc_zeros(nte * nte).map_err(Error::Cuda)?;
-        unsafe {
-            blas.gemm_c64(
-                ZgemmConfig {
-                    transa: blas::op::C,
-                    transb: blas::op::N,
-                    m: nte as i32,
-                    n: nte as i32,
-                    k: n_pw as i32,
-                    alpha: CudaComplex { x: 1.0, y: 0.0 },
-                    lda: n_pw as i32,
-                    ldb: n_pw as i32,
-                    beta: CudaComplex { x: 0.0, y: 0.0 },
-                    ldc: nte as i32,
-                },
-                &b_concat,
-                &b_concat,
-                &mut bh_b_dev,
-            )?;
-        }
-        // D2H: copy full complex B^H·B to CPU for M assembly.
-        let mut m_cpu: Vec<CudaComplex> = stream.clone_dtoh(&bh_b_dev).map_err(Error::Cuda)?;
-
-        // 5. M = Q⁻¹ + B^H·B + ε·I  (complex, in-place on m_cpu).
-        //    Q⁻¹ is real; imaginary parts come solely from B^H·B cross-ion phases.
-        for i in 0..nte {
-            for j in 0..nte {
-                m_cpu[i * nte + j].x += q_inv_global[i * nte + j];
-            }
-            // Regularisation prevents exact-zero pivot from zgetrf.
-            m_cpu[i * nte + i].x += 1e-12;
-        }
-
-        // 6. LU factor M = P·L·U.
-        let mut lu_m_dev = stream.clone_htod(&m_cpu).map_err(Error::Cuda)?;
-        pcie.h2d_bytes += m_cpu.len() * std::mem::size_of::<CudaComplex>();
-        let mut lu_ipiv_dev = stream.alloc_zeros::<i32>(nte).map_err(Error::Cuda)?;
-        let mut lu_info = stream.alloc_zeros::<i32>(1).map_err(Error::Cuda)?;
-        solver.zgetrf(
-            nte as i32,
-            nte as i32,
-            &mut lu_m_dev,
-            &mut lu_ipiv_dev,
-            &mut lu_info,
-        )?;
-        let lu_info_cpu: Vec<i32> = stream.clone_dtoh(&lu_info).map_err(Error::Cuda)?;
-        if lu_info_cpu[0] != 0 {
-            return Err(Error::Nvrtc(format!(
-                "global Woodbury M singular: zgetrf info = {} (zero pivot at row {})",
-                lu_info_cpu[0], lu_info_cpu[0],
-            )));
-        }
+        let shared_arc = match shared {
+            Some(ref arc) => arc.clone(),
+            None => Arc::new(KptSharedVnl {
+                screening_cache,
+                screening_cache_fine,
+                per_ion_beta_g,
+                per_ion_q,
+                per_ion_d0_expanded,
+                per_ion_n_expanded,
+                screening_h2d_bytes,
+            }),
+        };
 
         Ok(VnlBatchData {
             entries,
-            screening_h2d_bytes,
-            screening_cache,
-            screening_cache_fine,
-            b_concat,
-            lu_m: lu_m_dev,
-            lu_ipiv: lu_ipiv_dev,
-            n_total_expanded,
+            shared: shared_arc,
         })
     }
 
@@ -511,16 +435,14 @@ impl VnlBatchData {
         // otherwise fall back to wave-grid cache (pure Rust SCF path).
         let n_grid;
         let use_cache;
-        if let Some(ref fine_cache) = self.screening_cache_fine {
+        if let Some(ref fine_cache) = self.shared.screening_cache_fine {
             let [ngz_f, ngy_f, ngx_f] = fine_cache.wave_grid;
             n_grid = ngz_f * ngy_f * ngx_f;
             use_cache = fine_cache;
-        } else if let Some(ref c) = self.screening_cache {
-            let [ngz, ngy, ngx] = c.wave_grid;
-            n_grid = ngz * ngy * ngx;
-            use_cache = c;
         } else {
-            return Ok(());
+            let [ngz, ngy, ngx] = self.shared.screening_cache.wave_grid;
+            n_grid = ngz * ngy * ngx;
+            use_cache = &self.shared.screening_cache;
         };
 
         // FFT V_eff real → reciprocal on CPU.

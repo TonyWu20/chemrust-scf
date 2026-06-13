@@ -261,7 +261,6 @@ fn run_orthogonality_diagnostic(filter_mode: chemrust_scf::FilterMode, mode_name
         &mut pcie,
         &blas,
         &kernels,
-        &solver,
     )
     .expect("Failed to build VnlBatchData");
 
@@ -603,7 +602,6 @@ fn diagnostic_2_residual_norms_after_chebyshev_filter() {
         &mut pcie,
         &blas,
         &kernels,
-        &solver,
     )
     .expect("VnlBatchData::precompute");
 
@@ -1135,7 +1133,6 @@ fn diagnostic_s_norm_baseline() {
         &mut pcie,
         &blas,
         &kernels,
-        &solver,
     ).expect("VnlBatchData::precompute");
 
     // Compute norm²_S for band 0 of the CASTEP .check wavefunction
@@ -1342,7 +1339,7 @@ fn diagnostic_h_psi_differential() {
     let vnl_data = VnlBatchData::precompute(
         pw_coords, &fx.pots, &fx.bin.cell, &wave_grid, &k_point,
         &psi_input, n_bands, n_pw, Some(&occupations.0), Some(&v_eff_for_d),
-        &stream, &mut pcie, &blas, &kernels, &solver,
+        &stream, &mut pcie, &blas, &kernels,
     ).expect("VnlBatchData");
 
     // Upload V_eff to GPU
@@ -1565,7 +1562,6 @@ fn diagnostic_3_outer_loop_convergence() {
         &mut pcie,
         &blas,
         &kernels,
-        &solver,
     )
     .expect("VnlBatchData::precompute");
 
@@ -1984,7 +1980,7 @@ fn diagnostic_h_psi_component_breakdown() {
     let vnl_data = VnlBatchData::precompute(
         pw_coords, &fx.pots, cell, &wave_grid, &k_point,
         &psi_input, n_bands, n_pw, Some(&occupations.0), Some(&v_eff_for_d),
-        &stream, &mut pcie, &blas, &kernels, &solver,
+        &stream, &mut pcie, &blas, &kernels,
     ).expect("VnlBatchData");
 
     // Upload reference V_eff to GPU

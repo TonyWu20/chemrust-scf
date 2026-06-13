@@ -53,6 +53,12 @@ pub struct WaveSfEntry {
 /// Built fresh inside VnlBatchData::precompute, replacing the old
 /// HashMap<String, Option<QOnGrid>> local cache with a GPU-resident
 /// data structure.
+///
+/// **Clone safety**: `Clone` on this struct is a shallow clone — the inner
+/// `CudaSlice` fields are handle copies referencing the same GPU memory
+/// (cudarc 0.19 `CudaSlice::clone()` does NOT deep-copy VRAM).  Both the
+/// original and the clone share the same GPU allocation; dropping one does
+/// not free the memory until the last clone is dropped.
 #[derive(Clone)]
 pub struct WaveScreeningCache {
     pub species_entries: Vec<Option<WaveQSpeciesEntry>>,

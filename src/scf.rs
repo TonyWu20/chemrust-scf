@@ -26,7 +26,7 @@ use crate::eigensolver::davidson::{DavidsonDiagnostic, DAVIDSON_LAST_DIAG};
 use crate::eigensolver::rayleigh_ritz::rayleigh_ritz;
 #[cfg(all(any(test, feature = "scf_diag"), feature = "chebyshev"))]
 use crate::eigensolver::rayleigh_ritz::rayleigh_ritz_with_matrices;
-use crate::eigensolver::vnl_data::VnlBatchData;
+use crate::eigensolver::vnl_data::{KptSharedVnl, VnlBatchData};
 use crate::layout::{ColumnDistributed, Cpu, WavefunctionSet};
 use crate::mixing::{DensityHistory, Kerker, MixingOff, MixingPhase, Pulay};
 use crate::density::{QSfCache, build_q_sf_cache};
@@ -783,6 +783,9 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
         //       call hamiltonian_diagonalise(wvfn, nk, ns, ...)
         //     end do
         //   end do
+        //
+        // Shared VNL cache: spin-0 builds KptSharedVnl per kpt; spin-1 reuses.
+        let mut shared_vnl_cache: Vec<Option<Arc<KptSharedVnl>>> = vec![None; nkpts];
         // -----------------------------------------------------------------------
         for ispin in 0..nspins {
             // Initialize per-kpt result accumulators for this spin
@@ -853,14 +856,18 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
                 // 6. V_NL precomputation per (spin,kpt) — D-matrices are per-(kpt,spin).
                 //    CASTEP hamiltonian.f90:1013
                 let psi_host = self.psi_cpu[ispin][ikpt].clone();
+                // Share spin-independent VNL data across spin channels:
+                // spin-0 builds KptSharedVnl fresh; spin-1 reuses it.
+                let shared_vnl = shared_vnl_cache[ikpt].clone();
                 let mut vnl_data = VnlBatchData::precompute_with_d_override(
                     pw_coords_kpt, &self.pots, &self.cell,
                     &self.wave_grid, Some(&self.fine_grid), kpoint,
                     &psi_host, n_bands, n_pw_kpt, occupations,
                     None,
-                    d_override_per_ion,
-                    &stream, &mut pcie, &blas, &kernels, &solver,
+                    d_override_per_ion, shared_vnl,
+                    &stream, &mut pcie, &blas, &kernels,
                 )?;
+                shared_vnl_cache[ikpt] = Some(vnl_data.shared.clone());
 
                 if d_override_per_ion.is_none() {
                     vnl_data.rescreen_d(v_eff_arr, &stream, &kernels, &blas)?;
@@ -1061,7 +1068,7 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
             &self.wave_grid, &self.k_points[0],
             &psi_host, n_bands, n_pw, None,
             Some(&v_eff_for_d),
-            &stream, &mut pcie, &blas, &kernels, &solver,
+            &stream, &mut pcie, &blas, &kernels,
         )?;
 
         let eig: Option<&[f64]> = None;
@@ -1132,7 +1139,7 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
             &self.wave_grid, &self.k_points[0],
             &psi_host, n_bands, n_pw, occupations,
             Some(&v_eff_for_d),
-            &stream, &mut pcie, &blas, &kernels, &solver,
+            &stream, &mut pcie, &blas, &kernels,
         )?;
 
         let fft_idx_dev: CudaSlice<i32> = stream.clone_htod(&self.pw_fft_indices[0])
@@ -1190,7 +1197,7 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
             &self.wave_grid, &self.k_points[0],
             &psi_for_betapsi, n_bands_state, n_pw, None,
             Some(&v_eff_for_d),
-            &stream, &mut pcie, &blas, &kernels, &solver,
+            &stream, &mut pcie, &blas, &kernels,
         )?;
 
         crate::eigensolver::chebyshev::apply_s_for_test(

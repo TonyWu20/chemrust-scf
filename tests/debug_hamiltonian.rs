@@ -82,7 +82,7 @@ fn debug_rayleigh() {
     let mut pcie = PcieAccount::default();
     let vnl = VnlBatchData::precompute(
         &pwc, &pots, cell, &wg, &kp, &psi_flat, nb, npw, None,
-        Some(&veff_inner), &stream, &mut pcie, &blas, &kernels, &solver,
+        Some(&veff_inner), &stream, &mut pcie, &blas, &kernels,
     ).unwrap();
 
     // === H·ψ ===

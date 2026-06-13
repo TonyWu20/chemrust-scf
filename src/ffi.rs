@@ -19,7 +19,7 @@ use crate::eigensolver::davidson_types::{KineticPreconditioner, PwCoefficients};
 use crate::eigensolver::hamiltonian::apply_full_hamiltonian;
 use crate::eigensolver::kernels::CudaKernelSet;
 use crate::eigensolver::preconditioner::TpaPreconditioner;
-use crate::eigensolver::vnl_data::VnlBatchData;
+use crate::eigensolver::vnl_data::{KptSharedVnl, VnlBatchData};
 use crate::layout::{ColumnDistributed, WavefunctionSet};
 use crate::types::{EffectivePotential, FineGridArray, KPoint};
 
@@ -61,6 +61,9 @@ struct KptData {
     /// Lazily-initialised V_NL batch data per spin.  Created on the first call
     /// to step_inner with the REAL psi and n_bands — never dummy values.
     vnl: Vec<Option<VnlBatchData>>,
+    /// Shared spin-independent VNL state per k-point, built on first
+    /// step_inner call and reused by subsequent spin calls.
+    shared_vnl: Option<Arc<KptSharedVnl>>,
 }
 
 // ---- Opaque handle ---------------------------------------------------------
@@ -253,6 +256,7 @@ fn init_inner(
         // available.  Store only the ion-independent per-k-point data here.
         kpts.push(KptData {
             vnl: (0..nspins_u).map(|_| None).collect(),
+            shared_vnl: None,
             kpoint_frac: kf,
             k_point: kpt,
             pw_coords,
@@ -446,11 +450,13 @@ unsafe fn step_inner(
         // screening cache that matches CASTEP's convention.
         // Empirically: fine-grid D-screening gives iter-2 spin-polarised energy
         // (-7160.63 eV) close to reference (-7160.23 eV); wave-grid gives -7187 eV.
+        let shared_for_this_spin = kd.shared_vnl.clone();
         kd.vnl[isp] = Some(VnlBatchData::precompute_with_d_override(
             &kd.pw_coords, &h.pots, &h.cell, &h.wave_grid, Some(&h.fine_grid), &kd.k_point,
-            &psi_host, n_bands, n_pw, None, None, None,
-            &h.stream, &mut pcie, &h.blas, &h.kernels, &h.solver,
+            &psi_host, n_bands, n_pw, None, None, None, shared_for_this_spin,
+            &h.stream, &mut pcie, &h.blas, &h.kernels,
         ).map_err(|e| { eprintln!("[chemrust] VnlBatchData init failed: {e}"); CHEM_EIG_CUDA_ERROR })?);
+        kd.shared_vnl = Some(kd.vnl[isp].as_ref().unwrap().shared.clone());
     }
 
     let wfn = WavefunctionSet::<ColumnDistributed>::new(psi_host, n_bands, n_pw);
@@ -703,6 +709,12 @@ unsafe fn step_inner(
             .call()
             .map_err(|e| { eprintln!("[chemrust] H*psi after Davidson failed: {e}"); CHEM_EIG_CUDA_ERROR })?;
     }
+
+    // Free FFT grid buffer before D2H transfers to reduce peak VRAM.
+    // grid_buf holds n_bands * gs complex elements (~13.6 GB for Cu111_CO
+    // with fine grid).  Dropping here frees ~13.6 GB before we allocate
+    // psi_host_out and hpsi_host on the host.
+    drop(grid_buf);
 
     // Download and write back to CASTEP buffers
     let psi_host_out: Vec<CudaComplex> = stream.clone_dtoh(&davidson_result.psi_out)
