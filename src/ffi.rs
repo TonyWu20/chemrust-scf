@@ -6,7 +6,7 @@ use std::ffi::{c_char, c_void, CStr};
 use std::os::raw::{c_double, c_int};
 use std::sync::Arc;
 
-use chemrust_hamiltonian_core::{CellGeometry, GVectorGrid, Pseudopotential, PseudopotentialSet, RealLattice, RecipLattice};
+use chemrust_hamiltonian_core::{CellGeometry, GVectorGrid, PseudopotentialSet, RealLattice, RecipLattice};
 use cudarc::driver::{CudaContext, CudaSlice, CudaStream};
 
 use crate::device::blas::BlasHandle;

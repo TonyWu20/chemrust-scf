@@ -1,5 +1,47 @@
 # Failure Patterns
 
+## 2026-06-14: FFT plan caching breaks non-spin SCF convergence
+
+**Root cause**: `b6929d8` — caching `BatchedFftPlan3d` per kpt (`KptData.fft_plan`)
+instead of recreating the cuFFT plan fresh each `step_inner` call. The cached plan,
+when reused across SCF iterations, corrupts Hamiltonian FFTs (c2c_forward inside
+`apply_full_hamiltonian`), producing wrong H·ψ → wrong Davidson eigenvalues →
+wrong density → frozen V_eff (stuck at −8.440 Ha after iter 2) → energy runaway
+(−7.157e3 → −8.569e3 Ha in 4 iterations).
+
+**Mechanism**: The `CudaFft` plan (cuFFT handle) persists across SCF iterations.
+cuFFT manages internal workspace buffers allocated during the first execution.
+When the plan is reused without being destroyed and recreated, the workspace
+state from the previous iteration contaminates the next FFT execution. The old
+code created and dropped the plan each call — `CudaFft::Drop` calls `cufftDestroy`,
+which frees the workspace. The cached plan skips this cleanup, accumulating errors.
+
+**Bisection**: `96a1020` (HandleSharedVnl) alone converges. `96a1020` + `b6929d8` diverges.
+Reverting only `b6929d8` from HEAD restores convergence. HandleSharedVnl is confirmed
+correct by empirical FFI test.
+
+**Fix**: Revert `b6929d8` — recreate `BatchedFftPlan3d` fresh each `step_inner` call.
+Plan creation overhead (~8 ms) is negligible compared to eigensolver cost.
+
+**Pattern**: `cached-gpu-plan-workspace-contamination` — a GPU library plan (cuFFT)
+allocates internal workspace buffers on first execution. Caching the plan across
+execution cycles without explicit workspace reset allows state from one execution
+to contaminate the next. The safe pattern is: either recreate the plan each cycle,
+or explicitly reset the workspace between uses.
+
+**Lesson**: Caching a GPU plan for performance is only valid if the plan's internal
+state is proven stateless between executions. cuFFT plans are NOT stateless — they
+hold workspace allocations that accumulate data across executions. The performance
+gain (~5s per 24-iter NiO run) is trivial compared to the debugging cost of a
+divergent SCF.
+
+**Verification**: NiO non-spin FFI converges with revert. Cu111_CO spin converges
+(65 SCF iterations, confirmed at commit `6b57306` spin-opt only). HandleSharedVnl
+sharing (commit `96a1020`) is structurally verified correct by 3-agent adversarial
+workflow — the screening cache, Q, and D0 data are bit-identical between shared
+(via HandleSharedVnl) and per-kpt (fresh build) paths; only the FFT plan caching
+broke things.
+
 ## 2026-06-13: V_eff cache staleness + D-screening grid mismatch — NiO cold-start divergence
 
 **Root cause (primary)**: `cache_reuse` check at `src/ffi.rs` used `|max(|V_eff|) - prev| < 1e-8 Ha`

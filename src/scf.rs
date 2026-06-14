@@ -177,6 +177,14 @@ pub struct ScfIteration<
     /// `compute_density_from_wavefunctions` call that has a GPU stream.
     /// `None` until first build; geometry-static thereafter.
     pub(crate) q_sf_cache: Option<QSfCache>,
+    /// Kpt-independent V_NL shared state (screening caches, Q, D0).  Built
+    /// lazily on first `diagonalize_inner` call and persisted across SCF
+    /// iterations — matches `ffi.rs` `ChemrustHandle.handle_shared_vnl`.
+    pub(crate) handle_shared_vnl: Option<Arc<HandleSharedVnl>>,
+    /// Per-kpt V_NL shared state (per-ion β(G+k)).  Built lazily on first
+    /// `diagonalize_inner` call per kpt and persisted across SCF iterations.
+    /// Index `[ikpt]`.  Matches `ffi.rs` `KptData.shared_vnl`.
+    pub(crate) shared_vnl_cache: Vec<Option<Arc<KptSharedVnl>>>,
     /// USPP augmentation density ρ_aug(r) on the fine grid, regenerated from
     /// the current ψ + occ each iteration. `None` for iter-1 (fixture
     /// density already encodes augmentation in the wave-grid convention).
@@ -272,6 +280,8 @@ impl<S: SpinPolicy> ScfIteration<S, Initialized, MixingOff> {
                 (0..nspins).map(|_| KptDataSet::new(vec![None; nkpts], nkpts)).collect()
             )),
             q_sf_cache: None,
+            handle_shared_vnl: None,
+            shared_vnl_cache: vec![None; nkpts],
             density_aug_fine: PerSpinAugDensity(SpinChannelData::new::<S>(vec![None; nspins])),
             #[cfg(any(test, feature = "scf_diag"))]
             last_davidson_diagnostics: None,
@@ -319,6 +329,8 @@ impl<S: SpinPolicy, Phase: ScfPhase, M: MixingPhase> ScfIteration<S, Phase, M> {
             fermi_energy: self.fermi_energy,
             beta_psi_per_ion: self.beta_psi_per_ion,
             q_sf_cache: self.q_sf_cache,
+            handle_shared_vnl: self.handle_shared_vnl,
+            shared_vnl_cache: self.shared_vnl_cache,
             density_aug_fine: self.density_aug_fine,
             #[cfg(any(test, feature = "scf_diag"))]
             last_davidson_diagnostics: self.last_davidson_diagnostics,
@@ -730,7 +742,7 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
     }
 
     fn diagonalize_inner(
-        self,
+        mut self,
         _ndeg: usize,
         occupations: Option<&[f64]>,
         #[cfg(feature = "chebyshev")] filter_mode: FilterMode,
@@ -785,10 +797,8 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
         //   end do
         //
         // Shared VNL cache: spin-0 builds KptSharedVnl per kpt; spin-1 reuses.
-        let mut shared_vnl_cache: Vec<Option<Arc<KptSharedVnl>>> = vec![None; nkpts];
-        // Kpt-independent shared state (screening caches, Q, D0).  Built lazily
-        // on first use — depends only on pots/cell/grid, which are geometry-static.
-        let mut handle_shared: Option<Arc<HandleSharedVnl>> = None;
+        // Persisted in self.shared_vnl_cache and self.handle_shared_vnl across
+        // SCF iterations — matches ffi.rs ChemrustHandle/KptData lifecycle.
         // -----------------------------------------------------------------------
         for ispin in 0..nspins {
             // Initialize per-kpt result accumulators for this spin
@@ -860,25 +870,25 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
                 //    CASTEP hamiltonian.f90:1013
                 let psi_host = self.psi_cpu[ispin][ikpt].clone();
                 // Build kpt-independent HandleSharedVnl lazily on first use.
-                if handle_shared.is_none() {
-                    handle_shared = Some(build_handle_shared_vnl(
+                if self.handle_shared_vnl.is_none() {
+                    self.handle_shared_vnl = Some(build_handle_shared_vnl(
                         &self.pots, &self.cell, &self.wave_grid, Some(&self.fine_grid),
                         &stream, &mut pcie,
                     )?);
                 }
                 // Share spin-independent VNL data across spin channels:
                 // spin-0 builds KptSharedVnl fresh; spin-1 reuses it.
-                let shared_vnl = shared_vnl_cache[ikpt].clone();
+                let shared_vnl = self.shared_vnl_cache[ikpt].clone();
                 let mut vnl_data = VnlBatchData::precompute_with_d_override(
                     pw_coords_kpt, &self.pots, &self.cell,
                     &self.wave_grid, Some(&self.fine_grid), kpoint,
                     &psi_host, n_bands, n_pw_kpt, occupations,
                     None,
                     d_override_per_ion, shared_vnl,
-                    handle_shared.clone(),
+                    self.handle_shared_vnl.clone(),
                     &stream, &mut pcie, &blas, &kernels,
                 )?;
-                shared_vnl_cache[ikpt] = Some(vnl_data.shared.clone());
+                self.shared_vnl_cache[ikpt] = Some(vnl_data.shared.clone());
 
                 if d_override_per_ion.is_none() {
                     vnl_data.rescreen_d(v_eff_arr, &stream, &kernels, &blas)?;
@@ -1549,6 +1559,8 @@ impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated, MixingOff> {
             fermi_energy: fermi_energies,
             beta_psi_per_ion: self.beta_psi_per_ion,
             q_sf_cache: self.q_sf_cache,
+            handle_shared_vnl: self.handle_shared_vnl,
+            shared_vnl_cache: self.shared_vnl_cache,
             density_aug_fine,
             #[cfg(any(test, feature = "scf_diag"))]
             last_davidson_diagnostics: None,
@@ -1595,6 +1607,8 @@ impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated, MixingOff> {
             fermi_energy: fermi_energies,
             beta_psi_per_ion: self.beta_psi_per_ion,
             q_sf_cache: self.q_sf_cache,
+            handle_shared_vnl: self.handle_shared_vnl,
+            shared_vnl_cache: self.shared_vnl_cache,
             density_aug_fine,
             #[cfg(any(test, feature = "scf_diag"))]
             last_davidson_diagnostics: None,
@@ -1655,6 +1669,8 @@ impl<S: SpinPolicy> ScfIteration<S, DensityUpdated<MixingOff>, MixingOff> {
             fermi_energy: self.fermi_energy,
             beta_psi_per_ion: self.beta_psi_per_ion,
             q_sf_cache: self.q_sf_cache,
+            handle_shared_vnl: self.handle_shared_vnl,
+            shared_vnl_cache: self.shared_vnl_cache,
             density_aug_fine: self.density_aug_fine,
             #[cfg(any(test, feature = "scf_diag"))]
             last_davidson_diagnostics: self.last_davidson_diagnostics,
@@ -1706,6 +1722,8 @@ impl<S: SpinPolicy> ScfIteration<S, DensityUpdated<Kerker>, Kerker> {
             fermi_energy: self.fermi_energy,
             beta_psi_per_ion: self.beta_psi_per_ion,
             q_sf_cache: self.q_sf_cache,
+            handle_shared_vnl: self.handle_shared_vnl,
+            shared_vnl_cache: self.shared_vnl_cache,
             density_aug_fine: self.density_aug_fine,
             #[cfg(any(test, feature = "scf_diag"))]
             last_davidson_diagnostics: self.last_davidson_diagnostics,
@@ -1757,6 +1775,8 @@ impl<S: SpinPolicy> ScfIteration<S, DensityUpdated<Pulay>, Pulay> {
             fermi_energy: self.fermi_energy,
             beta_psi_per_ion: self.beta_psi_per_ion,
             q_sf_cache: self.q_sf_cache,
+            handle_shared_vnl: self.handle_shared_vnl,
+            shared_vnl_cache: self.shared_vnl_cache,
             density_aug_fine: self.density_aug_fine,
             #[cfg(any(test, feature = "scf_diag"))]
             last_davidson_diagnostics: self.last_davidson_diagnostics,
