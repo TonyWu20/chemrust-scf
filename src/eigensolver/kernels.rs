@@ -20,6 +20,21 @@ extern \"C\" __global__ void zero_buffer(double2* buf, int n) {
     for (int i = tid; i < n; i += stride) { buf[i].x = 0.0; buf[i].y = 0.0; }
 }
 
+// Simple element-wise device-to-device copy on the compute engine.
+// Used instead of cudaMemcpyAsync when the copy must be visible to
+// subsequent compute-engine kernels (cuBLAS ZGEMMs) — Pascal GPUs
+// have a known L1/L2 coherence gap between copy engine and compute
+// engine writes.
+extern \"C\" __global__ void copy_buffer(
+    double2* dst, const double2* src, int n
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+    for (int i = tid; i < n; i += stride) {
+        dst[i] = src[i];
+    }
+}
+
 extern \"C\" __global__ void zero_buffer_real(double* buf, int n) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     int stride = blockDim.x * gridDim.x;
@@ -215,6 +230,7 @@ pub struct CudaKernelSet {
     pub(crate) transpose_row_to_col: CudaFunction,
     pub(crate) cpx_mul_inplace: CudaFunction,
     pub(crate) cpx_conj_mul: CudaFunction,
+    pub(crate) copy_buffer: CudaFunction,
 }
 
 impl CudaKernelSet {
@@ -238,6 +254,7 @@ impl CudaKernelSet {
             transpose_row_to_col: load("transpose_row_to_col")?,
             cpx_mul_inplace: load("cpx_mul_inplace")?,
             cpx_conj_mul: load("cpx_conj_mul")?,
+            copy_buffer: load("copy_buffer")?,
         })
     }
 }

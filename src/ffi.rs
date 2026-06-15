@@ -695,12 +695,16 @@ unsafe fn step_inner(
             .map_err(|e| { eprintln!("[chemrust] davidson_diagonalise failed: {e}"); CHEM_EIG_CUDA_ERROR })?
     };
 
-    // Compute H·psi_new for hpsi_out
+    // Compute H·psi_new for hpsi_out.
+    // Reuse the BetaPhiCache from the Davidson solve — psi_out is the same
+    // psi that compute_all ran against at the end of the last outer iteration,
+    // so cached β^H·ψ projections are still valid.
     let psi_out_pw = PwCoefficients::new(davidson_result.psi_out.clone());
     let mut hpsi_new = PwCoefficients::new(
         stream.alloc_zeros(n_elem).map_err(|_| CHEM_EIG_CUDA_ERROR)?);
+    let mut post_cache: Option<crate::eigensolver::beta_phi_cache::BetaPhiCache> = None;
     unsafe {
-        apply_full_hamiltonian()
+        let h_builder = apply_full_hamiltonian()
             .psi_dev(&psi_out_pw)
             .v_eff_dev(v_eff_gpu.as_device_slice())
             .kinetic_dev(&kinetic_dev)
@@ -715,9 +719,13 @@ unsafe fn step_inner(
             .vnl_data(kd.vnl[isp].as_ref().unwrap())
             .blas(blas)
             .kernels(kernels)
-            .stream(stream)
-            .call()
-            .map_err(|e| { eprintln!("[chemrust] H*psi after Davidson failed: {e}"); CHEM_EIG_CUDA_ERROR })?;
+            .stream(stream);
+        if let Some(ref mut cache) = post_cache {
+            h_builder.maybe_beta_phi_cache(cache).call()
+        } else {
+            h_builder.call()
+        }
+        .map_err(|e| { eprintln!("[chemrust] H*psi after Davidson failed: {e}"); CHEM_EIG_CUDA_ERROR })?;
     }
 
     // Free FFT grid buffer before D2H transfers to reduce peak VRAM.

@@ -12,6 +12,8 @@ use cudarc::cusolver::safe::DnHandle;
 use cudarc::cusolver::sys::{
     self as sys, cublasFillMode_t, cublasOperation_t, cusolverEigMode_t,
 };
+#[cfg(any(test, feature = "chebyshev"))]
+use cudarc::cusolver::sys::cusolverEigType_t;
 use cudarc::driver::{result::DriverError, CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
 use thiserror::Error;
 
