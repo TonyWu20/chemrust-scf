@@ -1590,9 +1590,6 @@ pub(crate) unsafe fn davidson_diagonalise(
                 active_indices.clone(),
             )?;
 
-            // Raw pointers to eigenvalues data (bypass borrow checker for writes)
-            let eig_ptr: *mut f64 = eigenvalues.as_ptr() as *mut f64;
-
             // Raw pointers to psi_dev/hpsi_dev GPU memory.
             // device_ptr returns CUdeviceptr (u64) = the raw device pointer value.
             // Guards must stay alive until all GPU ops on these pointers complete.
@@ -1826,7 +1823,7 @@ pub(crate) unsafe fn davidson_diagonalise(
                             (h_super_ptr as *const CudaComplex).add(col * n_pw) as *const _, 1,
                             hpsi_dev_raw.add(gi * n_pw) as *mut _, 1,
                         ).result().map_err(Error::Blas)?;
-                        unsafe { *eig_ptr.add(gi) = inner_eigenvalues[col]; }
+                        eigenvalues[gi] = inner_eigenvalues[col];
                     }
                 }
 
