@@ -191,6 +191,26 @@ extern \"C\" __global__ void cpx_conj_mul(
         dst[i].y = ay * bx - ax * by;   // Im(a * conj(b))
     }
 }
+
+// Column scaling: out[r + c*nrow] *= eig[c]
+// Used in USPP preconditioner PASS 2 to scale beta_phi_psi by eigenvalues.
+// Matches CASTEP nlpot.f90:16100-16104 (E_beta = eigenvalue * beta_phi)
+extern \"C\" __global__ void scale_cols_by_eig(
+    double2* data,
+    const double* eig,
+    int nrow,
+    int ncol
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+    int total = nrow * ncol;
+    for (int i = tid; i < total; i += stride) {
+        int c = i / nrow;
+        double e = eig[c];
+        data[i].x *= e;
+        data[i].y *= e;
+    }
+}
 ";
 
 // ---------------------------------------------------------------------------
@@ -215,6 +235,7 @@ pub struct CudaKernelSet {
     pub(crate) transpose_row_to_col: CudaFunction,
     pub(crate) cpx_mul_inplace: CudaFunction,
     pub(crate) cpx_conj_mul: CudaFunction,
+    pub(crate) scale_cols_by_eig: CudaFunction,
 }
 
 impl CudaKernelSet {
@@ -238,6 +259,7 @@ impl CudaKernelSet {
             transpose_row_to_col: load("transpose_row_to_col")?,
             cpx_mul_inplace: load("cpx_mul_inplace")?,
             cpx_conj_mul: load("cpx_conj_mul")?,
+            scale_cols_by_eig: load("scale_cols_by_eig")?,
         })
     }
 }

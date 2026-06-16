@@ -978,6 +978,7 @@ pub(crate) unsafe fn davidson_diagonalise(
         .q_matrices(&q_matrices)
         .ion_n_expanded(&ion_n_expanded)
         .mixture_weights(&mixture_weights)
+        .maybe_stream(Some(stream))
         .call()?;
 
     // ------------------------------------------------------------------
@@ -1587,6 +1588,9 @@ pub(crate) unsafe fn davidson_diagonalise(
                 v_eff_dev, kinetic_dev, fft_idx_dev,
                 fft_plan, kernels,
                 Some(&precon_prep.r_beta_per_ion), Some(&precon_prep.q_rcq),
+                precon_prep.q_rcq_gpu.as_ref(),
+                precon_prep.r_beta_gpu.as_ref(),
+                Some(precon_prep.total_ne).filter(|&n| n > 0),
                 active_indices.clone(),
             )?;
 
@@ -3269,6 +3273,10 @@ struct DavidsonBlockCtx<'a> {
     kernels: &'a CudaKernelSet,
     r_beta_per_ion: Option<&'a [Array2<Complex64>]>,
     q_rcq: Option<&'a Array2<Complex64>>,
+    // GPU-resident USPP params (pre-uploaded in prepare_preconditioner)
+    q_rcq_gpu: Option<&'a CudaSlice<CudaComplex>>,
+    r_beta_gpu: Option<&'a CudaSlice<CudaComplex>>,
+    total_ne: Option<usize>,
 
     // --- Owned scratch buffers ---
     block_psi_temp: PwCoefficients,
@@ -3348,6 +3356,9 @@ impl<'a> DavidsonBlockCtx<'a> {
         kernels: &'a CudaKernelSet,
         r_beta_per_ion: Option<&'a [Array2<Complex64>]>,
         q_rcq: Option<&'a Array2<Complex64>>,
+        q_rcq_gpu: Option<&'a CudaSlice<CudaComplex>>,
+        r_beta_gpu: Option<&'a CudaSlice<CudaComplex>>,
+        total_ne: Option<usize>,
         active_indices: Vec<usize>,
     ) -> Result<Self, Error> {
         let ncol = active_indices.len();
@@ -3374,6 +3385,9 @@ impl<'a> DavidsonBlockCtx<'a> {
             kernels,
             r_beta_per_ion,
             q_rcq,
+            q_rcq_gpu,
+            r_beta_gpu,
+            total_ne,
             active_indices,
             block_psi_temp: PwCoefficients::new(
                 stream.alloc_zeros(n_pw * ncol).map_err(Error::Cuda)?),
@@ -3580,6 +3594,10 @@ impl<'a> DavidsonBlockCtx<'a> {
                 .blas(self.blas)
                 .maybe_r_beta_per_ion(self.r_beta_per_ion)
                 .maybe_q_rcq(self.q_rcq)
+                .maybe_q_rcq_gpu(self.q_rcq_gpu)
+                .maybe_r_beta_gpu(self.r_beta_gpu)
+                .maybe_total_ne(self.total_ne)
+                .maybe_kernels(Some(self.kernels))
                 .call()?
         };
         self.stream
