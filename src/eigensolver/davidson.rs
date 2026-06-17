@@ -1046,8 +1046,6 @@ pub(crate) unsafe fn davidson_diagonalise(
                     .blas(blas)
                     .kernels(kernels)
                     .stream(stream)
-                    // Pass the beta_phi_cache so V_NL can reuse β^H·ψ projections
-                    // across outer iterations for bands whose psi hasn't changed.
                     .maybe_beta_phi_cache(&mut beta_phi_cache)
                     .call()?;
             }
@@ -1247,10 +1245,8 @@ pub(crate) unsafe fn davidson_diagonalise(
                 eigenvalues[n_bands - 1]
             );
 
-        // ---- D1: S-norm diagnostic after A1 full-subspace ZHEGVD ----
-        // Verify that rotated eigenvectors maintain ⟨psi|S|psi⟩ ≈ 1.
-        // S-norm drift here contaminates lower-band reference columns for
-        // subsequent blocks' S-orthogonalization (Stage 3a in build()).
+        // ---- D1: S-norm diagnostic (scf_diag only) ----
+        #[cfg(feature = "scf_diag")]
         {
             let mut s_in = PwCoefficients::new(
                 stream.alloc_zeros(n_pw).map_err(Error::Cuda)?);
@@ -2062,10 +2058,8 @@ pub(crate) unsafe fn davidson_diagonalise(
             // end.  This avoids conduction states from one block corrupting
             // the ZHEEVD eigenvalue ordering of the next block.
 
-            // ---- D2: S-norm diagnostic after block 0 inner loop ----
-            // Block 0's A2 (post-ZHEGVD S-orthonormalize) is skipped because
-            // block_start == 0 (line 1463 guard).  Check whether ZHEGVD
-            // regularization has caused S-norm drift in psi_dev[0..current_nblock].
+            // ---- D2: S-norm diagnostic (scf_diag only) ----
+            #[cfg(feature = "scf_diag")]
             if block_start == 0 {
                 // Reuse the D1 buffer pattern but check only the block columns
                 let mut s_in = PwCoefficients::new(
@@ -2111,23 +2105,9 @@ pub(crate) unsafe fn davidson_diagonalise(
             }
         } // end block loop (for block_start)
 
-        // D12-04: Populate beta_phi_cache at the END of each outer iteration
-        // so that the NEXT iteration's apply_full_hamiltonian can reuse
-        // cached β^H·ψ projections.  Without this, the cache was populated
-        // at the start (before A1 rotation) and immediately invalidated by
-        // A1's invalidate_all(), making it dead code.
-        //
-        // After A1 (full subspace rotation, all bands changed) and A3
-        // (block-level copy-back), psi_dev holds the final wavefunctions
-        // for this outer iteration.  compute_all() at this point captures
-        // β^H·ψ for the psi_dev that will be used as the starting point
-        // of the next outer iteration.  At the start of the next iteration,
-        // apply_full_hamiltonian() will see the fully valid cache and use
-        // Case 1 (copy from cache, skip per-ion ZGEMM), saving one batch
-        // β^H·ψ ZGEMM per outer iteration.
-        unsafe {
-            beta_phi_cache.compute_all(&psi_dev, vnl_data, n_pw, blas, stream)?;
-        }
+        // SURV-01 (deferred): BetaPhiCache was populated here but never
+        // consumed (hamiltonian.rs:271 discards the cache).  Stage-level
+        // syncs now provide the barriers this dead code used to provide.
 
         // Step f-g: convergence check using inner-loop convergence criteria
         for b in 0..n_bands {
@@ -2599,6 +2579,7 @@ pub(crate) unsafe fn s_orthogonalise(
     if superspace_index == 0 {
         return Ok(());
     }
+    let _ = n_pw; // keep for builder API
 
     // Step 1: Compute S·search in batch → s_orth_out (n_pw × ncol)
     let (search_ptr, _) = search_dev.device_ptr(stream);
@@ -2611,15 +2592,14 @@ pub(crate) unsafe fn s_orthogonalise(
     // in spsi_dev before the call.  Without this pre-copy, s_orth_out
     // contains only the NL correction (missing the PW kinetic part),
     // producing wrong S·search → wrong ZGEMM overlap → eigenvalue explosion.
-    for j in 0..ncol {
-        let src = (search_ptr as *const CudaComplex).add(j * n_pw);
-        let dst_in = (s_in_mut as *mut CudaComplex).add(j * n_pw);
-        let dst_out = (s_out_mut as *mut CudaComplex).add(j * n_pw);
-        cublasZcopy_v2(handle, n_pw_i32, src as *const _, 1, dst_in as *mut _, 1)
-            .result().map_err(Error::Blas)?;
-        cublasZcopy_v2(handle, n_pw_i32, src as *const _, 1, dst_out as *mut _, 1)
-            .result().map_err(Error::Blas)?;
-    }
+    // Single contiguous copy: columns are contiguous in column-major (lda=n_pw).
+    // Safe now because build() syncs after s_orthogonalise returns.
+    cublasZcopy_v2(handle, n_pw_i32 * (ncol as i32),
+        search_ptr as *const _, 1, s_in_mut as *mut _, 1,
+    ).result().map_err(Error::Blas)?;
+    cublasZcopy_v2(handle, n_pw_i32 * (ncol as i32),
+        search_ptr as *const _, 1, s_out_mut as *mut _, 1,
+    ).result().map_err(Error::Blas)?;
     unsafe {
         apply_s_times()
             .psi_dev(&*s_orth_in)
@@ -2657,59 +2637,35 @@ pub(crate) unsafe fn s_orthogonalise(
     }
 
     // Step 3: search -= super_wvfn * overlap via ZGEMM
-    // Negate overlap: overlap *= -1
-    unsafe {
-        let alpha = CudaComplex { x: -1.0, y: 0.0 };
-        cublasZscal_v2(
-            handle,
-            (superspace_index * ncol) as i32,
-            &alpha as *const _ as *const _,
-            overlap_dev.device_ptr_mut(stream).0 as *mut _,
-            1,
-        ).result().map_err(Error::Blas)?;
-    }
+    // alpha=-1 directly — safe because build() syncs after this function.
     unsafe {
         blas.gemm_c64(
             ZgemmConfig {
-                transa: op::N,   // super_wvfn
-                transb: op::N,   // -overlap
-                m: n_pw_i32,
-                n: ncol as i32,
-                k: superspace_index as i32,
-                alpha: CudaComplex { x: 1.0, y: 0.0 },
-                lda: n_pw_i32,
-                ldb: superspace_index as i32,
+                transa: op::N,
+                transb: op::N,
+                m: n_pw_i32, n: ncol as i32, k: superspace_index as i32,
+                alpha: CudaComplex { x: -1.0, y: 0.0 },
+                lda: n_pw_i32, ldb: superspace_index as i32,
                 beta: CudaComplex { x: 1.0, y: 0.0 },
                 ldc: n_pw_i32,
             },
-            super_wvfn,
-            &overlap_dev,
-            search_dev,
+            super_wvfn, &overlap_dev, search_dev,
         )?;
     }
 
     // Step 4 (ADR-0005): hsearch -= hpsi_ref * overlap (lockstep transform).
-    // Reuses the same (negated) overlap coefficients from Step 3.
-    // The reference columns (hpsi_ref) are NOT modified — only the search
-    // H·psi columns are transformed.
     if let (Some(hpsi_search), Some(hpsi_ref_val)) = (hpsi_dev, hpsi_ref) {
         unsafe {
             blas.gemm_c64(
                 ZgemmConfig {
-                    transa: op::N,   // hpsi_ref
-                    transb: op::N,   // -overlap
-                    m: n_pw_i32,
-                    n: ncol as i32,
-                    k: superspace_index as i32,
-                    alpha: CudaComplex { x: 1.0, y: 0.0 },
-                    lda: n_pw_i32,
-                    ldb: superspace_index as i32,
+                    transa: op::N, transb: op::N,
+                    m: n_pw_i32, n: ncol as i32, k: superspace_index as i32,
+                    alpha: CudaComplex { x: -1.0, y: 0.0 },
+                    lda: n_pw_i32, ldb: superspace_index as i32,
                     beta: CudaComplex { x: 1.0, y: 0.0 },
                     ldc: n_pw_i32,
                 },
-                hpsi_ref_val,
-                &overlap_dev,
-                hpsi_search,
+                hpsi_ref_val, &overlap_dev, hpsi_search,
             )?;
         }
     }
@@ -3603,6 +3559,10 @@ impl<'a> DavidsonBlockCtx<'a> {
         self.stream
             .memcpy_dtod(&*precon_result, &mut self.search_dev.0)
             .map_err(Error::Cuda)?;
+        // GPU-resident preconditioner uses temporary per-ion buffers that
+        // are dropped at function exit. Sync here so those buffers aren't
+        // freed while cublasZcopy is still reading from them.
+        self.stream.synchronize().map_err(Error::Cuda)?;
 
         // Rust-SearchRaw: dump search direction coefficients for CASTEP comparison.
         // Matches CASTEP [CASTEP-SearchRaw] diagnostic at hamiltonian_searchspace_ks.
@@ -3831,7 +3791,9 @@ impl<'a> DavidsonBlockCtx<'a> {
                 .handle(self.handle)
                 .call()?;
         }
-
+        // Sync: s_orthogonalise allocated overlap_dev which is dropped at
+        // scope exit. Ensure GEMMs reading/writing it are complete.
+        self.stream.synchronize().map_err(Error::Cuda)?;
 
         // --- Stage 5: S-orthonormalize among themselves ---
         // No lockstep hpsi transform needed: Stage 6 overwrites hsearch_dev.
@@ -3850,6 +3812,10 @@ impl<'a> DavidsonBlockCtx<'a> {
                 .s_orth_out(&mut self.s_orth_out)
                 .call()?;
         }
+        // Sync: s_orthonormalise uses cuSOLVER ZPOTRF/ZTRSM which may
+        // use internal working streams.  Ensure they complete and write
+        // results to search_dev before Stage 6 reads it.
+        self.stream.synchronize().map_err(Error::Cuda)?;
 
         // --- Stage 6: Apply H to search directions ---
         unsafe {
