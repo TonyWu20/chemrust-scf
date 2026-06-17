@@ -47,6 +47,8 @@ use num_complex::Complex64;
 use crate::eigensolver::hamiltonian::{apply_full_hamiltonian, apply_s_times};
 #[cfg(feature = "scf_diag")]
 use crate::eigensolver::hamiltonian::apply_v_loc_hamiltonian;
+#[cfg(feature = "scf_diag")]
+use std::time::Instant;
 use crate::eigensolver::kernels::CudaKernelSet;
 use crate::eigensolver::preconditioner::{apply_preconditioner, compute_r_vector, prepare_preconditioner, TpaPreconditioner};
 
@@ -1019,6 +1021,8 @@ pub(crate) unsafe fn davidson_diagonalise(
 
     #[allow(unused_assignments)]
     for iteration in 0..max_outer_iter {
+        #[cfg(feature = "scf_diag")]
+        let _t_outer = Instant::now();
         let n_conv = band_converged.iter().filter(|&&c| c).count();
         davidson_diag!("[davidson] outer iter {iteration}: {n_conv}/{n_bands} converged");
 
@@ -1605,6 +1609,14 @@ pub(crate) unsafe fn davidson_diagonalise(
             for _inner_iter in 0..max_inner_iter {
                 davidson_diag!("[davidson]     inner iter {_inner_iter}: superspace_index={superspace_index}");
 
+                // ── Inner-iteration profiling accumulators (scf_diag) ──
+                #[cfg(feature = "scf_diag")]
+                let mut _t_inner_stage = Instant::now();
+                #[cfg(feature = "scf_diag")]
+                let mut _t_subspace_diag = 0.0f64;
+                #[cfg(feature = "scf_diag")]
+                let mut _t_rotation_copyback = 0.0f64;
+
                 // (1) Save previous eigenvalues for convergence tracking
                 // CASTEP hamiltonian.f90:431 — save ALL current_nblock
                 // eigenvalues, not just active ones.  The D1 re-check
@@ -1731,6 +1743,8 @@ pub(crate) unsafe fn davidson_diagonalise(
                     buf
                 };
 
+                #[cfg(feature = "scf_diag")]
+                { _t_inner_stage = Instant::now(); }
                 unsafe {
                     diagonalise_subspace()
                         .psi_block(&super_wvfn)
@@ -1750,6 +1764,8 @@ pub(crate) unsafe fn davidson_diagonalise(
                         .gamma_point(gamma_point)
                         .call()?;
                 }
+                #[cfg(feature = "scf_diag")]
+                { stream.synchronize().expect("sync"); _t_subspace_diag = _t_inner_stage.elapsed().as_secs_f64(); _t_inner_stage = Instant::now(); }
 
                 // Copy rotated results → super_wvfn, H_super_wvfn
                 stream
@@ -1840,6 +1856,16 @@ pub(crate) unsafe fn davidson_diagonalise(
                         .map(|(_, gi)| gi)
                         .collect();
                 beta_phi_cache.invalidate_bands(&modified_bands);
+
+                #[cfg(feature = "scf_diag")]
+                {
+                    stream.synchronize().expect("profile sync");
+                    _t_rotation_copyback = _t_inner_stage.elapsed().as_secs_f64();
+                    davidson_diag!(
+                        "[davidson-profile] inner iter {_inner_iter}: subspace_diag={:.4}s rot_copy={:.4}s",
+                        _t_subspace_diag, _t_rotation_copyback,
+                    );
+                }
 
                 davidson_diag!(
                     "[davidson]     inner iter {_inner_iter} eig: [{:.6}, ..., {:.6}]",
@@ -2162,6 +2188,15 @@ pub(crate) unsafe fn davidson_diagonalise(
         h_correct = false;
 
         n_outer_completed = iteration + 1;
+
+        #[cfg(feature = "scf_diag")]
+        {
+            stream.synchronize().expect("profile sync");
+            davidson_diag!(
+                "[davidson-profile] outer iter {iteration} total: {:.4}s",
+                _t_outer.elapsed().as_secs_f64(),
+            );
+        }
     }
 
     // ------------------------------------------------------------------
@@ -2599,6 +2634,7 @@ pub(crate) unsafe fn s_orthogonalise(
     if superspace_index == 0 {
         return Ok(());
     }
+    let _ = n_pw; // used only in per-column loop (now fused); keep for builder API
 
     // Step 1: Compute S·search in batch → s_orth_out (n_pw × ncol)
     let (search_ptr, _) = search_dev.device_ptr(stream);
@@ -2611,15 +2647,14 @@ pub(crate) unsafe fn s_orthogonalise(
     // in spsi_dev before the call.  Without this pre-copy, s_orth_out
     // contains only the NL correction (missing the PW kinetic part),
     // producing wrong S·search → wrong ZGEMM overlap → eigenvalue explosion.
-    for j in 0..ncol {
-        let src = (search_ptr as *const CudaComplex).add(j * n_pw);
-        let dst_in = (s_in_mut as *mut CudaComplex).add(j * n_pw);
-        let dst_out = (s_out_mut as *mut CudaComplex).add(j * n_pw);
-        cublasZcopy_v2(handle, n_pw_i32, src as *const _, 1, dst_in as *mut _, 1)
-            .result().map_err(Error::Blas)?;
-        cublasZcopy_v2(handle, n_pw_i32, src as *const _, 1, dst_out as *mut _, 1)
-            .result().map_err(Error::Blas)?;
-    }
+    // Single contiguous copy: all columns are contiguous in column-major layout
+    // (lda=n_pw), so one cublasZcopy is equivalent to the per-column loop.
+    cublasZcopy_v2(handle, n_pw_i32 * (ncol as i32),
+        search_ptr as *const _, 1, s_in_mut as *mut _, 1,
+    ).result().map_err(Error::Blas)?;
+    cublasZcopy_v2(handle, n_pw_i32 * (ncol as i32),
+        search_ptr as *const _, 1, s_out_mut as *mut _, 1,
+    ).result().map_err(Error::Blas)?;
     unsafe {
         apply_s_times()
             .psi_dev(&*s_orth_in)
@@ -2657,26 +2692,16 @@ pub(crate) unsafe fn s_orthogonalise(
     }
 
     // Step 3: search -= super_wvfn * overlap via ZGEMM
-    // Negate overlap: overlap *= -1
-    unsafe {
-        let alpha = CudaComplex { x: -1.0, y: 0.0 };
-        cublasZscal_v2(
-            handle,
-            (superspace_index * ncol) as i32,
-            &alpha as *const _ as *const _,
-            overlap_dev.device_ptr_mut(stream).0 as *mut _,
-            1,
-        ).result().map_err(Error::Blas)?;
-    }
+    // Use alpha=-1 directly (no need to pre-negate overlap with cublasZscal).
     unsafe {
         blas.gemm_c64(
             ZgemmConfig {
                 transa: op::N,   // super_wvfn
-                transb: op::N,   // -overlap
+                transb: op::N,   // overlap
                 m: n_pw_i32,
                 n: ncol as i32,
                 k: superspace_index as i32,
-                alpha: CudaComplex { x: 1.0, y: 0.0 },
+                alpha: CudaComplex { x: -1.0, y: 0.0 },  // search -= super_wvfn * overlap
                 lda: n_pw_i32,
                 ldb: superspace_index as i32,
                 beta: CudaComplex { x: 1.0, y: 0.0 },
@@ -2689,7 +2714,6 @@ pub(crate) unsafe fn s_orthogonalise(
     }
 
     // Step 4 (ADR-0005): hsearch -= hpsi_ref * overlap (lockstep transform).
-    // Reuses the same (negated) overlap coefficients from Step 3.
     // The reference columns (hpsi_ref) are NOT modified — only the search
     // H·psi columns are transformed.
     if let (Some(hpsi_search), Some(hpsi_ref_val)) = (hpsi_dev, hpsi_ref) {
@@ -2697,11 +2721,11 @@ pub(crate) unsafe fn s_orthogonalise(
             blas.gemm_c64(
                 ZgemmConfig {
                     transa: op::N,   // hpsi_ref
-                    transb: op::N,   // -overlap
+                    transb: op::N,   // overlap
                     m: n_pw_i32,
                     n: ncol as i32,
                     k: superspace_index as i32,
-                    alpha: CudaComplex { x: 1.0, y: 0.0 },
+                    alpha: CudaComplex { x: -1.0, y: 0.0 },  // hsearch -= hpsi_ref * overlap
                     lda: n_pw_i32,
                     ldb: superspace_index as i32,
                     beta: CudaComplex { x: 1.0, y: 0.0 },
@@ -2822,8 +2846,9 @@ pub(crate) unsafe fn s_orthonormalise(
         // (which uses its own internal stream) sees the complete matrix.
         blas.stream().synchronize().map_err(Error::Cuda)?;
 
-        // D2H snapshot of S_overlap + independent ZDOTC check of col 0.
+        #[cfg(feature = "scf_diag")]
         {
+            // D2H snapshot of S_overlap + independent ZDOTC check of col 0.
             let diag_host: Vec<CudaComplex> =
                 blas.stream().clone_dtoh(&s_overlap_gpu).map_err(Error::Cuda)?;
             let _n = ncol;
@@ -2945,23 +2970,23 @@ pub(crate) unsafe fn s_orthonormalise(
             // GPU ZPOTRF can return info=0 (success) for near-singular S_overlap
             // matrices while producing numerically inaccurate Cholesky factors.
             // CASTEP detects this via algor_invert status and falls back to
-            // per-column Gram-Schmidt with S-normalization.  We do the same:
-            // compute S·search[0] → check ⟨search[0]|S|search[0]⟩ ≈ 1.0.
-            // If the S-norm deviates significantly, the factorization was
-            // inaccurate — fall through to MGS.
+            // per-column Gram-Schmidt with S-normalization.  We check that
+            // column 0's S-norm after ZTRSM is ≈ 1.0.
+            // Minimised: only one apply_s_times for column 0 (n_bands=1) + zdotc.
             {
                 let (search_ptr, _) = search_dev.device_ptr(stream);
                 let search_0 = search_ptr as *const CudaComplex;
+                // Copy search[0] (post-ZTRSM) to s_orth_in/out — needed because
+                // s_orth_in/out still hold the old batch S·search data.
                 let (s_in_mut, _) = s_orth_in.device_ptr_mut(stream);
                 cublasZcopy_v2(handle, n_pw_i32,
-                    search_0 as *const _, 1,
-                    s_in_mut as *mut _, 1,
+                    search_0 as *const _, 1, s_in_mut as *mut _, 1,
                 ).result().map_err(Error::Blas)?;
                 let (s_out_mut, _) = s_orth_out.device_ptr_mut(stream);
                 cublasZcopy_v2(handle, n_pw_i32,
-                    search_0 as *const _, 1,
-                    s_out_mut as *mut _, 1,
+                    search_0 as *const _, 1, s_out_mut as *mut _, 1,
                 ).result().map_err(Error::Blas)?;
+                // Recompute S·search[0] (must use updated search[0] after ZTRSM)
                 unsafe {
                     apply_s_times()
                         .psi_dev(&*s_orth_in)
@@ -3444,6 +3469,20 @@ impl<'a> DavidsonBlockCtx<'a> {
         slice_eigenvalues: &[f64],
         slice_nbands: usize,
     ) -> Result<usize, Error> {
+        // ── Profiling timers (scf_diag feature only) ──
+        // Per-stage accumulators: sync stream, measure GPU wall-clock.
+        #[cfg(feature = "scf_diag")]
+        let mut _t_stage = Instant::now();
+        #[cfg(feature = "scf_diag")]
+        let mut _t_copyin = 0.0f64;
+        #[cfg(feature = "scf_diag")]
+        let mut _t_precon = 0.0f64;
+        #[cfg(feature = "scf_diag")]
+        let mut _t_s_ortho = 0.0f64;   // Stage 4: orthogonalise against superspace
+        #[cfg(feature = "scf_diag")]
+        let mut _t_s_orthonorm = 0.0f64; // Stage 5: orthonormalise among themselves
+        #[cfg(feature = "scf_diag")]
+        let mut _t_hsearch = 0.0f64;
         // --- Stage 1: Copy ψ and H·ψ from slice workspace to block temps ---
         // CASTEP hamiltonian.f90:404-409 copies slice and H_slice from
         // super_wvfn / H_super_wvfn into the slice workspace.  We follow
@@ -3577,6 +3616,8 @@ impl<'a> DavidsonBlockCtx<'a> {
                 }
             }
 
+        #[cfg(feature = "scf_diag")]
+        { self.stream.synchronize().expect("sync"); _t_copyin += _t_stage.elapsed().as_secs_f64(); _t_stage = Instant::now(); }
         // --- Stage 2: TPA preconditioner → search_dev ---
         // CASTEP nlpot.f90:15970 — kernel computes (Hψ - ε·ψ) * R(G).
         // USPP correction applied afterwards via NL weights.
@@ -3670,6 +3711,8 @@ impl<'a> DavidsonBlockCtx<'a> {
             );
         }
 
+        #[cfg(feature = "scf_diag")]
+        { self.stream.synchronize().expect("sync"); _t_precon += _t_stage.elapsed().as_secs_f64(); _t_stage = Instant::now(); }
         // --- Stage 3: Superspace bounds ---
         // CASTEP hamiltonian.f90:437-439 — when the superspace buffer would
         // overflow, wrap around to the END of the buffer:
@@ -3811,6 +3854,8 @@ impl<'a> DavidsonBlockCtx<'a> {
             );
         }
 
+        #[cfg(feature = "scf_diag")]
+        { self.stream.synchronize().expect("sync"); _t_stage = Instant::now(); }
         // --- Stage 4: S-orthogonalize against superspace ---
         // Same two-pass iterated Gram-Schmidt as Stage 3a above.
         // CASTEP hamiltonian.f90:442 — single pass of S-orthogonalize
@@ -3832,7 +3877,8 @@ impl<'a> DavidsonBlockCtx<'a> {
                 .call()?;
         }
 
-
+        #[cfg(feature = "scf_diag")]
+        { self.stream.synchronize().expect("sync"); _t_s_ortho += _t_stage.elapsed().as_secs_f64(); _t_stage = Instant::now(); }
         // --- Stage 5: S-orthonormalize among themselves ---
         // No lockstep hpsi transform needed: Stage 6 overwrites hsearch_dev.
         unsafe {
@@ -3851,6 +3897,8 @@ impl<'a> DavidsonBlockCtx<'a> {
                 .call()?;
         }
 
+        #[cfg(feature = "scf_diag")]
+        { self.stream.synchronize().expect("sync"); _t_s_orthonorm += _t_stage.elapsed().as_secs_f64(); _t_stage = Instant::now(); }
         // --- Stage 6: Apply H to search directions ---
         unsafe {
             apply_full_hamiltonian()
@@ -3911,6 +3959,8 @@ impl<'a> DavidsonBlockCtx<'a> {
             );
         }
 
+        #[cfg(feature = "scf_diag")]
+        { self.stream.synchronize().expect("sync"); _t_hsearch += _t_stage.elapsed().as_secs_f64(); _t_stage = Instant::now(); }
         // --- Stage 7: Copy search → superspace ---
         // CASTEP hamiltonian.f90:451-453 — copies ALL slice_searchspace columns
         // unconditionally; no validity pre-filter.
@@ -3945,6 +3995,22 @@ impl<'a> DavidsonBlockCtx<'a> {
             }
         }
 
+        #[cfg(feature = "scf_diag")]
+        {
+            self.stream.synchronize().expect("profile sync");
+            let total = _t_stage.elapsed().as_secs_f64() + _t_copyin + _t_precon + _t_s_ortho + _t_s_orthonorm + _t_hsearch;
+            if total > 0.001 {
+                davidson_diag!(
+                    "[davidson-profile] build(bs={} ncol={}): total={:.4}s copyin={:.1}% precon={:.1}% s_ortho={:.1}% s_orthonorm={:.1}% hsearch={:.1}%",
+                    self.block_start, self.active_indices.len(), total,
+                    100.0 * _t_copyin / total,
+                    100.0 * _t_precon / total,
+                    100.0 * _t_s_ortho / total,
+                    100.0 * _t_s_orthonorm / total,
+                    100.0 * _t_hsearch / total,
+                );
+            }
+        }
         Ok(self.active_indices.len())
     }
 }
