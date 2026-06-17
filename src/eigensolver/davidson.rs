@@ -1245,13 +1245,8 @@ pub(crate) unsafe fn davidson_diagonalise(
                 eigenvalues[n_bands - 1]
             );
 
-        // ---- D1: S-norm diagnostic after A1 full-subspace ZHEGVD ----
-        // Verify that rotated eigenvectors maintain ⟨psi|S|psi⟩ ≈ 1.
-        // S-norm drift here contaminates lower-band reference columns for
-        // subsequent blocks' S-orthogonalization (Stage 3a in build()).
-        // NOTE: the apply_s_times GEMMs queued here provide load-bearing
-        // stream ordering for the outer loop — removing this block causes
-        // divergence even with stage-level syncs in build().
+        // ---- D1: S-norm diagnostic (gated — CUDA_LAUNCH_BLOCKING investigation) ----
+        #[cfg(feature = "scf_diag")]
         {
             let mut s_in = PwCoefficients::new(
                 stream.alloc_zeros(n_pw).map_err(Error::Cuda)?);
@@ -2063,11 +2058,8 @@ pub(crate) unsafe fn davidson_diagonalise(
             // end.  This avoids conduction states from one block corrupting
             // the ZHEEVD eigenvalue ordering of the next block.
 
-            // ---- D2: S-norm diagnostic after block 0 inner loop ----
-            // Block 0's A2 (post-ZHEGVD S-orthonormalize) is skipped because
-            // block_start == 0 (line 1463 guard).  Check whether ZHEGVD
-            // regularization has caused S-norm drift in psi_dev[0..current_nblock].
-            // NOTE: apply_s_times GEMMs provide load-bearing stream ordering.
+            // ---- D2: S-norm diagnostic (gated — CUDA_LAUNCH_BLOCKING investigation) ----
+            #[cfg(feature = "scf_diag")]
             if block_start == 0 {
                 // Reuse the D1 buffer pattern but check only the block columns
                 let mut s_in = PwCoefficients::new(
@@ -2153,11 +2145,11 @@ pub(crate) unsafe fn davidson_diagonalise(
     }
 
     // ------------------------------------------------------------------
-    // Diagnostics: compute S⁻¹-weighted residual norms
+    // Diagnostics: compute S⁻¹-weighted residual norms (gated — investigation)
     // ------------------------------------------------------------------
-    // NOTE: apply_s_times() for ALL bands queues load-bearing stream ordering.
-    // Removing this (even with stage-level syncs in build()) causes divergence.
     let residual_norms_values: Vec<f64> = {
+        #[cfg(feature = "scf_diag")]
+        {
         // --- Compute S·ψ for residual (USPP: S ≠ I) ---
         // r_b = Hψ_b − λ_b·(Sψ)_b  (not Hψ_b − λ_b·ψ_b)
         // Using ψ instead of Sψ inflates residuals for ultrasoft
@@ -2238,6 +2230,11 @@ pub(crate) unsafe fn davidson_diagonalise(
             norms.push(dot.x.sqrt());
         }
         norms
+        }
+        #[cfg(not(feature = "scf_diag"))]
+        {
+            vec![0.0_f64; n_bands]
+        }
     };
 
     // ------------------------------------------------------------------
