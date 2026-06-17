@@ -16,7 +16,9 @@ pub use eigensolver::kernels::CudaKernelSet;
 #[cfg(feature = "chebyshev")]
 #[doc(hidden)]
 pub use eigensolver::chebyshev::{
-    apply_h_components_for_test, apply_s_for_test, chebyshev_filter_for_test,
+    apply_h_components_for_test, apply_s_for_test, cheb_oracle1, chebfi_ampfactor,
+    chebfi_rayleigh_ritz_quotients, chebfi_residual_norms, chebfi_run_rust,
+    chebfi_set_ndeg_from_residu, chebyshev_filter_for_test,
     chebyshev_filter_for_test_gpu, chebyshev_filter_iteration_gpu,
     compute_residual_norms_for_test, FilterMode, HComponentsForTest,
 };
@@ -51,7 +53,7 @@ pub use eigensolver::davidson::{check_inner_convergence, BandConvStatus};
 /// Rayleigh-Ritz test wrapper (returns subspace matrices for diagnostics).
 /// Gated behind `chebyshev` feature + `scf_diag` (default feature) or `test` cfg.
 #[cfg(all(any(test, feature = "scf_diag"), any(test, feature = "chebyshev")))]
-pub use eigensolver::rayleigh_ritz::rayleigh_ritz_with_matrices;
+pub use eigensolver::rayleigh_ritz::{rayleigh_ritz, rayleigh_ritz_with_matrices};
 #[cfg(any(test, feature = "scf_diag"))]
 pub use eigensolver::d_screening::test_api;
 #[doc(hidden)]
@@ -73,6 +75,7 @@ pub use spin_types::{
     PerSpinDensity, PerSpinEigenvalues, PerSpinPwCoefficients, SpinChannelData, SpinDensity,
 };
 pub use layout::{Cpu, ColumnDistributed, Layout, RowDistributed, WavefunctionSet};
+pub use device::fft::BatchedFftPlan3d;
 pub use device::{DeviceMapped, Gpu};
 pub mod energy;
 pub use energy::{EV_TO_HARTREE, HARTREE_TO_EV};

@@ -1,0 +1,237 @@
+\begin{thebibliography}{10}
+
+\bibitem{PhysRev.136.B864}
+Hohenberg, P. and Kohn, W.,
+\newblock Phys. Rev. {\bf 136} (1964) B864.
+
+\bibitem{PhysRev.140.A1133}
+Kohn, W. and Sham, L.~J.,
+\newblock Phys. Rev. {\bf 140} (1965) A1133.
+
+\bibitem{QE_GPU}
+Ruffino, F.~F. et~al.,
+\newblock Procedia Comput. Sci. {\bf 240} (2024) 52–60.
+
+\bibitem{https://doi.org/10.1002/jcc.23096}
+Hacene, M. et~al.,
+\newblock Journal of Computational Chemistry {\bf 33} (2012) 2581.
+
+\bibitem{10.1007/978-3-319-78054-2_8}
+Stegailov, V. and Vecher, V.,
+\newblock {Efficiency Analysis of Intel, AMD and Nvidia 64-Bit Hardware
+  for Memory-Bound Problems: A Case Study of Ab Initio Calculations with
+  VASP},
+\newblock in {\em Parallel Processing and Applied Mathematics}, edited by
+  Wyrzykowski, R., Dongarra, J., Deelman, E., and Karczewski, K., pages 81--90,
+  Cham, 2018, Springer International Publishing.
+
+\bibitem{10.1007/s11227-024-06066-0}
+Nieves-P\'{e}rez, I., Mu\~{n}oz, A., Almeida, F., and Blanco, V.,
+\newblock J. Supercomput. {\bf 80} (2024) 16679–16702.
+
+\bibitem{genovese2011improvements}
+Genovese, L., Videau, B., Deutsch, T., Tran, H., and Goedecker, S.,
+\newblock {Improvements of BigDFT code in modern HPC architectures}, 2011,
+\newblock PRACE White Paper.
+
+\bibitem{10.1063/5.0182685}
+Mortensen, J.~J. et~al.,
+\newblock The Journal of Chemical Physics {\bf 160} (2024) 092503.
+
+\bibitem{DAS2022108473}
+Das, S., Motamarri, P., Subramanian, V., Rogers, D.~M., and Gavini, V.,
+\newblock Computer Physics Communications {\bf 280} (2022) 108473.
+
+\bibitem{10.1145/3295500.3357157}
+Das, S. et~al.,
+\newblock {Fast, scalable and accurate finite-element based ab initio
+  calculations using mixed precision computing: 46 PFLOPS simulation of a
+  metallic dislocation system},
+\newblock in {\em Proceedings of the International Conference for High
+  Performance Computing, Networking, Storage and Analysis}, SC '19, New York,
+  NY, USA, 2019, Association for Computing Machinery.
+
+\bibitem{10.1063/5.0260892}
+Jing, X., Sharma, A., Pask, J.~E., and Suryanarayana, P.,
+\newblock The Journal of Chemical Physics {\bf 162} (2025) 184105.
+
+\bibitem{Verstraete2025}
+Verstraete, M.~J. et~al.,
+\newblock The Journal of Chemical Physics {\bf 163} (2025) 164126.
+
+\bibitem{GAVINI2023}
+Gavini, V. et~al.,
+\newblock Modelling and Simulation in Materials Science and Engineering {\bf
+  31} (2023) 063301.
+
+\bibitem{magma}
+Dongarra, J. et~al.,
+\newblock Numerical Linear Algebra with Applications {\bf 21} (2014) 457.
+
+\bibitem{CARTEREDWARDS20143202}
+{Carter Edwards}, H., Trott, C.~R., and Sunderland, D.,
+\newblock Journal of Parallel and Distributed Computing {\bf 74} (2014) 3202,
+\newblock Domain-Specific Languages and High-Level Frameworks for
+  High-Performance Computing.
+
+\bibitem{torrent:tel-04812107}
+Torrent, M.,
+\newblock {\em {Density-Functional Theory electronic structure calculations
+  within the ``Projector Augmented-Wave'' approach}},
+\newblock Habilitation {\`a} diriger des recherches, {Universit{\'e}
+  Paris-Saclay}, 2024.
+
+\bibitem{frigo1998fftw}
+Frigo, M. and Johnson, S.~G.,
+\newblock {FFTW: An adaptive software architecture for the FFT},
+\newblock in {\em Proceedings of the 1998 IEEE International Conference on
+  Acoustics, Speech and Signal Processing, ICASSP'98 (Cat. No. 98CH36181)},
+  volume~3, pages 1381--1384, IEEE, 1998.
+
+\bibitem{cufft}
+{NVIDIA Corporation},
+\newblock {cuFFT: the CUDA Fast Fourier Transform library},
+\newblock \url{https://developer.nvidia.com/cufft},
+\newblock Accessed: 2026-04-08.
+
+\bibitem{rocfft}
+{Advanced Micro Devices, Inc.},
+\newblock {rocFFT: discrete FFT written in HIP},
+\newblock \url{https://rocm.docs.amd.com/projects/rocFFT},
+\newblock Accessed: 2026-04-08.
+
+\bibitem{GONZE2016106}
+Gonze, X. et~al.,
+\newblock Computer Physics Communications {\bf 205} (2016) 106.
+
+\bibitem{GONZE2020107042}
+Gonze, X. et~al.,
+\newblock Computer Physics Communications {\bf 248} (2020) 107042.
+
+\bibitem{dongarra_batch}
+Haidar, A., Dong, T.~T., Tomov, S., Luszczek, P., and Dongarra, J.,
+\newblock {A Framework for Batched and GPU-Resident Factorization Algorithms
+  Applied to Block Householder Transformations},
+\newblock in {\em High Performance Computing}, edited by Kunkel, J.~M. and
+  Ludwig, T., pages 31--47, Cham, 2015, Springer International Publishing.
+
+\bibitem{Blochl1994}
+Bl\"ochl, P.~E.,
+\newblock  {\bf 50} (1994) 17953.
+
+\bibitem{BOTTIN2008329}
+Bottin, F., Leroux, S., Knyazev, A., and Zérah, G.,
+\newblock Computational Materials Science {\bf 42} (2008) 329.
+
+\bibitem{LEVITT201598}
+Levitt, A. and Torrent, M.,
+\newblock Computer Physics Communications {\bf 187} (2015) 98.
+
+\bibitem{doi:10.1137/070688778}
+Demmel, J.~W., Marques, O.~A., Parlett, B.~N., and V\"{o}mel, C.,
+\newblock SIAM Journal on Scientific Computing {\bf 30} (2008) 1508.
+
+\bibitem{d3ea2d52-5ab2-3128-8b80-efb85267295d}
+Cooley, J.~W. and Tukey, J.~W.,
+\newblock Mathematics of Computation {\bf 19} (1965) 297.
+
+\bibitem{doi:10.1177/1094342005051521}
+Thakur, R., Rabenseifner, R., and Gropp, W.,
+\newblock The International Journal of High Performance Computing Applications
+  {\bf 19} (2005) 49.
+
+\bibitem{OpenMP5.0}
+{OpenMP Architecture Review Board},
+\newblock {OpenMP Application Programming Interface, Version 5.0},
+\newblock Specification, 2018.
+
+\bibitem{cuda_manual}
+{NVIDIA Corporation},
+\newblock {CUDA Toolkit},
+\newblock \url{https://developer.nvidia.com/cuda/toolkit},
+\newblock Accessed: 2026-04-08.
+
+\bibitem{rocm_manual}
+{Advanced Micro Devices, Inc.},
+\newblock {AMD ROCm Software for HPC},
+\newblock \url{https://www.amd.com/en/products/software/rocm/hpc.html},
+\newblock Accessed: 2026-04-08.
+
+\bibitem{cublas}
+{NVIDIA Corporation},
+\newblock {cuBLAS: Basic Linear Algebra on NVIDIA GPUs},
+\newblock \url{https://developer.nvidia.com/cublas},
+\newblock Accessed: 2026-04-08.
+
+\bibitem{rocblas}
+{Advanced Micro Devices, Inc.},
+\newblock {rocBLAS: the ROCm Basic Linear Algebra Subprograms library},
+\newblock \url{https://rocm.docs.amd.com/projects/rocBLAS},
+\newblock Accessed: 2026-04-08.
+
+\bibitem{cusolver}
+{NVIDIA Corporation},
+\newblock {cuSOLVER: Direct Linear Solvers on NVIDIA GPUs},
+\newblock \url{https://developer.nvidia.com/cusolver},
+\newblock Accessed: 2026-04-08.
+
+\bibitem{rocsolver}
+{Advanced Micro Devices, Inc.},
+\newblock {rocSOLVER: LAPACK routines on top of the AMD ROCm platform},
+\newblock \url{https://rocm.docs.amd.com/projects/rocSOLVER},
+\newblock Accessed: 2026-04-08.
+
+\bibitem{marek2014elpa}
+Marek, A. et~al.,
+\newblock Journal of Physics: Condensed Matter {\bf 26} (2014) 213201.
+
+\bibitem{nvidia_nsight_compute}
+{NVIDIA Corporation},
+\newblock {Nsight Compute an interactive profiler for CUDA},
+\newblock \url{https://developer.nvidia.com/nsight-compute},
+\newblock Accessed: 2026-04-08.
+
+\bibitem{rocsolver_rocm642}
+{AMD ROCm Team},
+\newblock {rocSOLVER Release (ROCm 6.4.2 changelog)},
+\newblock \url{https://github.com/ROCm/rocSOLVER/releases/tag/rocm-6.4.2},
+  2025,
+\newblock Accessed: 2026-05-04.
+
+\bibitem{10.1145/1498765.1498785}
+Williams, S., Waterman, A., and Patterson, D.,
+\newblock Commun. ACM {\bf 52} (2009) 65–76.
+
+\bibitem{nvidia2020a100}
+{NVIDIA Corporation},
+\newblock {NVIDIA A100 Tensor Core GPU Architecture},
+\newblock \url{https://www.nvidia.com/en-us/data-center/a100},
+\newblock Accessed: 2026-04-08.
+
+\bibitem{LIOU2020107330}
+Liou, K.-H., Yang, C., and Chelikowsky, J.~R.,
+\newblock Computer Physics Communications {\bf 254} (2020) 107330.
+
+\bibitem{SCHOFIELD2012497}
+Schofield, G., Chelikowsky, J.~R., and Saad, Y.,
+\newblock Computer Physics Communications {\bf 183} (2012) 497.
+
+\bibitem{CCRT2026}
+{CCRT},
+\newblock {CCRT: Research and Technology Computing Center},
+\newblock \url{https://www-hpc.cea.fr/en/CCRT.html},
+\newblock Accessed: 2026-04-08.
+
+\bibitem{IDRIS2026}
+{IDRIS},
+\newblock {IDRIS High Performance Computing Center},
+\newblock \url{https://www.idris.fr/eng/},
+\newblock Accessed: 2026-04-08.
+
+\bibitem{CINES2026}
+{CINES},
+\newblock {CINES High Performance Computing Center},
+\newblock \url{https://www.cines.fr},
+\newblock Accessed: 2026-04-08.
+
+\end{thebibliography}

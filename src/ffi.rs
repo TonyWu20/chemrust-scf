@@ -464,6 +464,7 @@ unsafe fn step_inner(
             &kd.pw_coords, &h.pots, &h.cell, &h.wave_grid, Some(&h.fine_grid), &kd.k_point,
             &psi_host, n_bands, n_pw, None, None, None, shared_for_this_spin,
             h.handle_shared_vnl.clone(),
+            None,  // solver_thunk — no Woodbury in FFI path
             &h.stream, &mut pcie, &h.blas, &h.kernels,
         ).map_err(|e| { eprintln!("[chemrust] VnlBatchData init failed: {e}"); CHEM_EIG_CUDA_ERROR })?);
         kd.shared_vnl = Some(kd.vnl[isp].as_ref().unwrap().shared.clone());

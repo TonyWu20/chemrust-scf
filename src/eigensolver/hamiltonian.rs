@@ -14,10 +14,12 @@ use std::sync::Arc;
 #[cfg(feature = "scf_diag")]
 use std::time::Instant;
 
+use cudarc::cusolver::sys::cublasOperation_t;
 use cudarc::driver::{CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
 
 use crate::device::blas::{self, BlasHandle, ZgemmConfig};
 use crate::device::fft::BatchedFftPlan3d;
+use crate::device::solver::SolverHandle;
 use crate::device::CudaComplex;
 use crate::eigensolver::davidson_types::{
     KineticPreconditioner, PwCoefficients,
@@ -286,9 +288,9 @@ pub unsafe fn apply_full_hamiltonian(
             .n_pw(n_pw as i32)
             .n_bands(n_bands as i32)
             .grid_size(grid_size as i32)
-            .ngx(fft_plan.nx())
+            .ngx(fft_plan.nz()) // plan created as (ngz, ngy, ngx): nz=ngx
             .ngy(fft_plan.ny())
-            .ngz(fft_plan.nz())
+            .ngz(fft_plan.nx()) // plan created as (ngz, ngy, ngx): nx=ngz
             .inv_ntotal(inv_ntotal)
             .fft_plan(fft_plan)
             .kernels(kernels)
@@ -630,6 +632,208 @@ pub unsafe fn apply_s_times(
         }
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// S^{-1} operator (USPP preconditioned S-inverse via global Woodbury)
+// ---------------------------------------------------------------------------
+//
+// Applies S^{-1} via the global Woodbury formula:
+//   S^{-1} = I - B · M^{-1} · B^H
+//
+// where B = b_concat (concatenated beta-projectors, n_pw × n_total_expanded),
+// and M = Q^{-1} + B^H·B + eps·I (LU-factored, nte × nte).
+//
+// Only available under the `chebyshev` feature flag.
+#[cfg(feature = "chebyshev")]
+#[builder]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn apply_s_inverse(
+    hpsi_dev: &mut PwCoefficients,
+    vnl_data: &VnlBatchData,
+    n_bands: i32,
+    n_pw: i32,
+    blas: &BlasHandle,
+    stream: &Arc<CudaStream>,
+    #[allow(unused_variables)]
+    solver: &SolverHandle,
+) -> Result<(), Error> {
+    let nte = vnl_data.n_total_expanded;
+
+    if nte == 0 {
+        return Ok(());  // No USPP ions, S = I, S^{-1} = I
+    }
+
+    // 1. temp = B^H . hpsi  (nte × n_bands)
+    // n_pw rows of B^H, n_bands columns of hpsi
+    let mut temp: CudaSlice<CudaComplex> =
+        stream.alloc_zeros(nte as usize * n_bands as usize).map_err(Error::Cuda)?;
+    unsafe {
+        blas.gemm_c64(
+            ZgemmConfig {
+                transa: blas::op::C,  // B^H (conjugate transpose of B)
+                transb: blas::op::N,
+                m: nte,
+                n: n_bands,
+                k: n_pw,
+                alpha: CudaComplex { x: 1.0, y: 0.0 },
+                lda: n_pw,
+                ldb: n_pw,
+                beta: CudaComplex { x: 0.0, y: 0.0 },
+                ldc: nte,
+            },
+            &vnl_data.b_concat,
+            &**hpsi_dev,
+            &mut temp,
+        )?;
+    }
+
+    // 2. Solve M·y = temp via LU factor (zgetrs, in-place).
+    let mut info_dev = stream.alloc_zeros::<i32>(1).map_err(Error::Cuda)?;
+    solver.zgetrs(
+        cublasOperation_t::CUBLAS_OP_N,
+        nte,
+        n_bands,
+        &vnl_data.lu_m,
+        &vnl_data.lu_ipiv,
+        &mut temp,
+        &mut info_dev,
+    )?;
+
+    // 3. hpsi -= B . y  (accumulate with alpha = -1)
+    unsafe {
+        blas.gemm_c64(
+            ZgemmConfig {
+                transa: blas::op::N,
+                transb: blas::op::N,
+                m: n_pw,
+                n: n_bands,
+                k: nte,
+                alpha: CudaComplex { x: -1.0, y: 0.0 },
+                lda: n_pw,
+                ldb: nte,
+                beta: CudaComplex { x: 1.0, y: 0.0 },
+                ldc: n_pw,
+            },
+            &vnl_data.b_concat,
+            &temp,
+            &mut **hpsi_dev,
+        )?;
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// S⁻¹·S identity diagnostic — measures ‖S⁻¹·S·ψ − ψ‖_∞
+// ---------------------------------------------------------------------------
+/// Verify the global Woodbury S⁻¹ operator by computing
+/// `‖S⁻¹·(S·ψ) − ψ‖_∞` for a single-band test vector.
+///
+/// Returns `max_residual = max_i |(S⁻¹·S·ψ)_i − ψ_i|`.
+///
+/// The Woodbury formula S⁻¹ = I − B·(Q⁻¹ + B^H·B)⁻¹·B^H is algebraically
+/// exact for the finite-dimensional USPP overlap S = I + B·Q·B^H.
+/// Any deviation from zero reflects numerical error in:
+///   1. Q-matrix conditioning (near-singular Cu 3d projector Q)
+///   2. LU factorization precision (cusolver Zgetrf + Zgetrs)
+///   3. B^H·B Gram matrix accumulation (cublas Zgemm reduction order)
+///
+/// Gate 0: ζ = max_residual must be < 1e-10 before Chebyshev filtering
+/// can proceed. If ζ > 1e-10, the Woodbury construction must be
+/// debugged before any filtering tests.
+#[doc(hidden)]
+#[cfg(feature = "chebyshev")]
+pub fn check_s_inv_s_identity(
+    psi_host: &[num_complex::Complex64],
+    n_pw: usize,
+    vnl_data: &VnlBatchData,
+    blas: &BlasHandle,
+    stream: &Arc<CudaStream>,
+    solver: &SolverHandle,
+) -> Result<f64, Error> {
+    use crate::device::blas::op;
+
+    let n = n_pw as i32;
+    let psi_cuda: Vec<CudaComplex> = psi_host
+        .iter()
+        .map(|&c| CudaComplex { x: c.re, y: c.im })
+        .collect();
+    let psi_dev: CudaSlice<CudaComplex> = stream
+        .clone_htod(&psi_cuda).map_err(Error::Cuda)?;
+
+    // ---- Step 1: S·psi = psi + Σ_ion β_g · q · (β_g^H · psi) ----
+    let mut spsi_dev: CudaSlice<CudaComplex> =
+        stream.alloc_zeros(n_pw).map_err(Error::Cuda)?;
+    stream.memcpy_dtod(&psi_dev, &mut spsi_dev).map_err(Error::Cuda)?;
+
+    for entry in &vnl_data.entries {
+        let ne = entry.n_expanded;
+
+        let mut c_proj: CudaSlice<CudaComplex> =
+            stream.alloc_zeros(ne as usize).map_err(Error::Cuda)?;
+        unsafe {
+            blas.gemv_c64(
+                op::C, n, ne,
+                CudaComplex { x: 1.0, y: 0.0 },
+                &entry.beta_g, n,
+                &psi_dev, 1,
+                CudaComplex { x: 0.0, y: 0.0 },
+                &mut c_proj, 1,
+            ).map_err(Error::Blas)?;
+        }
+
+        let mut temp: CudaSlice<CudaComplex> =
+            stream.alloc_zeros(ne as usize).map_err(Error::Cuda)?;
+        unsafe {
+            blas.gemv_c64(
+                op::N, ne, ne,
+                CudaComplex { x: 1.0, y: 0.0 },
+                &entry.q_matrix, ne,
+                &c_proj, 1,
+                CudaComplex { x: 0.0, y: 0.0 },
+                &mut temp, 1,
+            ).map_err(Error::Blas)?;
+        }
+
+        unsafe {
+            blas.gemv_c64(
+                op::N, n, ne,
+                CudaComplex { x: 1.0, y: 0.0 },
+                &entry.beta_g, n,
+                &temp, 1,
+                CudaComplex { x: 1.0, y: 0.0 },
+                &mut spsi_dev, 1,
+            ).map_err(Error::Blas)?;
+        }
+    }
+
+    // ---- Step 2: S⁻¹ · (S·psi) via global Woodbury (builder pattern) ----
+    let mut spsi_pw = PwCoefficients(spsi_dev);
+    unsafe {
+        apply_s_inverse()
+            .hpsi_dev(&mut spsi_pw)
+            .vnl_data(vnl_data)
+            .n_bands(1)
+            .n_pw(n)
+            .blas(blas)
+            .stream(stream)
+            .solver(solver)
+            .call()?;
+    }
+
+    // ---- Step 3: D2H and compute ‖S⁻¹·S·ψ − ψ‖_∞ ----
+    stream.synchronize()?;
+    let result: Vec<CudaComplex> = stream.clone_dtoh(&*spsi_pw).map_err(Error::Cuda)?;
+    let max_residual = psi_host.iter().zip(result.iter())
+        .map(|(&p, &r)| {
+            let dr = r.x - p.re;
+            let di = r.y - p.im;
+            (dr * dr + di * di).sqrt()
+        })
+        .fold(0.0_f64, f64::max);
+
+    Ok(max_residual)
 }
 
 // ---------------------------------------------------------------------------

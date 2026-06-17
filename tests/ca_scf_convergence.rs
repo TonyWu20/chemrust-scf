@@ -788,6 +788,7 @@ fn s_inv_s_identity_test() {
     let n_pw = kpt_block.nplw;
     let k_point = KPoint {
         coords: kpt_block.coords,
+        weight: 1.0,
     };
 
     // Flat psi_data: band-major, col-major layout [band * n_pw + g]
@@ -800,25 +801,31 @@ fn s_inv_s_identity_test() {
         .expect("SolverHandle");
     let kernels = CudaKernelSet::new(&ctx).expect("CUDA kernels");
 
-    // Build VnlBatchData (bare D0, no occupations, no V_eff for screening)
+    // Build VnlBatchData with global Woodbury (bare D0, no V_eff screening).
+    // Must use precompute_with_d_override to pass solver_thunk for Woodbury.
     let mut pcie = PcieAccount::default();
-    let vnl_data = VnlBatchData::precompute(
+    let vnl_data = VnlBatchData::precompute_with_d_override(
         &kpt_block.pw_grid_coord,
         pots,
         cell,
         &wave_grid,
+        None,  // fine_grid: wave_grid equals fine_grid for this fixture
         &k_point,
         &psi_data,
         n_bands,
         n_pw,
-        None, // occupations: bare D0
-        None, // v_eff: no screening
+        None,   // occupations: bare D0
+        None,   // v_eff: no screening
+        None,   // d_override
+        None,   // shared
+        None,   // handle_shared — test path, builds fresh
+        Some(&solver),  // solver_thunk — NEEDED for Woodbury
         &stream,
         &mut pcie,
         &blas,
         &kernels,
     )
-    .expect("VnlBatchData::precompute");
+    .expect("VnlBatchData::precompute_with_d_override");
 
     // Take band 0 (the converged lowest eigenstate)
     let band0: Vec<Complex64> = psi_data.iter().take(n_pw).copied().collect();

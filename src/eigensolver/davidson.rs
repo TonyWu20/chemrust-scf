@@ -2498,19 +2498,16 @@ unsafe fn diagonalise_subspace(
         info_dev,
     )?;
 
-    // Check solver info
-    let info_cpu: Vec<i32> = stream.clone_dtoh(info_dev).map_err(Error::Cuda)?;
-    if info_cpu[0] != 0 {
-        return Err(Error::RayleighRitzFailed {
-            info: info_cpu[0],
-        });
-    }
+    // Synchronize cuSOLVER stream → default stream before reading results.
+    // ZHEEVD runs on solver's internal stream; h_sub (eigenvectors for the
+    // rotation ZGEMM below) and eig_dev (eigenvalues for convergence) are
+    // written asynchronously.  Without this sync, clone_dtoh and the ZGEMM
+    // may read stale GPU data — the host-GPU timing bug documented in
+    // docs/load-bearing-diagnostic-overhead.md.
+    solver.stream().synchronize().map_err(Error::Cuda)?;
 
-    // D2H eigenvalues
-    let blk_eig: Vec<f64> = stream.clone_dtoh(eig_dev).map_err(Error::Cuda)?;
-    eigenvalues_out.copy_from_slice(&blk_eig[..k]);
-
-    // Rotate: ψ_new = ψ_block · X  (n_pw × k)
+    // Rotate: ψ_new = ψ_block · X  (n_pw × k) — stays on GPU, no clone_dtoh needed.
+    // Launched on `stream` concurrently with the clone_dtoh below.
     unsafe {
         blas.gemm_c64(
             ZgemmConfig {
@@ -2549,6 +2546,20 @@ unsafe fn diagonalise_subspace(
             hpsi_rotated,
         )?;
     }
+
+    // ---- Deferred eigenvalue read: rotation GEMMs stay GPU-resident ----
+    // clone_dtoh is async in cudarc 0.19.7 — synchronize before reading.
+    let info_cpu: Vec<i32> = stream.clone_dtoh(info_dev).map_err(Error::Cuda)?;
+    stream.synchronize().map_err(Error::Cuda)?;
+    if info_cpu[0] != 0 {
+        return Err(Error::RayleighRitzFailed {
+            info: info_cpu[0],
+        });
+    }
+
+    let blk_eig: Vec<f64> = stream.clone_dtoh(eig_dev).map_err(Error::Cuda)?;
+    stream.synchronize().map_err(Error::Cuda)?;
+    eigenvalues_out.copy_from_slice(&blk_eig[..k]);
 
     Ok(())
 }

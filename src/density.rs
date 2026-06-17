@@ -900,7 +900,9 @@ pub mod test_api {
     };
     pub use crate::eigensolver::kernels::CudaKernelSet;
     #[cfg(feature = "chebyshev")]
-    pub use crate::eigensolver::chebyshev::{check_s_inv_s_identity, FilterMode};
+    pub use crate::eigensolver::chebyshev::FilterMode;
+    #[cfg(feature = "chebyshev")]
+    pub use crate::eigensolver::hamiltonian::check_s_inv_s_identity;
     pub use crate::eigensolver::vnl_data::{VnlBatchData, VnlIonData};
     #[cfg(all(any(test, feature = "scf_diag"), any(test, feature = "chebyshev")))]
     pub use crate::eigensolver::rayleigh_ritz::rayleigh_ritz_with_matrices;

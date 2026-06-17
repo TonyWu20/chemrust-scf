@@ -1,9 +1,9 @@
 #[cfg(feature = "chebyshev")]
-pub(crate) mod chebyshev;
+pub mod chebyshev;
 pub(crate) mod beta_phi_cache;
 #[doc(hidden)]
 pub mod davidson_types;
-pub(crate) mod hamiltonian;
+pub mod hamiltonian;
 pub(crate) mod kernels;
 pub(crate) mod preconditioner;
 pub(crate) mod d_screening;

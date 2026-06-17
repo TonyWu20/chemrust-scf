@@ -231,6 +231,7 @@ pub struct CudaKernelSet {
     pub(crate) cpx_mul_inplace: CudaFunction,
     pub(crate) cpx_conj_mul: CudaFunction,
     pub(crate) copy_buffer: CudaFunction,
+    pub(crate) band_scale_axpy: CudaFunction,
 }
 
 impl CudaKernelSet {
@@ -255,6 +256,7 @@ impl CudaKernelSet {
             cpx_mul_inplace: load("cpx_mul_inplace")?,
             cpx_conj_mul: load("cpx_conj_mul")?,
             copy_buffer: load("copy_buffer")?,
+            band_scale_axpy: load("band_scale_axpy")?,
         })
     }
 }

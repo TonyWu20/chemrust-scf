@@ -1,0 +1,90 @@
+%
+% Preamble
+%
+
+% Fonts
+\usepackage[T1]{fontenc}
+\usepackage{libertine}
+
+% Force \texttt to use Computer Modern Typewriter
+\renewcommand{\ttdefault}{cmtt}
+\usepackage{xspace}
+
+% Graphics
+\usepackage{graphicx}
+\usepackage{float}
+\usepackage{subcaption}
+\usepackage[inline]{enumitem}
+\usepackage{booktabs}
+\usepackage[title]{appendix}
+\usepackage{multirow}
+\usepackage[version=4]{mhchem}
+\usepackage{xcolor}
+
+% Bibliography
+\makeatletter
+\renewcommand{\bibsection}{%
+  \section*{\refname}%
+}
+\makeatother
+
+% Hyperlinks
+\usepackage{hyperref}
+
+% Math 
+\usepackage{mathtools,amsmath,amssymb}
+\usepackage{braket}
+\usepackage{algorithm}
+\usepackage{algorithmicx}
+\usepackage{algpseudocode}
+\usepackage{mdframed}       % nice framed box
+\usepackage{bm}
+
+\renewcommand{\algorithmicrequire}{\textbf{Input:}}
+\renewcommand{\algorithmicensure}{\textbf{Output:}}
+
+% macros for notation
+\newcommand{\abinit}{\textsc{Abinit}\xspace}
+\newcommand{\atompaw}{\textsc{atompaw}\xspace}
+\newcommand{\npw}{n_\mathrm{pw}}
+\newcommand{\nband}{n_\mathrm{band}}
+\newcommand{\nproj}{n_\mathrm{proj}}
+\newcommand{\ndeg}{n_\mathrm{deg}}
+\newcommand{\ecut}{E_\mathrm{cut}}
+\newcommand{\xgtools}{\texttt{xgTools}\xspace}
+\newcommand{\blas}{BLAS\xspace}
+\newcommand{\lapack}{LAPACK\xspace}
+\newcommand{\openmp}{OpenMP\xspace}
+\newcommand{\gemm}{\texttt{gemm}\xspace}
+\newcommand{\hegvd}{\texttt{hegvd}\xspace}
+\newcommand{\nvidia}{NVIDIA\xspace}
+\newcommand{\amd}{AMD\xspace}
+\newcommand{\openmptarget}{OpenMP \texttt{target}\xspace}
+\newcommand{\openmpoffload}{OpenMP offloading\xspace}
+\newcommand{\mpi}{MPI\xspace}
+\newcommand{\hip}{HIP\xspace}
+\newcommand{\cublas}{cuBLAS\xspace}
+\newcommand{\cufft}{cuFFT\xspace}
+\newcommand{\rocblas}{rocBLAS\xspace}
+\newcommand{\rocfft}{rocFFT\xspace}
+\newcommand{\cusolver}{cuSOLVER\xspace}
+\newcommand{\rocsolver}{rocSOLVER\xspace}
+\newcommand{\rocm}{ROCm\xspace}
+\newcommand{\cuda}{CUDA\xspace}
+\newcommand{\cray}{Cray\xspace}
+\newcommand{\llvm}{\texttt{llvm}\xspace}
+\newcommand{\nvhpc}{NVHPC\xspace}
+\newcommand{\topaze}{\textit{Topaze}\xspace}
+\newcommand{\jeanzay}{\textit{Jean Zay}\xspace}
+\newcommand{\adastra}{\textit{Adastra}\xspace}
+\newcommand{\lobpcg}{LOBPCG\xspace}
+\newcommand{\chebyshevfiltering}{Chebyshev filtering\xspace}
+\newcommand{\alltoall}{all-to-all communication\xspace}
+\newcommand{\kpoint}{$\bm{\mathsf{k}}$-point\xspace}
+% end macros
+
+% Custom colors
+\definecolor{cfblue}{HTML}{005A9C}
+\definecolor{capri}{rgb}{0.0, 0.75, 1.0}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
