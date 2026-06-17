@@ -1245,8 +1245,13 @@ pub(crate) unsafe fn davidson_diagonalise(
                 eigenvalues[n_bands - 1]
             );
 
-        // ---- D1: S-norm diagnostic (scf_diag only) ----
-        #[cfg(feature = "scf_diag")]
+        // ---- D1: S-norm diagnostic after A1 full-subspace ZHEGVD ----
+        // Verify that rotated eigenvectors maintain ⟨psi|S|psi⟩ ≈ 1.
+        // S-norm drift here contaminates lower-band reference columns for
+        // subsequent blocks' S-orthogonalization (Stage 3a in build()).
+        // NOTE: the apply_s_times GEMMs queued here provide load-bearing
+        // stream ordering for the outer loop — removing this block causes
+        // divergence even with stage-level syncs in build().
         {
             let mut s_in = PwCoefficients::new(
                 stream.alloc_zeros(n_pw).map_err(Error::Cuda)?);
@@ -2058,8 +2063,11 @@ pub(crate) unsafe fn davidson_diagonalise(
             // end.  This avoids conduction states from one block corrupting
             // the ZHEEVD eigenvalue ordering of the next block.
 
-            // ---- D2: S-norm diagnostic (scf_diag only) ----
-            #[cfg(feature = "scf_diag")]
+            // ---- D2: S-norm diagnostic after block 0 inner loop ----
+            // Block 0's A2 (post-ZHEGVD S-orthonormalize) is skipped because
+            // block_start == 0 (line 1463 guard).  Check whether ZHEGVD
+            // regularization has caused S-norm drift in psi_dev[0..current_nblock].
+            // NOTE: apply_s_times GEMMs provide load-bearing stream ordering.
             if block_start == 0 {
                 // Reuse the D1 buffer pattern but check only the block columns
                 let mut s_in = PwCoefficients::new(
@@ -2147,94 +2155,89 @@ pub(crate) unsafe fn davidson_diagonalise(
     // ------------------------------------------------------------------
     // Diagnostics: compute S⁻¹-weighted residual norms
     // ------------------------------------------------------------------
+    // NOTE: apply_s_times() for ALL bands queues load-bearing stream ordering.
+    // Removing this (even with stage-level syncs in build()) causes divergence.
     let residual_norms_values: Vec<f64> = {
-        #[cfg(feature = "scf_diag")]
-        {
-            // --- Compute S·ψ for residual (USPP: S ≠ I) ---
-            // r_b = Hψ_b − λ_b·(Sψ)_b  (not Hψ_b − λ_b·ψ_b)
-            // Using ψ instead of Sψ inflates residuals for ultrasoft
-            // pseudopotentials because S = I + β·Q·β^H ≠ I.
-            let mut spsi_dev = PwCoefficients::new(
-                stream.alloc_zeros(n_elem).map_err(Error::Cuda)?);
-            // Identity term: S = I + β·Q·β^H, pre-fill with ψ
-            stream
-                .memcpy_dtod(&*psi_dev, &mut spsi_dev.0)
-                .map_err(Error::Cuda)?;
-            unsafe {
-                apply_s_times()
-                    .psi_dev(&psi_dev)
-                    .spsi_dev(&mut spsi_dev)
-                    .vnl_data(vnl_data)
-                    .n_bands(n_bands as i32)
-                    .n_pw(n_pw as i32)
-                    .blas(blas)
-                    .stream(stream)
-                    .call()?;
-            }
-
-            // Allocate temp buffer for residual = hpsi - λ·Sψ
-            let mut residual_dev = PwCoefficients::new(
-                stream.alloc_zeros(n_elem).map_err(Error::Cuda)?);
-            stream
-                .memcpy_dtod(&*hpsi_dev, &mut residual_dev.0)
-                .map_err(Error::Cuda)?;
-
-            let (spsi_ptr, _) = spsi_dev.device_ptr(stream);
-            let (residual_mut, _) = residual_dev.device_ptr_mut(stream);
-
-            for b in 0..n_bands {
-                let spsi_b = (spsi_ptr as *const CudaComplex).add(b * n_pw);
-                let r_b = (residual_mut as *mut CudaComplex).add(b * n_pw);
-                let neg_eig = CudaComplex { x: -eigenvalues[b], y: 0.0 };
-                cublasZaxpy_v2(
-                    handle,
-                    n_pw as i32,
-                    &neg_eig as *const _ as *const _,
-                    spsi_b as *const _,
-                    1,
-                    r_b as *mut _,
-                    1,
-                )
-                .result()
-                .map_err(Error::Blas)?;
-            }
-
-            // S⁻¹ norm: sinv_r = S⁻¹ · residual
-            // NOTE: S⁻¹ application not yet implemented (needs CG or direct solve).
-            // Using S·r as a rough proxy for S⁻¹·r in the residual norm.
-            let mut sinv_r_dev = PwCoefficients::new(
-                stream.alloc_zeros(n_elem).map_err(Error::Cuda)?);
-            stream
-                .memcpy_dtod(&*residual_dev, &mut sinv_r_dev.0)
-                .map_err(Error::Cuda)?;
-
-            // ⟨r | r⟩ → sqrt for each band (plain L2 residual, no S⁻¹ weight)
-            let (residual_ptr, _) = residual_dev.device_ptr(stream);
-            let sinv_ptr = residual_ptr; // alias: use plain r, not S⁻¹·r
-            let mut norms = Vec::with_capacity(n_bands);
-            for b in 0..n_bands {
-                let r_b = (residual_ptr as *const CudaComplex).add(b * n_pw);
-                let sinv_b = (sinv_ptr as *const CudaComplex).add(b * n_pw);
-                let mut dot = CudaComplex { x: 0.0, y: 0.0 };
-                cublasZdotc_v2(
-                    handle,
-                    n_pw as i32,
-                    r_b as *const _,
-                    1,
-                    sinv_b as *const _,
-                    1,
-                    &mut dot as *mut _ as *mut _,
-                )
-                .result()
-                .map_err(Error::Blas)?;
-                norms.push(dot.x.sqrt());
-            }
-            norms
+        // --- Compute S·ψ for residual (USPP: S ≠ I) ---
+        // r_b = Hψ_b − λ_b·(Sψ)_b  (not Hψ_b − λ_b·ψ_b)
+        // Using ψ instead of Sψ inflates residuals for ultrasoft
+        // pseudopotentials because S = I + β·Q·β^H ≠ I.
+        let mut spsi_dev = PwCoefficients::new(
+            stream.alloc_zeros(n_elem).map_err(Error::Cuda)?);
+        // Identity term: S = I + β·Q·β^H, pre-fill with ψ
+        stream
+            .memcpy_dtod(&*psi_dev, &mut spsi_dev.0)
+            .map_err(Error::Cuda)?;
+        unsafe {
+            apply_s_times()
+                .psi_dev(&psi_dev)
+                .spsi_dev(&mut spsi_dev)
+                .vnl_data(vnl_data)
+                .n_bands(n_bands as i32)
+                .n_pw(n_pw as i32)
+                .blas(blas)
+                .stream(stream)
+                .call()?;
         }
-        #[cfg(not(feature = "scf_diag"))]
-        {
-            vec![0.0_f64; n_bands]
+
+        // Allocate temp buffer for residual = hpsi - λ·Sψ
+        let mut residual_dev = PwCoefficients::new(
+            stream.alloc_zeros(n_elem).map_err(Error::Cuda)?);
+        stream
+            .memcpy_dtod(&*hpsi_dev, &mut residual_dev.0)
+            .map_err(Error::Cuda)?;
+
+        let (spsi_ptr, _) = spsi_dev.device_ptr(stream);
+        let (residual_mut, _) = residual_dev.device_ptr_mut(stream);
+
+        for b in 0..n_bands {
+            let spsi_b = (spsi_ptr as *const CudaComplex).add(b * n_pw);
+            let r_b = (residual_mut as *mut CudaComplex).add(b * n_pw);
+            let neg_eig = CudaComplex { x: -eigenvalues[b], y: 0.0 };
+            cublasZaxpy_v2(
+                handle,
+                n_pw as i32,
+                &neg_eig as *const _ as *const _,
+                spsi_b as *const _,
+                1,
+                r_b as *mut _,
+                1,
+            )
+            .result()
+            .map_err(Error::Blas)?;
         }
+
+        // S⁻¹ norm: sinv_r = S⁻¹ · residual
+        // NOTE: S⁻¹ application not yet implemented (needs CG or direct solve).
+        // Using S·r as a rough proxy for S⁻¹·r in the residual norm.
+        let mut sinv_r_dev = PwCoefficients::new(
+            stream.alloc_zeros(n_elem).map_err(Error::Cuda)?);
+        stream
+            .memcpy_dtod(&*residual_dev, &mut sinv_r_dev.0)
+            .map_err(Error::Cuda)?;
+
+        // ⟨r | r⟩ → sqrt for each band (plain L2 residual, no S⁻¹ weight)
+        let (residual_ptr, _) = residual_dev.device_ptr(stream);
+        let sinv_ptr = residual_ptr; // alias: use plain r, not S⁻¹·r
+        let mut norms = Vec::with_capacity(n_bands);
+        for b in 0..n_bands {
+            let r_b = (residual_ptr as *const CudaComplex).add(b * n_pw);
+            let sinv_b = (sinv_ptr as *const CudaComplex).add(b * n_pw);
+            let mut dot = CudaComplex { x: 0.0, y: 0.0 };
+            cublasZdotc_v2(
+                handle,
+                n_pw as i32,
+                r_b as *const _,
+                1,
+                sinv_b as *const _,
+                1,
+                &mut dot as *mut _ as *mut _,
+            )
+            .result()
+            .map_err(Error::Blas)?;
+            norms.push(dot.x.sqrt());
+        }
+        norms
     };
 
     // ------------------------------------------------------------------
