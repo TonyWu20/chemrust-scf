@@ -17,7 +17,9 @@ use crate::device::{CudaComplex, Gpu};
 use crate::eigensolver::davidson_types::compute_kinetic_energies;
 use crate::eigensolver::kernels::CudaKernelSet;
 #[cfg(feature = "chebyshev")]
-use crate::eigensolver::chebyshev::{FilterMode, chebyshev_filter};
+use crate::eigensolver::chebyshev::{FilterMode, chebfi_run_rust};
+#[cfg(all(any(test, feature = "scf_diag"), feature = "chebyshev"))]
+use crate::eigensolver::chebyshev::chebyshev_filter;
 use crate::eigensolver::preconditioner::TpaPreconditioner;
 use crate::eigensolver::davidson_types::PwCoefficients;
 #[cfg(any(test, feature = "scf_diag"))]
@@ -31,12 +33,13 @@ use crate::layout::{ColumnDistributed, Cpu, WavefunctionSet};
 use crate::mixing::{DensityHistory, Kerker, MixingOff, MixingPhase, Pulay};
 use crate::density::{QSfCache, build_q_sf_cache};
 use crate::types::{
-    ChemicalPotential, Density, EffectivePotential, Error, FinalResult, FineGridArray, KPoint,
-    SmearingParams,
+    ChemicalPotential, Density, EffectivePotential, Error, FinalResult, FineDensity,
+    FineGridArray, KPoint, SmearingParams,
 };
 use crate::spin_types::{
-    FermiEnergies, KptDataSet, OccupationSet, PerSpinAugDensity, PerSpinBetaProjections,
-    PerSpinDensity, PerSpinEigenvalues, PerSpinPwCoefficients, SpinChannelData,
+    FermiEnergies, KptDataSet, OccupationSet, PerSpinAugDensity,
+    PerSpinBetaProjections, PerSpinDensity, PerSpinEigenvalues, PerSpinFineDensity,
+    PerSpinPwCoefficients, SpinChannelData,
 };
 use crate::energy::HARTREE_TO_EV;
 use crate::pipeline;
@@ -131,7 +134,13 @@ pub struct ScfIteration<
     pub(crate) nkpts: usize,
 
     // --- Mutable state, governed by phase ---
-    pub(crate) density: PerSpinDensity,
+    /// Charge density on the **fine grid** with aug baked in.
+    ///
+    /// After the first SCF iteration construct_density → mix, the density lives
+    /// on the fine grid with augmentation already added (matching CASTEP).
+    /// At initialisation from a fixture, the fixture density is upsampled to
+    /// the fine grid before the first V_eff build.
+    pub(crate) density: PerSpinFineDensity,
     pub(crate) psi: PerSpinPwCoefficients,
     /// Per-spin, per-kpt CPU-side psi data (needed by VnlBatchData / density construction).
     /// Indexed as `psi_cpu[ispin][ikpt]`.
@@ -141,7 +150,7 @@ pub struct ScfIteration<
     pub(crate) history: DensityHistory<M>,
     /// Will be read by `check()` in Phase 2 Goal 5. Suppressed until then.
     #[allow(dead_code)]
-    pub(crate) previous_density: PerSpinDensity,
+    pub(crate) previous_density: PerSpinFineDensity,
 
     /// Precomputed linear FFT grid indices for each PW coefficient, per k-point.
     /// Index = ix + ngx * (iy + ngy * iz) in C-order (cuFFT convention).
@@ -186,10 +195,9 @@ pub struct ScfIteration<
     /// Index `[ikpt]`.  Matches `ffi.rs` `KptData.shared_vnl`.
     pub(crate) shared_vnl_cache: Vec<Option<Arc<KptSharedVnl>>>,
     /// USPP augmentation density ρ_aug(r) on the fine grid, regenerated from
-    /// the current ψ + occ each iteration. `None` for iter-1 (fixture
-    /// density already encodes augmentation in the wave-grid convention).
-    /// Added inside `build_v_eff_with_energy_impl` to the upsampled smooth
-    /// density before V_H/V_xc evaluation.
+    /// the current ψ + occ each iteration.  After combining with soft density
+    /// in `combine_soft_aug_on_fine`, this is set to `None` — aug is baked
+    /// into `self.density` and must not be double-counted.
     pub(crate) density_aug_fine: PerSpinAugDensity,
 
     /// Diagnostics from the most recent Davidson eigensolve (Phase 0 Gate 3 tests).
@@ -198,6 +206,11 @@ pub struct ScfIteration<
     pub(crate) last_davidson_diagnostics: Option<DavidsonDiagnostic>,
     /// Current SCF iteration number (1-indexed). Updated by run_scf before diagonalize.
     pub(crate) scf_iter: usize,
+    /// Per-band squared residual norms from previous Chebyshev iteration,
+    /// indexed as [spin][kpt][band] — mirrors eigenvalues layout.
+    /// Fed back to chebfi_set_ndeg_from_residu for per-band locking.
+    #[cfg(feature = "chebyshev")]
+    pub(crate) residual_norms: Option<Vec<Vec<Vec<f64>>>>,
     /// True when spin freed (shared Fermi energy for both spins).
     pub(crate) spin_freed: bool,
 
@@ -228,6 +241,25 @@ impl<S: SpinPolicy> ScfIteration<S, Initialized, MixingOff> {
         max_history: usize,
     ) -> Self {
         let _ = max_history; // History size is fixed internally for now
+        // Upsample fixture density to fine grid so that every phase after
+        // Initialized carries compile-time evidence of fine-grid data.
+        let density: PerSpinFineDensity = {
+            use chemrust_hamiltonian_core::{upsample_density_to_fine_grid, fft::RealGrid};
+            let nspins = S::nspins();
+            let mut fine_vec: Vec<FineDensity> = Vec::with_capacity(nspins);
+            for ispin in 0..nspins {
+                let soft_fine = upsample_density_to_fine_grid(
+                    &RealGrid::from_inner(density[ispin].as_wave_array().clone()),
+                    &wave_grid,
+                    &fine_grid,
+                )
+                .expect("upsample fixture density to fine grid");
+                fine_vec.push(FineDensity::from_inner(
+                    FineGridArray::from_inner(soft_fine.into_inner()),
+                ));
+            }
+            PerSpinFineDensity(SpinChannelData::new::<S>(fine_vec))
+        };
         let previous_density = density.clone();
         let nspins = S::nspins();
         debug_assert_eq!(
@@ -286,6 +318,8 @@ impl<S: SpinPolicy> ScfIteration<S, Initialized, MixingOff> {
             #[cfg(any(test, feature = "scf_diag"))]
             last_davidson_diagnostics: None,
             scf_iter: 0,
+            #[cfg(feature = "chebyshev")]
+            residual_norms: None,
             spin_freed: false,
             _phase: PhantomData,
         }
@@ -336,12 +370,14 @@ impl<S: SpinPolicy, Phase: ScfPhase, M: MixingPhase> ScfIteration<S, Phase, M> {
             last_davidson_diagnostics: self.last_davidson_diagnostics,
             scf_iter: self.scf_iter,
             spin_freed: self.spin_freed,
+            #[cfg(feature = "chebyshev")]
+            residual_norms: self.residual_norms,
             _phase: PhantomData,
         }
     }
 
     /// Access the computed density (for testing) — total (sum of spin channels).
-    pub fn density(&self) -> Density {
+    pub fn density(&self) -> FineDensity {
         self.density.total()
     }
 
@@ -604,7 +640,7 @@ impl<S: SpinPolicy + BuildVEff> ScfIteration<S, Initialized, MixingOff> {
     pub fn build_v_eff(self) -> Result<ScfIteration<S, VEffBuilt, MixingOff>, Error> {
         let total_density = self.density.total();
         let core_rho = chemrust_hamiltonian_core::Density::from_inner(
-            chemrust_hamiltonian_core::fft::RealGrid::from_inner(total_density.as_wave_array().clone()),
+            chemrust_hamiltonian_core::fft::RealGrid::from_inner(total_density.as_fine_array().clone()),
         );
         // Extract spin density for SpinCollinear (ρ_spin = ρ_up − ρ_down).
         // build_v_eff_impl uses it for correct spin-polarised V_eff assembly
@@ -614,7 +650,7 @@ impl<S: SpinPolicy + BuildVEff> ScfIteration<S, Initialized, MixingOff> {
             let spin_density = self.density.spin();
             core_spin = Some(chemrust_hamiltonian_core::Density::from_inner(
                 chemrust_hamiltonian_core::fft::RealGrid::from_inner(
-                    spin_density.0.as_wave_array().clone(),
+                    spin_density.0.as_fine_array().clone(),
                 ),
             ));
             core_spin.as_ref()
@@ -640,41 +676,33 @@ impl<S: SpinPolicy + BuildVEffWithEnergy> ScfIteration<S, Initialized, MixingOff
     /// (`e_xc`, `e_hartree`, `rho_vxc`) from the XC/Hartree evaluation.
     /// These are needed by `check()` for total energy computation.
     pub fn build_v_eff_with_energy(self) -> Result<ScfIteration<S, VEffBuilt, MixingOff>, Error> {
+        // Density is on the fine grid (PerSpinFineDensity), aug already baked in.
+        // Construct core_rho directly from fine-grid data — no upsampling needed.
+        // Pass fine_grid as both source and dest so upsample_density_to_fine_grid
+        // (inside build_v_eff_with_energy_impl) is an identity.
         let total_density = self.density.total();
         let core_rho = chemrust_hamiltonian_core::Density::from_inner(
-            chemrust_hamiltonian_core::fft::RealGrid::from_inner(total_density.as_wave_array().clone()),
+            chemrust_hamiltonian_core::fft::RealGrid::from_inner(total_density.as_fine_array().clone()),
         );
         let spin_arg = if S::nspins() == 2 {
             let spin_d = self.density.spin().into_inner();
             Some(chemrust_hamiltonian_core::Density::from_inner(
-                chemrust_hamiltonian_core::fft::RealGrid::from_inner(spin_d.as_wave_array().clone()),
+                chemrust_hamiltonian_core::fft::RealGrid::from_inner(spin_d.as_fine_array().clone()),
             ))
         } else {
             None
         };
-        // Per-spin augmentation: CASTEP density.f90:1148-1149 adds
-        // Q_rho_sum (total) to charge and Q_rho_sum_sp (spin) to spin density.
-        // aug_up/dn = kpt-weighted augmentation per spin from beta_psi.
-        let (aug_total, aug_spin) = if S::nspins() == 2 {
-            match (self.density_aug_fine[0].as_ref(), self.density_aug_fine[1].as_ref()) {
-                (Some(a0), Some(a1)) => (
-                    Some(chemrust_hamiltonian_core::fft::RealGrid::from_inner(
-                        a0.as_real_array().to_owned() + a1.as_real_array())),
-                    Some(chemrust_hamiltonian_core::fft::RealGrid::from_inner(
-                        a0.as_real_array().to_owned() - a1.as_real_array())),
-                ),
-                (Some(a0), None) => (Some(a0.clone()), None),
-                _ => (None, None),
-            }
-        } else {
-            (self.density_aug_fine[0].as_ref().cloned(), None)
-        };
+        // Augmentation is baked into density by combine_soft_aug_on_fine.
+        // Pass None so build_v_eff_with_energy_impl does not double-count.
+        let aug_total: Option<chemrust_hamiltonian_core::fft::RealGrid<f64>> = None;
+        let aug_spin: Option<chemrust_hamiltonian_core::fft::RealGrid<f64>> = None;
         let (v_eff, e_xc, e_hartree, rho_vxc) = S::build_v_eff_with_energy_impl(
             &self.cell, &self.pots, &core_rho,
             spin_arg.as_ref(),
             aug_total.as_ref(),
             aug_spin.as_ref(),
-            &self.wave_grid, &self.fine_grid,
+            &self.fine_grid,  // source grid = fine (density already fine, upsample is identity)
+            &self.fine_grid,
         )
         .map_err(|_| Error::NotImplemented)?;
         let mut next: ScfIteration<S, VEffBuilt, MixingOff> = self.into_phase();
@@ -702,7 +730,7 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
         occupations: Option<&[f64]>,
     ) -> Result<ScfIteration<S, WavefunctionsUpdated, MixingOff>, Error> {
         #[cfg(feature = "chebyshev")]
-        { self.diagonalize_with_mode(ndeg, occupations, FilterMode::SinvHKeepHEig) }
+        { self.diagonalize_with_mode(ndeg, occupations, FilterMode::SinvHFullDas) }
         #[cfg(not(feature = "chebyshev"))]
         { self.diagonalize_inner(ndeg, occupations, None) }
     }
@@ -736,7 +764,7 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
     ) -> Result<ScfIteration<S, WavefunctionsUpdated, MixingOff>, Error> {
         self.diagonalize_inner(
             ndeg, occupations,
-            FilterMode::SinvHKeepHEig,
+            FilterMode::SinvHFullDas,
             Some(d_override_per_ion),
         )
     }
@@ -820,7 +848,7 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
             // Diagnostic (spin-0 only, kpt-0 only)
             if ispin == 0 && nkpts > 0 {
                 let total_density = self.density.total();
-                let rho_arr = total_density.as_wave_array();
+                let rho_arr = total_density.as_fine_array();
                 let n_grid = rho_arr.len() as f64;
                 let rho_sum: f64 = rho_arr.iter().sum();
                 #[allow(unused_variables)]
@@ -886,6 +914,10 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
                     None,
                     d_override_per_ion, shared_vnl,
                     self.handle_shared_vnl.clone(),
+                    #[cfg(feature = "chebyshev")]
+                    Some(&solver),
+                    #[cfg(not(feature = "chebyshev"))]
+                    None,
                     &stream, &mut pcie, &blas, &kernels,
                 )?;
                 self.shared_vnl_cache[ikpt] = Some(vnl_data.shared.clone());
@@ -958,25 +990,57 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
                     // Non-Davidson path: Chebyshev (if enabled) or error
                     #[cfg(feature = "chebyshev")]
                     {
-                        let _eig: Option<&[f64]> = None;
-                        let (psi_filtered_row, hpsi_row) = chebyshev_filter(
-                            &psi_gpu, &v_eff_gpu, &self.pots,
-                            &self.wave_grid, kpoint, &self.cell,
-                            pw_coords_kpt,
-                            &vnl_data, &kpt.fft_idx_dev, _min_veff, _max_veff,
-                            &kernels, &mut pcie, _eig, _ndeg, &blas, &solver, &stream, &ctx,
-                            filter_mode,
-                            None,
-                        )?;
-                        let pin_cfg = crate::eigensolver::rayleigh_ritz::RrPinConfig::from_env();
-                        let (psi_new_gpu, eigenvalues_cpu, beta_psi_gpu) = rayleigh_ritz(
-                            &psi_filtered_row, &hpsi_row, &vnl_data,
-                            n_bands, n_pw_kpt, &kernels,
-                            &mut pcie,
-                            &solver, &blas, &stream, &ctx,
-                            Some(prev_psi_dev),
-                            Some(&pin_cfg),
-                        )?;
+                        // λ_plus: max kinetic energy actually used (CBmin + Ecut),
+                        // not the FFT grid max (which includes G-vectors beyond the
+                        // spherical cutoff). ABINIT uses dtset%ecut from the physics cutoff.
+                        let ecut: f64 = kinetic_cpu.0.iter().cloned().fold(0.0_f64, f64::max);
+
+                        // NOTE: chebfi_run_rust now computes FRESH residual norms from
+                        // current V_eff H and S (Phase 2b), eliminating the cascade bug
+                        // where stale residuals from V_eff_{N-1} were used for locking.
+                        // The old feedback of prev_residuals/prev_eigs is removed.
+
+                        // ABINIT vtowfk inner loop: do inonsc = 1, nnsclo_now
+                        //   call chebfiwf2 → filter + RR → check residuals → exit
+                        // Multiple passes under same V_eff self-correct before SCF feedback.
+                        let max_inner = 3;
+                        let tol_res = 1e-6_f64;
+                        let mut psi_cur: &Gpu<WavefunctionSet<ColumnDistributed>> = &psi_gpu;
+                        let mut final_psi: Option<Gpu<WavefunctionSet<ColumnDistributed>>> = None;
+                        let mut final_eig = None;
+                        let mut final_beta = None;
+                        let mut n_inner = 0;
+                        for _ in 0..max_inner {
+                            let (pf, mut hf, _rz, fr, _nd) = chebfi_run_rust(
+                                psi_cur, v_eff_slice, &self.wave_grid, pw_coords_kpt,
+                                &vnl_data, &kpt.fft_idx_dev,
+                                ecut, _min_veff, _max_veff,
+                                tol_res, None, occupations, _ndeg, 1, 0.0, 1e-8,
+                                &kernels, &mut pcie, &blas, &solver, &stream, &ctx,
+                                filter_mode, Some(&kinetic_cpu.0), 0, n_bands, false,
+                            )?;
+                            let (pn, ec, bt) = rayleigh_ritz(
+                                &pf, &mut hf, &vnl_data, n_bands, n_pw_kpt, &kernels,
+                                &mut pcie, &solver, &blas, &stream, &ctx, None, None, None,
+                            )?;
+                            let max_res = fr.iter().cloned().fold(0.0_f64, f64::max);
+                            n_inner += 1;
+                            if max_res < tol_res {
+                                final_psi = Some(pn);
+                                final_eig = Some(ec);
+                                final_beta = Some(bt);
+                                break;
+                            }
+                            final_psi = Some(pn);
+                            final_eig = Some(ec);
+                            final_beta = Some(bt);
+                            psi_cur = final_psi.as_ref().unwrap();
+                        }
+                        let psi_new_gpu = final_psi.unwrap();
+                        let eigenvalues_cpu = final_eig.unwrap();
+                        let beta_psi_gpu = final_beta.unwrap();
+                        #[cfg(feature = "scf_diag")]
+                        eprintln!("[ChFSI] inner: {n_inner}/{max_inner} passes");
 
                         stream.synchronize()?;
                         #[cfg(feature = "scf_diag")]
@@ -1100,12 +1164,12 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
         pcie.h2d_bytes += self.pw_fft_indices[0].len() * std::mem::size_of::<i32>();
 
         let (psi_filtered_row, hpsi_row) = chebyshev_filter(
-            &psi_gpu, &v_eff_gpu, &self.pots,
+            &psi_gpu, v_eff_gpu.as_device_slice(), &self.pots,
             &self.wave_grid, &self.k_points[0], &self.cell,
             &pw_coords,
             &vnl_data, &fft_idx_dev, min_veff, max_veff,
             &kernels, &mut pcie, eig, ndeg, &blas, &solver, &stream, &ctx,
-            FilterMode::SinvHKeepHEig,
+            FilterMode::SinvHFullDas,
             None,
         )?;
 
@@ -1116,6 +1180,7 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
             &solver, &blas, &stream, &ctx,
             None,  // prev_psi_dev: not used in test-only variant
             None,  // pin_cfg: not used in test-only variant
+            None,  // spsi_row: not used in test-only variant
         )?;
 
         Ok((eigenvalues_cpu.into_inner(), h_sub_cpu.into_inner(), s_sub_cpu.into_inner(), x_cpu.into_inner()))
@@ -1134,7 +1199,7 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
         let ctx = Arc::new(CudaContext::new(0)?);
         let stream = ctx.default_stream();
         let blas = BlasHandle::new(stream.clone())?;
-        let solver = SolverHandle::new(stream.clone())?;
+        let _solver = SolverHandle::new(stream.clone())?;
         let kernels = CudaKernelSet::new(&ctx)?;
 
         // V_eff via SpinPolicy
@@ -1151,7 +1216,6 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
         let n_bands = self.n_bands;
         let psi_wfn = WavefunctionSet::<ColumnDistributed>::new(psi_host.clone(), n_bands, n_pw);
         let psi_gpu = Gpu::from_host_with(&psi_wfn, &stream, &mut pcie)?;
-
         let v_eff_for_d = chemrust_hamiltonian_core::EffectivePotential::from_inner(
             chemrust_hamiltonian_core::fft::RealGrid::from_inner(v_eff_wave.as_fine_array().clone()),
         );
@@ -1167,7 +1231,7 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
             .map_err(Error::Cuda)?;
 
         crate::eigensolver::chebyshev::apply_h_components_for_test(
-            &psi_gpu, &v_eff_gpu, &self.wave_grid, &self.pw_coords[0],
+            &psi_gpu, v_eff_gpu.as_device_slice(), &self.wave_grid, &self.pw_coords[0],
             &vnl_data, &fft_idx_dev, &kernels, &blas, &stream,
             self.k_points[0].coords,
         )
@@ -1197,7 +1261,7 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
         let ctx = Arc::new(CudaContext::new(0)?);
         let stream = ctx.default_stream();
         let blas = BlasHandle::new(stream.clone())?;
-        let solver = SolverHandle::new(stream.clone())?;
+        let _solver = SolverHandle::new(stream.clone())?;
         let kernels = CudaKernelSet::new(&ctx)?;
 
         let v_eff_ref = self.v_eff.as_ref().expect("VEffBuilt phase guarantees v_eff is Some");
@@ -1269,8 +1333,8 @@ impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated, MixingOff> {
         // ensures the spin polarisation is preserved through density reconstruction.
         // CASTEP electronic.f90:8742-8746: frac_elec(1)=0.5*(N+net_spin), frac_elec(2)=0.5*(N-net_spin).
         let net_spin: f64 = if nspins == 2 {
-            let up_arr = self.density[0].as_wave_array();
-            let dn_arr = self.density[1].as_wave_array();
+            let up_arr = self.density[0].as_fine_array();
+            let dn_arr = self.density[1].as_fine_array();
             let n_grid = up_arr.len() as f64;
             up_arr.iter().zip(dn_arr.iter())
                 .map(|(&u, &d)| u - d)
@@ -1507,16 +1571,60 @@ impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated, MixingOff> {
         Ok((per_spin_density, per_spin_aug, occ_set, fermi_energies))
     }
 
+    /// Combine soft (wave grid) + aug (fine grid) → combined density on fine grid.
+    ///
+    /// CASTEP density.f90:597-616 upsamples soft to fine grid, then calls
+    /// density_augment (adds aug in-place), then calls dm_mix_density on the
+    /// fine-grid combined density.  We replicate that flow here: upsample soft
+    /// to fine, add aug on fine, return a `Density` wrapping fine-grid data.
+    /// `density_aug_fine` is set to `None` (aug is now baked in).
+    fn combine_soft_aug_on_fine(
+        densities: Vec<Density>,
+        aug_densities: Vec<Option<chemrust_hamiltonian_core::fft::RealGrid<f64>>>,
+        wave_grid: &GVectorGrid,
+        fine_grid: &GVectorGrid,
+    ) -> Result<Vec<FineDensity>, Error> {
+        use chemrust_hamiltonian_core::{upsample_density_to_fine_grid, fft::RealGrid};
+        let nspins = densities.len();
+        let mut combined: Vec<FineDensity> = Vec::with_capacity(nspins);
+        for ispin in 0..nspins {
+            let soft_fine = upsample_density_to_fine_grid(
+                &RealGrid::from_inner(densities[ispin].as_wave_array().clone()),
+                wave_grid,
+                fine_grid,
+            )
+            .map_err(|_| Error::NotImplemented)?;
+            let total_fine = match &aug_densities[ispin] {
+                Some(aug_fine) => {
+                    RealGrid::from_inner(soft_fine.into_inner() + aug_fine.as_real_array())
+                }
+                None => soft_fine,
+            };
+            combined.push(FineDensity::from_inner(
+                FineGridArray::from_inner(total_fine.into_inner()),
+            ));
+        }
+        Ok(combined)
+    }
+
     /// Construct density with `Off` mixing phase — the history stays as-is
     /// and no mixing transformation is applied during `mix()`.
     pub fn construct_density_off(
         mut self,
     ) -> Result<ScfIteration<S, DensityUpdated<MixingOff>, MixingOff>, Error> {
         let (new_density, density_aug_fine, occ_set, fermi_energies) = self.compute_density_from_wavefunctions()?;
+        let densities_vec = new_density.0.into_inner();
+        let aug_vec = density_aug_fine.0.into_inner();
+        let combined_density = Self::combine_soft_aug_on_fine(
+            densities_vec,
+            aug_vec,
+            &self.wave_grid,
+            &self.fine_grid,
+        )?;
         let mut next: ScfIteration<S, DensityUpdated<MixingOff>, MixingOff> =
             self.into_phase();
-        next.density = new_density;
-        next.density_aug_fine = density_aug_fine;
+        next.density = PerSpinFineDensity(SpinChannelData::new::<S>(combined_density));
+        next.density_aug_fine = PerSpinAugDensity(SpinChannelData::new::<S>(vec![None; S::nspins()]));
         next.fermi_energy = fermi_energies;
         let _ = occ_set; // Used in future for energy computation
         Ok(next)
@@ -1527,8 +1635,18 @@ impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated, MixingOff> {
         mut self,
     ) -> Result<ScfIteration<S, DensityUpdated<Kerker>, Kerker>, Error> {
         let (new_density, density_aug_fine, occ_set, fermi_energies) = self.compute_density_from_wavefunctions()?;
-        // Convert history from MixingOff → Kerker (creates GPU preconditioner)
-        let kerker_history = self.history.into_kerker(&self.wave_grid)?;
+        let densities_vec = new_density.0.into_inner();
+        let aug_vec = density_aug_fine.0.into_inner();
+        let combined_density = Self::combine_soft_aug_on_fine(
+            densities_vec,
+            aug_vec,
+            &self.wave_grid,
+            &self.fine_grid,
+        )?;
+        // Convert history from MixingOff → Kerker (creates GPU preconditioner).
+        // CASTEP mixes on the FINE grid — pass fine_grid so Kerker/Pulay use
+        // fine-grid G-vectors and FFT dimensions.
+        let kerker_history = self.history.into_kerker(&self.fine_grid)?;
         let _ = occ_set;
         Ok(ScfIteration {
             cell: self.cell,
@@ -1542,7 +1660,7 @@ impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated, MixingOff> {
             nkpts: self.nkpts,
             pw_coords: self.pw_coords,
             pw_fft_indices: self.pw_fft_indices,
-            density: new_density,
+            density: PerSpinFineDensity(SpinChannelData::new::<S>(combined_density)),
             psi: self.psi,
             psi_cpu: self.psi_cpu,
             eigenvalues: self.eigenvalues,
@@ -1561,11 +1679,13 @@ impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated, MixingOff> {
             q_sf_cache: self.q_sf_cache,
             handle_shared_vnl: self.handle_shared_vnl,
             shared_vnl_cache: self.shared_vnl_cache,
-            density_aug_fine,
+            density_aug_fine: PerSpinAugDensity(SpinChannelData::new::<S>(vec![None; S::nspins()])),
             #[cfg(any(test, feature = "scf_diag"))]
             last_davidson_diagnostics: None,
             scf_iter: self.scf_iter,
             spin_freed: self.spin_freed,
+            #[cfg(feature = "chebyshev")]
+            residual_norms: self.residual_norms,
             _phase: PhantomData,
         })
     }
@@ -1575,8 +1695,17 @@ impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated, MixingOff> {
         mut self,
     ) -> Result<ScfIteration<S, DensityUpdated<Pulay>, Pulay>, Error> {
         let (new_density, density_aug_fine, _occ_set, fermi_energies) = self.compute_density_from_wavefunctions()?;
-        // Convert history: MixingOff → Kerker → Pulay
-        let kerker_history = self.history.into_kerker(&self.wave_grid)?;
+        let densities_vec = new_density.0.into_inner();
+        let aug_vec = density_aug_fine.0.into_inner();
+        let combined_density = Self::combine_soft_aug_on_fine(
+            densities_vec,
+            aug_vec,
+            &self.wave_grid,
+            &self.fine_grid,
+        )?;
+        // Convert history: MixingOff → Kerker → Pulay.
+        // CASTEP mixes on the FINE grid.
+        let kerker_history = self.history.into_kerker(&self.fine_grid)?;
         let pulay_history = kerker_history.into_pulay();
         Ok(ScfIteration {
             cell: self.cell,
@@ -1590,7 +1719,7 @@ impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated, MixingOff> {
             nkpts: self.nkpts,
             pw_coords: self.pw_coords,
             pw_fft_indices: self.pw_fft_indices,
-            density: new_density,
+            density: PerSpinFineDensity(SpinChannelData::new::<S>(combined_density)),
             psi: self.psi,
             psi_cpu: self.psi_cpu,
             eigenvalues: self.eigenvalues,
@@ -1609,11 +1738,13 @@ impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated, MixingOff> {
             q_sf_cache: self.q_sf_cache,
             handle_shared_vnl: self.handle_shared_vnl,
             shared_vnl_cache: self.shared_vnl_cache,
-            density_aug_fine,
+            density_aug_fine: PerSpinAugDensity(SpinChannelData::new::<S>(vec![None; S::nspins()])),
             #[cfg(any(test, feature = "scf_diag"))]
             last_davidson_diagnostics: None,
             scf_iter: self.scf_iter,
             spin_freed: self.spin_freed,
+            #[cfg(feature = "chebyshev")]
+            residual_norms: self.residual_norms,
             _phase: PhantomData,
         })
     }
@@ -1635,9 +1766,9 @@ impl<S: SpinPolicy> ScfIteration<S, DensityUpdated<MixingOff>, MixingOff> {
         let mut densities = Vec::with_capacity(nspins);
         let mut prev_densities = Vec::with_capacity(nspins);
         for ispin in 0..nspins {
-            let (mixed, prev) = self.history.mix(self.density[ispin].clone(), ispin);
-            densities.push(mixed);
-            prev_densities.push(prev);
+            let (mixed, prev) = self.history.mix(self.density[ispin].to_density(), ispin);
+            densities.push(mixed.into_fine());
+            prev_densities.push(prev.into_fine());
         }
         let history_off = self.history.into_off();
         ScfIteration {
@@ -1652,13 +1783,13 @@ impl<S: SpinPolicy> ScfIteration<S, DensityUpdated<MixingOff>, MixingOff> {
             nkpts: self.nkpts,
             pw_coords: self.pw_coords,
             pw_fft_indices: self.pw_fft_indices,
-            density: PerSpinDensity(SpinChannelData::new::<S>(densities)),
+            density: PerSpinFineDensity(SpinChannelData::new::<S>(densities)),
             psi: self.psi,
             psi_cpu: self.psi_cpu,
             eigenvalues: self.eigenvalues,
             v_eff: self.v_eff,
             history: history_off,
-            previous_density: PerSpinDensity(SpinChannelData::new::<S>(prev_densities)),
+            previous_density: PerSpinFineDensity(SpinChannelData::new::<S>(prev_densities)),
             next_mixing: self.next_mixing,
             e_xc: self.e_xc,
             e_hartree: self.e_hartree,
@@ -1676,6 +1807,8 @@ impl<S: SpinPolicy> ScfIteration<S, DensityUpdated<MixingOff>, MixingOff> {
             last_davidson_diagnostics: self.last_davidson_diagnostics,
             scf_iter: self.scf_iter,
             spin_freed: self.spin_freed,
+            #[cfg(feature = "chebyshev")]
+            residual_norms: self.residual_norms,
             _phase: PhantomData,
         }
     }
@@ -1688,9 +1821,9 @@ impl<S: SpinPolicy> ScfIteration<S, DensityUpdated<Kerker>, Kerker> {
         let mut densities = Vec::with_capacity(nspins);
         let mut prev_densities = Vec::with_capacity(nspins);
         for ispin in 0..nspins {
-            let (mixed, prev) = self.history.mix(self.density[ispin].clone(), ispin);
-            densities.push(mixed);
-            prev_densities.push(prev);
+            let (mixed, prev) = self.history.mix(self.density[ispin].to_density(), ispin);
+            densities.push(mixed.into_fine());
+            prev_densities.push(prev.into_fine());
         }
         let history_off = self.history.into_off();
         ScfIteration {
@@ -1705,13 +1838,13 @@ impl<S: SpinPolicy> ScfIteration<S, DensityUpdated<Kerker>, Kerker> {
             nkpts: self.nkpts,
             pw_coords: self.pw_coords,
             pw_fft_indices: self.pw_fft_indices,
-            density: PerSpinDensity(SpinChannelData::new::<S>(densities)),
+            density: PerSpinFineDensity(SpinChannelData::new::<S>(densities)),
             psi: self.psi,
             psi_cpu: self.psi_cpu,
             eigenvalues: self.eigenvalues,
             v_eff: self.v_eff,
             history: history_off,
-            previous_density: PerSpinDensity(SpinChannelData::new::<S>(prev_densities)),
+            previous_density: PerSpinFineDensity(SpinChannelData::new::<S>(prev_densities)),
             next_mixing: self.next_mixing,
             e_xc: self.e_xc,
             e_hartree: self.e_hartree,
@@ -1729,6 +1862,8 @@ impl<S: SpinPolicy> ScfIteration<S, DensityUpdated<Kerker>, Kerker> {
             last_davidson_diagnostics: self.last_davidson_diagnostics,
             scf_iter: self.scf_iter,
             spin_freed: self.spin_freed,
+            #[cfg(feature = "chebyshev")]
+            residual_norms: self.residual_norms,
             _phase: PhantomData,
         }
     }
@@ -1741,9 +1876,9 @@ impl<S: SpinPolicy> ScfIteration<S, DensityUpdated<Pulay>, Pulay> {
         let mut densities = Vec::with_capacity(nspins);
         let mut prev_densities = Vec::with_capacity(nspins);
         for ispin in 0..nspins {
-            let (mixed, prev) = self.history.mix(self.density[ispin].clone(), ispin);
-            densities.push(mixed);
-            prev_densities.push(prev);
+            let (mixed, prev) = self.history.mix(self.density[ispin].to_density(), ispin);
+            densities.push(mixed.into_fine());
+            prev_densities.push(prev.into_fine());
         }
         let history_off = self.history.into_off();
         ScfIteration {
@@ -1758,13 +1893,13 @@ impl<S: SpinPolicy> ScfIteration<S, DensityUpdated<Pulay>, Pulay> {
             nkpts: self.nkpts,
             pw_coords: self.pw_coords,
             pw_fft_indices: self.pw_fft_indices,
-            density: PerSpinDensity(SpinChannelData::new::<S>(densities)),
+            density: PerSpinFineDensity(SpinChannelData::new::<S>(densities)),
             psi: self.psi,
             psi_cpu: self.psi_cpu,
             eigenvalues: self.eigenvalues,
             v_eff: self.v_eff,
             history: history_off,
-            previous_density: PerSpinDensity(SpinChannelData::new::<S>(prev_densities)),
+            previous_density: PerSpinFineDensity(SpinChannelData::new::<S>(prev_densities)),
             next_mixing: self.next_mixing,
             e_xc: self.e_xc,
             e_hartree: self.e_hartree,
@@ -1782,6 +1917,8 @@ impl<S: SpinPolicy> ScfIteration<S, DensityUpdated<Pulay>, Pulay> {
             last_davidson_diagnostics: self.last_davidson_diagnostics,
             scf_iter: self.scf_iter,
             spin_freed: self.spin_freed,
+            #[cfg(feature = "chebyshev")]
+            residual_norms: self.residual_norms,
             _phase: PhantomData,
         }
     }
@@ -1847,8 +1984,8 @@ impl<S: SpinPolicy> ScfIteration<S, Mixed, MixingOff> {
         // CASTEP electronic.f90:8742-8746: frac_elec(1)=0.5*(N+net_spin),
         // frac_elec(2)=0.5*(N-net_spin).
         let net_spin: f64 = if nspins == 2 {
-            let up_arr = self.density[0].as_wave_array();
-            let dn_arr = self.density[1].as_wave_array();
+            let up_arr = self.density[0].as_fine_array();
+            let dn_arr = self.density[1].as_fine_array();
             let n_grid = up_arr.len() as f64;
             up_arr.iter().zip(dn_arr.iter())
                 .map(|(&u, &d)| u - d)
@@ -1979,8 +2116,8 @@ impl<S: SpinPolicy> ScfIteration<S, Mixed, MixingOff> {
         let dens_rms = {
             let total_current = self.density.total();
             let total_previous = self.previous_density.total();
-            let current = total_current.as_wave_array();
-            let previous = total_previous.as_wave_array();
+            let current = total_current.as_fine_array();
+            let previous = total_previous.as_fine_array();
             let diff = current - previous;
             let sum_sq: f64 = diff.iter().map(|&x| x * x).sum();
             let n = diff.len() as f64;
@@ -2015,6 +2152,9 @@ impl<S: SpinPolicy> ScfIteration<S, Mixed, MixingOff> {
         };
 
         // 6. Decision — mixing must have been active to declare convergence
+        // Set next_mixing on self before into_phase() so the returned state
+        // carries the correct mixing phase for the next iteration.
+        self.next_mixing = next_mixing;
         if mixing_was_active && dens_rms < tol && energy_converged {
             Ok(CheckOutcome::Converged(self.into_phase()))
         } else {
@@ -2328,7 +2468,7 @@ pub fn run_scf_with_energy_gated<S: SpinPolicy + BuildVEffWithEnergy>(
                         // Total electron count = soft (wave grid) + augmented (fine grid).
                         // CASTEP raw units (ρ×Ω): electrons = sum/N for each grid.
                         let total_density = next.density.total();
-                        let rho_arr = total_density.as_wave_array();
+                        let rho_arr = total_density.as_fine_array();
                         let soft_sum: f64 = rho_arr.iter().sum();
                         let n_soft = rho_arr.len() as f64;
                         let soft_e = soft_sum / n_soft;
@@ -2680,7 +2820,7 @@ impl<S: SpinPolicy, State: ScfPhase, M: MixingPhase> ScfIteration<S, State, M> {
 
     /// Per-spin density (ρ_up, ρ_down for SpinCollinear; ρ for NonSpin).
     #[doc(hidden)]
-    pub fn per_spin_density(&self) -> &PerSpinDensity { &self.density }
+    pub fn per_spin_density(&self) -> &PerSpinFineDensity { &self.density }
 
     /// Per-spin Fermi energies from the most recent occupation search.
     #[doc(hidden)]
@@ -2696,7 +2836,7 @@ impl<S: SpinPolicy, M: MixingPhase> ScfIteration<S, Mixed, M> {
 
 impl<S: SpinPolicy> ScfIteration<S, Initialized, MixingOff> {
     /// Mutable access to total density for spin-0 (for perturbation testing).
-    pub fn density_mut(&mut self) -> &mut Density {
+    pub fn density_mut(&mut self) -> &mut FineDensity {
         &mut self.density[0]
     }
     /// Clear the cached augmentation density (debug/testing only).
@@ -2787,6 +2927,7 @@ mod tests {
         let n_bands = 4;
         let n_pw = 27;
         let state: ScfIteration<NonSpin, Mixed, MixingOff> = ScfIteration {
+            #[cfg(feature = "chebyshev")]
             cell: dummy_cell(),
             pots: PseudopotentialSet::new(),
             wave_grid: dummy_grid(),
@@ -2798,7 +2939,7 @@ mod tests {
             nkpts: 1,
             pw_coords: KptDataSet::new(vec![Vec::new()], 1),
             pw_fft_indices: KptDataSet::new(vec![Vec::new()], 1),
-            density: PerSpinDensity(SpinChannelData::new::<NonSpin>(vec![density])),
+            density: PerSpinFineDensity(SpinChannelData::new::<NonSpin>(vec![density])),
             psi: PerSpinPwCoefficients(SpinChannelData::new::<NonSpin>(
                 vec![KptDataSet::new(vec![dummy_pw_coeffs()], 1)],
             )),
@@ -2808,7 +2949,7 @@ mod tests {
             )),
             v_eff: None,
             history: DensityHistory::new(1),
-            previous_density: PerSpinDensity(SpinChannelData::new::<NonSpin>(vec![previous_density])),
+            previous_density: PerSpinFineDensity(SpinChannelData::new::<NonSpin>(vec![previous_density])),
             next_mixing: MixingPhaseKind::Off,
             e_xc: None,
             e_hartree: None,
@@ -2826,6 +2967,8 @@ mod tests {
             handle_shared_vnl: None,
             shared_vnl_cache: vec![None; 1],
             scf_iter: 0,
+            #[cfg(feature = "chebyshev")]
+            residual_norms: None,
             spin_freed: false,
             _phase: PhantomData,
         };
@@ -2849,6 +2992,7 @@ mod tests {
         let n_bands = 4;
         let n_pw = 27;
         ScfIteration {
+            #[cfg(feature = "chebyshev")]
             cell: dummy_cell(),
             pots: PseudopotentialSet::new(),
             wave_grid: dummy_grid(),
@@ -2860,7 +3004,7 @@ mod tests {
             nkpts: 1,
             pw_coords: KptDataSet::new(vec![Vec::new()], 1),
             pw_fft_indices: KptDataSet::new(vec![Vec::new()], 1),
-            density: PerSpinDensity(SpinChannelData::new::<NonSpin>(vec![
+            density: PerSpinFineDensity(SpinChannelData::new::<NonSpin>(vec![
                 Density::from_inner(WaveGridArray::from_inner(Array3::<f64>::zeros(shape))),
             ])),
             psi: PerSpinPwCoefficients(SpinChannelData::new::<NonSpin>(
@@ -2874,7 +3018,7 @@ mod tests {
             )),
             v_eff: None,
             history: DensityHistory::new(1),
-            previous_density: PerSpinDensity(SpinChannelData::new::<NonSpin>(vec![
+            previous_density: PerSpinFineDensity(SpinChannelData::new::<NonSpin>(vec![
                 Density::from_inner(WaveGridArray::from_inner(
                     Array3::<f64>::from_elem(shape, 2.0),
                 )),
@@ -2896,6 +3040,8 @@ mod tests {
             handle_shared_vnl: None,
             shared_vnl_cache: vec![None; 1],
             scf_iter: 0,
+            #[cfg(feature = "chebyshev")]
+            residual_norms: None,
             spin_freed: false,
             _phase: PhantomData,
         }

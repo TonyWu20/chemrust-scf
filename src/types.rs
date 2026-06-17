@@ -117,6 +117,82 @@ impl Mul<f64> for Density {
     fn mul(self, rhs: f64) -> Self { Self(self.0 * rhs) }
 }
 
+impl Density {
+    /// Reinterpret as a [`FineDensity`].  The inner array is consumed and
+    /// re-wrapped — the caller must ensure the data is actually on the fine
+    /// grid (i.e. has fine-grid dimensions).
+    pub fn into_fine(self) -> FineDensity {
+        FineDensity(FineGridArray(self.0 .0))
+    }
+}
+
+/// Electron density ρ(r) on the fine grid.
+///
+/// Unlike [`Density`] (wave grid), this type is compile-time evidence that the
+/// density is already on the fine grid — no upsampling is needed before V_eff
+/// assembly.  Created by [`combine_soft_aug_on_fine`] and consumed by
+/// [`build_v_eff_with_energy`].
+///
+/// CASTEP stores its mixed density on the fine grid (density.f90:597-616,
+/// electronic.f90:597-616).
+#[derive(Debug, Clone)]
+pub struct FineDensity(pub(crate) FineGridArray);
+
+impl FineDensity {
+    /// View the fine-grid data as a raw `Array3<f64>`.
+    pub fn as_fine_array(&self) -> &Array3<f64> {
+        self.0.as_array()
+    }
+
+    /// Mutable view of the fine-grid data.
+    pub fn as_fine_array_mut(&mut self) -> &mut Array3<f64> {
+        self.0.as_array_mut()
+    }
+
+    /// Consume and return the inner [`FineGridArray`].
+    pub fn into_inner(self) -> FineGridArray {
+        self.0
+    }
+
+    /// Wrap a [`FineGridArray`].
+    pub fn from_inner(arr: FineGridArray) -> Self {
+        Self(arr)
+    }
+
+    /// Flatten to a `Vec<f64>` in row-major order (for GPU upload).
+    pub fn flatten_host(&self) -> Vec<f64> {
+        self.0.as_array().iter().cloned().collect()
+    }
+
+    /// Number of grid points.
+    pub fn len(&self) -> usize {
+        self.0.as_array().len()
+    }
+}
+
+// ── Arithmetic ops ──
+
+impl Add for FineDensity {
+    type Output = Self;
+    fn add(self, rhs: Self) -> Self { Self(self.0 + rhs.0) }
+}
+impl Sub for FineDensity {
+    type Output = Self;
+    fn sub(self, rhs: Self) -> Self { Self(self.0 - rhs.0) }
+}
+impl Mul<f64> for FineDensity {
+    type Output = Self;
+    fn mul(self, rhs: f64) -> Self { Self(self.0 * rhs) }
+}
+
+impl FineDensity {
+    /// Re-wrap as a [`Density`] for mixing.rs compatibility.
+    /// The inner array retains fine-grid dimensions.
+    pub fn to_density(&self) -> Density {
+        Density(WaveGridArray(self.0.as_array().clone()))
+    }
+}
+
 /// Effective potential V_eff[ρ] assembled on the fine grid.
 #[derive(Debug, Clone)]
 pub struct EffectivePotential(pub(crate) FineGridArray);
@@ -300,7 +376,7 @@ pub struct SmearingParams {
 /// Output of a converged SCF calculation.
 #[derive(Debug, Clone)]
 pub struct FinalResult {
-    pub density: Density,
+    pub density: FineDensity,
     pub eigenvalues: crate::spin_types::PerSpinEigenvalues,
     pub total_energy: f64,
 }

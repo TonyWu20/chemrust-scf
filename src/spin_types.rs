@@ -16,7 +16,7 @@ use chemrust_hamiltonian_core::fft::RealGrid;
 
 use crate::device::CudaComplex;
 use crate::eigensolver::davidson_types::PwCoefficients;
-use crate::types::Density;
+use crate::types::{Density, FineDensity};
 
 // ---------------------------------------------------------------------------
 // SpinChannelData<T> — generic container with length validation
@@ -427,5 +427,67 @@ impl Deref for PerSpinAugDensity {
 impl DerefMut for PerSpinAugDensity {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PerSpinFineDensity — compile-time evidence of fine-grid density
+// ---------------------------------------------------------------------------
+
+/// Charge density ρ(r) on the **fine grid** for each spin channel.
+///
+/// Unlike [`PerSpinDensity`] (wave grid), this type guarantees at compile time
+/// that the density lives on the fine grid — no upsampling is needed before
+/// V_eff assembly.  Created after mixing and consumed by
+/// `build_v_eff_with_energy`.
+///
+/// CASTEP stores its mixed density on the fine grid.
+#[derive(Debug, Clone)]
+pub struct PerSpinFineDensity(pub SpinChannelData<FineDensity>);
+
+impl PerSpinFineDensity {
+    pub fn new(value: SpinChannelData<FineDensity>) -> Self {
+        Self(value)
+    }
+
+    /// Total charge density: `ρ↑ + ρ↓` (or ρ for NonSpin).
+    pub fn total(&self) -> FineDensity {
+        if self.nspins() == 1 {
+            self[0].clone()
+        } else {
+            self[0].clone() + self[1].clone()
+        }
+    }
+
+    /// Spin density: `ρ↑ - ρ↓` (zero for NonSpin).
+    pub fn spin(&self) -> FineSpinDensity {
+        if self.nspins() == 1 {
+            FineSpinDensity(self[0].clone() - self[0].clone())
+        } else {
+            FineSpinDensity(self[0].clone() - self[1].clone())
+        }
+    }
+}
+
+impl Deref for PerSpinFineDensity {
+    type Target = SpinChannelData<FineDensity>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for PerSpinFineDensity {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+/// Spin density `ρ↑ - ρ↓` on the fine grid.
+#[derive(Debug, Clone)]
+pub struct FineSpinDensity(pub FineDensity);
+
+impl FineSpinDensity {
+    pub fn into_inner(self) -> FineDensity {
+        self.0
     }
 }
