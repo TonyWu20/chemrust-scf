@@ -1588,17 +1588,33 @@ impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated, MixingOff> {
         let nspins = densities.len();
         let mut combined: Vec<FineDensity> = Vec::with_capacity(nspins);
         for ispin in 0..nspins {
+            let soft_wave_arr = densities[ispin].as_wave_array();
+            let soft_wave_sum: f64 = soft_wave_arr.iter().sum();
+            let soft_wave_n = soft_wave_arr.len() as f64;
             let soft_fine = upsample_density_to_fine_grid(
-                &RealGrid::from_inner(densities[ispin].as_wave_array().clone()),
+                &RealGrid::from_inner(soft_wave_arr.clone()),
                 wave_grid,
                 fine_grid,
             )
             .map_err(|_| Error::NotImplemented)?;
+            let soft_fine_arr = soft_fine.as_real_array();
+            let soft_fine_sum: f64 = soft_fine_arr.iter().sum();
+            let soft_fine_n = soft_fine_arr.len() as f64;
             let total_fine = match &aug_densities[ispin] {
                 Some(aug_fine) => {
+                    let aug_sum: f64 = aug_fine.as_real_array().iter().sum();
+                    let aug_n = aug_fine.as_real_array().len() as f64;
+                    eprintln!("[combine] spin={ispin} soft_wave_e={:.4} soft_fine_e={:.4} aug_e={:.4} total_e={:.4}",
+                        soft_wave_sum/soft_wave_n, soft_fine_sum/soft_fine_n,
+                        aug_sum/aug_n, (soft_fine_sum + aug_sum)/soft_fine_n);
                     RealGrid::from_inner(soft_fine.into_inner() + aug_fine.as_real_array())
                 }
-                None => soft_fine,
+                None => {
+                    eprintln!("[combine] spin={ispin} soft_wave_e={:.4} soft_fine_e={:.4} aug_e=None total_e={:.4}",
+                        soft_wave_sum/soft_wave_n, soft_fine_sum/soft_fine_n,
+                        soft_fine_sum/soft_fine_n);
+                    soft_fine
+                }
             };
             combined.push(FineDensity::from_inner(
                 FineGridArray::from_inner(total_fine.into_inner()),
@@ -1646,7 +1662,12 @@ impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated, MixingOff> {
         // Convert history from MixingOff → Kerker (creates GPU preconditioner).
         // CASTEP mixes on the FINE grid — pass fine_grid so Kerker/Pulay use
         // fine-grid G-vectors and FFT dimensions.
-        let kerker_history = self.history.into_kerker(&self.fine_grid)?;
+        // Kerker kernel on fine grid: mask G-vectors beyond the wave-grid cutoff.
+        // CASTEP's dm_apply_kerker only mixes up to num_mix_plane_waves (≤ mix_charge_gmax).
+        // Without this mask, high-G noise on the fine grid is mixed at full amplitude (K≈1),
+        // causing catastrophic density corruption at the first Kerker iteration.
+        let wave_g2_max = self.wave_grid.g2().iter().cloned().fold(0.0_f64, f64::max);
+        let kerker_history = self.history.into_kerker(&self.fine_grid, Some(wave_g2_max))?;
         let _ = occ_set;
         Ok(ScfIteration {
             cell: self.cell,
@@ -1705,7 +1726,12 @@ impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated, MixingOff> {
         )?;
         // Convert history: MixingOff → Kerker → Pulay.
         // CASTEP mixes on the FINE grid.
-        let kerker_history = self.history.into_kerker(&self.fine_grid)?;
+        // Kerker kernel on fine grid: mask G-vectors beyond the wave-grid cutoff.
+        // CASTEP's dm_apply_kerker only mixes up to num_mix_plane_waves (≤ mix_charge_gmax).
+        // Without this mask, high-G noise on the fine grid is mixed at full amplitude (K≈1),
+        // causing catastrophic density corruption at the first Kerker iteration.
+        let wave_g2_max = self.wave_grid.g2().iter().cloned().fold(0.0_f64, f64::max);
+        let kerker_history = self.history.into_kerker(&self.fine_grid, Some(wave_g2_max))?;
         let pulay_history = kerker_history.into_pulay();
         Ok(ScfIteration {
             cell: self.cell,
