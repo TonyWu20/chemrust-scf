@@ -978,7 +978,7 @@ unsafe fn step_inner_chebyshev(
     let ndeg_filter_max = 40usize; // ABINIT hard cap (not CASTEP's max_deg=12)
     let oracle_mode = 2usize;      // two-target: per-band decrease target via oracle_factor
     let oracle_factor = 0.1_f64;   // target ratio for decrease path (max 15 iters)
-    let oracle_min_occ = 0.1_f64;  // skip bands with occupancy below 0.1
+    let oracle_min_occ = 0.0001_f64;  // ABINIT default: skip bands with occ < 1e-4
 
     // Chebyshev filtering — SinvHKeepHEig for USPP (S⁻¹·H operator).
     let mut pcie = PcieAccount::default();
