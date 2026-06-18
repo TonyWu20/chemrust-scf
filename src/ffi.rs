@@ -976,8 +976,8 @@ unsafe fn step_inner_chebyshev(
     // >12 iterations get under-filtered, causing eigenvalue oscillation.
     let tolerance = 1e-6_f64;
     let ndeg_filter_max = 40usize; // ABINIT hard cap (not CASTEP's max_deg=12)
-    let oracle_mode = 2usize;      // two-target: per-band decrease target via oracle_factor
-    let oracle_factor = 0.1_f64;   // target ratio for decrease path (max 15 iters)
+    let oracle_mode = 1usize;      // conservative: cap at min(needed, global_oracle, ndeg_filter_max)
+    let oracle_factor = 0.1_f64;   // unused in mode 1
     let oracle_min_occ = 0.0001_f64;  // ABINIT default: skip bands with occ < 1e-4
 
     // Chebyshev filtering — SinvHKeepHEig for USPP (S⁻¹·H operator).
