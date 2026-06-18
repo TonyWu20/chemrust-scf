@@ -2705,6 +2705,18 @@ pub fn chebfi_run_rust(
         final_psi_buf = &mut x_curr;
     }
 
+    // Diagnostic: check psi data before Cholesky QR
+    {
+        stream.synchronize().map_err(Error::Cuda)?;
+        let sample: Vec<CudaComplex> = stream.clone_dtoh(&final_psi_buf.0[..n_pw.min(5)]).map_err(Error::Cuda)?;
+        let mut max_abs = 0.0f64;
+        for c in &sample { max_abs = max_abs.max((c.x*c.x + c.y*c.y).sqrt()); }
+        eprintln!(
+            "[chebfi] Phase 5 output sample (first {} of band 0, n_pw={} n_bands={}): max|psi|={:.6e}",
+            sample.len(), n_pw, n_bands, max_abs,
+        );
+    }
+
     // =====================================================================
     // Phase 6: Cholesky QR (ABINIT xg_Block_xgBlock_xg_QP).
     // S_sub = X^T·S·X, ZPOTRF → R, ZTRSM → X·R^{-1}.
