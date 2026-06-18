@@ -294,7 +294,16 @@ fn init_inner(
         cell: cell_clone,
         wave_grid,
         fine_grid,
-        eigensolver_mode: EigensolverMode::Davidson,
+        eigensolver_mode: {
+            #[cfg(feature = "chebyshev")]
+            if std::env::var("CHEMRUST_EIGENSOLVER").unwrap_or_default() == "chebyshev" {
+                EigensolverMode::Chebyshev
+            } else {
+                EigensolverMode::Davidson
+            }
+            #[cfg(not(feature = "chebyshev"))]
+            EigensolverMode::Davidson
+        },
     })))
 }
 
