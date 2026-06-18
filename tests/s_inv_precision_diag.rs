@@ -201,6 +201,9 @@ mod tests {
         // ζ = full Woodbury error
         let band0: Vec<Complex64> = psi_data.iter().take(n_pw).copied().collect();
         let zeta = check_s_inv_s_identity(&band0, n_pw, &vnl_data, &blas, &stream, &solver).unwrap();
+        // Iterative refinement (ABINIT m_invovl.F90:1102-1140) must improve
+        // Woodbury S⁻¹ precision below 1e-8.  Without refinement, ζ ≈ 3.4e-6.
+        assert!(zeta < 1e-8, "[precision] {label}: ζ={zeta:.6e} exceeds 1e-8 gate — Woodbury refinement broken");
 
         // η = zgetrs relative residual
         let band0_cplx: Vec<CudaComplex> = band0.iter()
