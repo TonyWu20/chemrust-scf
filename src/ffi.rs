@@ -66,6 +66,16 @@ struct KptData {
     shared_vnl: Option<Arc<KptSharedVnl>>,
 }
 
+// ---- Eigensolver mode ------------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+enum EigensolverMode {
+    Davidson = 0,
+    #[cfg(feature = "chebyshev")]
+    Chebyshev = 1,
+}
+
 // ---- Opaque handle ---------------------------------------------------------
 
 struct ChemrustHandle {
@@ -94,6 +104,7 @@ struct ChemrustHandle {
     cell: CellGeometry,
     wave_grid: GVectorGrid,  // STANDARD grid — matches CASTEP's internal FFT grid
     fine_grid: GVectorGrid,  // FINE grid — for V_eff downsampling only
+    eigensolver_mode: EigensolverMode,
 }
 
 // ---- Init ------------------------------------------------------------------
@@ -283,7 +294,28 @@ fn init_inner(
         cell: cell_clone,
         wave_grid,
         fine_grid,
+        eigensolver_mode: EigensolverMode::Davidson,
     })))
+}
+
+// ---- Set eigensolver mode ---------------------------------------------------
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn chemrust_eigensolve_set_mode(
+    handle: *mut c_void,
+    mode: c_int,
+) -> c_int {
+    let h = match unsafe { (handle as *mut ChemrustHandle).as_mut() } {
+        Some(h) => h,
+        None => return CHEM_EIG_NULL_HANDLE,
+    };
+    match mode {
+        0 => h.eigensolver_mode = EigensolverMode::Davidson,
+        #[cfg(feature = "chebyshev")]
+        1 => h.eigensolver_mode = EigensolverMode::Chebyshev,
+        _ => return CHEM_EIG_CUDA_ERROR,
+    }
+    CHEM_EIG_OK
 }
 
 // ---- Destroy ---------------------------------------------------------------
@@ -306,6 +338,19 @@ pub unsafe extern "C" fn chemrust_eigensolve_step(
     max_deg: c_int,
     converged: *mut c_int,
 ) -> c_int {
+    let h = match unsafe { (handle as *mut ChemrustHandle).as_mut() } {
+        Some(h) => h,
+        None => return CHEM_EIG_NULL_HANDLE,
+    };
+    #[cfg(feature = "chebyshev")]
+    if h.eigensolver_mode == EigensolverMode::Chebyshev {
+        return match unsafe { step_inner_chebyshev(handle, psi_data, v_eff_data, kinetic_data,
+            fft_idx_data, eigenvalues_ptr, hpsi_out, npw, nbands, ikpt, ispin, max_deg, converged) }
+        {
+            Ok(()) => CHEM_EIG_OK,
+            Err(c) => c,
+        };
+    }
     match unsafe { step_inner(handle, psi_data, v_eff_data, kinetic_data, fft_idx_data,
         eigenvalues_ptr, hpsi_out, npw, nbands, ikpt, ispin, max_deg, converged) }
     {
