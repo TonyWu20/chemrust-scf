@@ -3501,6 +3501,13 @@ impl<'a> DavidsonBlockCtx<'a> {
         slice_eigenvalues: &[f64],
         slice_nbands: usize,
     ) -> Result<usize, Error> {
+        #[cfg(feature = "scf_diag")]
+        let ev_build_start = self.stream.context().new_event(
+            Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT),
+        ).map_err(Error::Cuda)?;
+        #[cfg(feature = "scf_diag")]
+        ev_build_start.record(self.stream).map_err(Error::Cuda)?;
+
         // --- Stage 1: Copy ψ and H·ψ from slice workspace to block temps ---
         // CASTEP hamiltonian.f90:404-409 copies slice and H_slice from
         // super_wvfn / H_super_wvfn into the slice workspace.  We follow
@@ -3996,6 +4003,17 @@ impl<'a> DavidsonBlockCtx<'a> {
                 .result()
                 .map_err(Error::Blas)?;
             }
+        }
+
+        #[cfg(feature = "scf_diag")]
+        {
+            let ev_build_end = self.stream.context().new_event(
+                Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT),
+            ).map_err(Error::Cuda)?;
+            ev_build_end.record(self.stream).map_err(Error::Cuda)?;
+            let build_ms = ev_build_start.elapsed_ms(&ev_build_end).unwrap_or(-1.0);
+            eprintln!("[bld-timing] blk={:3} nactive={:2} build: {:.3}ms",
+                self.block_start, self.active_indices.len(), build_ms);
         }
 
         Ok(self.active_indices.len())
