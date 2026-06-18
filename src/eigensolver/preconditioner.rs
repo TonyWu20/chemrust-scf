@@ -34,6 +34,7 @@ use crate::device::CudaComplex;
 use crate::eigensolver::davidson_types::{
     KineticPreconditioner, PreconditionerVector, PwCoefficients,
 };
+use crate::eigensolver::kernels::CudaKernelSet;
 use crate::eigensolver::vnl_data::VnlBatchData;
 use crate::types::Error;
 
@@ -639,6 +640,13 @@ pub unsafe fn apply_preconditioner(
     r_beta_per_ion: Option<&[Array2<Complex64>]>,
     q_rcq: Option<&Array2<Complex64>>,
     blas: Option<&BlasHandle>,
+    // GPU-resident USPP parameters (pre-uploaded in prepare_preconditioner).
+    // When all three are provided, weights are computed entirely on GPU
+    // without D2H/H2D transfers for beta_phi projections.
+    q_rcq_gpu: Option<&CudaSlice<CudaComplex>>,
+    r_beta_gpu: Option<&CudaSlice<CudaComplex>>,
+    total_ne: Option<usize>,
+    kernels: Option<&CudaKernelSet>,
 ) -> Result<PwCoefficients, Error> {
     let total = n_pw * n_bands;
     let out_dev: CudaSlice<CudaComplex> = stream.alloc_zeros(total).map_err(Error::Cuda)?;
@@ -694,6 +702,314 @@ pub unsafe fn apply_preconditioner(
             return Ok(precon);
         }
 
+        // ===================================================================
+        // GPU-RESIDENT PATH
+        // ===================================================================
+        // When Q_RCQ and R_beta were pre-uploaded to GPU (prepare_preconditioner
+        // with a stream), compute USPP weights entirely on-device.  This
+        // eliminates D2H transfers of beta_phi projections (~4 KB per ion)
+        // and H2D transfers of per-ion weights.  More importantly, it removes
+        // stream synchronisation points (clone_dtoh) that create pipeline
+        // bubbles between the TPA kernel and the subsequent GEMMs.
+        //
+        // CASTEP reference: nlpot.f90:15879-16231 (nlpot_apply_precon_ES_slice)
+        // ===================================================================
+        if let (Some(q_rcq_gpu), Some(r_beta_gpu), Some(total_ne), Some(kernels)) =
+            (q_rcq_gpu, r_beta_gpu, total_ne, kernels)
+        {
+            // Build ion_offsets from cumulative n_expanded sums
+            let mut gpu_ion_offsets = Vec::with_capacity(vnl_data.entries.len() + 1);
+            let mut gpu_cum = 0usize;
+            for entry in &vnl_data.entries {
+                gpu_ion_offsets.push(gpu_cum);
+                gpu_cum += entry.n_expanded as usize;
+            }
+            gpu_ion_offsets.push(gpu_cum);
+            debug_assert_eq!(gpu_cum, total_ne, "total_ne mismatch: pre-uploaded {total_ne} vs computed {gpu_cum}");
+
+            // Clone the TPA-preconditioned buffer BEFORE any USPP NL modification.
+            // CRITICAL: CASTEP nlpot.f90:15995 calls wave_beta_phi(precon_slice)
+            // on the freshly TPA-preconditioned residual BEFORE any in-place
+            // correction.  Same requirement as the CPU path.
+            let precon_tpa_dev: CudaSlice<CudaComplex> =
+                stream.alloc_zeros(n_pw * n_bands).map_err(Error::Cuda)?;
+            let handle: cublasHandle_t = blas.raw_handle();
+            unsafe {
+                let (precon_ptr, _) = precon.device_ptr(stream);
+                let (tpa_ptr, _) = precon_tpa_dev.device_ptr(stream);
+                cublasZcopy_v2(
+                    handle,
+                    (n_pw * n_bands) as i32,
+                    precon_ptr as *const _,
+                    1,
+                    tpa_ptr as *mut _,
+                    1,
+                );
+            }
+            let precon_tpa = PwCoefficients::new(precon_tpa_dev);
+
+            // Byte size of a complex element (used for pointer arithmetic below).
+            // Defined once here and reused in PASS 1 accumulation and PASS 3 extraction.
+            let cpx_bytes = std::mem::size_of::<CudaComplex>() as u64;
+
+            // Allocate global GPU buffers (column-major, lda = total_ne)
+            let mut global_beta_phi_psi_dev: CudaSlice<CudaComplex> = stream
+                .alloc_zeros(total_ne * n_bands)
+                .map_err(Error::Cuda)?;
+            let global_beta_phi_precon_dev: CudaSlice<CudaComplex> = stream
+                .alloc_zeros(total_ne * n_bands)
+                .map_err(Error::Cuda)?;
+
+            // ---------------------------------------------------------------
+            // PASS 1: Per-ion GEMMs → GPU-side global accumulation
+            // ---------------------------------------------------------------
+            // For each ion i with ne projectors:
+            //   beta_phi_psi      = beta_g^H · psi        (ne × n_bands)
+            //   beta_phi_precon   = beta_g^H · precon_tpa (ne × n_bands)
+            // Copy into global buffers at row offset (no D2H).
+            for (i, entry) in vnl_data.entries.iter().enumerate() {
+                let ne = entry.n_expanded as usize;
+                if ne == 0 {
+                    continue;
+                }
+                let offset = gpu_ion_offsets[i];
+
+                // GEMM: beta_phi_psi = beta_g^H · psi  (ne × n_bands)
+                let mut beta_phi_psi_dev: CudaSlice<CudaComplex> = stream
+                    .alloc_zeros(ne * n_bands)
+                    .map_err(Error::Cuda)?;
+                unsafe {
+                    blas.gemm_c64(
+                        ZgemmConfig {
+                            transa: op::C,
+                            transb: op::N,
+                            m: ne as i32,
+                            n: n_bands as i32,
+                            k: n_pw as i32,
+                            alpha: CudaComplex { x: 1.0, y: 0.0 },
+                            lda: n_pw as i32,
+                            ldb: n_pw as i32,
+                            beta: CudaComplex { x: 0.0, y: 0.0 },
+                            ldc: ne as i32,
+                        },
+                        &entry.beta_g,
+                        psi,
+                        &mut beta_phi_psi_dev,
+                    )?;
+                }
+
+                // GEMM: beta_phi_precon = beta_g^H · precon_tpa  (ne × n_bands)
+                let mut beta_phi_precon_dev: CudaSlice<CudaComplex> = stream
+                    .alloc_zeros(ne * n_bands)
+                    .map_err(Error::Cuda)?;
+                unsafe {
+                    blas.gemm_c64(
+                        ZgemmConfig {
+                            transa: op::C,
+                            transb: op::N,
+                            m: ne as i32,
+                            n: n_bands as i32,
+                            k: n_pw as i32,
+                            alpha: CudaComplex { x: 1.0, y: 0.0 },
+                            lda: n_pw as i32,
+                            ldb: n_pw as i32,
+                            beta: CudaComplex { x: 0.0, y: 0.0 },
+                            ldc: ne as i32,
+                        },
+                        &entry.beta_g,
+                        &precon_tpa,
+                        &mut beta_phi_precon_dev,
+                    )?;
+                }
+
+                // GPU-side accumulation: copy per-ion column-major blocks
+                // into global buffers (also column-major, lda=total_ne).
+                // For each band b, copy ne elements at row offset.
+                // Use byte-offset arithmetic (not typed-pointer .add())
+                // to avoid Rust pointer-provenance issues with CUdeviceptr.
+                {
+                    let (global_psi_ptr, _) = global_beta_phi_psi_dev.device_ptr(stream);
+                    let (global_precon_ptr, _) = global_beta_phi_precon_dev.device_ptr(stream);
+                    let (ion_psi_ptr, _) = beta_phi_psi_dev.device_ptr(stream);
+                    let (ion_precon_ptr, _) = beta_phi_precon_dev.device_ptr(stream);
+                    let ne_i32 = ne as i32;
+                    for b in 0..n_bands {
+                        let src_psi_byte = ion_psi_ptr.wrapping_add((b * ne) as u64 * cpx_bytes);
+                        let src_precon_byte = ion_precon_ptr.wrapping_add((b * ne) as u64 * cpx_bytes);
+                        let dst_psi_byte = global_psi_ptr.wrapping_add((offset + b * total_ne) as u64 * cpx_bytes);
+                        let dst_precon_byte = global_precon_ptr.wrapping_add((offset + b * total_ne) as u64 * cpx_bytes);
+                        unsafe {
+                            cublasZcopy_v2(handle, ne_i32,
+                                src_psi_byte as *const _, 1,
+                                dst_psi_byte as *mut _, 1,
+                            );
+                            cublasZcopy_v2(handle, ne_i32,
+                                src_precon_byte as *const _, 1,
+                                dst_precon_byte as *mut _, 1,
+                            );
+                        }
+                    }
+                }
+            }
+
+            // ---------------------------------------------------------------
+            // PASS 2: GPU-resident weight computation
+            // ---------------------------------------------------------------
+            // CASTEP nlpot.f90:16077-16119:
+            //   scaled[n,b] = beta_phi_psi[n,b] * eigenvalue[b]
+            //   global_weight = Q_RCQ · scaled + R_beta · beta_phi_precon
+            //
+            // Step 2a: Column scaling (in-place on global_beta_phi_psi_dev)
+            //   scaled[n + b*total_ne] *= eigenvalues[b]
+            let total_elem = total_ne * n_bands;
+            unsafe {
+                stream
+                    .launch_builder(&kernels.scale_cols_by_eig)
+                    .arg(&mut global_beta_phi_psi_dev)
+                    .arg(eigenvalues)
+                    .arg(&(total_ne as i32))
+                    .arg(&(n_bands as i32))
+                    .launch(LaunchConfig::for_num_elems(total_elem as u32))
+                    .map(|_| ())
+            }
+            .map_err(Error::Cuda)?;
+
+            // Step 2b: global_weight = Q_RCQ · scaled  (total_ne × n_bands)
+            let mut global_weight_dev: CudaSlice<CudaComplex> = stream
+                .alloc_zeros(total_ne * n_bands)
+                .map_err(Error::Cuda)?;
+            unsafe {
+                blas.gemm_c64(
+                    ZgemmConfig {
+                        transa: op::N, // Q_RCQ uploaded in column-major
+                        transb: op::N, // scaled is column-major (lda=total_ne)
+                        m: total_ne as i32,
+                        n: n_bands as i32,
+                        k: total_ne as i32,
+                        alpha: CudaComplex { x: 1.0, y: 0.0 },
+                        lda: total_ne as i32,
+                        ldb: total_ne as i32,
+                        beta: CudaComplex { x: 0.0, y: 0.0 },
+                        ldc: total_ne as i32,
+                    },
+                    q_rcq_gpu,
+                    &global_beta_phi_psi_dev, // now contains scaled (in-place)
+                    &mut global_weight_dev,
+                )?;
+            }
+
+            // Step 2c: global_weight += R_beta · beta_phi_precon  (accumulate)
+            unsafe {
+                blas.gemm_c64(
+                    ZgemmConfig {
+                        transa: op::N, // R_beta uploaded in column-major
+                        transb: op::N, // beta_phi_precon is column-major
+                        m: total_ne as i32,
+                        n: n_bands as i32,
+                        k: total_ne as i32,
+                        alpha: CudaComplex { x: 1.0, y: 0.0 },
+                        lda: total_ne as i32,
+                        ldb: total_ne as i32,
+                        beta: CudaComplex { x: 1.0, y: 0.0 }, // accumulate
+                        ldc: total_ne as i32,
+                    },
+                    r_beta_gpu,
+                    &global_beta_phi_precon_dev,
+                    &mut global_weight_dev,
+                )?;
+            }
+
+            // ---------------------------------------------------------------
+            // PASS 3: Per-ion NL correction apply (GPU-side weight extraction)
+            // ---------------------------------------------------------------
+            // Extract per-ion weight slices from global_weight_dev on GPU
+            // using explicit byte-offset arithmetic (avoiding typed-pointer
+            // casts that may interact poorly with CUDA's pointer model).
+            let global_w_ptr = {
+                let (p, _) = global_weight_dev.device_ptr(stream);
+                p
+            };
+
+            for (i, entry) in vnl_data.entries.iter().enumerate() {
+                let ne = entry.n_expanded as usize;
+                if ne == 0 {
+                    continue;
+                }
+                let offset = gpu_ion_offsets[i];
+
+                // Allocate and extract weight_i on GPU
+                let weight_dev: CudaSlice<CudaComplex> = stream
+                    .alloc_zeros(ne * n_bands)
+                    .map_err(Error::Cuda)?;
+                {
+                    let (weight_ptr, _) = weight_dev.device_ptr(stream);
+                    for b in 0..n_bands {
+                        // Source: global_weight[offset..offset+ne, band b]
+                        // In column-major: element (offset+n, b) is at
+                        //   offset + n + b * total_ne
+                        let src_byte = global_w_ptr
+                            .wrapping_add((offset + b * total_ne) as u64 * cpx_bytes);
+                        // Dest: weight_i[0..ne, band b]
+                        // In column-major: element (n, b) is at n + b * ne
+                        let dst_byte = weight_ptr
+                            .wrapping_add((b * ne) as u64 * cpx_bytes);
+                        unsafe {
+                            cublasZcopy_v2(
+                                handle,
+                                ne as i32,
+                                src_byte as *const _,
+                                1,
+                                dst_byte as *mut _,
+                                1,
+                            );
+                        }
+                    }
+                }
+
+                // temp = beta_g · weight_i  (n_pw × n_bands)
+                let mut temp_dev: CudaSlice<CudaComplex> = stream
+                    .alloc_zeros(n_pw * n_bands)
+                    .map_err(Error::Cuda)?;
+                unsafe {
+                    blas.gemm_c64(
+                        ZgemmConfig {
+                            transa: op::N,
+                            transb: op::N,
+                            m: n_pw as i32,
+                            n: n_bands as i32,
+                            k: ne as i32,
+                            alpha: CudaComplex { x: 1.0, y: 0.0 },
+                            lda: n_pw as i32,
+                            ldb: ne as i32,
+                            beta: CudaComplex { x: 0.0, y: 0.0 },
+                            ldc: n_pw as i32,
+                        },
+                        &entry.beta_g,
+                        &weight_dev,
+                        &mut temp_dev,
+                    )?;
+                }
+
+                // Apply TPA scaling: precon += temp · R(G)
+                let temp_pw = PwCoefficients::new(temp_dev);
+                unsafe {
+                    tpa_preconditioner.apply_add(
+                        &mut precon,
+                        &temp_pw,
+                        r_vector,
+                        n_pw,
+                        n_bands,
+                        stream,
+                    )?;
+                }
+            }
+
+            return Ok(precon);
+        } // end GPU-resident path
+
+        // ===================================================================
+        // CPU PATH (fallback — used when GPU params not available)
+        // ===================================================================
         // Download eigenvalues to CPU (needed for weight scaling in step 4)
         let eigenvalues_cpu: Vec<f64> = stream
             .clone_dtoh(eigenvalues)
@@ -1013,8 +1329,6 @@ pub unsafe fn apply_preconditioner(
                 let mut max_bpp_iter = 0.0f64;
                 for v in beta_phi_precon_arr.iter() { let a = v.norm(); if a > max_bpp_iter { max_bpp_iter = a; } }
                 let max_bps_iter = beta_phi_psi_arr.iter().map(|c| c.norm()).fold(0.0f64, f64::max);
-                #[cfg(not(feature = "scf_diag"))]
-                { let _ = &max_bps_iter; } // used only in precon_diag! which is cfg-gated
                 let mut max_bpp_idx = 0.0f64;
                 let mut max_bps_idx = 0.0f64;
                 for b in 0..n_bands {
@@ -1156,8 +1470,15 @@ pub struct PreconditionerPrepResult {
     pub r_vector: Vec<f64>,
     /// Per-ion R_beta = (−Q⁻¹ − C)⁻¹ matrices.
     pub r_beta_per_ion: Vec<Array2<Complex64>>,
-    /// Global Q_RCQ = −Q + C·Q − R_beta·(C·Q) matrix.
+    /// Global Q_RCQ = −Q + C·Q − R_beta·(C·Q) matrix (CPU, row-major).
     pub q_rcq: Array2<Complex64>,
+    /// Global Q_RCQ uploaded to GPU (column-major, lda=total_ne).
+    /// None when stream was not provided (standalone tests).
+    pub q_rcq_gpu: Option<CudaSlice<CudaComplex>>,
+    /// Global R_beta = block-diag(R_beta_i) uploaded to GPU (column-major, lda=total_ne).
+    pub r_beta_gpu: Option<CudaSlice<CudaComplex>>,
+    /// Total number of beta projectors across all ions.
+    pub total_ne: usize,
 }
 
 /// Prepare the USPP preconditioner matrices.
@@ -1169,8 +1490,9 @@ pub struct PreconditionerPrepResult {
 /// 4. Assemble R_beta = (−Q⁻¹ − C)⁻¹ per ion
 /// 5. Assemble Q_RCQ = −Q + C·Q − R_beta·(C·Q) global matrix
 ///
-/// All computation happens on CPU. The caller is responsible for uploading
-/// results to GPU as needed.
+/// All computation happens on CPU. When `stream` is provided, Q_RCQ and
+/// global R_beta are also uploaded to GPU in column-major layout for the
+/// GPU-resident apply path.
 ///
 /// Reference: CASTEP nlpot.f90:13525-14736 (nlpot_prepare_precon)
 #[bon::builder]
@@ -1182,6 +1504,7 @@ pub fn prepare_preconditioner(
     q_matrices: &[Vec<f64>],
     ion_n_expanded: &[usize],
     mixture_weights: &[f64],
+    stream: Option<&Arc<CudaStream>>,
 ) -> Result<PreconditionerPrepResult, Error> {
     // 1. Compute R(G) on CPU: R(G) = tpa(pw_ek / mean_ek)
     let r_vector: Vec<f64> = pw_ek
@@ -1316,10 +1639,60 @@ pub fn prepare_preconditioner(
         );
     }
 
+    // -------------------------------------------------------------------
+    // GPU upload: Q_RCQ and global R_beta in column-major for GPU-resident path
+    // -------------------------------------------------------------------
+    // When a stream is provided (FFI path), upload Q_RCQ and the block-diagonal
+    // global R_beta to the GPU so that apply_preconditioner can compute weights
+    // entirely on-device without D2H/H2D transfers.
+    let total_ne = cum;
+    let (q_rcq_gpu, r_beta_gpu) = if let Some(s) = stream {
+        // Upload Q_RCQ in column-major order (cuBLAS convention).
+        // On CPU: Q_RCQ[[row, col]] is at offset row * total_ne + col (row-major).
+        // On GPU: element (row, col) must be at offset row + col * lda (column-major).
+        // Iterating col-then-row achieves this transposition during upload.
+        let mut q_rcq_flat: Vec<CudaComplex> = Vec::with_capacity(total_ne * total_ne);
+        for col in 0..total_ne {
+            for row in 0..total_ne {
+                let c = q_rcq[[row, col]];
+                q_rcq_flat.push(CudaComplex { x: c.re, y: c.im });
+            }
+        }
+        let q_gpu = s.clone_htod(&q_rcq_flat).map_err(Error::Cuda)?;
+
+        // Assemble global R_beta (block-diagonal) and upload in column-major.
+        let mut r_beta_global = Array2::<Complex64>::zeros((total_ne, total_ne));
+        for i in 0..n_ions {
+            let offset = ion_offsets[i];
+            let ne = ion_n_expanded[i];
+            if ne == 0 { continue; }
+            for m in 0..ne {
+                for n in 0..ne {
+                    r_beta_global[[offset + m, offset + n]] = r_beta_per_ion_vec[i][[m, n]];
+                }
+            }
+        }
+        let mut r_beta_flat: Vec<CudaComplex> = Vec::with_capacity(total_ne * total_ne);
+        for col in 0..total_ne {
+            for row in 0..total_ne {
+                let c = r_beta_global[[row, col]];
+                r_beta_flat.push(CudaComplex { x: c.re, y: c.im });
+            }
+        }
+        let r_gpu = s.clone_htod(&r_beta_flat).map_err(Error::Cuda)?;
+
+        (Some(q_gpu), Some(r_gpu))
+    } else {
+        (None, None)
+    };
+
     Ok(PreconditionerPrepResult {
         r_vector,
         r_beta_per_ion: r_beta_per_ion_vec,
         q_rcq,
+        q_rcq_gpu,
+        r_beta_gpu,
+        total_ne,
     })
 }
 
