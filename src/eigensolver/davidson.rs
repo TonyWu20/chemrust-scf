@@ -3571,11 +3571,6 @@ impl<'a> DavidsonBlockCtx<'a> {
         self.stream
             .memcpy_dtod(&*precon_result, &mut self.search_dev.0)
             .map_err(Error::Cuda)?;
-        // GPU-resident preconditioner uses temporary per-ion buffers that
-        // are dropped at function exit. Sync here so those buffers aren't
-        // freed while cublasZcopy is still reading from them.
-        self.stream.synchronize().map_err(Error::Cuda)?;
-
         // Rust-SearchRaw: dump search direction coefficients for CASTEP comparison.
         // Matches CASTEP [CASTEP-SearchRaw] diagnostic at hamiltonian_searchspace_ks.
         // Triggered at SCF iter 1, block 0, inner iter 0 only.
@@ -3803,10 +3798,6 @@ impl<'a> DavidsonBlockCtx<'a> {
                 .handle(self.handle)
                 .call()?;
         }
-        // Sync: s_orthogonalise allocated overlap_dev which is dropped at
-        // scope exit. Ensure GEMMs reading/writing it are complete.
-        self.stream.synchronize().map_err(Error::Cuda)?;
-
         // --- Stage 5: S-orthonormalize among themselves ---
         // No lockstep hpsi transform needed: Stage 6 overwrites hsearch_dev.
         unsafe {
@@ -3824,11 +3815,6 @@ impl<'a> DavidsonBlockCtx<'a> {
                 .s_orth_out(&mut self.s_orth_out)
                 .call()?;
         }
-        // Sync: s_orthonormalise uses cuSOLVER ZPOTRF/ZTRSM which may
-        // use internal working streams.  Ensure they complete and write
-        // results to search_dev before Stage 6 reads it.
-        self.stream.synchronize().map_err(Error::Cuda)?;
-
         // --- Stage 6: Apply H to search directions ---
         unsafe {
             apply_full_hamiltonian()
