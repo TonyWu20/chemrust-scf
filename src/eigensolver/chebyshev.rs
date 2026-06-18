@@ -2678,102 +2678,24 @@ pub fn chebfi_run_rust(
         // ------------------------------------------------------------
         // Step 4: Chebyshev ampfactor normalisation (ABINIT lines 958–1006)
         // ------------------------------------------------------------
-        // After filtering, each band's vector is T_n(ε_b)·ψ_b where ε_b is
-        // the eigenvalue estimate. The amplification factor T_n(ε_b) varies
-        // by band — larger for small eigenvalues, smaller for large ones.
-        // Dividing each column by ampfactor normalises the filter output so
-        // that Rayleigh-Ritz works on balanced vectors.
-        //
-        // chebfi_ampfactor operates on CPU slices (f64, real-only).
-        // Each CudaComplex = 2 consecutive f64s, so total_spacedim = 2*n_pw.
-        // Must sync before D2H: cudarc 0.19.7 clone_dtoh is async.
-        // For Cu111_CO (160 bands, 60067 PW), 3×153 MB downloads without
-        // sync → ampfactor scales garbage → ZHEGVD info=159/160.
-        stream.synchronize().map_err(Error::Cuda)?;
-
-        // Download x_curr as Vec<CudaComplex>, re-interpret as &mut [f64]
-        let x_cplx: Vec<CudaComplex> = stream.clone_dtoh(&x_curr.0).map_err(Error::Cuda)?;
-        // SAFETY: CudaComplex is #[repr(C)] with fields (x: f64, y: f64),
-        // so a slice of CudaComplex has the same layout as a slice of 2*len f64s.
-        let mut x_re_f64: Vec<f64> = unsafe {
-            let (ptr, len, cap) = {
-                let v = std::mem::ManuallyDrop::new(x_cplx);
-                let ptr = v.as_ptr() as *mut f64;
-                (ptr, v.len() * 2, v.capacity() * 2)
-            };
-            Vec::from_raw_parts(ptr, len, cap)
-        };
-
-        // Recompute H·x_curr (x_curr may have been locked above)
-        unsafe {
-            apply_full_hamiltonian()
-                .psi_dev(&x_curr)
-                .v_eff_dev(v_eff_dev)
-                .kinetic_dev(&kinetic_dev)
-                .fft_idx_dev(fft_idx_dev)
-                .n_pw(n_pw)
-                .n_bands(n_bands)
-                .grid_size(grid_size)
-                .inv_ntotal(inv_ntotal)
-                .fft_plan(&fft_plan)
-                .hpsi_dev(&mut hpsi_dev)
-                .grid_dev(&mut grid_dev)
-                .vnl_data(vnl_data)
-                .blas(blas)
-                .kernels(kernels)
-                .stream(stream)
-                .call()?;
+        // Ampfactor: scale x_curr columns by 1/T_n(ε_b).  GPU-resident:
+        // compute factors on CPU (n_bands doubles), upload, launch kernel.
+        // HX/SX are recomputed fresh in Phase 8 — only X needs scaling.
+        {
+            let amp_factors: Vec<f64> = ndeg_filter_bands.iter().zip(ritz_values.iter())
+                .map(|(&ndeg, &eig)| {
+                    let raw = cheb_poly1(eig, ndeg, lambda_minus, lambda_plus);
+                    if raw.abs() < 1e-3 { 1e-3 } else { raw }
+                })
+                .collect();
+            let inv_amp: Vec<f64> = amp_factors.iter().map(|&a| 1.0 / a).collect();
+            let inv_amp_dev: CudaSlice<f64> = stream.clone_htod(&inv_amp).map_err(Error::Cuda)?;
+            unsafe {
+                stream.launch_builder(&kernels.scale_cols_by_eig)
+                    .arg(&mut x_curr.0).arg(&inv_amp_dev).arg(&n_pw).arg(&n_bands)
+                    .launch(LaunchConfig::for_num_elems(n_elem as u32))
+            }.map_err(Error::Cuda)?;
         }
-        // Download H·x_curr as Vec<CudaComplex>, re-interpret as &mut [f64]
-        let hx_cplx: Vec<CudaComplex> = stream.clone_dtoh(&hpsi_dev.0).map_err(Error::Cuda)?;
-        let mut hx_re_f64: Vec<f64> = unsafe {
-            let v = std::mem::ManuallyDrop::new(hx_cplx);
-            let ptr = v.as_ptr() as *mut f64;
-            Vec::from_raw_parts(ptr, v.len() * 2, v.capacity() * 2)
-        };
-
-        // Compute S·x_curr
-        stream.memcpy_dtod(&*x_curr, &mut spsi_dev.0).map_err(Error::Cuda)?;
-        unsafe {
-            apply_s_times()
-                .psi_dev(&x_curr)
-                .spsi_dev(&mut spsi_dev)
-                .vnl_data(vnl_data)
-                .n_bands(n_bands_i32)
-                .n_pw(n_pw_i32)
-                .blas(blas)
-                .stream(stream)
-                .call()?;
-        }
-        // Download S·x_curr as Vec<CudaComplex>, re-interpret as &mut [f64]
-        let sx_cplx: Vec<CudaComplex> = stream.clone_dtoh(&spsi_dev.0).map_err(Error::Cuda)?;
-        let mut sx_re_f64: Vec<f64> = unsafe {
-            let v = std::mem::ManuallyDrop::new(sx_cplx);
-            let ptr = v.as_ptr() as *mut f64;
-            Vec::from_raw_parts(ptr, v.len() * 2, v.capacity() * 2)
-        };
-
-        // Apply ampfactor: scale each band's column in X, HX, SX by 1/T_n(ε_b)
-        chebfi_ampfactor(
-            &ndeg_filter_bands,
-            &ritz_values,
-            lambda_minus,
-            lambda_plus,
-            2 * n_pw,   // total_spacedim: 2 f64 per complex PW coefficient
-            &mut x_re_f64,
-            &mut hx_re_f64,
-            &mut sx_re_f64,
-            n_bands,
-        );
-
-        // Re-upload the ampfactor-corrected X vectors to GPU.
-        // Re-interpret the &mut [f64] back to Vec<CudaComplex> for upload.
-        let x_cplx_upload: Vec<CudaComplex> = unsafe {
-            let v = std::mem::ManuallyDrop::new(x_re_f64);
-            let ptr = v.as_ptr() as *mut CudaComplex;
-            Vec::from_raw_parts(ptr, v.len() / 2, v.capacity() / 2)
-        };
-        stream.memcpy_htod(&x_cplx_upload, &mut x_curr.0).map_err(Error::Cuda)?;
 
         final_psi_buf = &mut x_curr;
     }
