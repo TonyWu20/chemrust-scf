@@ -655,7 +655,6 @@ pub(crate) unsafe fn apply_s_inverse(
     n_pw: i32,
     blas: &BlasHandle,
     stream: &Arc<CudaStream>,
-    #[allow(unused_variables)]
     solver: &SolverHandle,
 ) -> Result<(), Error> {
     let nte = vnl_data.n_total_expanded;
@@ -700,7 +699,224 @@ pub(crate) unsafe fn apply_s_inverse(
         &mut info_dev,
     )?;
 
-    // 3. hpsi -= B . y  (accumulate with alpha = -1)
+    // 3. Save original hpsi as h_in for iterative refinement
+    let mut h_in: CudaSlice<CudaComplex> =
+        stream.alloc_zeros(n_pw as usize * n_bands as usize).map_err(Error::Cuda)?;
+    stream.memcpy_dtod(&**hpsi_dev, &mut h_in).map_err(Error::Cuda)?;
+
+    // 4. Iterative refinement of y (3 iterations).
+    //    Block-diagonal Q preconditioner stationary iteration:
+    //      h_out = h_in - B·y
+    //      bt_h  = B^H · h_out
+    //      q_bt  = Q · bt_h       (per-ion block-diagonal)
+    //      y_corr = y - q_bt
+    //      r_h   = B · y_corr
+    //      r_y   = B^H · r_h
+    //      dy    = M^{-1} · r_y   (zgetrs)
+    //      y    += dy
+    //
+    //    Equivalent to ABINIT's m_invovl.F90:1102-1140.
+    {
+        // Scratch buffers reused across iterations
+        let mut bt_h: CudaSlice<CudaComplex> =
+            stream.alloc_zeros(nte as usize * n_bands as usize).map_err(Error::Cuda)?;
+        let mut h_out: CudaSlice<CudaComplex> =
+            stream.alloc_zeros(n_pw as usize * n_bands as usize).map_err(Error::Cuda)?;
+
+        let per_ion_ne = &vnl_data.shared.handle.per_ion_n_expanded;
+
+        for _iter in 0..3 {
+            // 4a. h_out = h_in - B·y   (n_pw × n_bands, GEMM with alpha=-1, beta=0)
+            unsafe {
+                blas.gemm_c64(
+                    ZgemmConfig {
+                        transa: blas::op::N,
+                        transb: blas::op::N,
+                        m: n_pw,
+                        n: n_bands,
+                        k: nte,
+                        alpha: CudaComplex { x: -1.0, y: 0.0 },
+                        lda: n_pw,
+                        ldb: nte,
+                        beta: CudaComplex { x: 0.0, y: 0.0 },
+                        ldc: n_pw,
+                    },
+                    &vnl_data.b_concat,
+                    &temp,
+                    &mut h_out,
+                )?;
+            }
+            // h_out += h_in  (AXPY)
+            blas.axpy_c64(
+                n_pw * n_bands,
+                CudaComplex { x: 1.0, y: 0.0 },
+                &h_in,
+                1,
+                &mut h_out,
+                1,
+            )?;
+
+            // 4b. bt_h = B^H · h_out  (nte × n_bands)
+            unsafe {
+                blas.gemm_c64(
+                    ZgemmConfig {
+                        transa: blas::op::C,
+                        transb: blas::op::N,
+                        m: nte,
+                        n: n_bands,
+                        k: n_pw,
+                        alpha: CudaComplex { x: 1.0, y: 0.0 },
+                        lda: n_pw,
+                        ldb: n_pw,
+                        beta: CudaComplex { x: 0.0, y: 0.0 },
+                        ldc: nte,
+                    },
+                    &vnl_data.b_concat,
+                    &h_out,
+                    &mut bt_h,
+                )?;
+            }
+
+            // 4c. q_bt = Q · bt_h  (block-diagonal per-ion Q × bt_h slice)
+            //     Allocate bt_q (nte × n_bands, initialized to zero).
+            let mut bt_q: CudaSlice<CudaComplex> =
+                stream.alloc_zeros(nte as usize * n_bands as usize).map_err(Error::Cuda)?;
+
+            let mut offset: usize = 0;
+            for (ion_idx, ion_ne) in per_ion_ne.iter().enumerate() {
+                let ne = *ion_ne;
+                if ne == 0 {
+                    continue;
+                }
+                let ne_bands = ne as usize * n_bands as usize;
+
+                // Allocate temp buffer for this ion's bt_h slice (ne × n_bands)
+                let mut ion_bt_h: CudaSlice<CudaComplex> =
+                    stream.alloc_zeros(ne_bands).map_err(Error::Cuda)?;
+                // Copy bt_h[offset..offset+ne_bands] into temp via CudaView-as-source
+                {
+                    let src_view = bt_h.slice(offset..offset + ne_bands);
+                    stream.memcpy_dtod(&src_view, &mut ion_bt_h).map_err(Error::Cuda)?;
+                }
+
+                // Allocate result buffer
+                let mut ion_q_bt: CudaSlice<CudaComplex> =
+                    stream.alloc_zeros(ne_bands).map_err(Error::Cuda)?;
+
+                // Q_ion (ne×ne) · ion_bt_h (ne×n_bands) = ion_q_bt (ne×n_bands)
+                // ldb = ne (row-major ne×ne Q), ldb = ne (bt_h block contiguously stored)
+                unsafe {
+                    blas.gemm_c64(
+                        ZgemmConfig {
+                            transa: blas::op::N,
+                            transb: blas::op::N,
+                            m: ne,
+                            n: n_bands,
+                            k: ne,
+                            alpha: CudaComplex { x: 1.0, y: 0.0 },
+                            lda: ne,
+                            ldb: ne,
+                            beta: CudaComplex { x: 0.0, y: 0.0 },
+                            ldc: ne,
+                        },
+                        &vnl_data.shared.handle.per_ion_q[ion_idx],
+                        &ion_bt_h,
+                        &mut ion_q_bt,
+                    )?;
+                }
+
+                // Write back into bt_q at offset
+                {
+                    let mut dst_view = bt_q.slice_mut(offset..offset + ne_bands);
+                    stream.memcpy_dtod(&ion_q_bt, &mut dst_view).map_err(Error::Cuda)?;
+                }
+                offset += ne_bands;
+            }
+
+            // 4d. y_corr = y - q_bt   (copy y to y_corr, then AXPY -q_bt)
+            let mut y_corr: CudaSlice<CudaComplex> =
+                stream.alloc_zeros(nte as usize * n_bands as usize).map_err(Error::Cuda)?;
+            stream.memcpy_dtod(&temp, &mut y_corr).map_err(Error::Cuda)?;
+            blas.axpy_c64(
+                nte * n_bands,
+                CudaComplex { x: -1.0, y: 0.0 },
+                &bt_q,
+                1,
+                &mut y_corr,
+                1,
+            )?;
+
+            // 4e. r_h = B · y_corr  (n_pw × n_bands)
+            let mut r_h: CudaSlice<CudaComplex> =
+                stream.alloc_zeros(n_pw as usize * n_bands as usize).map_err(Error::Cuda)?;
+            unsafe {
+                blas.gemm_c64(
+                    ZgemmConfig {
+                        transa: blas::op::N,
+                        transb: blas::op::N,
+                        m: n_pw,
+                        n: n_bands,
+                        k: nte,
+                        alpha: CudaComplex { x: 1.0, y: 0.0 },
+                        lda: n_pw,
+                        ldb: nte,
+                        beta: CudaComplex { x: 0.0, y: 0.0 },
+                        ldc: n_pw,
+                    },
+                    &vnl_data.b_concat,
+                    &y_corr,
+                    &mut r_h,
+                )?;
+            }
+
+            // 4f. r_y = B^H · r_h  (nte × n_bands)
+            let mut r_y: CudaSlice<CudaComplex> =
+                stream.alloc_zeros(nte as usize * n_bands as usize).map_err(Error::Cuda)?;
+            unsafe {
+                blas.gemm_c64(
+                    ZgemmConfig {
+                        transa: blas::op::C,
+                        transb: blas::op::N,
+                        m: nte,
+                        n: n_bands,
+                        k: n_pw,
+                        alpha: CudaComplex { x: 1.0, y: 0.0 },
+                        lda: n_pw,
+                        ldb: n_pw,
+                        beta: CudaComplex { x: 0.0, y: 0.0 },
+                        ldc: nte,
+                    },
+                    &vnl_data.b_concat,
+                    &r_h,
+                    &mut r_y,
+                )?;
+            }
+
+            // 4g. dy = M^{-1} · r_y  (zgetrs in-place on r_y)
+            let mut info_dev2 = stream.alloc_zeros::<i32>(1).map_err(Error::Cuda)?;
+            solver.zgetrs(
+                cublasOperation_t::CUBLAS_OP_N,
+                nte,
+                n_bands,
+                &vnl_data.lu_m,
+                &vnl_data.lu_ipiv,
+                &mut r_y,
+                &mut info_dev2,
+            )?;
+
+            // 4h. y += dy  (temp = temp + r_y via AXPY)
+            blas.axpy_c64(
+                nte * n_bands,
+                CudaComplex { x: 1.0, y: 0.0 },
+                &r_y,
+                1,
+                &mut temp,
+                1,
+            )?;
+        }
+    }
+
+    // 5. hpsi = h_in - B·y  (final GEMM + AXPY)
     unsafe {
         blas.gemm_c64(
             ZgemmConfig {
@@ -712,7 +928,7 @@ pub(crate) unsafe fn apply_s_inverse(
                 alpha: CudaComplex { x: -1.0, y: 0.0 },
                 lda: n_pw,
                 ldb: nte,
-                beta: CudaComplex { x: 1.0, y: 0.0 },
+                beta: CudaComplex { x: 0.0, y: 0.0 },
                 ldc: n_pw,
             },
             &vnl_data.b_concat,
@@ -720,6 +936,15 @@ pub(crate) unsafe fn apply_s_inverse(
             &mut **hpsi_dev,
         )?;
     }
+    // hpsi += h_in  (AXPY)
+    blas.axpy_c64(
+        n_pw * n_bands,
+        CudaComplex { x: 1.0, y: 0.0 },
+        &h_in,
+        1,
+        &mut **hpsi_dev,
+        1,
+    )?;
 
     Ok(())
 }
