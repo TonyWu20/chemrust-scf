@@ -2734,6 +2734,22 @@ pub fn chebfi_run_rust(
                 .vnl_data(vnl_data).n_bands(n_bands_i32).n_pw(n_pw_i32)
                 .blas(blas).stream(stream).call()?;
         }
+
+        // Diagnostic: check S·psi after apply_s_times
+        {
+            stream.synchronize().map_err(Error::Cuda)?;
+            let spsi_sample: Vec<CudaComplex> = stream.clone_dtoh(&spsi_dev.0).map_err(Error::Cuda)?;
+            let n_sample = n_pw.min(5);
+            let mut max_spsi = 0.0f64;
+            for c in spsi_sample.iter().take(n_sample) {
+                max_spsi = max_spsi.max((c.x*c.x + c.y*c.y).sqrt());
+            }
+            eprintln!(
+                "[chebfi] Phase 6 S·psi sample (first {} of band 0): max|S·psi|={:.6e}",
+                n_sample, max_spsi,
+            );
+        }
+
         let nb = n_bands;
         let nb_i32 = n_bands_i32;
         // S_sub = X^T · (S·X)
