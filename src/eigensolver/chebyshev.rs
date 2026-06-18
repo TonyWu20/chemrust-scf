@@ -2430,7 +2430,11 @@ pub fn chebfi_run_rust(
     // the initial guess produces — bands above tolerance get filtered.
     //
     // occ_vals is optional — only needed for nbdbuf=-101 occupancy-driven skipping.
-    let (ndeg_filter_global, ndeg_filter_bands) = {
+    // ABINIT m_chebfi2.F90:628 — if oracle=0, skip per-band; use global degree for all.
+    let (ndeg_filter_global, ndeg_filter_bands) = if oracle == 0 {
+        let bands = vec![ndeg_filter_max.min(ndeg_oracle); n_bands];
+        (ndeg_filter_max.min(ndeg_oracle), bands)
+    } else {
         let (g, bands) = chebfi_set_ndeg_from_residu()
             .bandpp(n_bands)
             .eig_vals(&ritz_values)
