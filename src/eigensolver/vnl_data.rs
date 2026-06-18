@@ -31,6 +31,9 @@ pub struct HandleSharedVnl {
     pub screening_cache_fine: Option<WaveScreeningCache>,
     /// Per-ion USPP Q augmentation matrices on GPU (n_expanded × n_expanded).
     pub per_ion_q: Vec<CudaSlice<CudaComplex>>,
+    /// Per-ion Q^{-1} matrices on GPU (n_expanded × n_expanded).  Used by
+    /// iterative Woodbury refinement for M·y = Q^{-1}·y + B^T·(B·y).
+    pub per_ion_q_inv: Vec<CudaSlice<CudaComplex>>,
     /// Per-ion unscreened D0 matrices (CPU).
     pub per_ion_d0_expanded: Vec<Vec<f64>>,
     /// Per-ion expanded projector count.
@@ -170,6 +173,7 @@ pub fn build_handle_shared_vnl(
         None => None,
     };
     let mut per_ion_q = Vec::new();
+    let mut per_ion_q_inv = Vec::new();
     let mut per_ion_d0 = Vec::new();
     let mut per_ion_ne = Vec::new();
     for ion_idx in 0..cell.num_ions {
@@ -183,9 +187,17 @@ pub fn build_handle_shared_vnl(
                     .map(|&q| CudaComplex { x: q, y: 0.0 }).collect();
                 let q_dev = stream.clone_htod(&q_flat).map_err(Error::Cuda)?;
                 pcie.h2d_bytes += q_flat.len() * std::mem::size_of::<CudaComplex>();
+                // Q^{-1}: invert small real matrix, upload to GPU
+                let ne = n_exp as usize;
+                let q_inv_cpu = invert_small_real_matrix(&q_cpu, ne);
+                let q_inv_flat: Vec<CudaComplex> = q_inv_cpu.iter()
+                    .map(|&q| CudaComplex { x: q, y: 0.0 }).collect();
+                let q_inv_dev = stream.clone_htod(&q_inv_flat).map_err(Error::Cuda)?;
+                pcie.h2d_bytes += q_inv_flat.len() * std::mem::size_of::<CudaComplex>();
                 let d0 = build_d0_expanded(aug);
                 let d0_flat: Vec<f64> = d0.iter().cloned().collect();
                 per_ion_q.push(q_dev);
+                per_ion_q_inv.push(q_inv_dev);
                 per_ion_d0.push(d0_flat);
                 per_ion_ne.push(n_exp);
             }
@@ -195,6 +207,7 @@ pub fn build_handle_shared_vnl(
         screening_cache: sc,
         screening_cache_fine: sc_fine,
         per_ion_q,
+        per_ion_q_inv,
         per_ion_d0_expanded: per_ion_d0,
         per_ion_n_expanded: per_ion_ne,
         screening_h2d_bytes: pcie.h2d_bytes,
@@ -351,6 +364,7 @@ impl VnlBatchData {
         // Collectors for the shared Arc (populated only in fresh-build path).
         let mut per_ion_beta_g: Vec<CudaSlice<CudaComplex>> = Vec::new();
         let mut per_ion_q: Vec<CudaSlice<CudaComplex>> = Vec::new();
+        let mut per_ion_q_inv: Vec<CudaSlice<CudaComplex>> = Vec::new();
         let mut per_ion_d0_expanded: Vec<Vec<f64>> = Vec::new();
         let mut per_ion_n_expanded: Vec<i32> = Vec::new();
 
@@ -371,7 +385,7 @@ impl VnlBatchData {
             // When `shared` is Some, reuse from existing KptSharedVnl.
             // When `shared` is None but `handle_shared` is Some, use handle for q/d0
             // and build fresh beta_g.
-            let (beta_dev, q_dev, d0_expanded, n_expanded) = match shared {
+            let (beta_dev, q_dev, _q_inv_dev, d0_expanded, n_expanded) = match shared {
                 Some(ref shared_arc) => {
                     debug_assert!(
                         entries.len() < shared_arc.per_ion_beta_g.len(),
@@ -380,9 +394,10 @@ impl VnlBatchData {
                     let handle = &shared_arc.handle;
                     let bg = shared_arc.per_ion_beta_g[entries.len()].clone();
                     let qm = handle.per_ion_q[entries.len()].clone();
+                    let qim = handle.per_ion_q_inv[entries.len()].clone();
                     let d0 = handle.per_ion_d0_expanded[entries.len()].clone();
                     let ne = handle.per_ion_n_expanded[entries.len()];
-                    (bg, qm, d0, ne)
+                    (bg, qm, qim, d0, ne)
                 }
                 None => {
                     let beta_g = compute_beta_g(
@@ -400,33 +415,41 @@ impl VnlBatchData {
                     pcie.h2d_bytes += beta_flat.len() * std::mem::size_of::<CudaComplex>();
 
                     // Q and D0 are kpt-independent — take from handle if available.
-                    let (q_dev, d0_flat) = match handle_shared {
+                    let (q_dev, q_inv_dev, d0_flat) = match handle_shared {
                         Some(ref h) => {
                             let qm = h.per_ion_q[entries.len()].clone();
+                            let qim = h.per_ion_q_inv[entries.len()].clone();
                             let d0 = h.per_ion_d0_expanded[entries.len()].clone();
-                            (qm, d0)
+                            (qm, qim, d0)
                         }
                         None => {
                             let q_cpu = build_q_expanded(aug);
+                            let ne = (q_cpu.len() as f64).sqrt() as usize;
                             let q_flat: Vec<CudaComplex> =
                                 q_cpu.iter().map(|&q| CudaComplex { x: q, y: 0.0 }).collect();
                             let q_dev = stream.clone_htod(&q_flat).map_err(Error::Cuda)?;
                             pcie.h2d_bytes += q_flat.len() * std::mem::size_of::<CudaComplex>();
+                            // Q⁻¹ for Woodbury iterative refinement
+                            let q_inv_cpu = invert_small_real_matrix(&q_cpu, ne);
+                            let q_inv_flat: Vec<CudaComplex> = q_inv_cpu.iter()
+                                .map(|&q| CudaComplex { x: q, y: 0.0 }).collect();
+                            let q_inv_dev = stream.clone_htod(&q_inv_flat).map_err(Error::Cuda)?;
                             let d0_flat: Vec<f64> = d0_expanded.iter().cloned().collect();
-                            (q_dev, d0_flat)
+                            (q_dev, q_inv_dev, d0_flat)
                         }
                     };
 
                     // Collect for KptSharedVnl / HandleSharedVnl.
                     per_ion_beta_g.push(beta_dev.clone());
                     if handle_shared.is_none() {
-                        // Fresh build: collect Q and D0 for HandleSharedVnl construction.
+                        // Fresh build: collect Q, Q⁻¹ and D0 for HandleSharedVnl construction.
                         per_ion_q.push(q_dev.clone());
+                        per_ion_q_inv.push(q_inv_dev.clone());
                         per_ion_d0_expanded.push(d0_flat.clone());
                         per_ion_n_expanded.push(n_expanded);
                     }
 
-                    (beta_dev, q_dev, d0_flat, n_expanded)
+                    (beta_dev, q_dev, q_inv_dev, d0_flat, n_expanded)
                 }
             };
 
@@ -528,6 +551,7 @@ impl VnlBatchData {
                             screening_cache,
                             screening_cache_fine,
                             per_ion_q,
+                            per_ion_q_inv,
                             per_ion_d0_expanded,
                             per_ion_n_expanded,
                             screening_h2d_bytes,

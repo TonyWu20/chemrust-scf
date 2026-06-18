@@ -737,32 +737,40 @@ pub(crate) unsafe fn apply_s_inverse(
             unsafe { stream.memcpy_dtod(&bt_h_in, &mut r).map_err(Error::Cuda)?; }
             blas.axpy_c64(n_nte as i32, CudaComplex { x: -1.0, y: 0.0 }, &bt_b_y, 1, &mut r, 1)?;
 
-            // Q^{-1}·y on CPU (nte is small, ~100 for NiO)
-            stream.synchronize().map_err(Error::Cuda)?;
-            let y_cpu: Vec<CudaComplex> = stream.clone_dtoh(&temp).map_err(Error::Cuda)?;
-            let mut qinv_y = vec![CudaComplex { x: 0.0, y: 0.0 }; n_nte];
-            let mut off = 0usize;
-            for q_inv in &vnl_data.q_inv_per_ion {
-                let ne = (q_inv.len() as f64).sqrt() as usize;
-                for b in 0..n_bands as usize {
-                    for i in 0..ne {
-                        let mut sum_re = 0.0_f64;
-                        let mut sum_im = 0.0_f64;
-                        for j in 0..ne {
-                            let qv = q_inv[i * ne + j];
-                            let yj = y_cpu[off + j + b * nte as usize];
-                            sum_re += qv * yj.x;
-                            sum_im += qv * yj.y;
-                        }
-                        qinv_y[off + i + b * nte as usize] = CudaComplex { x: sum_re, y: sum_im };
-                    }
+            // Q^{-1}·y on GPU: per-ion ZGEMM (n_expanded × n_expanded) · (y slice)
+            let per_ion_q_inv = &vnl_data.shared.handle.per_ion_q_inv;
+            let per_ion_ne = &vnl_data.shared.handle.per_ion_n_expanded;
+            let mut qinv_y: CudaSlice<CudaComplex> =
+                stream.alloc_zeros(n_nte).map_err(Error::Cuda)?;
+            let mut off: usize = 0;
+            for (ion_idx, &ne) in per_ion_ne.iter().enumerate() {
+                if ne == 0 { continue; }
+                let ne_usize = ne as usize;
+                let ne_bands = ne_usize * n_bands as usize;
+                // Copy y[off..off+ne_bands] to contiguous temp
+                let mut ion_y: CudaSlice<CudaComplex> =
+                    stream.alloc_zeros(ne_bands).map_err(Error::Cuda)?;
+                {
+                    let src = temp.slice(off..off + ne_bands);
+                    stream.memcpy_dtod(&src, &mut ion_y).map_err(Error::Cuda)?;
                 }
-                off += ne;
+                let mut ion_qinv_y: CudaSlice<CudaComplex> =
+                    stream.alloc_zeros(ne_bands).map_err(Error::Cuda)?;
+                unsafe {
+                    blas.gemm_c64(ZgemmConfig {
+                        transa: blas::op::N, transb: blas::op::N,
+                        m: ne, n: n_bands, k: ne,
+                        alpha: CudaComplex { x: 1.0, y: 0.0 },
+                        lda: ne, ldb: ne, ldc: ne,
+                        beta: CudaComplex { x: 0.0, y: 0.0 },
+                    }, &per_ion_q_inv[ion_idx], &ion_y, &mut ion_qinv_y)?;
+                }
+                { let mut dst = qinv_y.slice_mut(off..off + ne_bands);
+                  stream.memcpy_dtod(&ion_qinv_y, &mut dst).map_err(Error::Cuda)?; }
+                off += ne_bands;
             }
-            let mut qinv_y_dev: CudaSlice<CudaComplex> =
-                stream.clone_htod(&qinv_y).map_err(Error::Cuda)?;
             // r -= Q^{-1}·y
-            blas.axpy_c64(n_nte as i32, CudaComplex { x: -1.0, y: 0.0 }, &qinv_y_dev, 1, &mut r, 1)?;
+            blas.axpy_c64(n_nte as i32, CudaComplex { x: -1.0, y: 0.0 }, &qinv_y, 1, &mut r, 1)?;
 
             // dy = M^{-1} · r
             let mut info_dev2 = stream.alloc_zeros::<i32>(1).map_err(Error::Cuda)?;
