@@ -47,6 +47,8 @@ use num_complex::Complex64;
 use crate::eigensolver::hamiltonian::{apply_full_hamiltonian, apply_s_times};
 #[cfg(feature = "scf_diag")]
 use crate::eigensolver::hamiltonian::apply_v_loc_hamiltonian;
+#[cfg(feature = "scf_diag")]
+use cudarc::driver::CudaEvent;
 use crate::eigensolver::kernels::CudaKernelSet;
 use crate::eigensolver::preconditioner::{apply_preconditioner, compute_r_vector, prepare_preconditioner, TpaPreconditioner};
 
@@ -1017,6 +1019,12 @@ pub(crate) unsafe fn davidson_diagonalise(
     // converged (unchanged) bands survive across iterations.
     let mut beta_phi_cache = BetaPhiCache::new(vnl_data, n_bands, stream)?;
 
+    // GPU event-based timing (scf_diag only).  CUDA events record timestamps
+    // on the GPU stream without blocking the CPU — no divergence risk.
+    // Processed at function exit after all GPU work is complete.
+    #[cfg(feature = "scf_diag")]
+    let mut gpu_timing: Vec<(&'static str, CudaEvent, CudaEvent, usize, Option<usize>)> = Vec::new();
+
     #[allow(unused_assignments)]
     for iteration in 0..max_outer_iter {
         let n_conv = band_converged.iter().filter(|&&c| c).count();
@@ -1029,6 +1037,10 @@ pub(crate) unsafe fn davidson_diagonalise(
         // stale subspace-rotated H·ψ.
         if !h_correct || iteration > 0 {
             davidson_diag!("[davidson] computing H·psi...");
+            #[cfg(feature = "scf_diag")]
+            let ev_hpsi0 = ctx.new_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT)).map_err(Error::Cuda)?;
+            #[cfg(feature = "scf_diag")]
+            ev_hpsi0.record(stream).map_err(Error::Cuda)?;
             unsafe {
                 apply_full_hamiltonian()
                     .psi_dev(&psi_dev)
@@ -1051,6 +1063,12 @@ pub(crate) unsafe fn davidson_diagonalise(
             }
 
             h_correct = true;
+            #[cfg(feature = "scf_diag")]
+            {
+                let ev_hpsi1 = ctx.new_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT)).map_err(Error::Cuda)?;
+                ev_hpsi1.record(stream).map_err(Error::Cuda)?;
+                gpu_timing.push(("H·psi", ev_hpsi0, ev_hpsi1, iteration, None));
+            }
             davidson_diag!("[davidson] H·psi done");
 
             // Diagnostic: decompose H_sub[0,0] = T_contrib + V_loc+V_NL_contrib
@@ -1153,6 +1171,10 @@ pub(crate) unsafe fn davidson_diagonalise(
             // Compute initial eigenvalue estimates via Rayleigh quotient
             // ε_b = Re⟨ψ_b|H|ψ_b⟩ for ALL bands. This fills eigenvalues[]
             // with physically correct values before the block loop starts.
+            #[cfg(feature = "scf_diag")]
+            let ev_ray0 = ctx.new_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT)).map_err(Error::Cuda)?;
+            #[cfg(feature = "scf_diag")]
+            ev_ray0.record(stream).map_err(Error::Cuda)?;
             // Without this, bands in blocks 1+ start with e=0, causing the
             // preconditioner to produce H|ψ⟩ (full Hamiltonian) instead of
             // the residual (H−ε)|ψ⟩, contaminating search directions and
@@ -1184,6 +1206,12 @@ pub(crate) unsafe fn davidson_diagonalise(
                 eigenvalues[0],
                 eigenvalues[n_bands - 1]
             );
+            #[cfg(feature = "scf_diag")]
+            {
+                let ev_ray1 = ctx.new_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT)).map_err(Error::Cuda)?;
+                ev_ray1.record(stream).map_err(Error::Cuda)?;
+                gpu_timing.push(("Rayleigh-ZDOTC", ev_ray0, ev_ray1, iteration, None));
+            }
         }
 
         // ---- Save Rayleigh eigenvalues before full subspace diagonalization ----
@@ -1206,6 +1234,10 @@ pub(crate) unsafe fn davidson_diagonalise(
         // Rayleigh quotients alone are poor eigenvalue estimates for cold-start
         // wavefunctions with similar character across blocks — cross-band mixing
         // is never captured.
+        #[cfg(feature = "scf_diag")]
+        let ev_a1_0 = ctx.new_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT)).map_err(Error::Cuda)?;
+        #[cfg(feature = "scf_diag")]
+        ev_a1_0.record(stream).map_err(Error::Cuda)?;
         let mut psi_full_rotated = PwCoefficients::new(
             stream.alloc_zeros(n_elem).map_err(Error::Cuda)?);
         let mut hpsi_full_rotated = PwCoefficients::new(
@@ -1234,6 +1266,12 @@ pub(crate) unsafe fn davidson_diagonalise(
         stream
             .memcpy_dtod(&*hpsi_full_rotated, &mut hpsi_dev.0)
             .map_err(Error::Cuda)?;
+        #[cfg(feature = "scf_diag")]
+        {
+            let ev_a1_1 = ctx.new_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT)).map_err(Error::Cuda)?;
+            ev_a1_1.record(stream).map_err(Error::Cuda)?;
+            gpu_timing.push(("A1-ZHEEVD", ev_a1_0, ev_a1_1, iteration, None));
+        }
 
         // A1 rotates ALL bands' psi via subspace diagonalization.
         // All cached β^H·ψ projections are now stale.
@@ -1726,6 +1764,10 @@ pub(crate) unsafe fn davidson_diagonalise(
                     buf
                 };
 
+                #[cfg(feature = "scf_diag")]
+                let ev_a2_0 = ctx.new_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT)).map_err(Error::Cuda)?;
+                #[cfg(feature = "scf_diag")]
+                ev_a2_0.record(stream).map_err(Error::Cuda)?;
                 unsafe {
                     diagonalise_subspace()
                         .psi_block(&super_wvfn)
@@ -1753,6 +1795,12 @@ pub(crate) unsafe fn davidson_diagonalise(
                 stream
                     .memcpy_dtod(&*h_rotated_inner, &mut h_super_wvfn.0)
                     .map_err(Error::Cuda)?;
+                #[cfg(feature = "scf_diag")]
+                {
+                    let ev_a2_1 = ctx.new_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT)).map_err(Error::Cuda)?;
+                    ev_a2_1.record(stream).map_err(Error::Cuda)?;
+                    gpu_timing.push(("A2-ZHEEVD", ev_a2_0, ev_a2_1, iteration, Some(block_start)));
+                }
 
                 // ---- C1: Reset super_hamiltonian to diagonal ----
                 // CASTEP hamiltonian.f90:503-506 — after subspace diagonalization,
@@ -2283,6 +2331,31 @@ pub(crate) unsafe fn davidson_diagonalise(
         lock_tol: tol_abs,
         eigenvalue_deltas: vec![0.0_f64; n_bands],
     });
+
+    // ------------------------------------------------------------------
+    // GPU event timing report (scf_diag only) — process events AFTER
+    // the outer loop so stream synchronization doesn't affect convergence.
+    // ------------------------------------------------------------------
+    #[cfg(feature = "scf_diag")]
+    {
+        let mut by_label: std::collections::BTreeMap<&str, (f32, usize, f32, f32)> = std::collections::BTreeMap::new();
+        for (label, start, end, _iter, _block) in &gpu_timing {
+            let ms = start.elapsed_ms(end).unwrap_or(-1.0);
+            let entry = by_label.entry(label).or_insert((0.0, 0, f32::MAX, 0.0));
+            entry.0 += ms;
+            entry.1 += 1;
+            entry.2 = entry.2.min(ms);
+            entry.3 = entry.3.max(ms);
+        }
+        eprintln!("[gpu-timing] outer loop GPU time breakdown ({} events):", gpu_timing.len());
+        for (label, (total, n, min, max)) in &by_label {
+            let avg = total / *n as f32;
+            eprintln!("[gpu-timing]   {:<20}  n={:3}  total={:8.2}ms  avg={:7.2}ms  min={:7.2}ms  max={:7.2}ms",
+                label, n, total, avg, min, max);
+        }
+        let grand_total: f32 = by_label.values().map(|(t, _, _, _)| t).sum();
+        eprintln!("[gpu-timing]   grand total: {:.2}ms", grand_total);
+    }
 
     // ------------------------------------------------------------------
     // Result
