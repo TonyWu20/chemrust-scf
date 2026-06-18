@@ -981,30 +981,48 @@ unsafe fn step_inner_chebyshev(
     let oracle_min_occ = 0.0001_f64;  // ABINIT default: skip bands with occ < 1e-4
 
     // Chebyshev filtering — SinvHKeepHEig for USPP (S⁻¹·H operator).
+    // ABINIT m_vtorho.F90:610: nnsclo_now=2 for istep<=2 (cold start).
+    // Zhou 2014 Algorithm 5.1: 3-4 iters of filter→orthonormalize→RR to
+    // converge the initial random subspace before density reconstruction.
     let mut pcie = PcieAccount::default();
-    let (pf, mut hf, _ritz_values, _residuals, _ndeg) = chebfi_run_rust(
+
+    // Pass 1: initial filter + RR
+    let (pf1, mut hf1, _ritz1, _res1, _ndeg1) = chebfi_run_rust(
         &psi_gpu,
         v_eff_gpu.as_device_slice(),
-        &h.wave_grid,
-        &kd.pw_coords,
-        kd.vnl[isp].as_ref().unwrap(),
+        &h.wave_grid, &kd.pw_coords, kd.vnl[isp].as_ref().unwrap(),
         &fft_idx_dev,
         ecut, ve_min, ve_max,
         tolerance, None, None,
         ndeg_filter_max, oracle_mode, oracle_factor, oracle_min_occ,
         kernels, &mut pcie, blas, solver, stream, ctx,
-        FilterMode::SinvHKeepHEig,
-        Some(&ke_castep),
+        FilterMode::SinvHKeepHEig, Some(&ke_castep),
         0, n_bands, !have_gamma,
-    ).map_err(|e| { eprintln!("[chemrust-chebyshev] chebfi_run_rust failed: {e}"); CHEM_EIG_CUDA_ERROR })?;
-
-    // Rayleigh-Ritz: transforms RowDistributed -> ColumnDistributed,
-    // computes eigenvalues, and produces the final orthonormal psi.
-    let (psi_col, eig_cpu, _beta_psi) = rayleigh_ritz(
-        &pf, &mut hf, kd.vnl[isp].as_ref().unwrap(),
+    ).map_err(|e| { eprintln!("[chemrust-chebyshev] chebfi_run_rust pass1 failed: {e}"); CHEM_EIG_CUDA_ERROR })?;
+    let (psi_col1, eig_cpu1, _beta1) = rayleigh_ritz(
+        &pf1, &mut hf1, kd.vnl[isp].as_ref().unwrap(),
         n_bands, n_pw, kernels, &mut pcie, solver, blas, stream, ctx,
         None, None, None,
-    ).map_err(|e| { eprintln!("[chemrust-chebyshev] rayleigh_ritz failed: {e}"); CHEM_EIG_CUDA_ERROR })?;
+    ).map_err(|e| { eprintln!("[chemrust-chebyshev] rayleigh_ritz pass1 failed: {e}"); CHEM_EIG_CUDA_ERROR })?;
+
+    // Pass 2: refine subspace (ColumnDistributed from pass1 as input)
+    let (pf2, mut hf2, _ritz2, _res2, _ndeg2) = chebfi_run_rust(
+        &psi_col1,
+        v_eff_gpu.as_device_slice(),
+        &h.wave_grid, &kd.pw_coords, kd.vnl[isp].as_ref().unwrap(),
+        &fft_idx_dev,
+        ecut, ve_min, ve_max,
+        tolerance, None, None,
+        ndeg_filter_max, oracle_mode, oracle_factor, oracle_min_occ,
+        kernels, &mut pcie, blas, solver, stream, ctx,
+        FilterMode::SinvHKeepHEig, Some(&ke_castep),
+        0, n_bands, !have_gamma,
+    ).map_err(|e| { eprintln!("[chemrust-chebyshev] chebfi_run_rust pass2 failed: {e}"); CHEM_EIG_CUDA_ERROR })?;
+    let (psi_col, eig_cpu, _beta2) = rayleigh_ritz(
+        &pf2, &mut hf2, kd.vnl[isp].as_ref().unwrap(),
+        n_bands, n_pw, kernels, &mut pcie, solver, blas, stream, ctx,
+        None, None, None,
+    ).map_err(|e| { eprintln!("[chemrust-chebyshev] rayleigh_ritz pass2 failed: {e}"); CHEM_EIG_CUDA_ERROR })?;
 
     // ---- Compute H·psi for hpsi_out (CASTEP stores into wvfn_gradient) ----
     let gs = (h.ngx_std * h.ngy_std * h.ngz_std) as usize;
