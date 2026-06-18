@@ -2706,74 +2706,69 @@ pub fn chebfi_run_rust(
     }
 
     // =====================================================================
-    // Phase 6: Gram-Schmidt S-orthonormalisation (unchanged, lines 1022-1121)
-    // =====================================================================
-    let mut gs_col = PwCoefficients::new(stream.alloc_zeros(n_pw).map_err(Error::Cuda)?);
-    let mut gs_s_col = PwCoefficients::new(stream.alloc_zeros(n_pw).map_err(Error::Cuda)?);
-    unsafe {
-        let (psi_ptr, _) = final_psi_buf.0.device_ptr_mut(stream);
-        let (gs_col_ptr, _) = gs_col.0.device_ptr_mut(stream);
-        for _pass in 0..2 {
-            for b in 0..n_bands {
-                let col_b = (psi_ptr as *mut CudaComplex).add(b * n_pw);
-                // Copy col_b → gs_col (device-to-device)
-                cudarc::cublas::sys::cublasZcopy_v2(
-                    blas.raw_handle(), n_pw_i32,
-                    col_b as *const _, 1,
-                    gs_col_ptr as *mut _, 1,
+    // Phase 6: Cholesky QR (ABINIT xg_Block_xgBlock_xg_QP).
+    // S_sub = X^T·S·X, ZPOTRF → R, ZTRSM → X·R^{-1}.
+    // Stabler than Gram-Schmidt for near-dependent vectors after filtering.
+    {
+        use crate::device::blas::{op, ZgemmConfig};
+        // S·X for all bands (batched)
+        stream.memcpy_dtod(&**final_psi_buf, &mut spsi_dev.0).map_err(Error::Cuda)?;
+        unsafe {
+            apply_s_times()
+                .psi_dev(final_psi_buf).spsi_dev(&mut spsi_dev)
+                .vnl_data(vnl_data).n_bands(n_bands_i32).n_pw(n_pw_i32)
+                .blas(blas).stream(stream).call()?;
+        }
+        let nb = n_bands;
+        let nb_i32 = n_bands_i32;
+        // S_sub = X^T · (S·X)
+        let mut s_sub: CudaSlice<CudaComplex> =
+            stream.alloc_zeros(nb * nb).map_err(Error::Cuda)?;
+        unsafe {
+            blas.gemm_c64(ZgemmConfig {
+                transa: op::C, transb: op::N,
+                m: nb_i32, n: nb_i32, k: n_pw_i32,
+                alpha: CudaComplex { x: 1.0, y: 0.0 },
+                lda: n_pw_i32, ldb: n_pw_i32, ldc: nb_i32,
+                beta: CudaComplex { x: 0.0, y: 0.0 },
+            }, &**final_psi_buf, &*spsi_dev, &mut s_sub)?;
+        }
+        // ZPOTRF → R (Cholesky factor, upper triangular, in-place)
+        let mut chol_info: CudaSlice<i32> =
+            stream.alloc_zeros(1).map_err(Error::Cuda)?;
+        solver.zpotrf(
+            cudarc::cusolver::sys::cublasFillMode_t::CUBLAS_FILL_MODE_UPPER,
+            nb_i32, &mut s_sub, &mut chol_info,
+        )?;
+        solver.stream().synchronize().map_err(Error::Cuda)?;
+        let info_host: Vec<i32> = solver.stream().clone_dtoh(&chol_info).map_err(Error::Cuda)?;
+        if info_host[0] == 0 {
+            // ZTRSM: X = X · R^{-1}
+            use cudarc::cublas::sys::{
+                cublasSideMode_t, cublasDiagType_t,
+                cublasOperation_t,
+                cublasZtrsm_v2,
+                cublasFillMode_t as cublas_sys_fill,
+            };
+            let alpha_one = CudaComplex { x: 1.0, y: 0.0 };
+            unsafe {
+                let (ptr, _) = final_psi_buf.0.device_ptr_mut(stream);
+                let (s_sub_ptr, _) = s_sub.device_ptr(stream);
+                cublasZtrsm_v2(
+                    blas.raw_handle(),
+                    cublasSideMode_t::CUBLAS_SIDE_RIGHT,
+                    cublas_sys_fill::CUBLAS_FILL_MODE_UPPER,
+                    cublasOperation_t::CUBLAS_OP_N,
+                    cublasDiagType_t::CUBLAS_DIAG_NON_UNIT,
+                    n_pw_i32, nb_i32,
+                    &alpha_one as *const _ as *const _,
+                    s_sub_ptr as *const _, nb_i32,
+                    ptr as *mut _, n_pw_i32,
                 ).result().map_err(Error::Blas)?;
-                // gs_s_col = S · gs_col
-                stream.memcpy_dtod(&*gs_col, &mut gs_s_col.0).map_err(Error::Cuda)?;
-                apply_s_times()
-                    .psi_dev(&gs_col)
-                    .spsi_dev(&mut gs_s_col)
-                    .vnl_data(vnl_data)
-                    .n_bands(1)
-                    .n_pw(n_pw_i32)
-                    .blas(blas)
-                    .stream(stream)
-                    .call()?;
-                // Get device pointer from gs_s_col after mutable ops complete
-                let (gs_s_col_ptr, _) = gs_s_col.0.device_ptr_mut(stream);
-                let mut norm_sq_s = CudaComplex { x: 0.0, y: 0.0 };
-                cudarc::cublas::sys::cublasZdotc_v2(
-                    blas.raw_handle(), n_pw_i32,
-                    col_b as *const _, 1,
-                    gs_s_col_ptr as *const _, 1,
-                    &mut norm_sq_s as *mut _ as *mut _,
-                ).result().map_err(Error::Blas)?;
-                // Subtract projections onto all previous S-orthonormal columns
-                for j in 0..b {
-                    let col_j = (psi_ptr as *mut CudaComplex).add(j * n_pw);
-                    let mut dot = CudaComplex { x: 0.0, y: 0.0 };
-                    cudarc::cublas::sys::cublasZdotc_v2(
-                        blas.raw_handle(), n_pw_i32,
-                        col_j as *const _, 1,
-                        gs_s_col_ptr as *const _, 1,
-                        &mut dot as *mut _ as *mut _,
-                    ).result().map_err(Error::Blas)?;
-                    // col_b -= dot * col_j
-                    let neg_dot = CudaComplex { x: -dot.x, y: -dot.y };
-                    cudarc::cublas::sys::cublasZaxpy_v2(
-                        blas.raw_handle(), n_pw_i32,
-                        &neg_dot as *const _ as *const _,
-                        col_j as *const _, 1,
-                        col_b as *mut _, 1,
-                    ).result().map_err(Error::Blas)?;
-                    norm_sq_s.x -= dot.x * dot.x + dot.y * dot.y;
-                }
-                // Normalize col_b with S-norm
-                let norm_s = norm_sq_s.x.sqrt();
-                if norm_s > 1e-30 {
-                    let inv_norm = CudaComplex { x: 1.0 / norm_s, y: 0.0 };
-                    cudarc::cublas::sys::cublasZscal_v2(
-                        blas.raw_handle(), n_pw_i32,
-                        &inv_norm as *const _ as *const _,
-                        col_b as *mut _, 1,
-                    ).result().map_err(Error::Blas)?;
-                }
             }
         }
+        // If ZPOTRF fails (info != 0), vectors are too dependent — skip ortho
+        // and let rayleigh_ritz handle via ZPOTRF+SVD fallback.
     }
 
     // =====================================================================
