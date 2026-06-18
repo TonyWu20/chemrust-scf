@@ -2417,7 +2417,7 @@ pub fn chebfi_run_rust(
         .xx(lambda_min_rq)    // smallest eigenvalue — hardest to amplify
         .aa(lambda_minus)    // filter interval lower bound
         .bb(lambda_plus)     // filter interval upper bound
-        .tol(1e-6)           // target residual-reduction ratio
+        .tol(1e-16)          // ABINIT m_chebfi2.F90:625 uses 1D-16
         .nmax(ndeg_filter_max)
         .call()
         .min(40);            // ABINIT hard cap at 40
