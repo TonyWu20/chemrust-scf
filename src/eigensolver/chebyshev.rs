@@ -2774,10 +2774,7 @@ pub fn chebfi_run_rust(
         } else {
             // ZPOTRF failed — S_sub is not positive definite.
             // Regularize: S_sub += ε·I with ε based on max diagonal magnitude.
-            eprintln!(
-                "[chebfi] Cholesky QR ZPOTRF failed: info={chol_info_val} (n_bands={nb}) — "
-                "regularizing S_sub",
-            );
+            eprintln!("[chebfi] Cholesky QR ZPOTRF failed: info={chol_info_val} (n_bands={nb}) — regularizing S_sub");
             // Download the diagonal of S_sub to estimate regularization strength
             let mut s_diag: Vec<CudaComplex> = vec![CudaComplex { x: 0.0, y: 0.0 }; nb];
             let s_sub_cpu: Vec<CudaComplex> = solver.stream().clone_dtoh(&s_sub).map_err(Error::Cuda)?;
@@ -2831,11 +2828,7 @@ pub fn chebfi_run_rust(
                     ).result().map_err(Error::Blas)?;
                 }
             } else {
-                eprintln!(
-                    "[chebfi] Cholesky QR ZPOTRF retry also failed: info={} — "
-                    "skipping orthonormalization (rayleigh_ritz will attempt recovery)",
-                    info_retry[0],
-                );
+                eprintln!("[chebfi] Cholesky QR ZPOTRF retry also failed: info={} — skipping orthonormalization (rayleigh_ritz will attempt recovery)", info_retry[0]);
             }
         }
     }

@@ -347,10 +347,7 @@ pub fn rayleigh_ritz(
         let max_diag_imag: f64 = (0..nb)
             .map(|i| s_sub_cpu[i * nb + i].y.abs())
             .fold(0.0_f64, f64::max);
-        eprintln!(
-            "[RR-diag] S_sub before ZHEGVD: n={nb} diag=[{min_diag:.6e}, {max_diag:.6e}] "
-            "max|off|= {max_off_mag:.6e} max|Im(diag)|= {max_diag_imag:.6e}",
-        );
+        eprintln!("[RR-diag] S_sub before ZHEGVD: n={nb} diag=[{min_diag:.6e}, {max_diag:.6e}] max|off|={max_off_mag:.6e} max|Im(diag)|={max_diag_imag:.6e}");
     }
 
     let mut eigenvalues_dev: CudaSlice<f64> =
