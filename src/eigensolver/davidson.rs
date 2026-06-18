@@ -2103,9 +2103,18 @@ pub(crate) unsafe fn davidson_diagonalise(
             }
         } // end block loop (for block_start)
 
-        // SURV-01 (deferred): BetaPhiCache was populated here but never
-        // consumed (hamiltonian.rs:271 discards the cache).  Stage-level
-        // syncs now provide the barriers this dead code used to provide.
+        // D12-04: Populate beta_phi_cache at the END of each outer iteration
+        // so that the NEXT iteration's apply_full_hamiltonian can reuse
+        // cached β^H·ψ projections.  Without this, the cache was populated
+        // at the start (before A1 rotation) and immediately invalidated by
+        // A1's invalidate_all(), making it dead code.
+        //
+        // The cuBLAS GEMMs queued here (β^H·ψ for all bands) are load-bearing
+        // for GPU stream ordering — removing this causes divergence. See
+        // docs/load-bearing-diagnostic-overhead.md for the full investigation.
+        unsafe {
+            beta_phi_cache.compute_all(&psi_dev, vnl_data, n_pw, blas, stream)?;
+        }
 
         // Step f-g: convergence check using inner-loop convergence criteria
         for b in 0..n_bands {
