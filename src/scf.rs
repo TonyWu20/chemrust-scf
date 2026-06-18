@@ -1417,6 +1417,16 @@ impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated, MixingOff> {
                 )?
             };
 
+            // Diagnostic: total occupation sum (should equal n_electrons_per_spin)
+            {
+                let occ_sum: f64 = occupations_all_kpts.iter()
+                    .zip(kpt_weights.iter())
+                    .map(|(occs, &w)| w * occs.iter().sum::<f64>())
+                    .sum();
+                eprintln!("[occ] spin={ispin} scf_iter={} occ_sum={:.6} target={:.6} chem_pot={:.6}",
+                    self.scf_iter, occ_sum, n_electrons_per_spin[ispin], chem_pot.0);
+            }
+
             // Density accumulation across kpts (weighted sum)
             let mut total_density: Option<Density> = None;
             let mut total_aug: Option<chemrust_hamiltonian_core::fft::RealGrid<f64>> = None;

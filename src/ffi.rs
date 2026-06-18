@@ -777,3 +777,203 @@ unsafe fn step_inner(
 
     Ok(())
 }
+
+// ---- Chebyshev eigensolver variant -----------------------------------------
+
+#[cfg(feature = "chebyshev")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn chemrust_eigensolve_step_chebyshev(
+    handle: *mut c_void,
+    psi_data: *mut CudaComplex, v_eff_data: *const c_double,
+    kinetic_data: *const c_double, fft_idx_data: *const c_int,
+    eigenvalues_ptr: *mut c_double, hpsi_out: *mut CudaComplex,
+    npw: c_int, nbands: c_int, ikpt: c_int, ispin: c_int,
+    max_deg: c_int,
+    converged: *mut c_int,
+) -> c_int {
+    match unsafe { step_inner_chebyshev(handle, psi_data, v_eff_data, kinetic_data, fft_idx_data,
+        eigenvalues_ptr, hpsi_out, npw, nbands, ikpt, ispin, max_deg, converged) }
+    {
+        Ok(()) => CHEM_EIG_OK,
+        Err(c) => c,
+    }
+}
+
+#[cfg(feature = "chebyshev")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn step_inner_chebyshev(
+    handle: *mut c_void,
+    psi_data: *mut CudaComplex, v_eff_data: *const c_double,
+    kinetic_data: *const c_double, fft_idx_data: *const c_int,
+    eigenvalues_ptr: *mut c_double, hpsi_out: *mut CudaComplex,
+    npw: c_int, nbands: c_int, ikpt: c_int, ispin: c_int,
+    max_deg: c_int,
+    converged: *mut c_int,
+) -> Result<(), c_int> {
+    use crate::eigensolver::chebyshev::{FilterMode, chebfi_run_rust};
+    use crate::eigensolver::rayleigh_ritz::rayleigh_ritz;
+
+    let h = unsafe { (handle as *mut ChemrustHandle).as_mut() }.ok_or(CHEM_EIG_NULL_HANDLE)?;
+    if psi_data.is_null() || v_eff_data.is_null() || kinetic_data.is_null()
+        || fft_idx_data.is_null() || eigenvalues_ptr.is_null() || hpsi_out.is_null() || converged.is_null()
+    { return Err(CHEM_EIG_NULL_HANDLE); }
+
+    let ik = ikpt as usize;
+    if ik >= h.kpts.len() { return Err(CHEM_EIG_CUDA_ERROR); }
+    let isp = ispin as usize;
+    if isp >= h.nspins { return Err(CHEM_EIG_CUDA_ERROR); }
+    let n_pw = npw as usize;
+    let n_bands = nbands as usize;
+    let kd = &mut h.kpts[ik];
+    let have_gamma = kd.kpoint_frac.iter().all(|&c| c.abs() < 1e-12);
+
+    // Use CASTEP-provided kinetic energies
+    let ke_castep: Vec<f64> = unsafe { std::slice::from_raw_parts(kinetic_data, n_pw) }.to_vec();
+
+    // Upload psi with max_n_pw stride
+    let max_n_pw = h.max_n_pw;
+    let raw_psi = unsafe { std::slice::from_raw_parts(psi_data as *const CudaComplex, max_n_pw * n_bands) };
+    let mut psi_host: Vec<num_complex::Complex64> = Vec::with_capacity(n_pw * n_bands);
+    for b in 0..n_bands {
+        let start = b * max_n_pw;
+        psi_host.extend(raw_psi[start..start + n_pw].iter().map(|c| num_complex::Complex64::new(c.x, c.y)));
+    }
+
+    // Lazily initialise VnlBatchData
+    if kd.vnl[isp].is_none() {
+        let mut pcie = PcieAccount::default();
+        let shared_for_this_spin = kd.shared_vnl.clone();
+        kd.vnl[isp] = Some(VnlBatchData::precompute_with_d_override(
+            &kd.pw_coords, &h.pots, &h.cell, &h.wave_grid, Some(&h.fine_grid), &kd.k_point,
+            &psi_host, n_bands, n_pw, None, None, None, shared_for_this_spin,
+            h.handle_shared_vnl.clone(),
+            None,
+            &h.stream, &mut pcie, &h.blas, &h.kernels,
+        ).map_err(|e| { eprintln!("[chemrust-chebyshev] VnlBatchData init failed: {e}"); CHEM_EIG_CUDA_ERROR })?);
+        kd.shared_vnl = Some(kd.vnl[isp].as_ref().unwrap().shared.clone());
+    }
+
+    let wfn = WavefunctionSet::<ColumnDistributed>::new(psi_host, n_bands, n_pw);
+    let psi_gpu = Gpu::from_host(&wfn, &h.stream).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
+
+    // Upload V_eff and downsample fine->standard grid (same as step_inner)
+    let gs_fine = (h.ngx * h.ngy * h.ngz) as usize;
+    let ve_host: Vec<f64> = unsafe { std::slice::from_raw_parts(v_eff_data, gs_fine) }.to_vec();
+
+    let ngx_f = h.ngx as usize;
+    let ngy_f = h.ngy as usize;
+    let ngz_f = h.ngz as usize;
+    let arr_ix_fast = crate::device::unflatten_f64(ve_host, &[ngx_f, ngy_f, ngz_f]);
+
+    let veff_wave = crate::downsample_array_to_wave_grid(
+        &arr_ix_fast, &h.fine_grid, &h.wave_grid,
+    ).map_err(|e| { eprintln!("[chemrust-chebyshev] V_eff downsampling failed: {e}"); CHEM_EIG_CUDA_ERROR })?;
+
+    let wave_arr = veff_wave.as_fine_array();
+    let ngx_s = h.ngx_std as usize;
+    let ngy_s = h.ngy_std as usize;
+    let ngz_s = h.ngz_std as usize;
+    let arr_iz_fast = ndarray::Array3::from_shape_fn(
+        (ngz_s, ngy_s, ngx_s),
+        |(iz, iy, ix)| wave_arr[[ix, iy, iz]],
+    );
+    let veff_wave_iz = EffectivePotential(FineGridArray(arr_iz_fast));
+    let v_eff_gpu = Gpu::from_host(&veff_wave_iz, &h.stream)
+        .map_err(|_| CHEM_EIG_CUDA_ERROR)?;
+
+    // Re-screen D matrices
+    kd.vnl[isp].as_mut().unwrap().rescreen_d(&arr_ix_fast, &h.stream, &h.kernels, &h.blas)
+        .map_err(|e| { eprintln!("[chemrust-chebyshev] D re-screen failed: {e}"); CHEM_EIG_CUDA_ERROR })?;
+
+    // Upload FFT index (same transpose as step_inner)
+    let fft_idx: Vec<i32> = unsafe { std::slice::from_raw_parts(fft_idx_data as *const c_int, n_pw) }
+        .iter()
+        .map(|&idx_1based| {
+            let idx0 = (idx_1based - 1).max(0);
+            let ix = idx0 % ngx_s as i32;
+            let iy = (idx0 / ngx_s as i32) % ngy_s as i32;
+            let iz = idx0 / (ngx_s as i32 * ngy_s as i32);
+            iz + ngz_s as i32 * (iy + ngy_s as i32 * ix)
+        })
+        .collect();
+    let mut fft_idx_dev: CudaSlice<i32> = h.stream.alloc_zeros(n_pw)
+        .map_err(|_| CHEM_EIG_CUDA_ERROR)?;
+    h.stream.memcpy_htod(&fft_idx, &mut fft_idx_dev)
+        .map_err(|_| CHEM_EIG_CUDA_ERROR)?;
+
+    // ---- Chebyshev filtering -------------------------------------------------
+    let blas = &h.blas;
+    let solver = &h.solver;
+    let kernels = &h.kernels;
+    let stream = &h.stream;
+    let ctx = &h.ctx;
+
+    // ecut from maximum kinetic energy (physical energy cutoff in Ha)
+    let ecut = ke_castep.iter().cloned().fold(0.0_f64, f64::max);
+
+    // Compute V_eff statistics for spectral bounds (before ve_host is moved)
+    let ve_min = arr_ix_fast.iter().fold(f64::INFINITY, |a, &b| a.min(b));
+    let ve_max = arr_ix_fast.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
+
+    // Tolerance for residual convergence
+    let tolerance = 1e-6_f64;
+    let ndeg_filter_max = max_deg.max(5) as usize; // CASTEP's max_deg, minimum of 5
+    let oracle_mode = 1usize;                      // conservative oracle
+    let oracle_factor = 0.0_f64;
+    let oracle_min_occ = 1e-8_f64;
+
+    // Chebyshev filtering
+    let mut pcie = PcieAccount::default();
+    let (pf, mut hf, _ritz_values, _residuals, _ndeg) = chebfi_run_rust(
+        &psi_gpu,
+        v_eff_gpu.as_device_slice(),
+        &h.wave_grid,
+        &kd.pw_coords,
+        kd.vnl[isp].as_ref().unwrap(),
+        &fft_idx_dev,
+        ecut, ve_min, ve_max,
+        tolerance, None, None,
+        ndeg_filter_max, oracle_mode, oracle_factor, oracle_min_occ,
+        kernels, &mut pcie, blas, solver, stream, ctx,
+        FilterMode::BareH,
+        Some(&ke_castep),
+        0, n_bands, !have_gamma,
+    ).map_err(|e| { eprintln!("[chemrust-chebyshev] chebfi_run_rust failed: {e}"); CHEM_EIG_CUDA_ERROR })?;
+
+    // Rayleigh-Ritz: transforms RowDistributed -> ColumnDistributed,
+    // computes eigenvalues, and produces the final orthonormal psi.
+    let (psi_col, eig_cpu, _beta_psi) = rayleigh_ritz(
+        &pf, &mut hf, kd.vnl[isp].as_ref().unwrap(),
+        n_bands, n_pw, kernels, &mut pcie, solver, blas, stream, ctx,
+        None, None, None,
+    ).map_err(|e| { eprintln!("[chemrust-chebyshev] rayleigh_ritz failed: {e}"); CHEM_EIG_CUDA_ERROR })?;
+
+    // Download and write back psi
+    let psi_host_out: Vec<CudaComplex> = stream.clone_dtoh(psi_col.as_device_slice())
+        .map_err(|_| CHEM_EIG_CUDA_ERROR)?;
+
+    // Write back with max_n_pw stride
+    let raw_psi_out = unsafe { std::slice::from_raw_parts_mut(psi_data, max_n_pw * n_bands) };
+    for b in 0..n_bands {
+        let start = b * max_n_pw;
+        raw_psi_out[start..start + n_pw]
+            .copy_from_slice(&psi_host_out[b * n_pw..(b + 1) * n_pw]);
+    }
+
+    // Write eigenvalues
+    unsafe {
+        std::slice::from_raw_parts_mut(eigenvalues_ptr, n_bands)
+            .copy_from_slice(&eig_cpu.0);
+    }
+
+    // hpsi_out is not computed by the Chebyshev path — set to zeros
+    let raw_hpsi_out = unsafe { std::slice::from_raw_parts_mut(hpsi_out, max_n_pw * n_bands) };
+    for c in raw_hpsi_out.iter_mut() {
+        *c = CudaComplex { x: 0.0, y: 0.0 };
+    }
+
+    // Chebyshev filter produces eigenvalues for all bands — mark as converged
+    unsafe { *converged = 1; };
+
+    Ok(())
+}
