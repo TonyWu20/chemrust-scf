@@ -970,11 +970,15 @@ unsafe fn step_inner_chebyshev(
     let ve_max = arr_ix_fast.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
 
     // Tolerance for residual convergence
+    // ABINIT m_chebfi2.F90: ndeg capped at 40 (Phase 3 hard cap), not CASTEP's
+    // max_deg (=12).  Conservative oracle (mode 1) caps ALL bands at
+    // min(global_oracle, ndeg_filter_max) — with max_deg=12, bands needing
+    // >12 iterations get under-filtered, causing eigenvalue oscillation.
     let tolerance = 1e-6_f64;
-    let ndeg_filter_max = max_deg.max(5) as usize;
-    let oracle_mode = 1usize;
-    let oracle_factor = 0.0_f64;
-    let oracle_min_occ = 1e-8_f64;
+    let ndeg_filter_max = 40usize; // ABINIT hard cap (not CASTEP's max_deg=12)
+    let oracle_mode = 2usize;      // two-target: per-band decrease target via oracle_factor
+    let oracle_factor = 0.1_f64;   // target ratio for decrease path (max 15 iters)
+    let oracle_min_occ = 0.1_f64;  // skip bands with occupancy below 0.1
 
     // Chebyshev filtering — SinvHKeepHEig for USPP (S⁻¹·H operator).
     let mut pcie = PcieAccount::default();
