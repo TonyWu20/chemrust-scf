@@ -2579,8 +2579,6 @@ pub(crate) unsafe fn s_orthogonalise(
     if superspace_index == 0 {
         return Ok(());
     }
-    let _ = n_pw; // keep for builder API
-
     // Step 1: Compute S·search in batch → s_orth_out (n_pw × ncol)
     let (search_ptr, _) = search_dev.device_ptr(stream);
     let (s_in_mut, _) = s_orth_in.device_ptr_mut(stream);
@@ -2592,14 +2590,15 @@ pub(crate) unsafe fn s_orthogonalise(
     // in spsi_dev before the call.  Without this pre-copy, s_orth_out
     // contains only the NL correction (missing the PW kinetic part),
     // producing wrong S·search → wrong ZGEMM overlap → eigenvalue explosion.
-    // Single contiguous copy: columns are contiguous in column-major (lda=n_pw).
-    // Safe now because build() syncs after s_orthogonalise returns.
-    cublasZcopy_v2(handle, n_pw_i32 * (ncol as i32),
-        search_ptr as *const _, 1, s_in_mut as *mut _, 1,
-    ).result().map_err(Error::Blas)?;
-    cublasZcopy_v2(handle, n_pw_i32 * (ncol as i32),
-        search_ptr as *const _, 1, s_out_mut as *mut _, 1,
-    ).result().map_err(Error::Blas)?;
+    for j in 0..ncol {
+        let src = (search_ptr as *const CudaComplex).add(j * n_pw);
+        let dst_in = (s_in_mut as *mut CudaComplex).add(j * n_pw);
+        let dst_out = (s_out_mut as *mut CudaComplex).add(j * n_pw);
+        cublasZcopy_v2(handle, n_pw_i32, src as *const _, 1, dst_in as *mut _, 1)
+            .result().map_err(Error::Blas)?;
+        cublasZcopy_v2(handle, n_pw_i32, src as *const _, 1, dst_out as *mut _, 1)
+            .result().map_err(Error::Blas)?;
+    }
     unsafe {
         apply_s_times()
             .psi_dev(&*s_orth_in)
