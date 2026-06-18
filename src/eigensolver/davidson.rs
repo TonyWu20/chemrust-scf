@@ -2152,9 +2152,11 @@ pub(crate) unsafe fn davidson_diagonalise(
     }
 
     // ------------------------------------------------------------------
-    // Diagnostics: compute S⁻¹-weighted residual norms
+    // Diagnostics: compute S⁻¹-weighted residual norms (scf_diag only)
     // ------------------------------------------------------------------
     let residual_norms_values: Vec<f64> = {
+        #[cfg(feature = "scf_diag")]
+        {
         // --- Compute S·ψ for residual (USPP: S ≠ I) ---
         // r_b = Hψ_b − λ_b·(Sψ)_b  (not Hψ_b − λ_b·ψ_b)
         // Using ψ instead of Sψ inflates residuals for ultrasoft
@@ -2235,6 +2237,11 @@ pub(crate) unsafe fn davidson_diagonalise(
             norms.push(dot.x.sqrt());
         }
         norms
+        }
+        #[cfg(not(feature = "scf_diag"))]
+        {
+            vec![0.0_f64; n_bands]
+        }
     };
 
     // ------------------------------------------------------------------
