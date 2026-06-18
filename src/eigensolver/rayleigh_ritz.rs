@@ -324,6 +324,35 @@ pub fn rayleigh_ritz(
     // ---- Step 3: Solve generalized eigenvalue problem via ZHEGVD ----
     // A * X = lambda * B * X  where A = H_sub, B = S_sub
     // On return: h_sub_dev contains eigenvectors X (column-major, n x n)
+
+    // Diagnostic: check S_sub diagonal and off-diagonal extrema before ZHEGVD.
+    // A non-positive-definite S_sub will cause ZHEGVD info > n_bands.
+    {
+        stream.synchronize().map_err(Error::Cuda)?;
+        let s_sub_cpu: Vec<CudaComplex> = stream.clone_dtoh(&s_sub_dev).map_err(Error::Cuda)?;
+        let nb = n_bands;
+        let (min_diag, max_diag) = (0..nb)
+            .map(|i| s_sub_cpu[i * nb + i])
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(mn, mx), c| {
+                (mn.min(c.x), mx.max(c.x))
+            });
+        let max_off_mag: f64 = (0..nb).flat_map(|i| (0..nb).map(move |j| (i, j)))
+            .filter(|&(i, j)| i != j)
+            .map(|(i, j)| {
+                let c = s_sub_cpu[i * nb + j];
+                (c.x * c.x + c.y * c.y).sqrt()
+            })
+            .fold(0.0_f64, f64::max);
+        // Check imaginary part of diagonal (should be ~0 for Hermitian)
+        let max_diag_imag: f64 = (0..nb)
+            .map(|i| s_sub_cpu[i * nb + i].y.abs())
+            .fold(0.0_f64, f64::max);
+        eprintln!(
+            "[RR-diag] S_sub before ZHEGVD: n={nb} diag=[{min_diag:.6e}, {max_diag:.6e}] "
+            "max|off|= {max_off_mag:.6e} max|Im(diag)|= {max_diag_imag:.6e}",
+        );
+    }
+
     let mut eigenvalues_dev: CudaSlice<f64> =
         stream.alloc_zeros(n_bands).map_err(Error::Cuda)?;
     let mut info_dev: CudaSlice<i32> = stream.alloc_zeros(1).map_err(Error::Cuda)?;

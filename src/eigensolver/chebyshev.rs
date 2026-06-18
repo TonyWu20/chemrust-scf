@@ -2734,6 +2734,10 @@ pub fn chebfi_run_rust(
             }, &**final_psi_buf, &*spsi_dev, &mut s_sub)?;
         }
         // ZPOTRF → R (Cholesky factor, upper triangular, in-place)
+        // CRITICAL: sync user stream before crossing to solver stream.
+        // The GEMM that wrote s_sub ran on blas's stream; ZPOTRF runs on
+        // solver's stream. Without this barrier, ZPOTRF may read stale data.
+        stream.synchronize().map_err(Error::Cuda)?;
         let mut chol_info: CudaSlice<i32> =
             stream.alloc_zeros(1).map_err(Error::Cuda)?;
         solver.zpotrf(
@@ -2742,7 +2746,8 @@ pub fn chebfi_run_rust(
         )?;
         solver.stream().synchronize().map_err(Error::Cuda)?;
         let info_host: Vec<i32> = solver.stream().clone_dtoh(&chol_info).map_err(Error::Cuda)?;
-        if info_host[0] == 0 {
+        let chol_info_val = info_host[0];
+        if chol_info_val == 0 {
             // ZTRSM: X = X · R^{-1}
             use cudarc::cublas::sys::{
                 cublasSideMode_t, cublasDiagType_t,
@@ -2766,9 +2771,73 @@ pub fn chebfi_run_rust(
                     ptr as *mut _, n_pw_i32,
                 ).result().map_err(Error::Blas)?;
             }
+        } else {
+            // ZPOTRF failed — S_sub is not positive definite.
+            // Regularize: S_sub += ε·I with ε based on max diagonal magnitude.
+            eprintln!(
+                "[chebfi] Cholesky QR ZPOTRF failed: info={chol_info_val} (n_bands={nb}) — "
+                "regularizing S_sub",
+            );
+            // Download the diagonal of S_sub to estimate regularization strength
+            let mut s_diag: Vec<CudaComplex> = vec![CudaComplex { x: 0.0, y: 0.0 }; nb];
+            let s_sub_cpu: Vec<CudaComplex> = solver.stream().clone_dtoh(&s_sub).map_err(Error::Cuda)?;
+            let max_diag_mag: f64 = (0..nb)
+                .map(|i| s_sub_cpu[i * nb + i].x.abs())
+                .fold(0.0_f64, f64::max);
+            let eps_reg = max_diag_mag * 1e-12_f64;
+            eprintln!(
+                "[chebfi] Cholesky QR regularization: max_diag={:.6e}, eps_reg={:.6e}",
+                max_diag_mag, eps_reg,
+            );
+            // Rebuild S_sub with regularization (download-then-upload is
+            // acceptable since this is an error-recovery path)
+            let mut s_reg: Vec<CudaComplex> = s_sub_cpu.clone();
+            for i in 0..nb {
+                s_reg[i * nb + i].x += eps_reg;
+            }
+            s_sub = stream.clone_htod(&s_reg).map_err(Error::Cuda)?;
+            // Sync user stream before crossing to solver stream
+            stream.synchronize().map_err(Error::Cuda)?;
+            // Retry ZPOTRF
+            chol_info = stream.alloc_zeros(1).map_err(Error::Cuda)?;
+            solver.zpotrf(
+                cudarc::cusolver::sys::cublasFillMode_t::CUBLAS_FILL_MODE_UPPER,
+                nb_i32, &mut s_sub, &mut chol_info,
+            )?;
+            solver.stream().synchronize().map_err(Error::Cuda)?;
+            let info_retry: Vec<i32> = solver.stream().clone_dtoh(&chol_info).map_err(Error::Cuda)?;
+            if info_retry[0] == 0 {
+                eprintln!("[chebfi] Cholesky QR ZPOTRF retry succeeded after regularization");
+                use cudarc::cublas::sys::{
+                    cublasSideMode_t, cublasDiagType_t,
+                    cublasOperation_t,
+                    cublasZtrsm_v2,
+                    cublasFillMode_t as cublas_sys_fill,
+                };
+                let alpha_one = CudaComplex { x: 1.0, y: 0.0 };
+                unsafe {
+                    let (ptr, _) = final_psi_buf.0.device_ptr_mut(stream);
+                    let (s_sub_ptr, _) = s_sub.device_ptr(stream);
+                    cublasZtrsm_v2(
+                        blas.raw_handle(),
+                        cublasSideMode_t::CUBLAS_SIDE_RIGHT,
+                        cublas_sys_fill::CUBLAS_FILL_MODE_UPPER,
+                        cublasOperation_t::CUBLAS_OP_N,
+                        cublasDiagType_t::CUBLAS_DIAG_NON_UNIT,
+                        n_pw_i32, nb_i32,
+                        &alpha_one as *const _ as *const _,
+                        s_sub_ptr as *const _, nb_i32,
+                        ptr as *mut _, n_pw_i32,
+                    ).result().map_err(Error::Blas)?;
+                }
+            } else {
+                eprintln!(
+                    "[chebfi] Cholesky QR ZPOTRF retry also failed: info={} — "
+                    "skipping orthonormalization (rayleigh_ritz will attempt recovery)",
+                    info_retry[0],
+                );
+            }
         }
-        // If ZPOTRF fails (info != 0), vectors are too dependent — skip ortho
-        // and let rayleigh_ritz handle via ZPOTRF+SVD fallback.
     }
 
     // =====================================================================

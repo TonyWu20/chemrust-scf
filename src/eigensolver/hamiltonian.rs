@@ -11,9 +11,6 @@
 
 use std::sync::Arc;
 
-#[cfg(feature = "scf_diag")]
-use std::time::Instant;
-
 use cudarc::cusolver::sys::cublasOperation_t;
 use cudarc::driver::{CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
 
@@ -57,33 +54,6 @@ unsafe fn c2c_forward_inplace(
 // Full Hamiltonian application (T + V_loc on GPU)
 // ---------------------------------------------------------------------------
 
-// ---------------------------------------------------------------------------
-// Profiling support (scf_diag feature)
-// ---------------------------------------------------------------------------
-// Per-operation GPU timings for apply_v_loc_hamiltonian, accumulated into a
-// thread-local so that apply_full_hamiltonian can print a combined summary.
-#[cfg(feature = "scf_diag")]
-mod profile {
-    use std::cell::RefCell;
-
-    /// Per-operation timing record from one apply_v_loc_hamiltonian call.
-    pub(super) struct VLocProfile {
-        pub times: [(&'static str, f64); 7], // (label, seconds)
-        pub total_s: f64,
-        pub n_pw: usize,
-        pub n_bands: usize,
-        pub ngx: usize,
-        pub ngy: usize,
-        pub ngz: usize,
-    }
-
-    thread_local! {
-        pub(super) static V_LOC_PROFILE: RefCell<Option<VLocProfile>> = const { RefCell::new(None) };
-    }
-}
-#[cfg(feature = "scf_diag")]
-use profile::V_LOC_PROFILE;
-
 /// Compute (T + V_loc)|psi> on GPU using FFT-based approach.
 ///
 /// Steps:
@@ -114,20 +84,7 @@ pub(crate) unsafe fn apply_v_loc_hamiltonian(
     stream: &Arc<CudaStream>,
     _blas: Option<&BlasHandle>,
 ) -> Result<(), Error> {
-    // ── Profiling: per-operation GPU timings (scf_diag feature) ──────
-    // Each operation is measured with stream sync before/after to capture
-    // true GPU execution time.  Sync overhead (~50 µs each) is acceptable
-    // for profiling; the feature is off in production builds.
-    #[cfg(feature = "scf_diag")]
-    let mut _p_times: [(&str, f64); 7] = [("", 0.0); 7];
-    #[cfg(feature = "scf_diag")]
-    let _p_total_begin = Instant::now();
-
     // 1. hpsi = kinetic * psi  (T|psi>)
-    #[cfg(feature = "scf_diag")]
-    { stream.synchronize().map_err(Error::Cuda)?; }
-    #[cfg(feature = "scf_diag")]
-    let _t1 = Instant::now();
     unsafe {
         stream
             .launch_builder(&kernels.init_kinetic)
@@ -139,12 +96,8 @@ pub(crate) unsafe fn apply_v_loc_hamiltonian(
             .launch(LaunchConfig::for_num_elems((n_bands * n_pw) as u32))
     }
     .map_err(Error::Cuda)?;
-    #[cfg(feature = "scf_diag")]
-    { stream.synchronize().map_err(Error::Cuda)?; _p_times[0] = ("init_kinetic", _t1.elapsed().as_secs_f64()); }
 
     // 2. Zero grid, then scatter psi to FFT grid positions
-    #[cfg(feature = "scf_diag")]
-    let _t2a = Instant::now();
     unsafe {
         stream
             .launch_builder(&kernels.zero_buffer)
@@ -153,16 +106,12 @@ pub(crate) unsafe fn apply_v_loc_hamiltonian(
             .launch(LaunchConfig::for_num_elems((n_bands * grid_size) as u32))
     }
     .map_err(Error::Cuda)?;
-    #[cfg(feature = "scf_diag")]
-    { stream.synchronize().map_err(Error::Cuda)?; _p_times[1] = ("zero_buffer", _t2a.elapsed().as_secs_f64()); }
 
     // Nyquist: -1 if odd-sized (no Nyquist plane), N/2 if even.
     let nyq_x = if ngx % 2 == 0 { ngx / 2 } else { -1 };
     let nyq_y = if ngy % 2 == 0 { ngy / 2 } else { -1 };
     let nyq_z = if ngz % 2 == 0 { ngz / 2 } else { -1 };
 
-    #[cfg(feature = "scf_diag")]
-    let _t2b = Instant::now();
     unsafe {
         stream
             .launch_builder(&kernels.scatter_pw_to_grid_nyq)
@@ -180,19 +129,11 @@ pub(crate) unsafe fn apply_v_loc_hamiltonian(
             .launch(LaunchConfig::for_num_elems((n_bands * n_pw) as u32))
     }
     .map_err(Error::Cuda)?;
-    #[cfg(feature = "scf_diag")]
-    { stream.synchronize().map_err(Error::Cuda)?; _p_times[2] = ("scatter_pw", _t2b.elapsed().as_secs_f64()); }
 
     // 3. Batched C2C IFFT (in-place)
-    #[cfg(feature = "scf_diag")]
-    let _t3 = Instant::now();
     unsafe { c2c_inverse_inplace(fft_plan, grid_dev)?; }
-    #[cfg(feature = "scf_diag")]
-    { stream.synchronize().map_err(Error::Cuda)?; _p_times[3] = ("cuFFT IFFT", _t3.elapsed().as_secs_f64()); }
 
     // 4. V_eff multiply: grid *= V_eff
-    #[cfg(feature = "scf_diag")]
-    let _t4 = Instant::now();
     unsafe {
         stream
             .launch_builder(&kernels.veff_multiply)
@@ -203,20 +144,12 @@ pub(crate) unsafe fn apply_v_loc_hamiltonian(
             .launch(LaunchConfig::for_num_elems((n_bands * grid_size) as u32))
     }
     .map_err(Error::Cuda)?;
-    #[cfg(feature = "scf_diag")]
-    { stream.synchronize().map_err(Error::Cuda)?; _p_times[4] = ("veff_multiply", _t4.elapsed().as_secs_f64()); }
 
     // 5. Batched C2C FFT (in-place)
-    #[cfg(feature = "scf_diag")]
-    let _t5 = Instant::now();
     unsafe { c2c_forward_inplace(fft_plan, grid_dev)?; }
-    #[cfg(feature = "scf_diag")]
-    { stream.synchronize().map_err(Error::Cuda)?; _p_times[5] = ("cuFFT FFT", _t5.elapsed().as_secs_f64()); }
 
     // 6. Gather: hpsi += grid / N_total
     // grid is const (read-only), hpsi is mutable (read-write for accumulation)
-    #[cfg(feature = "scf_diag")]
-    let _t6 = Instant::now();
     unsafe {
         stream
             .launch_builder(&kernels.gather_add_kinetic)
@@ -230,24 +163,6 @@ pub(crate) unsafe fn apply_v_loc_hamiltonian(
             .launch(LaunchConfig::for_num_elems((n_bands * n_pw) as u32))
     }
     .map_err(Error::Cuda)?;
-    #[cfg(feature = "scf_diag")]
-    {
-        stream.synchronize().map_err(Error::Cuda)?;
-        _p_times[6] = ("gather_add", _t6.elapsed().as_secs_f64());
-        let vloc_total = _p_total_begin.elapsed().as_secs_f64();
-        // Store timings in thread-local for apply_full_hamiltonian to print
-        V_LOC_PROFILE.with(|cell| {
-            cell.replace(Some(profile::VLocProfile {
-                times: _p_times,
-                total_s: vloc_total,
-                n_pw: n_pw as usize,
-                n_bands: n_bands as usize,
-                ngx: ngx as usize,
-                ngy: ngy as usize,
-                ngz: ngz as usize,
-            }));
-        });
-    }
     Ok(())
 }
 
@@ -274,9 +189,6 @@ pub unsafe fn apply_full_hamiltonian(
     stream: &Arc<CudaStream>,
     mut maybe_beta_phi_cache: Option<&mut BetaPhiCache>,
 ) -> Result<(), Error> {
-    #[cfg(feature = "scf_diag")]
-    let _p_h_total_begin = Instant::now();
-
     unsafe {
         apply_v_loc_hamiltonian()
             .psi_dev(psi_dev)
@@ -298,8 +210,6 @@ pub unsafe fn apply_full_hamiltonian(
             .maybe_blas(Some(blas))
             .call()?;
 
-    #[cfg(feature = "scf_diag")]
-    let _p_vnl_begin = Instant::now();
     {
         // bon::builder unwraps Option<T> — the setter takes T, not Option<T>.
         // Conditionally attach the cache so the default (None) is used when
@@ -320,51 +230,6 @@ pub unsafe fn apply_full_hamiltonian(
         }
     }
 
-    #[cfg(feature = "scf_diag")]
-    {
-        stream.synchronize().map_err(Error::Cuda)?;
-        let vnl_elapsed = _p_vnl_begin.elapsed().as_secs_f64();
-        let h_total = _p_h_total_begin.elapsed().as_secs_f64();
-
-        // Print combined V_loc + V_NL profile
-        V_LOC_PROFILE.with(|cell| {
-            if let Some(ref p) = *cell.borrow() {
-                eprintln!(
-                    "[profile-Hpsi] ===== H·psi (npw={} nbands={} grid={}x{}x{}) =====",
-                    p.n_pw, p.n_bands, p.ngx, p.ngy, p.ngz,
-                );
-                let mut vloc_sum = 0.0f64;
-                for &(label, secs) in &p.times {
-                    let ms = secs * 1000.0;
-                    let pct = if p.total_s > 0.0 { 100.0 * secs / p.total_s } else { 0.0 };
-                    eprintln!("[profile-Hpsi]   {:<20} {:>8.1} ms  ({:>5.1}%)",
-                        label, ms, pct);
-                    vloc_sum += secs;
-                }
-                let vloc_ms = vloc_sum * 1000.0;
-                let vnl_ms = vnl_elapsed * 1000.0;
-                let total_ms = h_total * 1000.0;
-                eprintln!("[profile-Hpsi]   {:-<20} {:->8.1} ms", "", vloc_ms);
-                eprintln!("[profile-Hpsi]   {:<20} {:>8.1} ms  (V_NL cuBLAS)", "V_NL", vnl_ms);
-                eprintln!("[profile-Hpsi]   {:=<20} {:=>8.1} ms  total", "", total_ms);
-                // FFT fraction — key metric for grid-decomposition decision
-                let fft_frac = if h_total > 0.0 {
-                    (p.times[3].1 + p.times[5].1) / h_total
-                } else {
-                    0.0
-                };
-                eprintln!(
-                    "[profile-Hpsi]   FFT fraction: {:.1}% {}",
-                    fft_frac * 100.0,
-                    if fft_frac > 0.6 { "→ grid decomposition justified" }
-                    else if fft_frac > 0.4 { "→ FFT + V_NL both significant" }
-                    else { "→ V_NL dominates; optimize cuBLAS path" },
-                );
-            }
-        });
-    }
-
-    // Diag: |hpsi|² for last band after full H — (scf_diag: API needs DevicePtr + cublas)
     }
     Ok(())
 }
@@ -420,11 +285,6 @@ pub(crate) unsafe fn apply_v_nl_hamiltonian(
         .as_ref()
         .map(|c| c.are_all_valid())
         .unwrap_or(false);
-
-    #[cfg(feature = "scf_diag")]
-    if cache_all_valid {
-        eprintln!("[profile-Hpsi]   BetaPhiCache HIT — skipping β^H·ψ ZGEMM");
-    }
 
     for (ion_idx, entry) in vnl_data.entries.iter().enumerate() {
         let ne = entry.n_expanded;
