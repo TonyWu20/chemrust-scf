@@ -2636,35 +2636,57 @@ pub(crate) unsafe fn s_orthogonalise(
     }
 
     // Step 3: search -= super_wvfn * overlap via ZGEMM
-    // alpha=-1 directly — safe because build() syncs after this function.
+    // Negate overlap: overlap *= -1
+    unsafe {
+        let alpha = CudaComplex { x: -1.0, y: 0.0 };
+        cublasZscal_v2(
+            handle,
+            (superspace_index * ncol) as i32,
+            &alpha as *const _ as *const _,
+            overlap_dev.device_ptr_mut(stream).0 as *mut _,
+            1,
+        ).result().map_err(Error::Blas)?;
+    }
     unsafe {
         blas.gemm_c64(
             ZgemmConfig {
-                transa: op::N,
-                transb: op::N,
-                m: n_pw_i32, n: ncol as i32, k: superspace_index as i32,
-                alpha: CudaComplex { x: -1.0, y: 0.0 },
-                lda: n_pw_i32, ldb: superspace_index as i32,
+                transa: op::N,   // super_wvfn
+                transb: op::N,   // -overlap
+                m: n_pw_i32,
+                n: ncol as i32,
+                k: superspace_index as i32,
+                alpha: CudaComplex { x: 1.0, y: 0.0 },
+                lda: n_pw_i32,
+                ldb: superspace_index as i32,
                 beta: CudaComplex { x: 1.0, y: 0.0 },
                 ldc: n_pw_i32,
             },
-            super_wvfn, &overlap_dev, search_dev,
+            super_wvfn,
+            &overlap_dev,
+            search_dev,
         )?;
     }
 
     // Step 4 (ADR-0005): hsearch -= hpsi_ref * overlap (lockstep transform).
+    // Reuses the same (negated) overlap coefficients from Step 3.
     if let (Some(hpsi_search), Some(hpsi_ref_val)) = (hpsi_dev, hpsi_ref) {
         unsafe {
             blas.gemm_c64(
                 ZgemmConfig {
-                    transa: op::N, transb: op::N,
-                    m: n_pw_i32, n: ncol as i32, k: superspace_index as i32,
-                    alpha: CudaComplex { x: -1.0, y: 0.0 },
-                    lda: n_pw_i32, ldb: superspace_index as i32,
+                    transa: op::N,   // hpsi_ref
+                    transb: op::N,   // -overlap
+                    m: n_pw_i32,
+                    n: ncol as i32,
+                    k: superspace_index as i32,
+                    alpha: CudaComplex { x: 1.0, y: 0.0 },
+                    lda: n_pw_i32,
+                    ldb: superspace_index as i32,
                     beta: CudaComplex { x: 1.0, y: 0.0 },
                     ldc: n_pw_i32,
                 },
-                hpsi_ref_val, &overlap_dev, hpsi_search,
+                hpsi_ref_val,
+                &overlap_dev,
+                hpsi_search,
             )?;
         }
     }
