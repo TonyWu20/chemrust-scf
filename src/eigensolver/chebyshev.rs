@@ -2686,6 +2686,10 @@ pub fn chebfi_run_rust(
         //
         // chebfi_ampfactor operates on CPU slices (f64, real-only).
         // Each CudaComplex = 2 consecutive f64s, so total_spacedim = 2*n_pw.
+        // Must sync before D2H: cudarc 0.19.7 clone_dtoh is async.
+        // For Cu111_CO (160 bands, 60067 PW), 3×153 MB downloads without
+        // sync → ampfactor scales garbage → ZHEGVD info=159/160.
+        stream.synchronize().map_err(Error::Cuda)?;
 
         // Download x_curr as Vec<CudaComplex>, re-interpret as &mut [f64]
         let x_cplx: Vec<CudaComplex> = stream.clone_dtoh(&x_curr.0).map_err(Error::Cuda)?;
