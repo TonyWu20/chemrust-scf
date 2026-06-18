@@ -1245,8 +1245,7 @@ pub(crate) unsafe fn davidson_diagonalise(
                 eigenvalues[n_bands - 1]
             );
 
-        // ---- D1: S-norm diagnostic (gated — CUDA_LAUNCH_BLOCKING investigation) ----
-        #[cfg(feature = "scf_diag")]
+        // ---- D1: S-norm diagnostic after A1 full-subspace ZHEGVD ----
         {
             let mut s_in = PwCoefficients::new(
                 stream.alloc_zeros(n_pw).map_err(Error::Cuda)?);
@@ -2058,8 +2057,7 @@ pub(crate) unsafe fn davidson_diagonalise(
             // end.  This avoids conduction states from one block corrupting
             // the ZHEEVD eigenvalue ordering of the next block.
 
-            // ---- D2: S-norm diagnostic (gated — CUDA_LAUNCH_BLOCKING investigation) ----
-            #[cfg(feature = "scf_diag")]
+            // ---- D2: S-norm diagnostic after block 0 inner loop ----
             if block_start == 0 {
                 // Reuse the D1 buffer pattern but check only the block columns
                 let mut s_in = PwCoefficients::new(
@@ -2145,11 +2143,9 @@ pub(crate) unsafe fn davidson_diagonalise(
     }
 
     // ------------------------------------------------------------------
-    // Diagnostics: compute S⁻¹-weighted residual norms (gated — investigation)
+    // Diagnostics: compute S⁻¹-weighted residual norms
     // ------------------------------------------------------------------
     let residual_norms_values: Vec<f64> = {
-        #[cfg(feature = "scf_diag")]
-        {
         // --- Compute S·ψ for residual (USPP: S ≠ I) ---
         // r_b = Hψ_b − λ_b·(Sψ)_b  (not Hψ_b − λ_b·ψ_b)
         // Using ψ instead of Sψ inflates residuals for ultrasoft
@@ -2230,11 +2226,6 @@ pub(crate) unsafe fn davidson_diagonalise(
             norms.push(dot.x.sqrt());
         }
         norms
-        }
-        #[cfg(not(feature = "scf_diag"))]
-        {
-            vec![0.0_f64; n_bands]
-        }
     };
 
     // ------------------------------------------------------------------
