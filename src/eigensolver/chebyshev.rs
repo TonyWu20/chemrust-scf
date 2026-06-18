@@ -2763,8 +2763,25 @@ pub fn chebfi_run_rust(
                 lda: n_pw_i32, ldb: n_pw_i32, ldc: nb_i32,
                 beta: CudaComplex { x: 0.0, y: 0.0 },
             }, &**final_psi_buf, &*spsi_dev, &mut s_sub)?;
+
+        // Diagnostic: check S_sub corner after GEMM
+        {
+            stream.synchronize().map_err(Error::Cuda)?;
+            let s_sub_cpu: Vec<CudaComplex> = stream.clone_dtoh(&s_sub).map_err(Error::Cuda)?;
+            let nb = n_bands;
+            eprintln!("[chebfi] Phase 6 S_sub[0..3,0..3] after GEMM: [{:.6e}+{:.6e}i, {:.6e}+{:.6e}i, {:.6e}+{:.6e}i]",
+                s_sub_cpu[0*nb+0].x, s_sub_cpu[0*nb+0].y,
+                s_sub_cpu[0*nb+1].x, s_sub_cpu[0*nb+1].y,
+                s_sub_cpu[0*nb+2].x, s_sub_cpu[0*nb+2].y,
+            );
+            eprintln!("[chebfi] Phase 6 S_sub diag[0,1,2,3] after GEMM: {:.6e}+{:.6e}i, {:.6e}+{:.6e}i, {:.6e}+{:.6e}i, {:.6e}+{:.6e}i",
+                s_sub_cpu[0*nb+0].x, s_sub_cpu[0*nb+0].y,
+                s_sub_cpu[1*nb+1].x, s_sub_cpu[1*nb+1].y,
+                s_sub_cpu[2*nb+2].x, s_sub_cpu[2*nb+2].y,
+                s_sub_cpu[3*nb+3].x, s_sub_cpu[3*nb+3].y,
+            );
         }
-        // ZPOTRF → R (Cholesky factor, upper triangular, in-place)
+        }
         // CRITICAL: sync user stream before crossing to solver stream.
         // The GEMM that wrote s_sub ran on blas's stream; ZPOTRF runs on
         // solver's stream. Without this barrier, ZPOTRF may read stale data.
