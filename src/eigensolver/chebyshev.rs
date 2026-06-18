@@ -2678,23 +2678,28 @@ pub fn chebfi_run_rust(
         // ------------------------------------------------------------
         // Step 4: Chebyshev ampfactor normalisation (ABINIT lines 958–1006)
         // ------------------------------------------------------------
-        // Ampfactor: scale x_curr columns by 1/T_n(ε_b).  GPU-resident:
-        // compute factors on CPU (n_bands doubles), upload, launch kernel.
-        // HX/SX are recomputed fresh in Phase 8 — only X needs scaling.
+        // Ampfactor: scale x_curr columns by 1/T_n(ε_b).  Factors computed
+        // on CPU (n_bands doubles), applied via cublasZscal per band.
+        // No upload — GPU buffer stays resident.
         {
-            let amp_factors: Vec<f64> = ndeg_filter_bands.iter().zip(ritz_values.iter())
+            let inv_amp: Vec<f64> = ndeg_filter_bands.iter().zip(ritz_values.iter())
                 .map(|(&ndeg, &eig)| {
                     let raw = cheb_poly1(eig, ndeg, lambda_minus, lambda_plus);
-                    if raw.abs() < 1e-3 { 1e-3 } else { raw }
+                    1.0 / if raw.abs() < 1e-3 { 1e-3 } else { raw }
                 })
                 .collect();
-            let inv_amp: Vec<f64> = amp_factors.iter().map(|&a| 1.0 / a).collect();
-            let inv_amp_dev: CudaSlice<f64> = stream.clone_htod(&inv_amp).map_err(Error::Cuda)?;
-            unsafe {
-                stream.launch_builder(&kernels.scale_cols_by_eig)
-                    .arg(&mut x_curr.0).arg(&inv_amp_dev).arg(&n_pw).arg(&n_bands)
-                    .launch(LaunchConfig::for_num_elems(n_elem as u32))
-            }.map_err(Error::Cuda)?;
+            for b in 0..n_bands {
+                if ndeg_filter_bands[b] == 0 { continue; }
+                let alpha = CudaComplex { x: inv_amp[b], y: 0.0 };
+                unsafe {
+                    let (ptr, _) = x_curr.0.device_ptr_mut(stream);
+                    let col_ptr = (ptr as *mut CudaComplex).add(b * n_pw) as *mut _;
+                    cudarc::cublas::sys::cublasZscal_v2(
+                        blas.raw_handle(), n_pw_i32,
+                        &alpha as *const _ as *const _, col_ptr, 1,
+                    ).result().map_err(Error::Blas)?;
+                }
+            }
         }
 
         final_psi_buf = &mut x_curr;
