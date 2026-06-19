@@ -2457,9 +2457,13 @@ pub fn chebfi_run_rust(
     let (ndeg_filter_global, ndeg_filter_bands) = if oracle == 0 {
         let deg = ndeg_filter_max.min(ndeg_oracle);
         let mut bands = vec![deg; n_bands];
-        // Lock converged bands (ABINIT: bands with residual < tolerance get ndeg=0
-        // regardless of oracle mode). Without this, already-converged bands get
-        // unnecessarily filtered, producing near-linearly-dependent vectors.
+        // Lock converged bands — DIVERGENCE from ABINIT oracle=0.
+        // ABINIT's oracle=0 broadcasts the same scalar ndeg to ALL bands
+        // (m_chebfi2.F90:626,630). Our pipeline requires locking because
+        // the Woodbury S⁻¹ + Cholesky QR combination is less robust against
+        // near-linear-dependence than ABINIT's getAX_BX-inside-loop +
+        // matrix-free RR pipeline. Without locking, filtering already-converged
+        // bands produces S_sub off-diagonals ≈ 0.999 → ZPOTRF/ZHEEVD failure.
         let n_locked = (0..n_bands).filter(|&b| bands[b] > 0 && fresh_residuals[b] < tolerance).count();
         if n_locked > 0 {
             for b in 0..n_bands {
