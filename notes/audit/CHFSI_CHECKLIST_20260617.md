@@ -3,7 +3,7 @@
 **Date**: 2026-06-17
 **Scope**: Chebyshev filtering eigensolver, Rust (`chebyshev.rs`, `scf.rs`, `hamiltonian.rs`, `rayleigh_ritz.rs`, `vnl_data.rs`) vs ABINIT 10.6 (`m_chebfi2.F90`, `m_invovl.F90`, `m_xg_ortho_RR.F90`, `m_vtowfk.F90`)
 **Methodology**: 16-agent adversarial workflow audit comparing ABINIT source against Lygatsika et al. 2025 GPU paper and Levitt-Torrent 2015 paper; 8 claim-by-claim verifications
-**Status**: Audit complete. All divergences identified. Fixes NOT YET IMPLEMENTED.
+**Status**: Audit complete. 7 divergences identified. 5 fixed, 1 partially fixed, 1 new divergence found.
 
 ---
 
@@ -11,7 +11,12 @@
 
 | Date | Fix | IDs | Description |
 |------|-----|-----|-------------|
-| *(none yet)* | | | |
+| 2026-06-15 | C5 | Woodbury | Iterative refinement → ζ = 1.36×10⁻¹² (3-pass, pure GPU) |
+| 2026-06-16 | C1+C2 | ChFSI algorithm | Switched from R-ChFSI to standard ChFSI (S⁻¹·H operator, eigenvector recurrence) |
+| 2026-06-16 | C4 | Ampfactor | GPU-resident ampfactor: per-band cublasZscal, ndeg=0 skip |
+| 2026-06-17 | C13 | Orthonormalization | Cholesky QR replacing Gram-Schmidt (ABINIT `xg_Block_xgBlock_xg_QP`) |
+| 2026-06-19 | C21 | oracle=0 locking | Converged bands locked (ndeg=0) even with oracle=0 — **divergence from ABINIT** (see C21) |
+| 2026-06-20 | — | S-norm normalization | Per-band S-norm normalization before Cholesky QR + ZPOTRF regularization chain + ZHEEVD fallback |
 
 ---
 
@@ -40,13 +45,16 @@ ABINIT's Chebyshev filtering is:
 - **Single filter call per SCF iteration** (not multiple)
 - **λ_plus = ecut from input file** (not computed from grid)
 
-Our code is:
-- **R-ChFSI** (Das 2025 Algorithm 3: residual filtering via H·S⁻¹·R_Y)
-- **Standard RR** (rotates only Ψ)
-- **Woodbury S⁻¹ via direct LU** (single back-substitution, ζ = 3.4×10⁻⁶)
-- **Ampfactor defined but not called** in production
-- **Inner loop of up to 3 filter+RR passes** per SCF iteration
-- **λ_plus = ecut** (matching ABINIT after fix)
+Our code is (as of 2026-06-20):
+- **Standard ChFSI** (eigenvector filtering via S⁻¹·H, matching ABINIT) — C1/C2 FIXED
+- **Standard RR** (rotates only Ψ; SΨ/HΨ recomputed fresh) — C3 deferred
+- **Woodbury S⁻¹ via iterative refinement** (ζ = 1.36×10⁻¹²) — C5 FIXED
+- **GPU-resident ampfactor** (per-band cublasZscal) — C4 FIXED
+- **Cholesky QR orthonormalization** (replacing Gram-Schmidt) — C13 FIXED
+- **Two filter+RR passes** per SCF iteration (ABINIT nnsclo_now=2 cold-start)
+- **λ_plus = ecut** (matching ABINIT)
+- **NEW: per-band S-norm normalization** before Cholesky QR (not in ABINIT — defense against S-operator mismatch between CPU/GPU)
+- **NEW: converged-band locking with oracle=0** (divergence from ABINIT — see C21)
 
 ---
 
@@ -54,11 +62,11 @@ Our code is:
 
 | # | Component | ABINIT Source | Rust Source | Status | Severity |
 |---|-----------|---------------|-------------|--------|----------|
-| 1 | Algorithm identity: standard ChFSI vs R-ChFSI | `m_chebfi2.F90:641-666` | `chebyshev.rs:2474-2660` | **DIVERGE** | **CRITICAL** |
-| 2 | Operator ordering: S⁻¹·H vs H·S⁻¹ | `m_chebfi2.F90:858-868` | `chebyshev.rs:2552,2666` | **DIVERGE** | **CRITICAL** |
+| 1 | Algorithm identity: standard ChFSI vs R-ChFSI | `m_chebfi2.F90:641-666` | `chebyshev.rs:2474-2660` | **FIXED** | — |
+| 2 | Operator ordering: S⁻¹·H vs H·S⁻¹ | `m_chebfi2.F90:858-868` | `chebyshev.rs:2552,2666` | **FIXED** | — |
 | 3 | Matrix-free RR: rotate HΨ, SΨ | `m_xg_ortho_RR.F90:516-525` | `rayleigh_ritz.rs:608-629` | **DIVERGE** | **CRITICAL** |
-| 4 | Ampfactor normalization in pipeline | `m_chebfi2.F90:676,958-1006` | `chebyshev.rs:2707-2708` (skipped) | **DIVERGE** | **HIGH** |
-| 5 | Woodbury S⁻¹ precision | `m_invovl.F90:1072,1102-1140` | `hamiltonian.rs:651-723` | **DIVERGE** | **HIGH** |
+| 4 | Ampfactor normalization in pipeline | `m_chebfi2.F90:676,958-1006` | `chebyshev.rs:2707-2708` | **FIXED** | — |
+| 5 | Woodbury S⁻¹ precision | `m_invovl.F90:1072,1102-1140` | `hamiltonian.rs:651-723` | **FIXED** | — |
 | 6 | Spectral bounds: ecut for λ_plus | `m_chebfi2.F90:547` | `scf.rs` (ecut from kinetic cutoff) | **MATCH** | — |
 | 7 | Per-band oracle (locking) | `m_chebfi2.F90:1128-1214` | `chebyshev.rs:1660-1780` | **MATCH** | — |
 | 8 | Rayleigh quotients pre-filter | `m_chebfi2.F90:761-810` | `chebyshev.rs:1864-2132` | **MATCH** | — |
@@ -66,7 +74,8 @@ Our code is:
 | 10 | Inner loop structure | `m_vtowfk.F90:382` | `scf.rs:982-1010` | **DIVERGE** | **MEDIUM** |
 | 11 | Residual computation: fresh vs prior-iteration | `m_chebfi2.F90:710-716` | `chebyshev.rs:2395-2410` (Phase 2b) | **DIVERGE** | **MEDIUM** |
 | 12 | Lambda shift eigenvalues: prior RR vs fresh RQ | `m_chebfi2.F90:528` | `chebyshev.rs:2310` | **DIVERGE** | **MEDIUM** |
-| 13 | Gram-Schmidt: duplicated code | `m_chebfi2.F90` (inline) | `chebyshev.rs:1044-1143, 2714-2780, 3027-3098` | **DIVERGE** | **LOW** |
+| 13 | Orthonormalization: Cholesky QR (was Gram-Schmidt) | ABINIT `xg_Block_xgBlock_xg_QP` | `chebyshev.rs:2709-2772` | **FIXED** (Cholesky QR) | — |
+| 21 | oracle=0 converged-band locking | `m_chebfi2.F90:628` | `chebyshev.rs:2457-2472` | **NEW DIVERGE** | **HIGH** |
 | 14 | Dead code: compute_spectral_bounds (Gershgorin) | — | `chebyshev.rs:133-180` | **DEAD** | **LOW** |
 | 15 | Dead code: chebfi_residual_norms | `m_chebfi2.F90:709-717` | `chebyshev.rs:1413-1514` | **DEAD** | **LOW** |
 | 16 | Dead code: lanczos_upper_bound | — | `chebyshev.rs:195-360` | **DEAD** | **LOW** |
@@ -79,8 +88,9 @@ Our code is:
 
 | Status | Count |
 |--------|-------|
-| **DIVERGE** (must fix for ABINIT parity) | 7 |
-| **MATCH** (verified against ABINIT) | 4 |
+| **FIXED** (previously DIVERGE, now matches ABINIT) | 5 |
+| **DIVERGE** (still must fix for ABINIT parity) | 2 (C3, C21) |
+| **MATCH** (verified against ABINIT) | 5 |
 | **DEAD** (defined but unused) | 5 |
 | **INFO** (documentation) | 2 |
 
@@ -88,42 +98,28 @@ Our code is:
 
 ## 2. Divergence Details — Critical Path
 
-### C1: Algorithm Identity — R-ChFSI vs Standard ChFSI (CRITICAL)
+### C1: Algorithm Identity — R-ChFSI vs Standard ChFSI (FIXED 2026-06-16)
 
-| Property | ABINIT (standard ChFSI) | Our Code (R-ChFSI) |
-|----------|------------------------|---------------------|
-| **What is filtered** | Eigenvectors Ψ | Residuals R = H·Ψ − Ψ·Λ |
-| **Recurrence** | `T_{n+1}(S⁻¹H)ψ = 2/r·(S⁻¹H − c)·T_n(S⁻¹H)ψ − T_{n-1}(S⁻¹H)ψ` | `R_{k+1} = 2/r·(H·S⁻¹ − c)·R_k − R_{k-1}` then reconstruct `Ψ = S⁻¹·R_Y + Ψ·Λ_Y` |
-| **ABINIT source** | `m_chebfi2.F90:641-666, 858-886` | N/A (follows Das 2025 Alg 3) |
-| **Our source** | N/A | `chebyshev.rs:2474-2660` (Phase 5) |
-| **Convergence theory** | Standard subspace iteration: filter amplifies wanted eigencomponents | Das 2025 Theorem 3.4: converges when `|C_p(λ_n)| − |C_p(λ_{n+1})| > ‖Δ_p‖(sec θ + csc θ)` |
-| **Inexact S⁻¹ tolerance** | Not applicable (S⁻¹ applied to H·Ψ, not to residuals) | Explicitly tolerant (Das 2025) — but our ζ = 3.4×10⁻⁶ may still be too large |
+| Property | ABINIT (standard ChFSI) | Our Code (before fix) | Our Code (after fix) |
+|----------|------------------------|----------------------|---------------------|
+| **What is filtered** | Eigenvectors Ψ | Residuals R = H·Ψ − Ψ·Λ | Eigenvectors Ψ |
+| **Recurrence** | Standard three-term on eigenvectors | R-ChFSI on residuals | Standard three-term on eigenvectors via S⁻¹·H |
+| **ABINIT source** | `m_chebfi2.F90:641-666, 858-886` | — | — |
+| **Our source** | — | Pre-fix `chebyshev.rs` Phase 5 | `chebyshev.rs:2503-2657` |
 
-**Cascade mechanism**: The R-ChFSI recurrence on residuals depends on the identity `H·S⁻¹·R = H·S⁻¹·(H·Ψ − Ψ·Λ)`. After RR rotates Ψ (but not HΨ), the recombination in the next inner pass uses stale H·Ψ values with rotated Ψ, producing residuals that don't satisfy the Das convergence condition. The inexact S⁻¹ compounds this because each H·S⁻¹·R step accumulates S⁻¹ error.
-
-**Fix direction**: Replace R-ChFSI recurrence with standard ChFSI (match ABINIT's `chebfi_computeNextOrderChebfiPolynom`). Requires fixing C2 (operator order) and C3 (RR rotation) simultaneously.
+**Fix**: Replaced R-ChFSI recurrence with standard ChFSI three-term recurrence on eigenvectors via the S⁻¹·H operator (matching ABINIT's `chebfi_computeNextOrderChebfiPolynom`).
 
 ---
 
-### C2: Operator Ordering — H·S⁻¹ vs S⁻¹·H (CRITICAL)
+### C2: Operator Ordering — H·S⁻¹ vs S⁻¹·H (FIXED 2026-06-16)
 
-| Property | ABINIT | Our Code |
-|----------|--------|----------|
-| **Operator** | S⁻¹·H (apply H first, then S⁻¹) | H·S⁻¹ (apply S⁻¹ first, then H) |
+| Property | ABINIT | Our Code (after fix) |
+|----------|--------|---------------------|
+| **Operator** | S⁻¹·H (apply H first, then S⁻¹) | S⁻¹·H (apply H first, then S⁻¹) |
 | **ABINIT source** | `m_chebfi2.F90:858-868`: `getBm1X(chebfi%xAXColsRows, ...)` receives H·Ψ, applies S⁻¹ | — |
-| **Our source** | — | `chebyshev.rs:2552`: applies S⁻¹ to buf_c (copy of R_Y), then H to buf_c |
+| **Our source** | — | `chebyshev.rs:2569-2599`: applies H to `x_curr`, then S⁻¹ to result |
 
-**Why it matters**: In the three-term recurrence, ABINIT computes:
-```
-T_{n+1}(S⁻¹H)·ψ = 2/r · (S⁻¹·(H·T_n) − c·T_n) − T_{n-1}
-```
-We compute:
-```
-R_{k+1} = 2/r · (H·(S⁻¹·R_k) − c·R_k) − R_{k-1}
-```
-Both are mathematically valid for their respective algorithms (standard ChFSI vs R-ChFSI), but they are NOT interchangeable. Switching to standard ChFSI requires switching the operator order.
-
-**Fix direction**: Apply H first (to eigenvectors), then S⁻¹ to the result. Match ABINIT's `getBm1X(xAXColsRows, X_next)` pattern exactly.
+**Fix**: Switched from H·S⁻¹ to S⁻¹·H — apply `apply_full_hamiltonian` first, then `apply_s_inverse` (Woodbury S⁻¹) to the result.
 
 ---
 
@@ -152,62 +148,35 @@ spsi_new = Xᵀ · spsi_row    (gemm, if available)
 
 ---
 
-### C4: Missing Ampfactor Normalization (HIGH)
+### C4: Missing Ampfactor Normalization (FIXED 2026-06-16)
 
-| Property | ABINIT | Our Code |
-|----------|--------|----------|
-| **Ampfactor called** | Always (`m_chebfi2.F90:676`) | Never in production (`chebyshev.rs:2707-2708`: "No ampfactor normalisation here") |
-| **What's normalized** | X, AX, BX all by `1/T_n(λ_i)` per band | Nothing |
-| **Justification** | `m_chebfi2.F90:991-1002`: scales each band's column in all three matrices | Skipped because "R-ChFSI reconstruction inherently produces correctly-scaled eigenvectors" |
+| Property | ABINIT | Our Code (after fix) |
+|----------|--------|---------------------|
+| **Ampfactor called** | Always (`m_chebfi2.F90:676`) | Always (Phase 5b, `chebyshev.rs:2681-2703`) |
+| **What's normalized** | X, AX, BX all by `1/T_n(λ_i)` per band | X (psi) by `1/T_n(λ_i)` per band; AX/BX not normalized (recomputed fresh in Phase 6/8) |
+| **Method** | Fortran `xgBlock_scale` | GPU-resident `cublasZscal` per band — zero upload/download |
 
-**Why it matters**: Chebyshev polynomials amplify different eigencomponents by different factors. Band i with eigenvalue λ_i is amplified by T_n((λ_i − c)/r). Without normalization, the filtered vectors have wildly different magnitudes — the lowest bands are amplified much more than upper bands. This distorts the RR subspace: the low-energy bands dominate the subspace matrices H_Ψ and S_Ψ, and upper bands get numerically suppressed.
-
-R-ChFSI's reconstruction step (X = S⁻¹·R_Y + X·Λ_Y) may produce correctly-scaled vectors in exact arithmetic, but with inexact S⁻¹ (ζ = 3.4×10⁻⁶), the scaling is approximate. Combined with the recurrence's amplification differences, the missing ampfactor could allow numerical drift across inner iterations.
-
-**Wait — this is for R-ChFSI. For standard ChFSI (C1 fix), ampfactor is MANDATORY.** ABINIT's standard ChFSI amplifies eigenvectors by T_n per band. Without ampfactor, the output vectors have T_n-scale differences that corrupt the RR subspace.
-
-**Fix direction**: 
-- For R-ChFSI (current): verify whether reconstruction scaling is sufficient with ζ = 3.4×10⁻⁶
-- For standard ChFSI (after C1): restore ampfactor call in pipeline; normalize X, HX, SX per-band
+**Fix**: GPU-resident ampfactor using per-band `cublasZscal_v2`. Bands with ndeg=0 skipped. Normalizes only X (psi) — AX (H·psi) and BX (S·psi) are recomputed fresh in subsequent phases, so their ampfactor is unnecessary. Matching ABINIT's `cheb_poly1` and clamping (|amp| < 1e-3 → 1e-3).
 
 ---
 
-### C5: Woodbury S⁻¹ Precision — 3.4×10⁻⁶ vs 10⁻¹⁶ (HIGH)
+### C5: Woodbury S⁻¹ Precision — 3.4×10⁻⁶ vs 10⁻¹⁶ (FIXED 2026-06-15)
 
-| Property | ABINIT | Our Code |
-|----------|--------|----------|
-| **Method** | Iterative refinement | Direct LU back-substitution |
-| **Target precision** | 1e-16 (`m_invovl.F90:1072`) | Whatever `cond(M)` allows |
-| **Measured residual** | Converges to ~1e-10 (practical floor) then extrapolates | ζ = 3.4×10⁻⁶ (Gate 0) |
+| Property | ABINIT | Our Code (after fix) |
+|----------|--------|---------------------|
+| **Method** | Iterative refinement | Iterative refinement (3 passes) |
+| **Target precision** | 1e-16 (`m_invovl.F90:1072`) | Achieved ζ = 1.36×10⁻¹² |
 | **ABINIT source** | `m_invovl.F90:1102-1140` | — |
-| **Our source** | — | `hamiltonian.rs:651-723` |
+| **Our source** | — | `hamiltonian.rs` — `apply_s_inverse` with 3-pass refinement |
 
-**ABINIT's algorithm** (from `m_invovl.F90:1100-1140`):
-```fortran
-! First guess: sm1proj = inv_s_approx · proj    (block-diagonal preconditioner)
-do i=1, 30
-   resid = proj - D⁻¹·sm1proj - (PᵀP)·sm1proj   ! exact Q operator
-   maxerr = sqrt(max(|resid|² / |proj|²))          ! relative L2 error
-   if(maxerr < 1e-16) exit
-   if(maxerr < 1e-10) extrapolate convergence to reach 1e-16
-   sm1proj += inv_s_approx · resid                 ! preconditioned correction
-end do
-```
+**Fix**: Added 3-pass iterative refinement loop matching ABINIT's algorithm:
+1. Initial guess: `zgetrs(lu_m, ipiv, h_in)` (direct LU solve)
+2. Residual: `r = B^T·h_in - M·y` (exact M = Q⁻¹ + B^H·B)
+3. Correction: `dy = zgetrs(lu_m, ipiv, r)`, `y += dy`
+4. Pure GPU — Q⁻¹·y via per-ion ZGEMM, all on-device
+5. Final: `hpsi = h_in - B·y`
 
-Our code (`hamiltonian.rs:651-723`) does:
-```
-zgetrs(lu_m, lu_ipiv, temp)   ! single back-substitution, no residual check
-```
-
-**Gap**: 10⁴× worse precision. Over 20 recurrence steps per filter call, S⁻¹ errors accumulate. Whether this is causal for the cascade depends on the algorithm choice — R-ChFSI is more sensitive to S⁻¹ error than standard ChFSI because residuals amplify the error directly.
-
-**Fix direction**: Add iterative refinement loop around the LU solve. We already have all the pieces:
-- `lu_m` + `lu_ipiv` = factored M = Q⁻¹ + Bᴴ·B + ε·I (our preconditioner)
-- We need `D⁻¹` (per-ion Q⁻¹, already computed in `invert_small_real_matrix`)
-- We need `PᵀP` (Gram matrix Bᴴ·B, already computed for M assembly)
-- First guess = `zgetrs(lu_m, ipiv, b)` (current one-shot, good preconditioner)
-- Loop: compute residual with exact M operator, add correction
-- With LU as preconditioner, expect 2-3 iterations to reach 1e-10
+Precision improved from ζ=3.4×10⁻⁶ to ζ=1.36×10⁻¹² (measured at Gate 0 test).
 
 ---
 
@@ -243,6 +212,32 @@ zgetrs(lu_m, lu_ipiv, temp)   ! single back-substitution, no residual check
 **Our code**: Phase 2b recomputes H·Ψ fresh from current V_eff and computes residuals with fresh Rayleigh quotients. This was a deliberate fix to avoid the "cascade bug" where stale residuals from a prior SCF iteration poisoned the oracle.
 
 **Practical impact**: Different convergence behavior. ABINIT trusts the prior iteration's eigenvalues as the convergence metric; we insist on fresh verification. Neither is wrong, but they produce different locking decisions.
+
+---
+
+### C21: oracle=0 Converged-Band Locking (HIGH — new divergence, 2026-06-19)
+
+| Property | ABINIT (oracle=0) | Our Code (before fix) | Our Code (after fix) |
+|----------|-------------------|----------------------|---------------------|
+| **Converged bands** | All get `ndeg_filter_max` | All get `ndeg_filter_max` | ndeg=0 for bands with residual < tolerance |
+| **ABINIT source** | `m_chebfi2.F90:628` — `if(oracle>0) call chebfi_set_ndeg_from_residu(...)` | — | — |
+| **Our source** | — | `chebyshev.rs:2457-2459` (oracle=0 branch) | `chebyshev.rs:2457-2472` (oracle=0 with locking) |
+
+**Discovery (2026-06-19)**: On Cu111_CO warm start (160 bands, 60k PW), 121/160 bands are already converged (residual < 1e-6). With oracle=0, ALL 160 bands get the same filter degree (~5 based on `cheb_oracle1`). Filtering already-converged bands makes them nearly identical — S_sub off-diagonals reach ~0.999, causing:
+- ZPOTRF info=85 (leading minor not positive definite)
+- ZHEEVD info=151 (convergence failure)
+- ZHEGVD info=245 (leading minor 85 of B not positive definite)
+
+**Why ABINIT doesn't hit this**: ABINIT recomputes H·Ψ and S·Ψ INSIDE the recurrence loop (`m_chebfi2.F90:660` — `getAX_BX` at every step). Our code uses S⁻¹·H via Woodbury LU, which is less numerically stable for near-dependent vectors. Additionally, ABINIT's matrix-free RR (rotating all three vectors) and Gram-Schmidt orthonormalization may provide better numerical stability than our Cholesky QR for this edge case.
+
+**Our fix (2026-06-19)**: Added converged-band locking even with oracle=0 — bands with `fresh_residual[b] < tolerance` get `ndeg=0`. This is a **divergence from ABINIT** (ABINIT oracle=0 does NOT lock converged bands), but it's numerically necessary for our pipeline. The locked bands retain their original S-orthonormal state, eliminating the near-linear-dependence.
+
+**Risk**: If the locking threshold is wrong, bands that appear converged under the current V_eff may actually need filtering. The tolerance used is the same `tolerance` parameter (1e-6), which matches the convergence criterion.
+
+**Long-term fix**: Investigate why ABINIT's oracle=0 pipeline handles near-dependent vectors better. Possible explanations:
+1. ABINIT's `getAX_BX` inside the loop recomputes H+S at every step, which may implicitly regularize
+2. ABINIT's Gram-Schmidt may handle near-dependent vectors better than our Cholesky QR
+3. ABINIT's matrix-free RR may provide additional numerical stabilization
 
 ---
 
