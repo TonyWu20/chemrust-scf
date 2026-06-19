@@ -547,36 +547,95 @@ pub(crate) unsafe fn apply_s_inverse(
         )?;
     }
 
-    // 2. Solve M·y = temp via LU factorization, then iteratively refine using
-    //    standard linear system refinement: r = B^T·h - M·y, dy = M^{-1}·r.
-    //    Levitt-Torrent 2015 §4.1: block-diagonal preconditioner converges in
-    //    10-20 iterations.  Our LU is exact — 2-3 iterations suffice.
+    // 2. Iterative refinement via per-ion block-diagonal Q^{-1} preconditioner.
+    //    Matches ABINIT m_invovl.F90:1100-1140:
+    //      y_0 = block_diag(Q^{-1}) · proj
+    //      r = proj - Q^{-1}·y - B^H·B·y
+    //      y += block_diag(Q^{-1}) · r
+    //    Block-diagonal preconditioner converges slower than global LU (10-20
+    //    iterations vs 2-3) but avoids LU factorization of potentially
+    //    ill-conditioned M = Q^{-1} + B^H·B.
     {
         let n_elem = n_pw as usize * n_bands as usize;
         let n_nte = nte as usize * n_bands as usize;
-        // Save original B^T·h_in = temp before zgetrs overwrites it
-        let mut bt_h_in: CudaSlice<CudaComplex> =
+        // Save original proj = B^H·h_in
+        let mut proj: CudaSlice<CudaComplex> =
             stream.alloc_zeros(n_nte).map_err(Error::Cuda)?;
-        unsafe { stream.memcpy_dtod(&temp, &mut bt_h_in).map_err(Error::Cuda)?; }
+        unsafe { stream.memcpy_dtod(&temp, &mut proj).map_err(Error::Cuda)?; }
 
-        let mut info_dev = stream.alloc_zeros::<i32>(1).map_err(Error::Cuda)?;
-        solver.zgetrs(
-            cublasOperation_t::CUBLAS_OP_N, nte, n_bands,
-            &vnl_data.lu_m, &vnl_data.lu_ipiv, &mut temp, &mut info_dev,
-        )?;
-
-        // Buffers for refinement
+        // Pre-buffers for refinement
         let mut b_y: CudaSlice<CudaComplex> =
             stream.alloc_zeros(n_elem).map_err(Error::Cuda)?;
         let mut bt_b_y: CudaSlice<CudaComplex> =
             stream.alloc_zeros(n_nte).map_err(Error::Cuda)?;
         let mut r: CudaSlice<CudaComplex> =
             stream.alloc_zeros(n_nte).map_err(Error::Cuda)?;
+        let mut qinv_y: CudaSlice<CudaComplex> =
+            stream.alloc_zeros(n_nte).map_err(Error::Cuda)?;
 
-        for _iter in 0..3 {
-            // r = B^T·h_in - B^T·B·y - Q^{-1}·y
-            // B^T·h_in  = bt_h_in
-            // B^T·B·y: compute B·y, then B^T·(B·y)
+        let per_ion_q_inv = &vnl_data.shared.handle.per_ion_q_inv;
+        let per_ion_ne = &vnl_data.shared.handle.per_ion_n_expanded;
+
+        // Helper: apply block-diagonal Q^{-1} to input → output.
+        // input/output are nte × n_bands, column-major (stride=nte between bands).
+        // Uses per-ion ZGEMM: Q_i^{-1} · ion_block (ne_i × n_bands) for each ion.
+        unsafe fn apply_block_qinv(
+            input: &CudaSlice<CudaComplex>,
+            output: &mut CudaSlice<CudaComplex>,
+            per_ion_q_inv: &[CudaSlice<CudaComplex>],
+            per_ion_ne: &[i32],
+            n_bands: usize,
+            nte: i32,
+            stream: &Arc<CudaStream>,
+            blas: &BlasHandle,
+        ) -> Result<(), Error> {
+            let n_bands_i32 = n_bands as i32;
+            let nte_usize = nte as usize;
+            let mut off: usize = 0;
+            for (ion_idx, &ne) in per_ion_ne.iter().enumerate() {
+                if ne == 0 { continue; }
+                let ne_usize = ne as usize;
+                let ne_bands = ne_usize * n_bands;
+                // Pack: extract ion's block from global (nte×n_bands, col-major)
+                // → contiguous (ne×n_bands, col-major, lda=ne)
+                let mut ion_block: CudaSlice<CudaComplex> =
+                    stream.alloc_zeros(ne_bands).map_err(Error::Cuda)?;
+                for b in 0..n_bands {
+                    let src = input.slice((off + b * nte_usize)..(off + b * nte_usize + ne_usize));
+                    let mut dst = ion_block.slice_mut((b * ne_usize)..((b+1) * ne_usize));
+                    stream.memcpy_dtod(&src, &mut dst).map_err(Error::Cuda)?;
+                }
+                // Q_i^{-1} · ion_block → result_block (ne×n_bands)
+                let mut result_block: CudaSlice<CudaComplex> =
+                    stream.alloc_zeros(ne_bands).map_err(Error::Cuda)?;
+                blas.gemm_c64(ZgemmConfig {
+                    transa: blas::op::N, transb: blas::op::N,
+                    m: ne, n: n_bands_i32, k: ne,
+                    alpha: CudaComplex { x: 1.0, y: 0.0 },
+                    lda: ne, ldb: ne, ldc: ne,
+                    beta: CudaComplex { x: 0.0, y: 0.0 },
+                }, &per_ion_q_inv[ion_idx], &ion_block, &mut result_block)?;
+                // Unpack: result_block → output[ion_offset] (scattered)
+                for b in 0..n_bands {
+                    let src = result_block.slice((b * ne_usize)..((b+1) * ne_usize));
+                    let mut dst = output.slice_mut((off + b * nte_usize)..(off + b * nte_usize + ne_usize));
+                    stream.memcpy_dtod(&src, &mut dst).map_err(Error::Cuda)?;
+                }
+                off += ne_bands;
+            }
+            Ok(())
+        }
+
+        // --- y_0 = block_diag(Q^{-1}) · proj ---
+        unsafe {
+            apply_block_qinv(&proj, &mut temp, per_ion_q_inv, per_ion_ne,
+                n_bands as usize, nte, stream, blas)?;
+        }
+
+        // --- ABINIT iterative refinement loop (max 30 iterations) ---
+        let mut converged = false;
+        for _iter in 0..30 {
+            // B·y (n_pw × n_bands)
             unsafe {
                 blas.gemm_c64(ZgemmConfig {
                     transa: blas::op::N, transb: blas::op::N,
@@ -585,6 +644,7 @@ pub(crate) unsafe fn apply_s_inverse(
                     lda: n_pw, ldb: nte, ldc: n_pw,
                     beta: CudaComplex { x: 0.0, y: 0.0 },
                 }, &vnl_data.b_concat, &temp, &mut b_y)?;
+                // B^H·(B·y) (nte × n_bands)
                 blas.gemm_c64(ZgemmConfig {
                     transa: blas::op::C, transb: blas::op::N,
                     m: nte, n: n_bands, k: n_pw,
@@ -593,54 +653,52 @@ pub(crate) unsafe fn apply_s_inverse(
                     beta: CudaComplex { x: 0.0, y: 0.0 },
                 }, &vnl_data.b_concat, &b_y, &mut bt_b_y)?;
             }
-            // r = bt_h_in - bt_b_y  (so far, missing Q^{-1}·y)
-            unsafe { stream.memcpy_dtod(&bt_h_in, &mut r).map_err(Error::Cuda)?; }
-            blas.axpy_c64(n_nte as i32, CudaComplex { x: -1.0, y: 0.0 }, &bt_b_y, 1, &mut r, 1)?;
 
-            // Q^{-1}·y on GPU: per-ion ZGEMM (n_expanded × n_expanded) · (y slice)
-            let per_ion_q_inv = &vnl_data.shared.handle.per_ion_q_inv;
-            let per_ion_ne = &vnl_data.shared.handle.per_ion_n_expanded;
-            let mut qinv_y: CudaSlice<CudaComplex> =
-                stream.alloc_zeros(n_nte).map_err(Error::Cuda)?;
-            let mut off: usize = 0;
-            for (ion_idx, &ne) in per_ion_ne.iter().enumerate() {
-                if ne == 0 { continue; }
-                let ne_usize = ne as usize;
-                let ne_bands = ne_usize * n_bands as usize;
-                // Copy y[off..off+ne_bands] to contiguous temp
-                let mut ion_y: CudaSlice<CudaComplex> =
-                    stream.alloc_zeros(ne_bands).map_err(Error::Cuda)?;
-                {
-                    let src = temp.slice(off..off + ne_bands);
-                    stream.memcpy_dtod(&src, &mut ion_y).map_err(Error::Cuda)?;
-                }
-                let mut ion_qinv_y: CudaSlice<CudaComplex> =
-                    stream.alloc_zeros(ne_bands).map_err(Error::Cuda)?;
-                unsafe {
-                    blas.gemm_c64(ZgemmConfig {
-                        transa: blas::op::N, transb: blas::op::N,
-                        m: ne, n: n_bands, k: ne,
-                        alpha: CudaComplex { x: 1.0, y: 0.0 },
-                        lda: ne, ldb: ne, ldc: ne,
-                        beta: CudaComplex { x: 0.0, y: 0.0 },
-                    }, &per_ion_q_inv[ion_idx], &ion_y, &mut ion_qinv_y)?;
-                }
-                { let mut dst = qinv_y.slice_mut(off..off + ne_bands);
-                  stream.memcpy_dtod(&ion_qinv_y, &mut dst).map_err(Error::Cuda)?; }
-                off += ne_bands;
+            // r = proj - Q^{-1}·y - B^H·B·y
+            unsafe { stream.memcpy_dtod(&proj, &mut r).map_err(Error::Cuda)?; }
+            // Q^{-1}·y
+            unsafe {
+                apply_block_qinv(&temp, &mut qinv_y, per_ion_q_inv, per_ion_ne,
+                    n_bands as usize, nte, stream, blas)?;
             }
             // r -= Q^{-1}·y
             blas.axpy_c64(n_nte as i32, CudaComplex { x: -1.0, y: 0.0 }, &qinv_y, 1, &mut r, 1)?;
+            // r -= B^H·B·y
+            blas.axpy_c64(n_nte as i32, CudaComplex { x: -1.0, y: 0.0 }, &bt_b_y, 1, &mut r, 1)?;
 
-            // dy = M^{-1} · r
-            let mut info_dev2 = stream.alloc_zeros::<i32>(1).map_err(Error::Cuda)?;
-            solver.zgetrs(
-                cublasOperation_t::CUBLAS_OP_N, nte, n_bands,
-                &vnl_data.lu_m, &vnl_data.lu_ipiv, &mut r, &mut info_dev2,
-            )?;
+            // Check per-band convergence (ABINIT: maxerr = max(|r|² / |proj|²))
+            {
+                let r_cpu: Vec<CudaComplex> = stream.clone_dtoh(&r).map_err(Error::Cuda)?;
+                let proj_cpu: Vec<CudaComplex> = stream.clone_dtoh(&proj).map_err(Error::Cuda)?;
+                let nte_usize = nte as usize;
+                let mut max_err: f64 = 0.0;
+                for b in 0..n_bands as usize {
+                    let mut r_norm_sq = 0.0f64;
+                    let mut p_norm_sq = 0.0f64;
+                    for i in 0..nte_usize {
+                        let idx = i + b * nte_usize;
+                        r_norm_sq += r_cpu[idx].x * r_cpu[idx].x + r_cpu[idx].y * r_cpu[idx].y;
+                        p_norm_sq += proj_cpu[idx].x * proj_cpu[idx].x + proj_cpu[idx].y * proj_cpu[idx].y;
+                    }
+                    let err = if p_norm_sq > 1e-30 { r_norm_sq / p_norm_sq } else { 0.0 };
+                    max_err = max_err.max(err);
+                }
+                if max_err < 1e-12 {
+                    converged = true;
+                    break;
+                }
+            }
 
+            // dy = block_diag(Q^{-1}) · r
+            unsafe {
+                apply_block_qinv(&r, &mut qinv_y, per_ion_q_inv, per_ion_ne,
+                    n_bands as usize, nte, stream, blas)?;
+            }
             // y += dy
-            blas.axpy_c64(n_nte as i32, CudaComplex { x: 1.0, y: 0.0 }, &r, 1, &mut temp, 1)?;
+            blas.axpy_c64(n_nte as i32, CudaComplex { x: 1.0, y: 0.0 }, &qinv_y, 1, &mut temp, 1)?;
+        }
+        if !converged {
+            eprintln!("[S-inv] Woodbury refinement did not converge in 30 iterations");
         }
     }
 
