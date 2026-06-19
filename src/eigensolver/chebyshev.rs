@@ -2455,8 +2455,21 @@ pub fn chebfi_run_rust(
     // occ_vals is optional — only needed for nbdbuf=-101 occupancy-driven skipping.
     // ABINIT m_chebfi2.F90:628 — if oracle=0, skip per-band; use global degree for all.
     let (ndeg_filter_global, ndeg_filter_bands) = if oracle == 0 {
-        let bands = vec![ndeg_filter_max.min(ndeg_oracle); n_bands];
-        (ndeg_filter_max.min(ndeg_oracle), bands)
+        let deg = ndeg_filter_max.min(ndeg_oracle);
+        let mut bands = vec![deg; n_bands];
+        // Lock converged bands (ABINIT: bands with residual < tolerance get ndeg=0
+        // regardless of oracle mode). Without this, already-converged bands get
+        // unnecessarily filtered, producing near-linearly-dependent vectors.
+        let n_locked = (0..n_bands).filter(|&b| bands[b] > 0 && fresh_residuals[b] < tolerance).count();
+        if n_locked > 0 {
+            for b in 0..n_bands {
+                if fresh_residuals[b] < tolerance {
+                    bands[b] = 0;
+                }
+            }
+            eprintln!("[chebfi] oracle=0: locked {n_locked}/{n_bands} converged bands (residual < {tolerance:.1e})");
+        }
+        (deg, bands)
     } else {
         let (g, bands) = chebfi_set_ndeg_from_residu()
             .bandpp(n_bands)
@@ -2917,7 +2930,7 @@ pub fn chebfi_run_rust(
                 .fold(0.0_f64, f64::max);
 
             // Try increasing regularization levels
-            let eps_levels = [1e-8_f64, 1e-6, 1e-4, 1e-2];
+            let eps_levels = [1e-8_f64, 1e-6, 1e-4, 1e-2, 3e-2, 1e-1, 3e-1, 1e0];
             let mut zp_succeeded = false;
             for &eps_scale in &eps_levels {
                 let eps_reg = max_diag_mag * eps_scale;
