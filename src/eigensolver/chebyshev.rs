@@ -2755,6 +2755,10 @@ pub fn chebfi_run_rust(
         // S_sub = X^T · (S·X)
         let mut s_sub: CudaSlice<CudaComplex> =
             stream.alloc_zeros(nb * nb).map_err(Error::Cuda)?;
+        // Bypass PwCoefficients Deref — pass underlying CudaSlice directly
+        // to eliminate any auto-deref ambiguity in the GEMM call.
+        let psi_raw: &CudaSlice<CudaComplex> = &final_psi_buf.0;
+        let spsi_raw: &CudaSlice<CudaComplex> = &spsi_dev.0;
         unsafe {
             blas.gemm_c64(ZgemmConfig {
                 transa: op::C, transb: op::N,
@@ -2762,7 +2766,7 @@ pub fn chebfi_run_rust(
                 alpha: CudaComplex { x: 1.0, y: 0.0 },
                 lda: n_pw_i32, ldb: n_pw_i32, ldc: nb_i32,
                 beta: CudaComplex { x: 0.0, y: 0.0 },
-            }, &**final_psi_buf, &*spsi_dev, &mut s_sub)?;
+            }, psi_raw, spsi_raw, &mut s_sub)?;
 
         // Diagnostic: check S_sub corner after GEMM
         {
@@ -2779,6 +2783,24 @@ pub fn chebfi_run_rust(
                 s_sub_cpu[1*nb+1].x, s_sub_cpu[1*nb+1].y,
                 s_sub_cpu[2*nb+2].x, s_sub_cpu[2*nb+2].y,
                 s_sub_cpu[3*nb+3].x, s_sub_cpu[3*nb+3].y,
+            );
+            // Manual ZDOTC check: compute S_sub[0,0] = psi_col0^H · (S·psi_col0)
+            let handle = blas.raw_handle();
+            let (psi_ptr, _) = psi_raw.device_ptr(stream);
+            let (spsi_ptr, _) = spsi_raw.device_ptr(stream);
+            let mut manual_dot = CudaComplex { x: 0.0, y: 0.0 };
+            unsafe {
+                cudarc::cublas::sys::cublasZdotc_v2(
+                    handle, n_pw_i32,
+                    psi_ptr as *const _, 1,
+                    spsi_ptr as *const _, 1,
+                    &mut manual_dot as *mut _ as *mut _,
+                ).result().map_err(Error::Blas)?;
+            }
+            stream.synchronize().map_err(Error::Cuda)?;
+            eprintln!("[chebfi] Phase 6 S_sub[0,0] manual ZDOTC: {:.6e}+{:.6e}i (GEMM says: {:.6e}+{:.6e}i)",
+                manual_dot.x, manual_dot.y,
+                s_sub_cpu[0*nb+0].x, s_sub_cpu[0*nb+0].y,
             );
         }
         }
