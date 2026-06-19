@@ -2454,8 +2454,19 @@ pub fn chebfi_run_rust(
     //
     // occ_vals is optional — only needed for nbdbuf=-101 occupancy-driven skipping.
     // ABINIT m_chebfi2.F90:628 — if oracle=0, skip per-band; use global degree for all.
+    // Cold-start degree cap: when all eigenvalues are clustered (spread < 1.0 Ha),
+    // the initial guess vectors contain deep-core components that get exponentially
+    // amplified. T_n(xred_min) with xred ≪ -1 overflows double precision for
+    // large n. Cap ndeg to a safe value until the eigenvalue spectrum spreads out.
+    let cold_start = (lambda_max_rq - lambda_min_rq).abs() < 1.0;
+    let cold_cap = if cold_start { 8usize } else { usize::MAX };
+    if cold_start {
+        eprintln!("[chebfi] cold start detected (ritz spread={:.3e} Ha) — capping ndeg ≤ {cold_cap}",
+            lambda_max_rq - lambda_min_rq);
+    }
+
     let (ndeg_filter_global, ndeg_filter_bands) = if oracle == 0 {
-        let deg = ndeg_filter_max.min(ndeg_oracle);
+        let deg = ndeg_filter_max.min(ndeg_oracle).min(cold_cap);
         let mut bands = vec![deg; n_bands];
         // Lock converged bands — DIVERGENCE from ABINIT oracle=0.
         // ABINIT's oracle=0 broadcasts the same scalar ndeg to ALL bands
@@ -2492,6 +2503,7 @@ pub fn chebfi_run_rust(
             .ndeg_filter_current(ndeg_oracle)
             .ndeg_filter_max(ndeg_filter_max)
             .call();
+        let g = g.min(cold_cap);
         #[cfg(feature = "scf_diag")]
         {
             let n_locked = bands.iter().filter(|&&d| d == 0).count();
