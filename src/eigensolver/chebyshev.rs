@@ -2305,6 +2305,29 @@ pub fn chebfi_run_rust(
             .call()?;
     }
 
+    // Diagnostic: check S-norm of INPUT psi (before filtering)
+    {
+        stream.synchronize().map_err(Error::Cuda)?;
+        let handle = blas.raw_handle();
+        let (psi_ptr, _) = psi_input.0.device_ptr(stream);
+        let (spsi_ptr, _) = spsi_dev.0.device_ptr(stream);
+        let n_check = n_bands.min(5);
+        for b in 0..n_check {
+            let psi_col = (psi_ptr as *const CudaComplex).wrapping_add(b * n_pw);
+            let spsi_col = (spsi_ptr as *const CudaComplex).wrapping_add(b * n_pw);
+            let mut s_norm = CudaComplex { x: 0.0, y: 0.0 };
+            unsafe {
+                cudarc::cublas::sys::cublasZdotc_v2(
+                    handle, n_pw_i32,
+                    psi_col as *const _, 1,
+                    spsi_col as *const _, 1,
+                    &mut s_norm as *mut _ as *mut _,
+                ).result().map_err(Error::Blas)?;
+            }
+            eprintln!("[chebfi] input psi band {b}: ⟨ψ|S|ψ⟩ = {:.6e}+{:.6e}i", s_norm.x, s_norm.y);
+        }
+    }
+
     // =====================================================================
     // Phase 2: Rayleigh quotients → lambda_minus, lambda_plus (ABINIT lines 516-575)
     // =====================================================================
@@ -2884,38 +2907,42 @@ pub fn chebfi_run_rust(
             }
         } else {
             // ZPOTRF failed — S_sub is not positive definite.
-            // Regularize: S_sub += ε·I with ε based on max diagonal magnitude.
-            eprintln!("[chebfi] Cholesky QR ZPOTRF failed: info={chol_info_val} (n_bands={nb}) — regularizing S_sub");
-            // Download the diagonal of S_sub to estimate regularization strength
-            let mut s_diag: Vec<CudaComplex> = vec![CudaComplex { x: 0.0, y: 0.0 }; nb];
+            // Multi-level recovery: increasing regularization → ZHEEVD fallback.
+            eprintln!("[chebfi] Cholesky QR ZPOTRF failed: info={chol_info_val} (n_bands={nb})");
+
+            // Download S_sub for regularization / ZHEEVD fallback
             let s_sub_cpu: Vec<CudaComplex> = solver.stream().clone_dtoh(&s_sub).map_err(Error::Cuda)?;
             let max_diag_mag: f64 = (0..nb)
                 .map(|i| s_sub_cpu[i * nb + i].x.abs())
                 .fold(0.0_f64, f64::max);
-            let eps_reg = max_diag_mag * 1e-12_f64;
-            eprintln!(
-                "[chebfi] Cholesky QR regularization: max_diag={:.6e}, eps_reg={:.6e}",
-                max_diag_mag, eps_reg,
-            );
-            // Rebuild S_sub with regularization (download-then-upload is
-            // acceptable since this is an error-recovery path)
-            let mut s_reg: Vec<CudaComplex> = s_sub_cpu.clone();
-            for i in 0..nb {
-                s_reg[i * nb + i].x += eps_reg;
+
+            // Try increasing regularization levels
+            let eps_levels = [1e-8_f64, 1e-6, 1e-4, 1e-2];
+            let mut zp_succeeded = false;
+            for &eps_scale in &eps_levels {
+                let eps_reg = max_diag_mag * eps_scale;
+                eprintln!("[chebfi] Cholesky QR regularization: eps={:.3e} (scale={eps_scale})", eps_reg);
+                let mut s_reg: Vec<CudaComplex> = s_sub_cpu.clone();
+                for i in 0..nb {
+                    s_reg[i * nb + i].x += eps_reg;
+                }
+                s_sub = stream.clone_htod(&s_reg).map_err(Error::Cuda)?;
+                stream.synchronize().map_err(Error::Cuda)?;
+                chol_info = stream.alloc_zeros(1).map_err(Error::Cuda)?;
+                solver.zpotrf(
+                    cudarc::cusolver::sys::cublasFillMode_t::CUBLAS_FILL_MODE_UPPER,
+                    nb_i32, &mut s_sub, &mut chol_info,
+                )?;
+                solver.stream().synchronize().map_err(Error::Cuda)?;
+                let info_retry: Vec<i32> = solver.stream().clone_dtoh(&chol_info).map_err(Error::Cuda)?;
+                if info_retry[0] == 0 {
+                    eprintln!("[chebfi] Cholesky QR ZPOTRF succeeded with eps={:.3e}", eps_reg);
+                    zp_succeeded = true;
+                    break;
+                }
             }
-            s_sub = stream.clone_htod(&s_reg).map_err(Error::Cuda)?;
-            // Sync user stream before crossing to solver stream
-            stream.synchronize().map_err(Error::Cuda)?;
-            // Retry ZPOTRF
-            chol_info = stream.alloc_zeros(1).map_err(Error::Cuda)?;
-            solver.zpotrf(
-                cudarc::cusolver::sys::cublasFillMode_t::CUBLAS_FILL_MODE_UPPER,
-                nb_i32, &mut s_sub, &mut chol_info,
-            )?;
-            solver.stream().synchronize().map_err(Error::Cuda)?;
-            let info_retry: Vec<i32> = solver.stream().clone_dtoh(&chol_info).map_err(Error::Cuda)?;
-            if info_retry[0] == 0 {
-                eprintln!("[chebfi] Cholesky QR ZPOTRF retry succeeded after regularization");
+
+            if zp_succeeded {
                 use cudarc::cublas::sys::{
                     cublasSideMode_t, cublasDiagType_t,
                     cublasOperation_t,
@@ -2939,7 +2966,67 @@ pub fn chebfi_run_rust(
                     ).result().map_err(Error::Blas)?;
                 }
             } else {
-                eprintln!("[chebfi] Cholesky QR ZPOTRF retry also failed: info={} — skipping orthonormalization (rayleigh_ritz will attempt recovery)", info_retry[0]);
+                // ZPOTRF failed even after max regularization — fall back to
+                // ZHEEVD-based orthonormalization of S_sub.
+                eprintln!("[chebfi] Cholesky QR ZPOTRF failed after max regularization — falling back to ZHEEVD");
+                // S_sub = V · diag(λ) · V^H
+                // X_new = X · V · diag(1/sqrt(max(λ, ε)))
+                // This produces X_new^H · S · X_new ≈ I
+                let mut s_eigvals: CudaSlice<f64> = stream.alloc_zeros(nb).map_err(Error::Cuda)?;
+                let mut zheevd_info: CudaSlice<i32> = stream.alloc_zeros(1).map_err(Error::Cuda)?;
+                // ZHEEVD destroys s_sub (overwritten with eigenvectors V, col-major)
+                s_sub = stream.clone_htod(&s_sub_cpu).map_err(Error::Cuda)?;
+                stream.synchronize().map_err(Error::Cuda)?;
+                solver.zheevd(
+                    cudarc::cusolver::sys::cusolverEigMode_t::CUSOLVER_EIG_MODE_VECTOR,
+                    cudarc::cusolver::sys::cublasFillMode_t::CUBLAS_FILL_MODE_LOWER,
+                    nb_i32, &mut s_sub, &mut s_eigvals, &mut zheevd_info,
+                )?;
+                solver.stream().synchronize().map_err(Error::Cuda)?;
+                let zheevd_info_host: Vec<i32> = solver.stream().clone_dtoh(&zheevd_info).map_err(Error::Cuda)?;
+                if zheevd_info_host[0] != 0 {
+                    eprintln!("[chebfi] ZHEEVD fallback also failed: info={} — skipping orthonormalization", zheevd_info_host[0]);
+                } else {
+                    let eigvals_host: Vec<f64> = solver.stream().clone_dtoh(&s_eigvals).map_err(Error::Cuda)?;
+                    let eps_clamp = eigvals_host.iter().cloned().fold(0.0_f64, f64::max) * 1e-12;
+                    // X_new = X · V · diag(1/sqrt(max(λ, ε_clamp)))
+                    // Step 1: X_temp = X · V  (n_pw × n_bands) · (n_bands × n_bands)
+                    let mut x_temp: CudaSlice<CudaComplex> =
+                        stream.alloc_zeros(n_pw * nb).map_err(Error::Cuda)?;
+                    unsafe {
+                        blas.gemm_c64(ZgemmConfig {
+                            transa: op::N, transb: op::N,
+                            m: n_pw_i32, n: nb_i32, k: nb_i32,
+                            alpha: CudaComplex { x: 1.0, y: 0.0 },
+                            lda: n_pw_i32, ldb: nb_i32, ldc: n_pw_i32,
+                            beta: CudaComplex { x: 0.0, y: 0.0 },
+                        }, psi_raw, &s_sub, &mut x_temp)?;
+                    }
+                    // Step 2: Scale each column by 1/sqrt(max(λ_b, ε_clamp))
+                    let handle = blas.raw_handle();
+                    for b in 0..nb {
+                        let ev = eigvals_host[b].max(eps_clamp);
+                        let scale = 1.0 / ev.sqrt();
+                        if scale.is_finite() && scale > 0.0 {
+                            let alpha = CudaComplex { x: scale, y: 0.0 };
+                            unsafe {
+                                let (x_ptr, _) = x_temp.device_ptr_mut(stream);
+                                let col = (x_ptr as *mut CudaComplex).wrapping_add(b * n_pw);
+                                cudarc::cublas::sys::cublasZscal_v2(
+                                    handle, n_pw_i32,
+                                    &alpha as *const _ as *const _,
+                                    col as *mut _, 1,
+                                ).result().map_err(Error::Blas)?;
+                            }
+                        }
+                    }
+                    // Step 3: Copy X_temp → final_psi_buf
+                    stream.memcpy_dtod(&x_temp, &mut final_psi_buf.0).map_err(Error::Cuda)?;
+                    eprintln!("[chebfi] ZHEEVD fallback orthonormalization complete (λ range: [{:.3e}, {:.3e}])",
+                        eigvals_host.iter().cloned().fold(f64::INFINITY, f64::min),
+                        eigvals_host.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
+                    );
+                }
             }
         }
     }
