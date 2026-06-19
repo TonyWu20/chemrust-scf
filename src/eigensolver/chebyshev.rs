@@ -3071,6 +3071,43 @@ pub fn chebfi_run_rust(
             .call()?;
     }
 
+    // Diagnostic: check H·psi quality for a few bands after Phase 8
+    {
+        stream.synchronize().map_err(Error::Cuda)?;
+        let handle = blas.raw_handle();
+        let (psi_ptr, _) = final_psi_buf.0.device_ptr(stream);
+        let (hpsi_ptr, _) = hpsi_dev.0.device_ptr(stream);
+        let check_bands = [0usize, 60, 120, 140, 155, n_bands-1];
+        for &b in &check_bands {
+            if b >= n_bands { continue; }
+            let psi_col = (psi_ptr as *const CudaComplex).wrapping_add(b * n_pw);
+            let hpsi_col = (hpsi_ptr as *const CudaComplex).wrapping_add(b * n_pw);
+            let mut h_dot = CudaComplex { x: 0.0, y: 0.0 };
+            unsafe {
+                cudarc::cublas::sys::cublasZdotc_v2(
+                    handle, n_pw_i32,
+                    psi_col as *const _, 1,
+                    hpsi_col as *const _, 1,
+                    &mut h_dot as *mut _ as *mut _,
+                ).result().map_err(Error::Blas)?;
+            }
+            let mut s_dot = CudaComplex { x: 0.0, y: 0.0 };
+            unsafe {
+                cudarc::cublas::sys::cublasZdotc_v2(
+                    handle, n_pw_i32,
+                    psi_col as *const _, 1,
+                    psi_col as *const _, 1,
+                    &mut s_dot as *mut _ as *mut _,
+                ).result().map_err(Error::Blas)?;
+            }
+            let rq = if s_dot.x > 1e-30 { h_dot.x / s_dot.x } else { 0.0 };
+            eprintln!(
+                "[chebfi] Phase 8 band {b}: ⟨ψ|Hψ⟩={:.6e} ⟨ψ|ψ⟩={:.6e} RQ={:.6e} (orig ritz={:.6e})",
+                h_dot.x, s_dot.x, rq, ritz_values[b],
+            );
+        }
+    }
+
     // =====================================================================
     // Phase 9: Output preparation
     // =====================================================================
