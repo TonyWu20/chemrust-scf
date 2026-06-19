@@ -2752,6 +2752,47 @@ pub fn chebfi_run_rust(
 
         let nb = n_bands;
         let nb_i32 = n_bands_i32;
+
+        // =================================================================
+        // Per-band S-norm normalization (NEW — fixes ZPOTRF failure).
+        // The input psi may have S-norms ≠ 1 (e.g., warm-start .check
+        // wavefunctions are not re-orthonormalized on read). Scale each
+        // column of psi and S·psi to unit S-norm before Cholesky QR.
+        // =================================================================
+        {
+            let handle = blas.raw_handle();
+            let (psi_ptr, _) = final_psi_buf.0.device_ptr(stream);
+            let (spsi_ptr, _) = spsi_dev.0.device_ptr(stream);
+            for b in 0..n_bands {
+                let psi_col = (psi_ptr as *const CudaComplex).wrapping_add(b * n_pw);
+                let spsi_col = (spsi_ptr as *const CudaComplex).wrapping_add(b * n_pw);
+                let mut s_norm = CudaComplex { x: 0.0, y: 0.0 };
+                unsafe {
+                    cudarc::cublas::sys::cublasZdotc_v2(
+                        handle, n_pw_i32,
+                        psi_col as *const _, 1,
+                        spsi_col as *const _, 1,
+                        &mut s_norm as *mut _ as *mut _,
+                    ).result().map_err(Error::Blas)?;
+                }
+                if s_norm.x <= 0.0 { continue; } // non-positive S-norm — skip
+                let scale = 1.0 / s_norm.x.sqrt();
+                let alpha = CudaComplex { x: scale, y: 0.0 };
+                unsafe {
+                    cudarc::cublas::sys::cublasZscal_v2(
+                        handle, n_pw_i32,
+                        &alpha as *const _ as *const _,
+                        psi_col as *mut _, 1,
+                    ).result().map_err(Error::Blas)?;
+                    cudarc::cublas::sys::cublasZscal_v2(
+                        handle, n_pw_i32,
+                        &alpha as *const _ as *const _,
+                        spsi_col as *mut _, 1,
+                    ).result().map_err(Error::Blas)?;
+                }
+            }
+        }
+
         // S_sub = X^T · (S·X)
         let mut s_sub: CudaSlice<CudaComplex> =
             stream.alloc_zeros(nb * nb).map_err(Error::Cuda)?;
