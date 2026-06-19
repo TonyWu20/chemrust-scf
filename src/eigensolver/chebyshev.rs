@@ -2569,6 +2569,35 @@ pub fn chebfi_run_rust(
                 .solver(solver)
                 .call()?;
         }
+        // Diagnostic: check H·psi before vs after S⁻¹ for a few bands
+        {
+            stream.synchronize().map_err(Error::Cuda)?;
+            let handle = blas.raw_handle();
+            let (psi_ptr, _) = psi_input.0.device_ptr(stream);
+            let (x_ptr, _) = x_curr.0.device_ptr(stream);
+            let check_bands = [0usize, 60, 120, 159];
+            for &b in &check_bands {
+                if b >= n_bands { continue; }
+                // Before S⁻¹: x_curr[b] = H·psi_input[b]
+                // After S⁻¹: x_curr[b] = S⁻¹·H·psi_input[b]
+                // We can't measure "before" here since S⁻¹ already ran.
+                // Instead measure the effect: ⟨psi_input[b] | x_curr[b]⟩ (pre-shift T_1)
+                let psi_col = (psi_ptr as *const CudaComplex).wrapping_add(b * n_pw);
+                let x_col = (x_ptr as *const CudaComplex).wrapping_add(b * n_pw);
+                let mut dot = CudaComplex { x: 0.0, y: 0.0 };
+                unsafe {
+                    cudarc::cublas::sys::cublasZdotc_v2(
+                        handle, n_pw_i32,
+                        psi_col as *const _, 1,
+                        x_col as *const _, 1,
+                        &mut dot as *mut _ as *mut _,
+                    ).result().map_err(Error::Blas)?;
+                }
+                eprintln!("[chebfi] T_1 band {b}: ⟨ψ_input|S⁻¹·H·ψ_input⟩={:.6e}+{:.6e}i (ritz={:.6e})",
+                    dot.x, dot.y, ritz_values[b]);
+            }
+        }
+
         // x_curr = (x_curr − c·x_prev) / r  →  T_1 = (S⁻¹H − cI)/r · Ψ
         // Compose: buf_sx = −c * x_prev, then x_curr += buf_sx, then scale by 1/r
         stream.memcpy_dtod(&*x_prev, &mut buf_sx.0).map_err(Error::Cuda)?;
