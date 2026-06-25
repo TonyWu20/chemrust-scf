@@ -2454,19 +2454,36 @@ pub fn chebfi_run_rust(
     //
     // occ_vals is optional — only needed for nbdbuf=-101 occupancy-driven skipping.
     // ABINIT m_chebfi2.F90:628 — if oracle=0, skip per-band; use global degree for all.
-    // Cold-start degree cap: when all eigenvalues are clustered (spread < 1.0 Ha),
-    // the initial guess vectors contain deep-core components that get exponentially
-    // amplified. T_n(xred_min) with xred ≪ -1 overflows double precision for
-    // large n. Cap ndeg to a safe value until the eigenvalue spectrum spreads out.
-    let cold_start = (lambda_max_rq - lambda_min_rq).abs() < 1.0;
-    let cold_cap = if cold_start { 8usize } else { usize::MAX };
-    if cold_start {
-        eprintln!("[chebfi] cold start detected (ritz spread={:.3e} Ha) — capping ndeg ≤ {cold_cap}",
-            lambda_max_rq - lambda_min_rq);
-    }
+    // Safe degree cap: compute maximum ndeg such that T_n(xred_extreme) stays
+    // within double precision. xred_extreme is computed from the physically possible
+    // minimum eigenvalue (min_veff, the bottom of the effective potential).
+    // Without this, cold-start random vectors amplify deep-core components
+    // exponentially, causing numerical overflow (T_40(1.5) ≈ 10^16).
+    //
+    // T_n(x) ≈ (|x| + sqrt(x²-1))^n / 2 for |x| > 1
+    // Safe limit: T_n ≤ 1e10 → n_max = floor(ln(2e10) / ln(|x| + sqrt(x²-1)))
+    let safe_deg_cap = {
+        let lambda_extreme = lambda_min_rq.min(min_veff);
+        let xred_extreme = (2.0 * lambda_extreme - (lambda_plus + lambda_minus))
+            / (lambda_plus - lambda_minus);
+        let xabs = xred_extreme.abs();
+        if xabs > 1.0 {
+            let growth_rate = xabs + (xabs * xabs - 1.0).sqrt();
+            let safe = ((2.0e10_f64).ln() / growth_rate.ln()).floor() as usize;
+            Some(safe)
+        } else {
+            None
+        }
+    };
 
     let (ndeg_filter_global, ndeg_filter_bands) = if oracle == 0 {
-        let deg = ndeg_filter_max.min(ndeg_oracle).min(cold_cap);
+        let mut deg = ndeg_filter_max.min(ndeg_oracle);
+        if let Some(cap) = safe_deg_cap {
+            if cap < deg {
+                eprintln!("[chebfi] safe degree cap: ndeg {} → {} (growth cap)", deg, cap);
+                deg = cap;
+            }
+        }
         let mut bands = vec![deg; n_bands];
         // Lock converged bands — DIVERGENCE from ABINIT oracle=0.
         // ABINIT's oracle=0 broadcasts the same scalar ndeg to ALL bands
@@ -2486,7 +2503,7 @@ pub fn chebfi_run_rust(
         }
         (deg, bands)
     } else {
-        let (g, bands) = chebfi_set_ndeg_from_residu()
+        let (mut g, bands) = chebfi_set_ndeg_from_residu()
             .bandpp(n_bands)
             .eig_vals(&ritz_values)
             .residual_sq_norms(&fresh_residuals)
@@ -2503,7 +2520,7 @@ pub fn chebfi_run_rust(
             .ndeg_filter_current(ndeg_oracle)
             .ndeg_filter_max(ndeg_filter_max)
             .call();
-        let g = g.min(cold_cap);
+        if let Some(cap) = safe_deg_cap { if cap < g { g = cap; } }
         #[cfg(feature = "scf_diag")]
         {
             let n_locked = bands.iter().filter(|&&d| d == 0).count();
