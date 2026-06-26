@@ -2773,6 +2773,29 @@ pub fn chebfi_run_rust(
             }
         }
 
+            // Diagnostic: verify locked-band copy integrity
+            {
+                stream.synchronize().map_err(Error::Cuda)?;
+                let handle = blas.raw_handle();
+                let (x_ptr, _) = x_curr.0.device_ptr(stream);
+                let (p_ptr, _) = psi_input.0.device_ptr(stream);
+                let check_bands = [0usize, 120, 159];
+                for &b in &check_bands {
+                    if b >= n_bands || ndeg_filter_bands[b] != 0 { continue; }
+                    let x_col = (x_ptr as *const CudaComplex).wrapping_add(b * n_pw);
+                    let p_col = (p_ptr as *const CudaComplex).wrapping_add(b * n_pw);
+                    let mut auto = CudaComplex { x: 0.0, y: 0.0 };
+                    unsafe {
+                        cudarc::cublas::sys::cublasZdotc_v2(handle, n_pw_i32,
+                            x_col as *const _, 1, p_col as *const _, 1,
+                            &mut auto as *mut _ as *mut _,
+                        ).result().map_err(Error::Blas)?;
+                    }
+                    eprintln!("[chebfi] lock-check band {b}: ⟨x_curr|psi_input⟩={:.6e}+{:.6e}i",
+                        auto.x, auto.y);
+                }
+            }
+
         // ------------------------------------------------------------
         // Step 4: Chebyshev ampfactor normalisation (ABINIT lines 958–1006)
         // ------------------------------------------------------------
