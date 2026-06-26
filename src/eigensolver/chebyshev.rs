@@ -2956,6 +2956,22 @@ pub fn chebfi_run_rust(
         solver.stream().synchronize().map_err(Error::Cuda)?;
         let info_host: Vec<i32> = solver.stream().clone_dtoh(&chol_info).map_err(Error::Cuda)?;
         let chol_info_val = info_host[0];
+        // Diagnostic: check psi H-expectation BEFORE ZTRSM
+        {
+            let nb = n_bands;
+            let check_bands = [0usize, 60, 120, nb-1];
+            let psi_before: Vec<CudaComplex> = stream.clone_dtoh(&final_psi_buf.0).map_err(Error::Cuda)?;
+            for &b in &check_bands {
+                if b >= nb { continue; }
+                let psi_col = &psi_before[b * n_pw..(b+1) * n_pw];
+                eprintln!(
+                    "[chebfi] pre-ZTRSM band {b}: |psi|²={:.6e} first[0..2]=({:.6e}+{:.6e}i, {:.6e}+{:.6e}i)",
+                    psi_col.iter().map(|c| c.x*c.x + c.y*c.y).sum::<f64>(),
+                    psi_col[0].x, psi_col[0].y, psi_col[1].x, psi_col[1].y,
+                );
+            }
+        }
+
         if chol_info_val == 0 {
             // ZTRSM: X = X · R^{-1}
             use cudarc::cublas::sys::{
@@ -3103,6 +3119,23 @@ pub fn chebfi_run_rust(
                     );
                 }
             }
+        }
+    }
+
+    // Diagnostic: check psi AFTER all orthonormalization (pre-ZTRSM was above)
+    {
+        stream.synchronize().map_err(Error::Cuda)?;
+        let psi_after: Vec<CudaComplex> = stream.clone_dtoh(&final_psi_buf.0).map_err(Error::Cuda)?;
+        let nb = n_bands;
+        let check_bands = [0usize, 60, 120, nb-1];
+        for &b in &check_bands {
+            if b >= nb { continue; }
+            let psi_col = &psi_after[b * n_pw..(b+1) * n_pw];
+            eprintln!(
+                "[chebfi] post-ZTRSM band {b}: |psi|²={:.6e} first[0..2]=({:.6e}+{:.6e}i, {:.6e}+{:.6e}i)",
+                psi_col.iter().map(|c| c.x*c.x + c.y*c.y).sum::<f64>(),
+                psi_col[0].x, psi_col[0].y, psi_col[1].x, psi_col[1].y,
+            );
         }
     }
 
