@@ -2826,20 +2826,6 @@ pub fn chebfi_run_rust(
         final_psi_buf = &mut x_curr;
     }
 
-    // Diagnostic: check psi data before Cholesky QR
-    {
-        stream.synchronize().map_err(Error::Cuda)?;
-        let first_band: Vec<CudaComplex> = stream.clone_dtoh(&final_psi_buf.0).map_err(Error::Cuda)?;
-        let n_sample = n_pw.min(5);
-        let mut max_abs = 0.0f64;
-        for c in first_band.iter().take(n_sample) {
-            max_abs = max_abs.max((c.x*c.x + c.y*c.y).sqrt());
-        }
-        eprintln!(
-            "[chebfi] Phase 5 output sample (first {} of band 0, n_pw={} n_bands={}): max|psi|={:.6e}",
-            n_sample, n_pw, n_bands, max_abs,
-        );
-    }
 
     // =====================================================================
     // Phase 6: Cholesky QR (ABINIT xg_Block_xgBlock_xg_QP).
@@ -2854,21 +2840,6 @@ pub fn chebfi_run_rust(
                 .psi_dev(final_psi_buf).spsi_dev(&mut spsi_dev)
                 .vnl_data(vnl_data).n_bands(n_bands_i32).n_pw(n_pw_i32)
                 .blas(blas).stream(stream).call()?;
-        }
-
-        // Diagnostic: check S·psi after apply_s_times
-        {
-            stream.synchronize().map_err(Error::Cuda)?;
-            let spsi_sample: Vec<CudaComplex> = stream.clone_dtoh(&spsi_dev.0).map_err(Error::Cuda)?;
-            let n_sample = n_pw.min(5);
-            let mut max_spsi = 0.0f64;
-            for c in spsi_sample.iter().take(n_sample) {
-                max_spsi = max_spsi.max((c.x*c.x + c.y*c.y).sqrt());
-            }
-            eprintln!(
-                "[chebfi] Phase 6 S·psi sample (first {} of band 0): max|S·psi|={:.6e}",
-                n_sample, max_spsi,
-            );
         }
 
         let nb = n_bands;
