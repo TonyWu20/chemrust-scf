@@ -8,6 +8,9 @@
 // where H_sub = psi^dag * H|psi> and S_sub = psi^dag * psi.
 //
 // Then rotate psi to the new eigenbasis and extract eigenvalues.
+// ABINIT matrix-free pattern: rotates Ψ, HΨ, and SΨ together via gemm
+// (m_xg_ortho_RR.F90:516-525) so that all three remain consistent
+// after the eigenvector change of basis.
 
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -146,10 +149,13 @@ pub(crate) fn detect_degenerate_blocks(eigenvalues: &[f64], eps_degen: f64) -> V
 ///
 /// Input:
 /// - `psi_row`: filtered wavefunctions in RowDistributed layout (n_pw x n_bands)
-/// - `hpsi_row`: H|psi> in RowDistributed layout (n_pw x n_bands)
+/// - `hpsi_row`: H|psi> in RowDistributed layout (n_pw x n_bands);
+///   rotated in-place to match the new eigenbasis (same X matrix as psi_new = psi_row·X)
 /// - `vnl_data`: precomputed V_NL data (beta_g, D, Q matrices per ion)
 /// - `prev_psi_dev`: (optional) previous iteration's ψ for Procrustes pinning
 /// - `pin_cfg`: (optional) Procrustes pin configuration
+/// - `spsi_row`: (optional) S|psi> in RowDistributed layout (n_pw x n_bands);
+///   if provided, rotated in-place by the same eigenvector matrix X
 ///
 /// The overlap matrix S_sub includes the USPP augmentation:
 ///   S_sub = psi^dag·psi  +  Σ_ion C_proj^dag · q · C_proj
@@ -158,10 +164,15 @@ pub(crate) fn detect_degenerate_blocks(eigenvalues: &[f64], eps_degen: f64) -> V
 /// Output:
 /// - `psi_col`: rotated wavefunctions in ColumnDistributed layout (n_bands x n_pw)
 /// - `Cpu(eigenvalues)`: converged eigenvalues as a Vec<f64>
+///
+/// After RR, hpsi_row (and optionally spsi_row) are rotated by the same
+/// eigenvector matrix X so that hpsi_new = H·psi_new and spsi_new = S·psi_new
+/// remain consistent. This matches ABINIT's xg_RayleighRitz (m_xg_ortho_RR.F90:516-525)
+/// which rotates Ψ, HΨ, and SΨ together via gemm.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn rayleigh_ritz(
+pub fn rayleigh_ritz(
     psi_row: &Gpu<WavefunctionSet<RowDistributed>>,
-    hpsi_row: &Gpu<WavefunctionSet<RowDistributed>>,
+    hpsi_row: &mut Gpu<WavefunctionSet<RowDistributed>>,
     vnl_data: &VnlBatchData,
     n_bands: usize,
     n_pw: usize,
@@ -173,6 +184,7 @@ pub(crate) fn rayleigh_ritz(
     ctx: &Arc<CudaContext>,
     prev_psi_dev: Option<&CudaSlice<CudaComplex>>,
     pin_cfg: Option<&RrPinConfig>,
+    mut spsi_row: Option<&mut Gpu<WavefunctionSet<RowDistributed>>>,
 ) -> RayleighRitzResult {
     let n = n_bands as i32;
     let k = n_pw as i32;
@@ -312,6 +324,32 @@ pub(crate) fn rayleigh_ritz(
     // ---- Step 3: Solve generalized eigenvalue problem via ZHEGVD ----
     // A * X = lambda * B * X  where A = H_sub, B = S_sub
     // On return: h_sub_dev contains eigenvectors X (column-major, n x n)
+
+    // Diagnostic: check S_sub diagonal and off-diagonal extrema before ZHEGVD.
+    // A non-positive-definite S_sub will cause ZHEGVD info > n_bands.
+    {
+        stream.synchronize().map_err(Error::Cuda)?;
+        let s_sub_cpu: Vec<CudaComplex> = stream.clone_dtoh(&s_sub_dev).map_err(Error::Cuda)?;
+        let nb = n_bands;
+        let (min_diag, max_diag) = (0..nb)
+            .map(|i| s_sub_cpu[i * nb + i])
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(mn, mx), c| {
+                (mn.min(c.x), mx.max(c.x))
+            });
+        let max_off_mag: f64 = (0..nb).flat_map(|i| (0..nb).map(move |j| (i, j)))
+            .filter(|&(i, j)| i != j)
+            .map(|(i, j)| {
+                let c = s_sub_cpu[i * nb + j];
+                (c.x * c.x + c.y * c.y).sqrt()
+            })
+            .fold(0.0_f64, f64::max);
+        // Check imaginary part of diagonal (should be ~0 for Hermitian)
+        let max_diag_imag: f64 = (0..nb)
+            .map(|i| s_sub_cpu[i * nb + i].y.abs())
+            .fold(0.0_f64, f64::max);
+        eprintln!("[RR-diag] S_sub before ZHEGVD: n={nb} diag=[{min_diag:.6e}, {max_diag:.6e}] max|off|={max_off_mag:.6e} max|Im(diag)|={max_diag_imag:.6e}");
+    }
+
     let mut eigenvalues_dev: CudaSlice<f64> =
         stream.alloc_zeros(n_bands).map_err(Error::Cuda)?;
     let mut info_dev: CudaSlice<i32> = stream.alloc_zeros(1).map_err(Error::Cuda)?;
@@ -628,6 +666,67 @@ pub(crate) fn rayleigh_ritz(
         )?;
     }
 
+    // ---- Step 5: Rotate hpsi in-place: hpsi_new = hpsi_row · X ----
+    //
+    // Uses a scratch buffer (gemm cannot alias A and C). The same gemm pattern
+    // as psi rotation (Step 4): C(n_pw, n_bands) = A(n_pw, n_bands) · X(n_bands, n_bands).
+    // After gemm, scratch is copied back into hpsi_row's device slice.
+    // This matches ABINIT's xg_RayleighRitz (m_xg_ortho_RR.F90:516-525).
+    {
+        let mut hpsi_scratch: CudaSlice<CudaComplex> =
+            stream.alloc_zeros(n_bands * n_pw).map_err(Error::Cuda)?;
+        unsafe {
+            blas.gemm_c64(
+                ZgemmConfig {
+                    transa: op::N,
+                    transb: op::N,
+                    m: k,
+                    n,
+                    k: n,
+                    alpha: CudaComplex { x: 1.0, y: 0.0 },
+                    lda: k,
+                    ldb: n,
+                    beta: CudaComplex { x: 0.0, y: 0.0 },
+                    ldc: k,
+                },
+                hpsi_row.as_device_slice(),
+                &h_sub_dev,
+                &mut hpsi_scratch,
+            )?;
+        }
+        // Copy scratch back into hpsi_row in-place
+        stream.memcpy_dtod(&hpsi_scratch, hpsi_row.as_device_slice_mut()).map_err(Error::Cuda)?;
+    }
+
+    // ---- Step 5a: Rotate spsi in-place (if provided) ----
+    //
+    // Same pattern as hpsi rotation: spsi_new = spsi_row · X.
+    // Uses a scratch buffer; copies result back into spsi_row's device slice.
+    if let Some(ref mut spsi) = spsi_row {
+        let mut spsi_scratch: CudaSlice<CudaComplex> =
+            stream.alloc_zeros(n_bands * n_pw).map_err(Error::Cuda)?;
+        unsafe {
+            blas.gemm_c64(
+                ZgemmConfig {
+                    transa: op::N,
+                    transb: op::N,
+                    m: k,
+                    n,
+                    k: n,
+                    alpha: CudaComplex { x: 1.0, y: 0.0 },
+                    lda: k,
+                    ldb: n,
+                    beta: CudaComplex { x: 0.0, y: 0.0 },
+                    ldc: k,
+                },
+                spsi.as_device_slice(),
+                &h_sub_dev,
+                &mut spsi_scratch,
+            )?;
+        }
+        stream.memcpy_dtod(&spsi_scratch, spsi.as_device_slice_mut()).map_err(Error::Cuda)?;
+    }
+
     // ---- Step 5b: Project β_g^H · ψ_new per ion (USPP augmentation density) ----
     //
     // For each ion I, compute βψ_I = β_g^H · ψ_new with shape (n_expanded × n_bands).
@@ -707,6 +806,7 @@ pub fn rayleigh_ritz_with_matrices(
     ctx: &Arc<CudaContext>,
     _prev_psi_dev: Option<&CudaSlice<CudaComplex>>,
     _pin_cfg: Option<&RrPinConfig>,
+    _spsi_row: Option<&mut Gpu<WavefunctionSet<RowDistributed>>>,
 ) -> Result<
     (
         Gpu<WavefunctionSet<ColumnDistributed>>,

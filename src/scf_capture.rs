@@ -127,7 +127,7 @@ pub fn capture_as_castep_bin<S: SpinPolicy>(
     // --- Total density on fine grid ---
     // 1. Upsample smooth density from wave grid to fine grid
     let total_density = state.density.total();
-    let rho_wave = total_density.as_wave_array();
+    let rho_wave = total_density.as_fine_array();
     let rho_wave_padded = {
         let mut arr = ndarray::Array3::<f64>::zeros(wave_grid_dims);
         let shape = rho_wave.shape();

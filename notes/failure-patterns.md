@@ -543,3 +543,112 @@ for: (a) base convention (0 vs 1-based indices), (b) axis ordering (innermost di
 **Related**: §2026-06-04 ffi-fortran-1-based-index-mismatch-in-scatter-gather (Bug 1),
 §2026-05-20 cufft-dim-ordering-and-rr-transpose-layout (prior cuFFT ordering bug in Chebyshev path)
 
+## 2026-06-18: ChFSI FFT plan dimension ordering — SECOND instance of the same bug
+
+**Symptom**: ChFSI pre-filter Rayleigh quotient on Cu111_CO CASTEP wavefunctions
+gave +1.534 Ha (should be -1.055 Ha). V_loc contribution ≈ 0 Ha despite V_eff
+values being verified correct at every GPU grid point. CPU `apply_local_hamiltonian`
+on the same wavefunction gave V_loc = -2.666 Ha (correct). NiO worked perfectly
+(all 14 k-points matching CASTEP to ~0.03 meV).
+
+**Root cause**: `chebfi_run_rust` created the cuFFT plan with `plan_batched_c2c(ngz, ngy, ngx)`
+(iz-innermost), while the Davidson/SCF/FFI paths all used `plan_batched_c2c(ngx, ngy, ngz)`
+(ix-innermost). The V_eff and fft_idx data are iz-innermost. For a cubic grid (NiO
+20×20×20), the two conventions are identical, masking the bug. For Cu111_CO's
+non-cubic grid (54×90×90), the dimension swap caused cuFFT to interpret the
+iz-innermost data as if it were ix-innermost, applying V_eff at wrong spatial
+positions — constant V_eff tests passed (spatial position irrelevant for uniform
+fields) but spatially-varying V_eff was completely wrong.
+
+**Fix**: `src/eigensolver/chebyshev.rs` lines 213, 588, 2244, 2932 — change
+`plan_batched_c2c(ngz, ngy, ngx, ...)` → `plan_batched_c2c(ngx, ngy, ngz, ...)`.
+
+**Result**: Cu111_CO band 0 Δ = 1.79×10⁻⁵ Ha (0.5 meV). All 160 bands PASS.
+NiO all 14 k-points continue to PASS.
+
+**Pattern**: `failure-to-generalize-existing-fix`. The failure-patterns note
+`ffi-fortran-grid-layout-convention-mismatch` (2026-06-05) already documented
+the exact same root cause in the FFI path. The fix applied to `src/ffi.rs`
+(transposes to match Davidson convention) was read but misclassified as
+"FFI-only" — a Fortran→Rust boundary concern. The note was never generalized
+to "audit every `plan_batched_c2c` call site." Three separate code paths
+(Davidson in scf.rs, FFI in ffi.rs, ChFSI in chebyshev.rs) each independently
+chose their plan dimension ordering; two converged on `(ngx, ngy, ngz)` and
+one diverged with `(ngz, ngy, ngx)`.
+
+**Cost**: ~6 hours of diagnostic work (V_eff GPU readback, constant-V_eff
+tests, CPU vs GPU comparison, spatial misalignment hypothesis, Nyquist
+collision analysis) that would have been reduced to 30 seconds if the
+documented FFI fix had been generalized to "check all plan creation sites."
+
+**Lesson**: When a failure-patterns note describes a fix in component A
+for symptom S, and component B exhibits symptom S, the first diagnostic
+action is: **does component B have the same bug as component A?** Not
+"component B must have a different bug because the documented fix was
+in component A." The fix site and the bug site are not always the same.
+
+**Lesson 2**: Cubic grids (NiO 20³) mask dimension-ordering bugs. Any
+cross-path validation must include a non-cubic test system.
+Cu111_CO (54×90×90) serves this role — it catches dimension swaps that
+cubic grids are invariant under.
+
+**Verification**: `tests/nio_chfsi_gate4.rs::gate4_cu111co_chfsi_eigenvalues`
+(PASS, band0 Δ=1.79e-5 Ha) and `gate4_nio_all_kpoints` (PASS, 14/14 kpts).
+
+## 2026-06-18: Mixing operates on soft-only density; CASTEP mixes soft+aug combined
+
+**Symptom**: NiO SCF cascade — both Davidson and ChFSI diverge identically. Soft fraction
+drifts from 0.58 (matching CASTEP converged ~0.57) to 0.83 in 3 iterations. Electron count
+explodes from 64 to 12,598 by iter 4. Hamiltonian verified correct on frozen V_eff
+(Cu111_CO Δ=1.8e-5 Ha, NiO Δ=3e-5 Ha).
+
+**Root cause**: CASTEP's `electronic.f90:597-616` computes `dens_temp = soft` (fine grid,
+upsampled from wave grid via `basis_real_std_to_fine_grid` at `density.f90:1100`), then
+adds augmentation IN-PLACE (`dens_temp = dens_temp + Q_rho_sum` at `density.f90:3611`),
+then passes the COMBINED (soft+aug) density to `dm_mix_density(dens_temp, dens, ...)`.
+The mixing operates on the total physical density including augmentation charge.
+
+Our code (`scf.rs:1285-1550`) keeps soft density on the WAVE grid (`self.density =
+Density(WaveGridArray)`) and augmentation on the FINE grid separately
+(`self.density_aug_fine`). Mixing (`mixing.rs`) operates ONLY on the wave-grid soft
+density. Augmentation is added later in `build_v_eff_with_energy_impl` (line 454-458)
+during V_eff assembly, completely bypassing the mixing feedback loop.
+
+In CASTEP: mixing damps all components of the total density uniformly. In our code:
+only the soft component (40% of density) receives mixing feedback; the augmentation
+component (60% of density) drifts open-loop, driven solely by eigenstate rotation.
+The mixing damps soft → soft fraction shifts → V_eff changes → eigenstates rotate more
+→ aug changes more unchecked → positive feedback cascade.
+
+**Fix**: Structure `construct_density_*` to:
+1. Compute soft density on wave grid (existing)
+2. Upsample soft to fine grid (new)
+3. Add augmentation in-place on fine grid (new — combine before mixing)
+4. Pass combined fine-grid density to mixing (change `DensityHistory` grid)
+5. Store mixed combined density; use it directly for V_eff assembly
+
+Estimated ~150-200 LOC across `scf.rs` (construct_density methods, density flow),
+`mixing.rs` (grid dimension changes), and `density.rs` (upsample step).
+
+**Pattern**: `component-separation-violates-reference-architecture`. Our clean separation
+of soft and aug density (a natural Rust abstraction) broke the tight coupling that
+CASTEP's Fortran code achieves through in-place mutation of `dens_temp`. The separation
+looked elegant — augment is "always fresh from wavefunctions" — but it created an
+open-loop feedback path that CASTEP's architecture prevents by mixing the combined
+density. The elegance of the abstraction was directly responsible for hiding the bug
+from 9+ agents over 2 months.
+
+**Lesson**: When the reference implementation mutates a shared buffer in-place,
+replicating that mutation with separate cleanly-typed components requires verifying
+that ALL consumers of the mutated buffer receive the post-mutation value. CASTEP's
+`dens_temp = soft; dens_temp += aug; mix(dens_temp)` is a single linear sequence;
+our `self.density = soft; self.density_aug_fine = aug; mix(self.density)` forks the
+data flow — only the soft branch enters mixing.
+
+**Lesson 2**: "The mixing separates soft and aug" was stated as a fact in the code
+comments and memory entries for months. No agent challenged it. When a design choice
+is described as intentional in comments, it becomes invisible to auditors. Every
+"intentional" design decision that differs from the reference must be accompanied
+by a verification that the reference does NOT merge those data paths before the
+point of divergence.
+

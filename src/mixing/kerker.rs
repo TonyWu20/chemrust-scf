@@ -41,9 +41,18 @@ impl KerkerPreconditioner {
     /// The kernel is computed on CPU from `GVectorGrid::g2()` (which already
     /// provides |G|² for every reciprocal grid point in the cuFFT-compatible
     /// Fortran layout) and then transferred to GPU memory.
+    ///
+    /// `g2_cutoff`: if `Some(max_g2)`, G-vectors with |G|² > max_g2 are set
+    /// to K=0 (no mixing).  CASTEP's `dm_apply_kerker` only mixes up to
+    /// `num_mix_plane_waves` (= G-vectors within `mix_charge_gmax`, typically
+    /// the wave-function cutoff at 380 eV).  On the fine grid, high-frequency
+    /// G-vectors beyond this cutoff carry numerical noise and must be excluded
+    /// from mixing.  Pass `gvg_wave.g2().iter().cloned().fold(0.0, f64::max)`
+    /// when building the Kerker kernel on the fine grid.
     pub fn new(
         stream: &Arc<CudaStream>,
         gvg: &GVectorGrid,
+        g2_cutoff: Option<f64>,
     ) -> Result<Self, Error> {
         let shape = gvg.grid();  // [ngz, ngy, ngx]
         let q2 = 2.25;           // q = 1.5 a.u., q² = 2.25
@@ -58,6 +67,12 @@ impl KerkerPreconditioner {
             if g2_val == 0.0 {
                 // G = 0: no DC component mixing
                 0.0
+            } else if let Some(cut) = g2_cutoff {
+                if g2_val > cut {
+                    0.0  // beyond mixing cutoff — CASTEP num_mix_plane_waves
+                } else {
+                    g2_val / (g2_val + q2)
+                }
             } else {
                 g2_val / (g2_val + q2)
             }

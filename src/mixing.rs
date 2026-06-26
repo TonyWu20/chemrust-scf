@@ -332,12 +332,13 @@ impl DensityHistory<MixingOff> {
     /// on the history.
     pub fn into_kerker(
         mut self,
-        wave_grid: &GVectorGrid,
+        mixing_grid: &GVectorGrid,
+        g2_cutoff: Option<f64>,
     ) -> Result<DensityHistory<Kerker>, Error> {
         if self.kerker.is_none() {
             let ctx = Arc::new(CudaContext::new(0).map_err(Error::Cuda)?);
             let stream = ctx.default_stream();
-            let kerker = KerkerPreconditioner::new(&stream, wave_grid)?;
+            let kerker = KerkerPreconditioner::new(&stream, mixing_grid, g2_cutoff)?;
             self.kerker = Some(kerker);
             // Compile kernels on the same stream/context to avoid context
             // isolation (device pointers are not valid across contexts).

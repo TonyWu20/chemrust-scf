@@ -62,56 +62,34 @@ fn iter1_density_pointwise_vs_den_fmt() {
     );
 
     // Build state and run iter-1.
-    let state = fixtures::cu111_co::build_scf_state(fx);
+    let ctx = cudarc::driver::CudaContext::new(0).expect("cuda");
+    let stream = std::sync::Arc::new(ctx.default_stream());
+    let state = fixtures::cu111_co::build_scf_state(fx, &stream);
     let iter1_v = state.build_v_eff_with_energy().expect("iter-1 build_v_eff");
     let iter1_diag = iter1_v.diagonalize(8, None).expect("iter-1 diagonalize");
     let iter1_dens_state = iter1_diag.construct_density_off().expect("construct_density");
 
-    // Pull iter-1 output components.
-    let rho_pw_wave = iter1_dens_state.density().as_wave_array().clone();
-    let rho_aug_fine = iter1_dens_state
-        .density_aug_fine()
-        .expect("iter-1 must have ρ_aug")
-        .as_real_array()
-        .clone();
+    // After the fine-grid mixing refactor, construct_density_off combines soft+aug
+    // on the fine grid and stores the combined density.  density() returns the
+    // combined fine-grid density directly — no separate upsampling step needed.
+    let rho_total_iter1_arr = iter1_dens_state.density().as_fine_array().clone();
 
-    // Upsample ρ_PW from wave grid to fine grid (same path V_eff assembly uses).
-    use chemrust_hamiltonian_core::{upsample_density_to_fine_grid, fft::RealGrid, GVectorGrid};
-    let wave_grid_dims = fx.check.wavefunction.as_ref().unwrap().grid;
-    let wave_grid = GVectorGrid::new(
-        wave_grid_dims[0], wave_grid_dims[1], wave_grid_dims[2],
-        cell.recip_lattice,
-    );
-    let fine_grid_dims = fx.check.fine_grid.unwrap();
-    let fine_grid = GVectorGrid::new(
-        fine_grid_dims[0], fine_grid_dims[1], fine_grid_dims[2],
-        cell.recip_lattice,
-    );
+    assert_eq!(rho_total_iter1_arr.shape(), den_fmt_arr.shape(),
+        "shape mismatch: iter1 combined {:?} vs den_fmt {:?}",
+        rho_total_iter1_arr.shape(), den_fmt_arr.shape());
 
-    let rho_pw_grid = RealGrid::from_inner(rho_pw_wave);
-    let rho_pw_fine_grid = upsample_density_to_fine_grid(&rho_pw_grid, &wave_grid, &fine_grid)
-        .expect("upsample ρ_PW");
-    let rho_pw_fine = rho_pw_fine_grid.as_real_array().clone();
+    // Aug is baked into the density — verify it's absent from density_aug_fine.
+    assert!(iter1_dens_state.density_aug_fine().is_none(),
+        "after combine_soft_aug_on_fine, density_aug_fine must be None");
 
-    assert_eq!(rho_pw_fine.shape(), den_fmt_arr.shape(),
-        "shape mismatch: rho_pw_fine {:?} vs den_fmt {:?}",
-        rho_pw_fine.shape(), den_fmt_arr.shape());
-    assert_eq!(rho_aug_fine.shape(), den_fmt_arr.shape(),
-        "shape mismatch: rho_aug_fine {:?} vs den_fmt {:?}",
-        rho_aug_fine.shape(), den_fmt_arr.shape());
-
-    let rho_total_iter1 = &rho_pw_fine + &rho_aug_fine;
+    let rho_total_iter1 = rho_total_iter1_arr;
     let total_sum: f64 = rho_total_iter1.iter().sum();
-    let pw_sum: f64 = rho_pw_fine.iter().sum();
-    let aug_sum: f64 = rho_aug_fine.iter().sum();
     eprintln!(
-        "[iter-1 outputs] ρ_PW_upsampled sum={pw_sum:.4e}  ρ_aug sum={aug_sum:.4e}  total sum={total_sum:.4e}"
+        "[iter-1 output] combined soft+aug on fine grid, total sum={total_sum:.4e}"
     );
 
     // Dump for offline analysis.
-    dump_array_3d(&rho_pw_fine, "/tmp/cu111_iter1_rho_pw_upsampled.bin");
-    dump_array_3d(&rho_aug_fine, "/tmp/cu111_iter1_rho_aug.bin");
-    dump_array_3d(&rho_total_iter1, "/tmp/cu111_iter1_rho_total.bin");
+    dump_array_3d(&rho_total_iter1, "/tmp/cu111_iter1_rho_combined.bin");
     dump_array_3d(&den_fmt_arr, "/tmp/cu111_castep_rho_total.bin");
 
     // ---- Global pointwise comparisons ----
@@ -164,18 +142,11 @@ fn iter1_density_pointwise_vs_den_fmt() {
 
         let mut n_roi = 0usize;
         let mut sum_ref = 0.0_f64;
-        let mut sum_pw = 0.0_f64;
-        let mut sum_aug = 0.0_f64;
         let mut sum_total = 0.0_f64;
         let mut max_ref = f64::NEG_INFINITY;
-        let mut max_pw = f64::NEG_INFINITY;
-        let mut max_aug = f64::NEG_INFINITY;
         let mut max_total = f64::NEG_INFINITY;
         let mut diff_total_inf = 0.0_f64;
-        let mut diff_pw_inf = 0.0_f64;
-        let mut diff_aug_minus_residual_inf = 0.0_f64;
         let mut sum_diff_total_sq = 0.0_f64;
-        let mut sum_diff_pw_sq = 0.0_f64;
 
         for ix in 0..ngx {
             for iy in 0..ngy {
@@ -191,30 +162,16 @@ fn iter1_density_pointwise_vs_den_fmt() {
                     if d2 > radius_sq { continue; }
 
                     let rref = den_fmt_arr[[ix, iy, iz]];
-                    let rpw = rho_pw_fine[[ix, iy, iz]];
-                    let raug = rho_aug_fine[[ix, iy, iz]];
                     let rtot = rho_total_iter1[[ix, iy, iz]];
-                    let rresidual = rref - rpw; // What aug "should be" if PW is right
 
                     sum_ref += rref;
-                    sum_pw += rpw;
-                    sum_aug += raug;
                     sum_total += rtot;
                     if rref > max_ref { max_ref = rref; }
-                    if rpw > max_pw { max_pw = rpw; }
-                    if raug > max_aug { max_aug = raug; }
                     if rtot > max_total { max_total = rtot; }
 
                     let dt = (rtot - rref).abs();
                     if dt > diff_total_inf { diff_total_inf = dt; }
                     sum_diff_total_sq += dt * dt;
-
-                    let dp = (rpw - rref).abs(); // For comparison only
-                    if dp > diff_pw_inf { diff_pw_inf = dp; }
-                    sum_diff_pw_sq += dp * dp;
-
-                    let dar = (raug - rresidual).abs();
-                    if dar > diff_aug_minus_residual_inf { diff_aug_minus_residual_inf = dar; }
 
                     n_roi += 1;
                 }
@@ -223,21 +180,16 @@ fn iter1_density_pointwise_vs_den_fmt() {
 
         let inv_n = if n_roi > 0 { 1.0 / n_roi as f64 } else { 0.0 };
         let total_rms = (sum_diff_total_sq * inv_n).sqrt();
-        let pw_rms = (sum_diff_pw_sq * inv_n).sqrt();
 
         eprintln!(
             "[ROI Cu ion={ion_idx}  N={n_roi}]\n\
-             \tsum: ref={:.3e}  total={:.3e}  PW={:.3e}  aug={:.3e}\n\
-             \tmax: ref={:.3e}  total={:.3e}  PW={:.3e}  aug={:.3e}\n\
-             \tdiff (iter-1 total ρ vs ref): inf={:.3e}  rms={:.3e}\n\
-             \tdiff (iter-1 ρ_aug vs (ref − ρ_PW)): inf={:.3e}",
-            sum_ref, sum_total, sum_pw, sum_aug,
-            max_ref, max_total, max_pw, max_aug,
+             \tsum: ref={:.3e}  combined={:.3e}\n\
+             \tmax: ref={:.3e}  combined={:.3e}\n\
+             \tdiff (combined vs ref): inf={:.3e}  rms={:.3e}",
+            sum_ref, sum_total,
+            max_ref, max_total,
             diff_total_inf, total_rms,
-            diff_aug_minus_residual_inf,
         );
-        let _ = pw_rms;
-        let _ = diff_pw_inf;
     }
 
     std::io::stderr().flush().ok();

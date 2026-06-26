@@ -1,135 +1,133 @@
-# Handoff: Diagnostic 2 Complete — Per-Band Residual Baseline Established
+# Handoff — 2026-06-26: ZTRSM column mixing fixed; unoccupied band inflation remains
 
-**Date**: 2026-05-27  
-**Branch**: `diag/iterative-chebyshev-viability`  
-**Status**: ✅ Diagnostic 2 validated, ready for Diagnostic 3
-
-## Reevaluation Context
-
-This branch tests whether iterative Chebyshev filtering (PARSEC Algorithm 4 with outer loop) is viable for USPP metallic systems. Prior conclusions on `feat/phase-global-woodbury` deemed Chebyshev-RR "architecturally unsuitable," but that assessment was based on a single-sweep implementation (no outer loop, no band-locking). Diagnostics 1/1b (κ₂=1.0, perfect orthogonality for all filter modes) and Diagnostic 2 (reasonable residual baseline) have falsified the "unsuitable" claim. The outer loop (Diagnostic 3) is the remaining question.
-
-**Status tracking**: See `notes/diagnostics-status-and-evaluation.md` for comprehensive tracking of all diagnostic results and the reevaluation decision matrix.
+**Branch**: `feat/chebyshev-iterative-eigensolver`
+**Status**: Warm start converges in 4 iters (-24110.967 vs -24110.967 eV ref) ✅ | Unoccupied band eigenvalues inflated ⚠️ | Cold start fails (overflow) ⚠️
 
 ---
 
-## What Was Accomplished This Session
+## Resolved issues
 
-### Diagnostic 2: Per-Band Residual Norms After Chebyshev Filter + RR
+### ZTRSM column mixing (root cause of unoccupied band corruption)
 
-**Implementation**:
-- `chebyshev_filter_for_test_gpu()` — GPU-resident filter returning `(psi_row_gpu, hpsi_row_gpu, kernels)` for RR chaining
-- `compute_residual_norms_for_test()` — all-GPU residual computation following `davidson.rs:270-338`: gemm rotation, apply_s_times, per-band zcopy+zaxpy, batch S^{-1} via Woodbury, zdotc norms
-- `diagnostic_2` integration test — 5 anchored assertions, per-band table, per-group statistics
+**Symptom**: Bands 120+ had H-expectations diverging from pre-filter ritz values
+(ritz 0.04 → H-expectation 1.08). Locked bands (ndeg=0, copied from input)
+also showed wrong H-expectation.
 
-**Result**: ✅ **Test passed (93.31s). All assertions green.**
+**Root cause**: Cholesky QR's `ZTRSM` step (`X = X·R⁻¹`) mixes columns with
+very different bare `|ψ|²` magnitudes. For USPP (S ≠ I), occupied bands have
+`|ψ|² ≈ 1.0` while unoccupied bands have `|ψ|² ≈ 0.06`. ZTRSM redistributes
+norm from occupied columns to unoccupied columns.
 
-| Group | Count | S⁻¹ Max | S⁻¹ Mean | L2 Max | L2 Mean |
-|-------|-------|---------|---------|--------|---------|
-| DeepCore (band 0) | 1 | 4.2e-2 | 4.2e-2 | 5.7e-2 | 5.7e-2 |
-| **Cu 3d** (bands 1-14) | 14 | **2.09e-1** | **1.55e-1** | **5.02e-1** | **3.37e-1** |
-| Valence | 67 | 1.68e-1 | 1.32e-1 | 3.59e-1 | 2.70e-1 |
-| NearFermi | 15 | 1.05e-1 | 7.88e-2 | 2.00e-1 | 1.42e-1 |
-| Conduction | 63 | 5.70e-2 | **2.60e-2** | 8.62e-2 | **4.31e-2** |
+**Fix** (`c837b16`): Skip ZTRSM when ZPOTRF succeeds (info=0). Per-band S-norm
+normalization already gives `S_sub ≈ I` (max|off| ≈ 4×10⁻⁴), so `rayleigh_ritz`
+ZHEGVD handles it directly. Regularization retry + ZHEEVD fallback keep ZTRSM
+since nearly-diagonal R after regularization makes mixing negligible.
 
-### Key Findings
+**Verification**: Pre/post ZTRSM psi coefficients are now identical (no mixing).
 
-1. **Conduction bands converge well**: S⁻¹ residuals ~0.026 Ha mean after one pass — these would lock early with band-locking (Diagnostic 5).
+### ZPOTRF failure (info=85—160) on Cu111_CO non-cubic grid
 
-2. **Occupied bands (Cu 3d + valence, 81 bands) need more work**: Residuals ~0.13-0.21 Ha after one pass. The outer loop (Diagnostic 3-5) has a substantial workload — this is not "one sweep is enough."
+**Root cause**: All 160 bands filtered with oracle=0 (including 121 already-converged
+warm-start bands), producing near-linearly-dependent vectors with `S_sub` off-diagonals ≈ 0.999.
 
-3. **Cu 3d RR mixing confirmed**: MAE ratio (cu3d/separated) = 1.44, and Cu 3d residuals are the highest of any group. Degenerate subspace rotation is structural.
+**Fix** (`3e75331`): Lock converged bands even with oracle=0 — `ndeg=0` for bands
+with `fresh_residual[b] < tolerance`. This is a **divergence from ABINIT** (ABINIT's
+oracle=0 broadcasts same ndeg to all bands), necessary because ABINIT's `getAX_BX`
+inside the recurrence loop + matrix-free RR provide numerical stabilization our
+pipeline lacks.
 
-4. **Well-separated eigenvalue MAE = 0.0138 Ha** (slightly above the 0.01 Ha note threshold, not a failure). Conduction bands recover well despite this.
+### ABINIT-matching per-ion block-diagonal S⁻¹
 
-5. **Band 0 surprise**: Ranked 58th in residual (4.2e-2 Ha), not in top 5. This may be a filter spectral bound issue — band 0 at -1.055 Ha sits near the edge of the Chebyshev passband. The filter amplifies components near the passband center, and band 0 may be too far from center.
-
-6. **n_pw = 60067** (different from earlier 9477 — this is the full PW basis at the actual cutoff, not a test subset)
-
-### What This Means for Diagnostics 3-5
-
-- The outer loop has a clear signal to work with: ~0.1-0.2 Ha residuals for 81 occupied bands
-- Conduction bands (~63 bands) already near convergence — band-locking will help
-- Filter spectral bounds (b_low=0.0894 from max_veff) may be mis-identifying the lower bound — the filter window may not be centered optimally for the full spectral range
-- Harmonic RR (Diagnostic 4) is worth testing: the Cu 3d cluster shows clear mixing
-
-### Files Modified
-
-- `src/eigensolver/chebyshev.rs` — Added `chebyshev_filter_for_test_gpu()` + `compute_residual_norms_for_test()` + type alias
-- `src/lib.rs` — Added re-exports for the new wrappers and `rayleigh_ritz_with_matrices`
-- `tests/chebyshev_orthogonality_diagnostic.rs` — Added Diagnostic 2 test + helpers
+**Fix** (`56b6dec`): Replace global `M = Q⁻¹ + B^H·B` LU preconditioner with
+per-ion block-diagonal `Q⁻¹` preconditioner, matching ABINIT `m_invovl.F90:1100-1140`.
+Iterative refinement up to 30 iterations with per-band residual convergence tracking.
 
 ---
 
-## What To Do Next Session
+## Remaining issues
 
-### Immediate Next Step: Diagnostic 3
+### 1. Unoccupied band eigenvalue inflation (HIGH)
 
-**Goal**: Test if residuals decrease monotonically with a simple outer loop (5-10 iterations).
+**Symptom**: Cu111_CO warm start `.bands` shows bands 125+ with eigenvalues up to
+1.86 Ha vs 0.115 Ha CPU reference. Occupied bands (1-120) match reference within 0.0001 Ha.
+Final energy converges correctly (-24110.967 vs -24110.967 eV).
 
-**Implementation** (in the same test file or a new one):
+**Mechanism**: The filter's Chebyshev recurrence operates on all 160 bands simultaneously
+(column-independent). The 39 unlocked bands (with residual > tolerance) get corrupted
+by the filter. After rayleigh_ritz ZHEGVD, the eigenvector rotation matrix X mixes the
+corruption into ALL bands. In pass 2, the "locked" bands copy corrupted psi_input from
+pass 1's RR output. The corruption self-amplifies across SCF iterations.
 
-```rust
-#[test]
-#[ignore = "requires GPU and CASTEP fixture data"]
-fn diagnostic_3_outer_loop_convergence() {
-    // For each iteration 1..N:
-    //   1. Run Chebyshev filter (all bands, no locking yet)
-    //   2. Run standard Rayleigh-Ritz
-    //   3. Compute per-band S⁻¹-weighted residuals
-    //   4. Track per-band residual evolution
-    //   5. Track eigenvalue drift
-    // Report:
-    //   - Residual trajectories per band cluster
-    //   - Total residual sum over iterations
-    //   - Which bands converge and at what rate
-}
-```
+**Why ZTRSM fix wasn't sufficient**: ZTRSM was ONE source of column mixing. The RR
+ZHEGVD's eigenvector rotation matrix is ANOTHER source — it rotates all 160 columns
+simultaneously, propagating any corruption in the H_sub matrix.
 
-**Decision Point**:
-- If residuals decrease → proceed to Diagnostic 4 (Harmonic RR)
-- If residuals plateau → need Harmonic RR for degenerate clusters
-- If residuals increase → fundamental problem with approach
+**Why S⁻¹ fix wasn't sufficient**: The T_1 diagnostic confirmed S⁻¹ produces correct
+results (matching ritz) for all bands. The corruption enters during the full Chebyshev
+recurrence (T_2 through T_n), not the first S⁻¹·H step.
 
-**Estimated Time**: 1 day
+**Lock-check diagnostic** (`a3579c8`): Confirmed locked-band copy is correct
+(`⟨x_curr|psi_input⟩ = |psi|²`). The locked bands receive already-corrupted data
+from the previous RR output.
 
-### Subsequent Diagnostics (After Diagnostic 3)
+**Next step**: Investigate whether the Chebyshev recurrence itself is corrupting
+unlocked bands, or whether the RR ZHEGVD rotation is propagating corruption.
 
-#### Diagnostic 4: Harmonic RR vs. Standard RR
+### 2. Cold start overflow (HIGH)
 
-Test if Harmonic Rayleigh-Ritz stabilizes the Cu 3d degenerate cluster by using a shift σ near the cluster center.
+**Symptom**: Cu111_CO cold start: `max|psi| = 2×10¹⁹`, ZPOTRF info=63, ZHEEVD info=155,
+RR ZHEGVD info=223. All 160 bands have ritz clustered at 1.89-1.94 Ha.
 
-**Estimated Time**: 1-2 days
+**Root cause**: Random initial guess vectors contain deep-core components (λ ≈ -10 Ha,
+xred ≈ -1.5). T_40(1.5) ≈ 10¹⁶ causes double-precision overflow. Ampfactor divides by
+T_n(average ritz) ≈ 6.3 — insufficient against 10¹⁶.
 
-#### Diagnostic 5: Band-Locking Behavior
+**Partial fix** (`ddff9d9`): Safe degree cap based on eigenvalue bounds:
+`n_max = floor(ln(2×10¹⁰) / ln(|x| + sqrt(x²-1)))`. For Cu111_CO, caps ndeg at ~19.
+Prevents overflow but doesn't fix convergence — cold start needs many SCF iterations
+with such small ndeg.
 
-Test if band-locking works without causing regression. Conduction bands are prime candidates for early locking.
+**Rejected approach** (`ccf53d7`, reverted by `67fa50b`): Davidson fallback for first
+SCF iteration. Caused warm start divergence because Davidson→Chebyshev transition
+on iter 2 produced eigenvalue shifts that destabilized SCF convergence.
 
-**Estimated Time**: 1 day
-
-### Decision Point After Diagnostics 2-5
-
-**If all diagnostics pass** → Proceed to Phase 1: Full implementation of outer loop + band-locking + Harmonic RR.
-
-**If any diagnostic fails** → Investigate root cause. May need spectrum slicing, different filter bounds, or the already-proven Davidson v1 (which has locking built in).
+**Proper fix**: Improve initial guess quality (LCAO) or use iterative subspace
+expansion with per-band degree differentiation.
 
 ---
 
-## Reference Documents
+## Key files changed
 
-- **DIAGNOSTIC_PLAN.md** — Full diagnostic-first implementation plan
-- **HANDOFF.md** (this file) — Session log and status
-- **DIAGNOSTIC_1B_RESULT.md** — Detailed Diagnostic 1b test results
+| File | Key changes |
+|------|-------------|
+| `src/eigensolver/chebyshev.rs` | ZTRSM skip, converged-band locking, safe degree cap, per-band S-norm normalization, ZPOTRF regularization chain + ZHEEVD fallback, lock-check diagnostic |
+| `src/eigensolver/hamiltonian.rs` | Per-ion block-diagonal S⁻¹ iterative refinement (replaces global LU) |
+| `src/eigensolver/davidson.rs` | `compute_all()` restoration, CUDA event timing |
+| `src/eigensolver/rayleigh_ritz.rs` | S_sub diagnostic before ZHEGVD |
+| `src/ffi.rs` | (reverted) Davidson fallback for first SCF iteration |
+| `HANDOFF.md` | This file |
 
----
+## Key decisions
 
-## Commands to Resume Work
+1. **ZTRSM skipped for well-conditioned S_sub** — per-band normalization + small
+   off-diagonals is sufficient; ZHEGVD handles S_sub ≈ I
+2. **Converged-band locking is necessary** — divergence from ABINIT oracle=0, but
+   ABINIT's `getAX_BX`-inside-loop provides implicit regularization we lack
+3. **Davidson fallback breaks warm start** — eigenvalue shift on iter 2 causes
+   SCF oscillation; cold start needs a different solution
+4. **Per-ion S⁻¹ matches ABINIT algorithm** — eliminates global LU dependency
 
-```bash
-cd /home/tony/programming/chemrust-scf-chebyshev-iter
+## Reference fixtures
 
-# Run Diagnostic 2 (verify results)
-cargo test --test chebyshev_orthogonality_diagnostic diagnostic_2_residual_norms_after_chebyshev_filter -- --ignored --nocapture
+| Run | Path | What it proves |
+|-----|------|---------------|
+| Cu111_CO warm start | `/export/.../Cu111_CO_Single_Point_0604_warm_start/slurm_output_cheby_2838.txt` | ZTRSM skip confirmed, lock-check passes, unoccupied bands still inflated |
+| Cu111_CO cold start | `/export/.../Cu111_CO_Single_Point_0530_rust_eigensolver/slurm_output_cheby_2832.txt` | Safe degree cap works for pass 1 (no overflow), pass 2 overflows without additional fixes |
+| CPU reference | `/export/.../Cu111_CO_H_dump/Cu111_CO.bands` | Ground truth eigenvalues for comparison |
 
-# Run Diagnostics 1-2
-cargo test --test chebyshev_orthogonality_diagnostic -- --ignored --nocapture
-```
+## Pending
+
+- [ ] Investigate Chebyshev recurrence corruption of unlocked bands (or RR propagation)
+- [ ] Fix cold start (LCAO initial guess, Davidson fallback that works, or iterative degree increase)
+- [ ] Clean up verbose diagnostics once unoccupied band issue is resolved
+- [ ] Test NiO cold/warm start with all fixes
