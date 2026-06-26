@@ -2972,31 +2972,14 @@ pub fn chebfi_run_rust(
             }
         }
 
-        if chol_info_val == 0 {
-            // ZTRSM: X = X · R^{-1}
-            use cudarc::cublas::sys::{
-                cublasSideMode_t, cublasDiagType_t,
-                cublasOperation_t,
-                cublasZtrsm_v2,
-                cublasFillMode_t as cublas_sys_fill,
-            };
-            let alpha_one = CudaComplex { x: 1.0, y: 0.0 };
-            unsafe {
-                let (ptr, _) = final_psi_buf.0.device_ptr_mut(stream);
-                let (s_sub_ptr, _) = s_sub.device_ptr(stream);
-                cublasZtrsm_v2(
-                    blas.raw_handle(),
-                    cublasSideMode_t::CUBLAS_SIDE_RIGHT,
-                    cublas_sys_fill::CUBLAS_FILL_MODE_UPPER,
-                    cublasOperation_t::CUBLAS_OP_N,
-                    cublasDiagType_t::CUBLAS_DIAG_NON_UNIT,
-                    n_pw_i32, nb_i32,
-                    &alpha_one as *const _ as *const _,
-                    s_sub_ptr as *const _, nb_i32,
-                    ptr as *mut _, n_pw_i32,
-                ).result().map_err(Error::Blas)?;
-            }
-        } else {
+        // ZTRSM skipped: per-band S-norm normalization already gives
+        // S_sub diag ≈ 1.0. ZTRSM's X·R^{-1} mixes columns with very
+        // different bare |ψ|² (occupied ~0.9, unoccupied ~0.06 for USPP),
+        // injecting occupied character into unoccupied columns and
+        // inflating their eigenvalues. S_sub max|off| ≈ 4e-4 is small
+        // enough that ZHEGVD in rayleigh_ritz handles it directly.
+        // Original ZTRSM code preserved in git history if needed.
+        if chol_info_val != 0 {
             // ZPOTRF failed — S_sub is not positive definite.
             // Multi-level recovery: increasing regularization → ZHEEVD fallback.
             eprintln!("[chebfi] Cholesky QR ZPOTRF failed: info={chol_info_val} (n_bands={nb})");
