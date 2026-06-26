@@ -105,9 +105,6 @@ struct ChemrustHandle {
     wave_grid: GVectorGrid,  // STANDARD grid — matches CASTEP's internal FFT grid
     fine_grid: GVectorGrid,  // FINE grid — for V_eff downsampling only
     eigensolver_mode: EigensolverMode,
-    /// Per-(spin,kpt) flag: true until the first successful eigensolve.
-    /// Forces Davidson on SCF iter 0 regardless of eigensolver_mode.
-    first_scf_iter: Vec<Vec<bool>>,
 }
 
 // ---- Init ------------------------------------------------------------------
@@ -307,7 +304,6 @@ fn init_inner(
             #[cfg(not(feature = "chebyshev"))]
             EigensolverMode::Davidson
         },
-        first_scf_iter: vec![vec![true; nkpts as usize]; nspins_u],
     })))
 }
 
@@ -356,25 +352,20 @@ pub unsafe extern "C" fn chemrust_eigensolve_step(
         None => return CHEM_EIG_NULL_HANDLE,
     };
     #[cfg(feature = "chebyshev")]
-    if h.eigensolver_mode == EigensolverMode::Chebyshev && !h.first_scf_iter[ispin as usize][ikpt as usize] {
-        let result = match unsafe { step_inner_chebyshev(handle, psi_data, v_eff_data, kinetic_data,
+    if h.eigensolver_mode == EigensolverMode::Chebyshev {
+        return match unsafe { step_inner_chebyshev(handle, psi_data, v_eff_data, kinetic_data,
             fft_idx_data, eigenvalues_ptr, hpsi_out, npw, nbands, ikpt, ispin, max_deg, converged) }
         {
             Ok(()) => CHEM_EIG_OK,
             Err(c) => c,
         };
-        if result != CHEM_EIG_OK {
-            return result;
-        }
     }
-    let result = match unsafe { step_inner(handle, psi_data, v_eff_data, kinetic_data, fft_idx_data,
+    match unsafe { step_inner(handle, psi_data, v_eff_data, kinetic_data, fft_idx_data,
         eigenvalues_ptr, hpsi_out, npw, nbands, ikpt, ispin, max_deg, converged) }
     {
         Ok(()) => CHEM_EIG_OK,
         Err(c) => c,
-    };
-    h.first_scf_iter[ispin as usize][ikpt as usize] = false;
-    result
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
