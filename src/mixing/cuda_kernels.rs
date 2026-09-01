@@ -7,7 +7,8 @@ use std::sync::Arc;
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaModule, CudaStream,
 };
-use cudarc::nvrtc::compile_ptx;
+use cudarc::nvrtc::compile_ptx_with_opts;
+use cudarc::nvrtc::CompileOptions;
 
 use crate::device::blas::BlasHandle;
 use crate::types::Error;
@@ -83,7 +84,8 @@ impl MixingCudaKernels {
         let ctx = stream.context();
         let blas = BlasHandle::new(stream.clone())?;
 
-        let ptx = compile_ptx(CUDA_KERNEL_SRC).map_err(|e| Error::Nvrtc(e.to_string()))?;
+        let opts = CompileOptions { arch: Some("sm_120"), ..Default::default() };
+        let ptx = compile_ptx_with_opts(CUDA_KERNEL_SRC, opts).map_err(|e| Error::Nvrtc(e.to_string()))?;
         let module: Arc<CudaModule> = ctx.load_module(ptx).map_err(Error::Cuda)?;
 
         let load = |name: &str| -> Result<CudaFunction, Error> {

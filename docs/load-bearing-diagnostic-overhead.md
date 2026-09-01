@@ -1,8 +1,79 @@
 # Load-Bearing Diagnostic Overhead: Async Stream-Ordering Bug
 
-**Date:** 2026-06-18
-**Status:** Under investigation (racecheck running)
+**Date:** 2026-06-18 (root-cause revision: 2026-07)
+**Status:** ROOT CAUSE IDENTIFIED (2026-07). Pending one CASTEP-level
+verification run of the production (no-`scf_diag`) config.
 **Commits:** `ad717d7` (gated diagnostics → diverges), `007a294` (ungated → converges), `0f7da96` (regated for investigation)
+
+## Root cause (2026-07 revision)
+
+All GPU libraries in this pipeline run on ONE user stream:
+
+- cuBLAS: `cublasSetStream_v2` in cudarc `CudaBlas::new`.
+- cuSOLVER: `cusolverDnSetStream` in cudarc `DnHandle::new`.
+- cuFFT: `cufftPlanSetStream` in cudarc `CudaFft::plan_3d`.
+- NVRTC kernels: launched on the same `stream`.
+
+So GPU-GPU ordering is safe, and the `cuMemFreeAsync` cross-stream
+hypotheses (1 and 2 below) are dead. The hazard class is HOST reads of
+asynchronously-produced data. Two probes pin down which reads are racy:
+
+### Probe 1: `clone_dtoh` into a plain Vec is effectively synchronous
+
+`tests/async_dtoh_probe.rs` shows `cuMemcpyDtoHAsync` into pageable host
+memory blocks the host until the DMA data is available (D2H enqueue
+wall-time ≈ full DMA time, ~3-4 ms for 16 MB, on both the legacy
+default stream and a fresh non-blocking stream; immediate host reads
+match in all four configs). D2H/H2D of plain `Vec` buffers is NOT the
+racy class.
+
+Note for future work: switching D2H to `PinnedHostSlice` (cudarc
+pinned buffers) makes D2H truly async and REINTRODUCES the read race.
+Any pinned-buffer optimization must pair every host read with an event
+or stream sync.
+
+### Probe 2: `cublasZdotc_v2` host-pointer results are the racy class
+
+`tests/async_dtoh_mechanism.rs` proves it deterministically: a zdotc
+enqueued behind a GEMM delay returns to the host immediately; the host
+pointer still holds the stale value; after `stream.synchronize()` the
+result matches.
+
+The load-bearing racy read in the live block Davidson path was the
+initial Rayleigh estimate (`davidson_diagonalise`, per-band `cublasZdotc_v2`
+into `eigenvalues`). It is now enqueue-all + one sync + read.
+The residual-norms zdotc block (scf_diag only) got the same treatment.
+
+## What the "wall" actually did
+
+The ungated D1/D2 S-norm blocks and the residual-norms block queue
+`apply_s_times` GEMMs plus per-band zdotc reads. The GEMMs delay the
+host relative to the GPU, which kept the async zdotc results settled by
+the time the host read them. Gating the blocks removed the delay, the
+host outran the GPU, and the stale zdotc reads corrupted the initial
+eigenvalues → divergence. `CUDA_LAUNCH_BLOCKING=1` masked the same
+race by serializing every launch.
+
+## Applied fix
+
+- `davidson_diagonalise`: Rayleigh zdotc loop is enqueue-all + single
+  `stream.synchronize()` + read. Residual-norms zdotc loop: same.
+- D1/D2 S-norm blocks gated behind `#[cfg(feature = "scf_diag")]`
+  (true diagnostics; no longer load-bearing).
+- `compute_all` kept (it populates the β^H·ψ cache for the next
+  iteration); its "load-bearing wall" comment is corrected.
+- `SyncAudit` diagnostics (scf_diag): at every host read of GPU data in
+  the block Davidson path (entry kinetic/beta/q, Rayleigh zdotc, H_sub
+  D2Hs, FFI final D2H). They log `first_read vs post_sync maxdiff`.
+  A nonzero value at any site names a remaining race.
+
+## Verification status
+
+- `cargo test` (default + `chebyshev` + `scf_diag` builds): pending.
+- CASTEP run with `scf_diag`: read the `[SyncAudit]` lines; expect
+  `maxdiff = 0` at every site.
+- CASTEP run without `scf_diag` (production config): must converge.
+  This is the gate for the D1/D2 gating change.
 
 ## Summary
 

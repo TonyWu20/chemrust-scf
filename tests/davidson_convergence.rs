@@ -210,12 +210,15 @@ fn test_relative_stagnation_second_step() {
     // Simulate: first step had |ΔE| = 1e-6 → break_cond_tol = 1e-6
     //           second step |ΔE| = 2e-7 < 1e-6 * 0.3 = 3e-7
     //
+    // Use downhill direction (new < prev). CASTEP resets both flags when
+    // the eigenvalue moves up beyond the 100·EPS noise guard.
+    //
     // Source: hamiltonian.f90:1195-1216, Step 2 with tol_rel ≤ 0.
     // The 0.3 heuristic is CASTEP's stagnation detection.
     let mut break_cond_tol = 1e-6;  // set by first step
     let result = check_inner_convergence(
         1.0,
-        1.0 + 2e-7,  // |ΔE| = 2e-7
+        1.0 - 2e-7,  // |ΔE| = 2e-7, downhill
         1e-8,         // tol_abs (|ΔE| > tol_abs)
         0.0,          // tol_rel ≤ 0 → use 0.3 heuristic
         &mut break_cond_tol,
@@ -550,10 +553,12 @@ fn test_relative_stagnation_last_outer_iter_disabled() {
 fn test_relative_stagnation_non_last_uses_heuristic() {
     // Non-last iteration: 0.3 heuristic IS active.
     // Same as last-iter test but outer_iter=8 (not last).
+    // Downhill direction isolates the opt_stop check from the
+    // uphill reset (hamiltonian.f90:591-598).
     let mut break_cond_tol = 1e-6;
     let result = check_inner_convergence(
         1.0,
-        1.0 + 2e-7,
+        1.0 - 2e-7,  // |ΔE| < break_cond_tol * 0.3, downhill
         1e-8,
         0.0,
         &mut break_cond_tol,

@@ -23,6 +23,7 @@ use crate::eigensolver::davidson_types::{
 };
 use crate::eigensolver::beta_phi_cache::BetaPhiCache;
 use crate::eigensolver::kernels::CudaKernelSet;
+use crate::eigensolver::hubbard::{HubbardBatchData, apply_v_u_hamiltonian};
 use crate::eigensolver::vnl_data::VnlBatchData;
 use crate::types::Error;
 use bon::builder;
@@ -187,6 +188,8 @@ pub unsafe fn apply_full_hamiltonian(
     blas: &BlasHandle,
     kernels: &CudaKernelSet,
     stream: &Arc<CudaStream>,
+    maybe_hubbard_data: Option<&HubbardBatchData>,
+    maybe_hubbard_spin: Option<i32>,
     mut maybe_beta_phi_cache: Option<&mut BetaPhiCache>,
 ) -> Result<(), Error> {
     unsafe {
@@ -209,6 +212,23 @@ pub unsafe fn apply_full_hamiltonian(
             .stream(stream)
             .maybe_blas(Some(blas))
             .call()?;
+
+    // 2. V_U — Hubbard potential (if active).  Inserted between V_loc and V_NL.
+    // CASTEP order is T+V_loc → V_NL → V_exchange → V_U (hamiltonian.f90:1429-1521).
+    // Since all terms accumulate additively, ordering is irrelevant.
+    if let (Some(hd), Some(ns)) = (maybe_hubbard_data, maybe_hubbard_spin) {
+        if hd.n_channels > 0 && hd.aug_lcao_dev.is_some() {
+            apply_v_u_hamiltonian()
+                .psi_dev(psi_dev)
+                .hpsi_dev(hpsi_dev)
+                .hubbard(hd)
+                .n_bands(n_bands as i32)
+                .ns(ns)
+                .blas(blas)
+                .stream(stream)
+                .call()?;
+        }
+    }
 
     {
         // bon::builder unwraps Option<T> — the setter takes T, not Option<T>.
@@ -516,6 +536,7 @@ pub(crate) unsafe fn apply_s_inverse(
     blas: &BlasHandle,
     stream: &Arc<CudaStream>,
     solver: &SolverHandle,
+    kernels: Option<&CudaKernelSet>,
 ) -> Result<(), Error> {
     let nte = vnl_data.n_total_expanded;
 
@@ -578,50 +599,40 @@ pub(crate) unsafe fn apply_s_inverse(
 
         // Helper: apply block-diagonal Q^{-1} to input → output.
         // input/output are nte × n_bands, column-major (stride=nte between bands).
-        // Uses per-ion ZGEMM: Q_i^{-1} · ion_block (ne_i × n_bands) for each ion.
+        // Each ion block is a contiguous GEMM submatrix: rows [off..off+ne),
+        // all n_bands columns, ldb/ldc = nte. A single ZGEMM per ion replaces
+        // the old per-band pack/unpack D2D copies (n_ions × n_bands × 2
+        // memcpyAsync calls) with n_ions GEMM calls at zero copy cost.
         unsafe fn apply_block_qinv(
             input: &CudaSlice<CudaComplex>,
             output: &mut CudaSlice<CudaComplex>,
             per_ion_q_inv: &[CudaSlice<CudaComplex>],
             per_ion_ne: &[i32],
-            n_bands: usize,
+            n_bands: i32,
             nte: i32,
             stream: &Arc<CudaStream>,
             blas: &BlasHandle,
         ) -> Result<(), Error> {
-            let n_bands_i32 = n_bands as i32;
-            let nte_usize = nte as usize;
-            let mut off: usize = 0;
+            let elem = std::mem::size_of::<CudaComplex>();
+            let mut off: i32 = 0;
             for (ion_idx, &ne) in per_ion_ne.iter().enumerate() {
                 if ne == 0 { continue; }
-                let ne_usize = ne as usize;
-                let ne_bands = ne_usize * n_bands;
-                // Pack: extract ion's block from global (nte×n_bands, col-major)
-                // → contiguous (ne×n_bands, col-major, lda=ne)
-                let mut ion_block: CudaSlice<CudaComplex> =
-                    stream.alloc_zeros(ne_bands).map_err(Error::Cuda)?;
-                for b in 0..n_bands {
-                    let src = input.slice((off + b * nte_usize)..(off + b * nte_usize + ne_usize));
-                    let mut dst = ion_block.slice_mut((b * ne_usize)..((b+1) * ne_usize));
-                    stream.memcpy_dtod(&src, &mut dst).map_err(Error::Cuda)?;
-                }
-                // Q_i^{-1} · ion_block → result_block (ne×n_bands)
-                let mut result_block: CudaSlice<CudaComplex> =
-                    stream.alloc_zeros(ne_bands).map_err(Error::Cuda)?;
-                blas.gemm_c64(ZgemmConfig {
-                    transa: blas::op::N, transb: blas::op::N,
-                    m: ne, n: n_bands_i32, k: ne,
-                    alpha: CudaComplex { x: 1.0, y: 0.0 },
-                    lda: ne, ldb: ne, ldc: ne,
-                    beta: CudaComplex { x: 0.0, y: 0.0 },
-                }, &per_ion_q_inv[ion_idx], &ion_block, &mut result_block)?;
-                // Unpack: result_block → output[ion_offset] (scattered)
-                for b in 0..n_bands {
-                    let src = result_block.slice((b * ne_usize)..((b+1) * ne_usize));
-                    let mut dst = output.slice_mut((off + b * nte_usize)..(off + b * nte_usize + ne_usize));
-                    stream.memcpy_dtod(&src, &mut dst).map_err(Error::Cuda)?;
-                }
-                off += ne_bands;
+                let (in_ptr, _) = input.device_ptr(stream);
+                let (out_ptr, _) = output.device_ptr_mut(stream);
+                let (q_ptr, _) = per_ion_q_inv[ion_idx].device_ptr(stream);
+                let alpha = CudaComplex { x: 1.0, y: 0.0 };
+                let beta = CudaComplex { x: 0.0, y: 0.0 };
+                cudarc::cublas::sys::cublasZgemm_v2(
+                    blas.raw_handle(),
+                    blas::op::N, blas::op::N,
+                    ne, n_bands, ne,
+                    &alpha as *const _ as *const _,
+                    q_ptr as *const _, ne,
+                    (in_ptr as *const _).add(off as isize * (elem as isize)), nte,
+                    &beta as *const _ as *const _,
+                    (out_ptr as *mut _).add(off as isize * (elem as isize)), nte,
+                ).result().map_err(Error::Blas)?;
+                off += ne;
             }
             Ok(())
         }
@@ -629,7 +640,41 @@ pub(crate) unsafe fn apply_s_inverse(
         // --- y_0 = block_diag(Q^{-1}) · proj ---
         unsafe {
             apply_block_qinv(&proj, &mut temp, per_ion_q_inv, per_ion_ne,
-                n_bands as usize, nte, stream, blas)?;
+                n_bands, nte, stream, blas)?;
+        }
+
+        // GPU refinement check: precompute per-band |proj|² once (one launch +
+        // one small D2H of n_bands f64 values). The per-iteration check then
+        // needs only one band_sqnorms launch over r and the same small D2H.
+        // Without kernels (None) the legacy full D2H path runs below.
+        let gpu_check = kernels.is_some();
+        let mut proj2_cpu: Vec<f64> = Vec::new();
+        let mut r2_dev: Option<CudaSlice<f64>> = None;
+        if gpu_check {
+            let k = kernels.expect("gpu_check implies kernels");
+            let n_b = n_bands as usize;
+            let shared_bytes = (2 * 128 * std::mem::size_of::<f64>()) as u32;
+            let cfg = LaunchConfig {
+                grid_dim: (n_bands as u32, 1, 1),
+                block_dim: (128, 1, 1),
+                shared_mem_bytes: shared_bytes,
+            };
+            let p2_dev: CudaSlice<f64> = stream.alloc_zeros(n_b).map_err(Error::Cuda)?;
+            unsafe {
+                stream
+                    .launch_builder(&k.band_sqnorms)
+                    .arg(&proj)
+                    .arg(&proj)
+                    .arg(&mut p2_dev)
+                    .arg(&mut p2_dev)
+                    .arg(&nte)
+                    .arg(&n_bands)
+                    .launch(cfg)
+            }
+            .map(|_| ())
+            .map_err(Error::Cuda)?;
+            proj2_cpu = stream.clone_dtoh(&p2_dev).map_err(Error::Cuda)?;
+            r2_dev = Some(stream.alloc_zeros(n_b).map_err(Error::Cuda)?);
         }
 
         // --- ABINIT iterative refinement loop (max 30 iterations) ---
@@ -659,7 +704,7 @@ pub(crate) unsafe fn apply_s_inverse(
             // Q^{-1}·y
             unsafe {
                 apply_block_qinv(&temp, &mut qinv_y, per_ion_q_inv, per_ion_ne,
-                    n_bands as usize, nte, stream, blas)?;
+                    n_bands, nte, stream, blas)?;
             }
             // r -= Q^{-1}·y
             blas.axpy_c64(n_nte as i32, CudaComplex { x: -1.0, y: 0.0 }, &qinv_y, 1, &mut r, 1)?;
@@ -667,7 +712,40 @@ pub(crate) unsafe fn apply_s_inverse(
             blas.axpy_c64(n_nte as i32, CudaComplex { x: -1.0, y: 0.0 }, &bt_b_y, 1, &mut r, 1)?;
 
             // Check per-band convergence (ABINIT: maxerr = max(|r|² / |proj|²))
-            {
+            if gpu_check {
+                // GPU path: per-band Σ|r|² on device, small D2H, host ratio.
+                let k = kernels.expect("gpu_check implies kernels");
+                let r2_dev = r2_dev.as_mut().expect("r2_dev allocated with gpu_check");
+                let cfg = LaunchConfig {
+                    grid_dim: (n_bands as u32, 1, 1),
+                    block_dim: (128, 1, 1),
+                    shared_mem_bytes: (2 * 128 * std::mem::size_of::<f64>()) as u32,
+                };
+                unsafe {
+                    stream
+                        .launch_builder(&k.band_sqnorms)
+                        .arg(&r)
+                        .arg(&r)
+                        .arg(r2_dev)
+                        .arg(r2_dev)
+                        .arg(&nte)
+                        .arg(&n_bands)
+                        .launch(cfg)
+                }
+                .map(|_| ())
+                .map_err(Error::Cuda)?;
+                let r2_cpu: Vec<f64> = stream.clone_dtoh(r2_dev).map_err(Error::Cuda)?;
+                let max_err = r2_cpu
+                    .iter()
+                    .zip(proj2_cpu.iter())
+                    .map(|(&r2, &p2)| if p2 > 1e-30 { r2 / p2 } else { 0.0 })
+                    .fold(0.0_f64, f64::max);
+                if max_err < 1e-12 {
+                    converged = true;
+                    break;
+                }
+            } else {
+                // Legacy path: full D2H of both arrays + host reduction.
                 let r_cpu: Vec<CudaComplex> = stream.clone_dtoh(&r).map_err(Error::Cuda)?;
                 let proj_cpu: Vec<CudaComplex> = stream.clone_dtoh(&proj).map_err(Error::Cuda)?;
                 let nte_usize = nte as usize;
@@ -692,7 +770,7 @@ pub(crate) unsafe fn apply_s_inverse(
             // dy = block_diag(Q^{-1}) · r
             unsafe {
                 apply_block_qinv(&r, &mut qinv_y, per_ion_q_inv, per_ion_ne,
-                    n_bands as usize, nte, stream, blas)?;
+                    n_bands, nte, stream, blas)?;
             }
             // y += dy
             blas.axpy_c64(n_nte as i32, CudaComplex { x: 1.0, y: 0.0 }, &qinv_y, 1, &mut temp, 1)?;

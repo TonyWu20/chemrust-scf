@@ -34,12 +34,13 @@ use cudarc::cublas::sys::{
 };
 use cudarc::cusolver::sys::{cublasFillMode_t, cusolverEigMode_t};
 use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DevicePtr, DevicePtrMut, LaunchConfig, PushKernelArg};
-use cudarc::nvrtc::compile_ptx;
+use cudarc::nvrtc::compile_ptx_with_opts;
+use cudarc::nvrtc::CompileOptions;
 
 use crate::device::blas::{op, BlasHandle, ZgemmConfig};
 use crate::device::fft::BatchedFftPlan3d;
 use crate::device::solver::SolverHandle;
-use crate::device::CudaComplex;
+use crate::device::{CudaComplex, PinnedHost};
 use crate::eigensolver::beta_phi_cache::BetaPhiCache;
 use crate::eigensolver::davidson_types::*;
 use ndarray::Array2;
@@ -692,6 +693,15 @@ pub fn check_inner_convergence(
 ///
 /// User-facing progress message: always prints.  Used for `[davidson]` prefix
 /// lines (outer iteration, block loop, convergence).
+// The `[davidson]` progress lines. eprintln! per call in the default
+// build costs nothing on the GPU but floods CASTEP's log; gate them behind
+// scf_diag like the other diagnostics.
+#[cfg(not(feature = "scf_diag"))]
+macro_rules! davidson_diag {
+    ($($arg:tt)*) => {};
+}
+
+#[cfg(feature = "scf_diag")]
 macro_rules! davidson_diag {
     ($($arg:tt)*) => {
         eprintln!($($arg)*);
@@ -796,7 +806,8 @@ fn compute_band_kinetic_energies(
     stream: &Arc<CudaStream>,
     ctx: &Arc<CudaContext>,
 ) -> Result<Vec<f64>, Error> {
-    let ptx = compile_ptx(BAND_EK_KERNEL).map_err(|e| Error::Nvrtc(e.to_string()))?;
+    let opts = CompileOptions { arch: Some("sm_120"), ..Default::default() };
+    let ptx = compile_ptx_with_opts(BAND_EK_KERNEL, opts).map_err(|e| Error::Nvrtc(e.to_string()))?;
     let module = ctx.load_module(ptx).map_err(Error::Cuda)?;
     let kernel = module.load_function("band_ek").map_err(Error::Cuda)?;
 
@@ -906,6 +917,19 @@ pub(crate) unsafe fn davidson_diagonalise(
     // ------------------------------------------------------------------
     // Download kinetic energies from GPU (constant across outer iterations)
     let kinetic_host: Vec<f64> = stream.clone_dtoh(&**kinetic_dev).map_err(Error::Cuda)?;
+    #[cfg(feature = "scf_diag")]
+    {
+        // SyncAudit: is the first host read stale? Re-read after a sync.
+        // A nonzero maxdiff proves this read races the async D2H.
+        let kinetic_audit = stream.clone_dtoh(&**kinetic_dev).map_err(Error::Cuda)?;
+        stream.synchronize().map_err(Error::Cuda)?;
+        let md = kinetic_host
+            .iter()
+            .zip(kinetic_audit.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f64, f64::max);
+        eprintln!("[SyncAudit] kinetic entry: first_read vs post_sync maxdiff={md:.3e} (0 = no race)");
+    }
     // Compute per-band kinetic energies on GPU and average over bands.
     // This matches CASTEP hamiltonian.f90:348: mean_ek = sum(ek(1:nbands)) / nbands
     // where ek(b) = Σ_G |ψ_b(G)|² · 0.5|k+G|².
@@ -941,7 +965,7 @@ pub(crate) unsafe fn davidson_diagonalise(
 
     let mut beta_g_per_ion: Vec<Array2<Complex64>> = Vec::with_capacity(vnl_data.entries.len());
     let mut q_matrices: Vec<Vec<f64>> = Vec::with_capacity(vnl_data.entries.len());
-    for entry in &vnl_data.entries {
+    for (ion_i, entry) in vnl_data.entries.iter().enumerate() {
         let ne = entry.n_expanded as usize;
         if ne > 0 {
             let beta_host: Vec<CudaComplex> = stream.clone_dtoh(&entry.beta_g)
@@ -965,6 +989,31 @@ pub(crate) unsafe fn davidson_diagonalise(
             beta_g_per_ion.push(beta_correct.t().to_owned());
             let q_host: Vec<CudaComplex> = stream.clone_dtoh(&entry.q_matrix)
                 .map_err(Error::Cuda)?;
+            #[cfg(feature = "scf_diag")]
+            {
+                // SyncAudit: is the first host read stale? Re-read after a
+                // sync and sample-compare. beta_g can be tens of MB per ion.
+                let beta_audit = stream.clone_dtoh(&entry.beta_g).map_err(Error::Cuda)?;
+                let q_audit = stream.clone_dtoh(&entry.q_matrix).map_err(Error::Cuda)?;
+                stream.synchronize().map_err(Error::Cuda)?;
+                let step = (beta_host.len() / 256).max(1);
+                let md = (0..beta_host.len())
+                    .step_by(step)
+                    .map(|i| {
+                        (beta_host[i].x - beta_audit[i].x).abs()
+                            .max((beta_host[i].y - beta_audit[i].y).abs())
+                    })
+                    .fold(0.0f64, f64::max);
+                let qmd = q_host
+                    .iter()
+                    .zip(q_audit.iter())
+                    .map(|(a, b)| (a.x - b.x).abs())
+                    .fold(0.0f64, f64::max);
+                eprintln!(
+                    "[SyncAudit] beta_g/q ion {ion_i}: first_read vs post_sync \
+                     beta_maxdiff={md:.3e} q_maxdiff={qmd:.3e} (0 = no race)"
+                );
+            }
             q_matrices.push(q_host.iter().map(|c| c.x).collect());
         } else {
             beta_g_per_ion.push(Array2::zeros((n_pw, 0)));
@@ -1187,10 +1236,17 @@ pub(crate) unsafe fn davidson_diagonalise(
             {
                 let (psi_ptr, _) = psi_dev.device_ptr(stream);
                 let (hpsi_ptr, _) = hpsi_dev.device_ptr(stream);
+                // cublasZdotc_v2 in host-pointer mode writes the result
+                // asynchronously: the call returns after enqueuing, and the
+                // result lands in the host pointer only when the GPU
+                // kernel finishes. Reading `dot` before a stream sync is a
+                // data race (see tests/async_dtoh_mechanism.rs and
+                // docs/load-bearing-diagnostic-overhead.md). Enqueue all
+                // band dots, sync once, then read.
+                let mut dots: Vec<CudaComplex> = vec![CudaComplex { x: 0.0, y: 0.0 }; n_bands];
                 for b in 0..n_bands {
                     let psi_b = (psi_ptr as *const CudaComplex).add(b * n_pw);
                     let hpsi_b = (hpsi_ptr as *const CudaComplex).add(b * n_pw);
-                    let mut dot = CudaComplex { x: 0.0, y: 0.0 };
                     cublasZdotc_v2(
                         handle,
                         n_pw_i32,
@@ -1198,12 +1254,44 @@ pub(crate) unsafe fn davidson_diagonalise(
                         1,
                         hpsi_b as *const _,
                         1,
-                        &mut dot as *mut _ as *mut _,
+                        &mut dots[b] as *mut _ as *mut _,
                     )
                     .result()
                     .map_err(Error::Blas)?;
-                    eigenvalues[b] = dot.x; // Real part = ⟨ψ_b|H|ψ_b⟩
                 }
+                stream.synchronize().map_err(Error::Cuda)?;
+                for b in 0..n_bands {
+                    eigenvalues[b] = dots[b].x; // Real part = ⟨ψ_b|H|ψ_b⟩
+                }
+            }
+            #[cfg(feature = "scf_diag")]
+            {
+                // SyncAudit: is the per-band zdotc read stale? cublasZdotc_v2
+                // in host-pointer mode writes results asynchronously. Re-run
+                // the band dots into a second host vector, sync, and compare.
+                let (psi_ptr, _) = psi_dev.device_ptr(stream);
+                let (hpsi_ptr, _) = hpsi_dev.device_ptr(stream);
+                let mut dots2: Vec<CudaComplex> = vec![CudaComplex { x: 0.0, y: 0.0 }; n_bands];
+                for b in 0..n_bands {
+                    let psi_b = (psi_ptr as *const CudaComplex).add(b * n_pw);
+                    let hpsi_b = (hpsi_ptr as *const CudaComplex).add(b * n_pw);
+                    cublasZdotc_v2(
+                        handle,
+                        n_pw_i32,
+                        psi_b as *const _,
+                        1,
+                        hpsi_b as *const _,
+                        1,
+                        &mut dots2[b] as *mut _ as *mut _,
+                    )
+                    .result()
+                    .map_err(Error::Blas)?;
+                }
+                stream.synchronize().map_err(Error::Cuda)?;
+                let md = (0..n_bands)
+                    .map(|b| (eigenvalues[b] - dots2[b].x).abs())
+                    .fold(0.0f64, f64::max);
+                eprintln!("[SyncAudit] rayleigh-init: first_read vs post_sync maxdiff={md:.3e} (0 = no race)");
             }
             davidson_diag!(
                 "[davidson] initial Rayleigh eigenvalues: [{:.6}, ..., {:.6}]",
@@ -1281,13 +1369,6 @@ pub(crate) unsafe fn davidson_diagonalise(
         // All cached β^H·ψ projections are now stale.
         beta_phi_cache.invalidate_all();
 
-        #[cfg(feature = "scf_diag")]
-        {
-            let ev_a1_1 = ctx.new_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT)).map_err(Error::Cuda)?;
-            ev_a1_1.record(stream).map_err(Error::Cuda)?;
-            gpu_timing.push(("A1-ZHEEVD", ev_a1_0, ev_a1_1, iteration, None));
-        }
-
         davidson_diag!(
             "[davidson] full subspace diag: eigenvalues [{:.6}, ..., {:.6}]",
             eigenvalues[0],
@@ -1295,6 +1376,11 @@ pub(crate) unsafe fn davidson_diagonalise(
             );
 
         // ---- D1: S-norm diagnostic after A1 full-subspace ZHEGVD ----
+        // Gated: this block is a diagnostic. Its GEMMs used to act as an
+        // accidental host-delay wall masking async zdotc host reads.
+        // With the load-bearing reads now synced (see
+        // tests/async_dtoh_mechanism.rs), gating is safe.
+        #[cfg(feature = "scf_diag")]
         {
             let mut s_in = PwCoefficients::new(
                 stream.alloc_zeros(n_pw).map_err(Error::Cuda)?);
@@ -1397,6 +1483,14 @@ pub(crate) unsafe fn davidson_diagonalise(
             CudaComplex { x: 0.0, y: 0.0 };
             superspace_max_bands * superspace_max_bands
         ];
+
+        // Pinned H2D staging for the A3 H_sub upload. The A3 block drops a
+        // plain `Vec` right after the async `memcpy_htod`. The ~130 KB
+        // block crosses the 128 KB mmap threshold, so the freed pages can
+        // be remapped and rewritten while the DMA is still in flight.
+        // This staging outlives the whole call. The pinned pages are never
+        // recycled by the host allocator, so the H2D is safe at any pacing.
+        let mut h_sub_staging = PinnedHost::alloc(std::mem::size_of::<CudaComplex>() * superspace_max_bands * superspace_max_bands)?;
 
         davidson_diag!("[davidson] block loop: nblock={nblock} superspace_size={superspace_size}");
 
@@ -1503,6 +1597,19 @@ pub(crate) unsafe fn davidson_diagonalise(
                 // super_hamiltonian. This D2H is therefore inherent to the split design
                 // and its cost is negligible: ~7 KB/transfer vs ~2 GB FFT+H per batch.
                 let h_init_cpu: Vec<CudaComplex> = stream.clone_dtoh(&h_init).map_err(Error::Cuda)?;
+                #[cfg(feature = "scf_diag")]
+                {
+                    // SyncAudit: is the H_sub D2H read stale? Re-read after a
+                    // sync and compare the full k*k matrix.
+                    let h_audit = stream.clone_dtoh(&h_init).map_err(Error::Cuda)?;
+                    stream.synchronize().map_err(Error::Cuda)?;
+                    let md = h_init_cpu
+                        .iter()
+                        .zip(h_audit.iter())
+                        .map(|(a, b)| (a.x - b.x).abs().max((a.y - b.y).abs()))
+                        .fold(0.0f64, f64::max);
+                    eprintln!("[SyncAudit] H_sub-init: first_read vs post_sync maxdiff={md:.3e} (0 = no race)");
+                }
                 let diag_vals: Vec<String> = (0..k)
                     .map(|i| format!("{:.6}", h_init_cpu[i * (k + 1)].x))
                     .take(3)
@@ -1706,6 +1813,18 @@ pub(crate) unsafe fn davidson_diagonalise(
                     let h_new_rows_cpu: Vec<CudaComplex> = stream
                         .clone_dtoh(&h_new_rows)
                         .map_err(Error::Cuda)?;
+                    #[cfg(feature = "scf_diag")]
+                    {
+                        // SyncAudit: is the new-rows D2H read stale?
+                        let h_audit = stream.clone_dtoh(&h_new_rows).map_err(Error::Cuda)?;
+                        stream.synchronize().map_err(Error::Cuda)?;
+                        let md = h_new_rows_cpu
+                            .iter()
+                            .zip(h_audit.iter())
+                            .map(|(a, b)| (a.x - b.x).abs().max((a.y - b.y).abs()))
+                            .fold(0.0f64, f64::max);
+                        eprintln!("[SyncAudit] H_sub-newrows: first_read vs post_sync maxdiff={md:.3e} (0 = no race)");
+                    }
                     for i in 0..n_added {
                         for j in 0..new_total {
                             super_hamiltonian
@@ -1764,14 +1883,17 @@ pub(crate) unsafe fn davidson_diagonalise(
                     let mut buf = stream
                         .alloc_zeros(k_super * k_super)
                         .map_err(Error::Cuda)?;
-                    let mut host = vec![CudaComplex { x: 0.0, y: 0.0 }; k_super * k_super];
+                    // H2D from pinned staging: the source outlives the async
+                    // DMA. No dropped-Vec race, no extra sync.
+                    let staging = h_sub_staging.as_slice_mut::<CudaComplex>();
                     for i in 0..k_super {
                         for j in 0..k_super {
-                            host[i + j * k_super] =
+                            staging[i + j * k_super] =
                                 super_hamiltonian[i * superspace_max_bands + j];
                         }
                     }
-                    stream.memcpy_htod(&host, &mut buf).map_err(Error::Cuda)?;
+                    stream.memcpy_htod(&staging[..k_super * k_super], &mut buf)
+                        .map_err(Error::Cuda)?;
                     buf
                 };
 
@@ -2117,6 +2239,8 @@ pub(crate) unsafe fn davidson_diagonalise(
             // the ZHEEVD eigenvalue ordering of the next block.
 
             // ---- D2: S-norm diagnostic after block 0 inner loop ----
+            // Gated: diagnostic only. See the D1 gate note above.
+            #[cfg(feature = "scf_diag")]
             if block_start == 0 {
                 // Reuse the D1 buffer pattern but check only the block columns
                 let mut s_in = PwCoefficients::new(
@@ -2168,9 +2292,11 @@ pub(crate) unsafe fn davidson_diagonalise(
         // at the start (before A1 rotation) and immediately invalidated by
         // A1's invalidate_all(), making it dead code.
         //
-        // The cuBLAS GEMMs queued here (β^H·ψ for all bands) are load-bearing
-        // for GPU stream ordering — removing this causes divergence. See
-        // docs/load-bearing-diagnostic-overhead.md for the full investigation.
+        // The cuBLAS GEMMs queued here populate the cache for the NEXT
+        // iteration's apply_full_hamiltonian. Earlier versions treated
+        // this call as a load-bearing timing wall; that role is gone now
+        // that the racy zdotc host reads are synced explicitly.
+        // See docs/load-bearing-diagnostic-overhead.md.
         unsafe {
             beta_phi_cache.compute_all(&psi_dev, vnl_data, n_pw, blas, stream)?;
         }
@@ -2277,11 +2403,12 @@ pub(crate) unsafe fn davidson_diagonalise(
         // ⟨r | r⟩ → sqrt for each band (plain L2 residual, no S⁻¹ weight)
         let (residual_ptr, _) = residual_dev.device_ptr(stream);
         let sinv_ptr = residual_ptr; // alias: use plain r, not S⁻¹·r
-        let mut norms = Vec::with_capacity(n_bands);
+        // zdotc host results are async (see tests/async_dtoh_mechanism.rs).
+        // Enqueue all band dots, sync once, then read.
+        let mut dots: Vec<CudaComplex> = vec![CudaComplex { x: 0.0, y: 0.0 }; n_bands];
         for b in 0..n_bands {
             let r_b = (residual_ptr as *const CudaComplex).add(b * n_pw);
             let sinv_b = (sinv_ptr as *const CudaComplex).add(b * n_pw);
-            let mut dot = CudaComplex { x: 0.0, y: 0.0 };
             cublasZdotc_v2(
                 handle,
                 n_pw as i32,
@@ -2289,11 +2416,15 @@ pub(crate) unsafe fn davidson_diagonalise(
                 1,
                 sinv_b as *const _,
                 1,
-                &mut dot as *mut _ as *mut _,
+                &mut dots[b] as *mut _ as *mut _,
             )
             .result()
             .map_err(Error::Blas)?;
-            norms.push(dot.x.sqrt());
+        }
+        stream.synchronize().map_err(Error::Cuda)?;
+        let mut norms = Vec::with_capacity(n_bands);
+        for b in 0..n_bands {
+            norms.push(dots[b].x.sqrt());
         }
         norms
         }
@@ -2447,6 +2578,8 @@ unsafe fn diagonalise_subspace(
         stream.memcpy_dtod(prebuilt, &mut h_sub).map_err(Error::Cuda)?;
 
         // ---- Diagnostic: compare D10-01 prebuilt H_sub against fresh GEMM ----
+        // Extra GEMM + two k×k D2Hs per call. scf_diag only.
+        #[cfg(feature = "scf_diag")]
         {
             let mut h_sub_fresh: CudaSlice<CudaComplex> =
                 stream.alloc_zeros(k * k).map_err(Error::Cuda)?;
@@ -2515,6 +2648,8 @@ unsafe fn diagonalise_subspace(
     // CASTEP hamiltonian.f90:476-480 — algor_diagonalise solves STANDARD EVP
     // on S-orthonormalized superspace vectors (S_sub = I implicitly).  We
     // match this faithfully by calling ZHEEVD on H_sub directly.
+    // The D2H snapshot is diagnostic-only. scf_diag only.
+    #[cfg(feature = "scf_diag")]
     {
         let h_sub_cpu: Vec<CudaComplex> = stream.clone_dtoh(&h_sub).map_err(Error::Cuda)?;
         let mut max_h = 0.0f64;
@@ -2902,6 +3037,8 @@ pub(crate) unsafe fn s_orthonormalise(
         blas.stream().synchronize().map_err(Error::Cuda)?;
 
         // D2H snapshot of S_overlap + independent ZDOTC check of col 0.
+        // scf_diag only.
+        #[cfg(feature = "scf_diag")]
         {
             let diag_host: Vec<CudaComplex> =
                 blas.stream().clone_dtoh(&s_overlap_gpu).map_err(Error::Cuda)?;
@@ -3273,7 +3410,9 @@ pub(crate) unsafe fn s_orthonormalise(
         .map_err(Error::Blas)?;
 
         let inv_norm = 1.0 / nrm2_sq.x.sqrt();
-        // D5: track S-norm and L2-norm for first search column
+        // D5: track S-norm and L2-norm for first search column.
+        // Two zdotcs + a print per call. scf_diag only.
+        #[cfg(feature = "scf_diag")]
         if j == 0 {
             let mut l2_sq = CudaComplex { x: 0.0, y: 0.0 };
             cublasZdotc_v2(handle, n_pw_i32,
@@ -3361,6 +3500,10 @@ struct DavidsonBlockCtx<'a> {
     block_psi_temp: PwCoefficients,
     block_hpsi_temp: PwCoefficients,
     eig_block_dev: CudaSlice<f64>,
+    /// Pinned staging for the per-block eigenvalue H2D. The plain `Vec`
+    /// source dropped at the block scope can be recycled while the async
+    /// DMA is in flight. This staging outlives the block and the call.
+    eig_staging: PinnedHost,
     search_dev: PwCoefficients,
     hsearch_dev: PwCoefficients,
     s_orth_in: PwCoefficients,
@@ -3473,6 +3616,7 @@ impl<'a> DavidsonBlockCtx<'a> {
             block_hpsi_temp: PwCoefficients::new(
                 stream.alloc_zeros(n_pw * ncol).map_err(Error::Cuda)?),
             eig_block_dev: stream.alloc_zeros(ncol).map_err(Error::Cuda)?,
+            eig_staging: PinnedHost::alloc(ncol * std::mem::size_of::<f64>())?,
             search_dev: PwCoefficients::new(
                 stream.alloc_zeros(n_pw * ncol).map_err(Error::Cuda)?),
             hsearch_dev: PwCoefficients::new(
@@ -3578,25 +3722,34 @@ impl<'a> DavidsonBlockCtx<'a> {
             // Subspace eigenvalues incorporate band coupling via the full H_sub
             // matrix, producing more accurate USPP NL correction weights than
             // per-band Rayleigh quotients from freshly computed H·psi.
-            let eig_block_cpu: Vec<f64> = active_bands(&self.active_indices, self.block_start)
-                .map(|(ci, _gi)| slice_eigenvalues[ci])
-                .collect();
+            let n_eig = active_bands(&self.active_indices, self.block_start).count();
+            // Fill pinned staging, then H2D. The staging outlives the async
+            // DMA. No dropped-Vec race. No extra sync.
+            let staging = self.eig_staging.as_slice_mut::<f64>();
+            for (slot, (ci, _gi)) in staging[..n_eig]
+                .iter_mut()
+                .zip(active_bands(&self.active_indices, self.block_start))
+            {
+                *slot = slice_eigenvalues[ci];
+            }
             // Diagnostic: eigenvalues fed to preconditioner (first 3 + count)
             if self.block_start >= 104 {
-                let n = eig_block_cpu.len();
+                let n = n_eig;
                 eprintln!("[Diag-PreconEig] block_start={} ncol={} eig[0..3]=[{:.6}, {:.6}, {:.6}] eig[{}..]={:.6}",
                     self.block_start, n,
-                    eig_block_cpu.first().copied().unwrap_or(f64::NAN),
-                    eig_block_cpu.get(1).copied().unwrap_or(f64::NAN),
-                    eig_block_cpu.get(2).copied().unwrap_or(f64::NAN),
+                    staging.first().copied().unwrap_or(f64::NAN),
+                    staging.get(1).copied().unwrap_or(f64::NAN),
+                    staging.get(2).copied().unwrap_or(f64::NAN),
                     n.saturating_sub(1),
-                    eig_block_cpu.last().copied().unwrap_or(f64::NAN));
+                    staging.get(n.saturating_sub(1)).copied().unwrap_or(f64::NAN));
             }
             self.stream
-                .memcpy_htod(&eig_block_cpu, &mut self.eig_block_dev)
+                .memcpy_htod(&staging[..n_eig], &mut self.eig_block_dev)
                 .map_err(Error::Cuda)?;
 
-            // D9: Check psi and hpsi magnitudes + first elements at Stage 1
+            // D9: Check psi and hpsi magnitudes + first elements at Stage 1.
+            // zdotcs + D2H dumps per call. scf_diag only.
+            #[cfg(feature = "scf_diag")]
             {
                 let (psi_ptr, _) = self.block_psi_temp.device_ptr(self.stream);
                 let (hpsi_ptr, _) = self.block_hpsi_temp.device_ptr(self.stream);
@@ -3627,11 +3780,11 @@ impl<'a> DavidsonBlockCtx<'a> {
                     "[Diag-D9] Stage1 (bs={}): psi[0] L2²={:.6e} first5=[{:?}] hpsi[0] L2²={:.6e} eps={:.6e}",
                     self.block_start, psi_l2.x,
                     psi5.iter().map(|c| (c.x, c.y)).collect::<Vec<_>>(),
-                    hpsi_l2.x, eig_block_cpu[0]
+                    hpsi_l2.x, staging.get(0).copied().unwrap_or(f64::NAN)
                 );
 
                 // If anomaly detected in any eigenvalue, dump per-band psi/hpsi norms
-                let has_anomaly = eig_block_cpu.iter().any(|e| e.abs() > 1e10 || e.is_nan());
+                let has_anomaly = staging[..n_eig].iter().any(|e| e.abs() > 1e10 || e.is_nan());
                 if has_anomaly {
                     eprintln!("[Diag-D9] ANOMALY detected in eigenvalues — dumping per-band psi/hpsi norms:");
                     for i in 0..self.active_indices.len() {
@@ -3656,7 +3809,7 @@ impl<'a> DavidsonBlockCtx<'a> {
                         let h_first: Vec<CudaComplex> = self.stream.clone_dtoh(&tmp_h).map_err(Error::Cuda)?;
                         eprintln!(
                             "  band {}: eig={:.6e}  |psi|²={:.6e}  |hpsi|²={:.6e}  hpsi[0]=({:.6e},{:.6e})",
-                            i, eig_block_cpu[i], p_nrm.x, h_nrm.x,
+                            i, staging.get(i).copied().unwrap_or(f64::NAN), p_nrm.x, h_nrm.x,
                             h_first[0].x, h_first[0].y
                         );
                     }
@@ -3692,6 +3845,8 @@ impl<'a> DavidsonBlockCtx<'a> {
         // Rust-SearchRaw: dump search direction coefficients for CASTEP comparison.
         // Matches CASTEP [CASTEP-SearchRaw] diagnostic at hamiltonian_searchspace_ks.
         // Triggered at SCF iter 1, block 0, inner iter 0 only.
+        // zdotc + two D2H dumps. scf_diag only.
+        #[cfg(feature = "scf_diag")]
         if self.block_start == 0 {
             let (search_ptr, _) = self.search_dev.device_ptr(self.stream);
             let col0 = (search_ptr as *const CudaComplex).add(0);
@@ -3732,7 +3887,9 @@ impl<'a> DavidsonBlockCtx<'a> {
             eprintln!();
         }
 
-        // D8: Check preconditioner output magnitude + dump first entries
+        // ---- D8: Check preconditioner output magnitude + dump first entries ----
+        // zdotc + D2H dump per call. scf_diag only.
+        #[cfg(feature = "scf_diag")]
         {
             let (search_ptr, _) = self.search_dev.device_ptr(self.stream);
             let col0 = (search_ptr as *const CudaComplex).add(0);
@@ -3800,6 +3957,8 @@ impl<'a> DavidsonBlockCtx<'a> {
         }
 
         // ---- D6: Search column norm trace after Stage 3a ----
+        // apply_s_times GEMM + zdotc per call. scf_diag only.
+        #[cfg(feature = "scf_diag")]
         {
             let (search_ptr, _) = self.search_dev.device_ptr(self.stream);
             let col0 = (search_ptr as *const CudaComplex).add(0);
@@ -3846,6 +4005,8 @@ impl<'a> DavidsonBlockCtx<'a> {
         // overlap here means the s_orthogonalise formula (which assumes
         // unit S-norms on reference columns) is failing — the likely
         // proximate cause of subspace eigenvalue explosion in blocks 1+.
+        // apply_s_times GEMM + n_search zdotcs per call. scf_diag only.
+        #[cfg(feature = "scf_diag")]
         if self.block_start > 0 {
             let (search_ptr, _) = self.search_dev.device_ptr(self.stream);
             let (psi_ptr, _) = self.psi_dev.device_ptr(self.stream);
@@ -3962,7 +4123,9 @@ impl<'a> DavidsonBlockCtx<'a> {
                 .call()?;
         }
 
-        // D10: dump H·search entries for direct inspection
+        // D10: dump H·search entries for direct inspection.
+        // zdotc + D2H dump per call. scf_diag only.
+        #[cfg(feature = "scf_diag")]
         {
             let (hsearch_ptr, _) = self.hsearch_dev.device_ptr(self.stream);
             let hcol0 = (hsearch_ptr as *const CudaComplex).add(0);

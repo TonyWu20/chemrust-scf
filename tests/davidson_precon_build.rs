@@ -693,8 +693,12 @@ mod davidson_precon_build {
     /// C2: Q_RCQ against explicit manual computation.
     ///
     /// For a single ion with ne=3, computes Q_RCQ via the production function
-    /// AND via an explicit per-element computation of -Q + C·Q - R_beta·(C·Q).
+    /// AND via an explicit per-element computation of -Q - R_beta·(C·Q).
     /// Must agree to 1e-12 (cross-path verification).
+    ///
+    /// CASTEP nlpot.f90:13841-13893, 14162-14180 builds Q_RCQ = -Q*w and
+    /// then subtracts R_beta·tmp_matrix with tmp_matrix = C·(Q*w). There is
+    /// no standalone +C·Q term.
     ///
     /// The manual path uses plain ndarray dot products (structurally
     /// independent from the assembly function's per-loops).
@@ -743,19 +747,18 @@ mod davidson_precon_build {
             &[q.clone()], &c, &[r_beta.clone()], &ion_offsets, &mixture_weights,
         );
 
-        // Manual path: explicit -Q + C·Q - R_beta·(C·Q)
+        // Manual path: explicit -Q - R_beta·(C·Q)
         // Step 2: -Q * w
         let q_complex = Array2::from_shape_vec((ne, ne),
             q.iter().map(|&v| Complex64::new(-v * mixture_weight, 0.0)).collect()
         ).unwrap();
         let mut manual = q_complex.clone();
 
-        // Step 3: + C·Q
+        // Step 3: CQ = C·(Q*w)
         let q_w = Array2::from_shape_vec((ne, ne),
             q.iter().map(|&v| Complex64::new(v * mixture_weight, 0.0)).collect()
         ).unwrap();
         let cq = c.dot(&q_w);
-        manual = manual + &cq;
 
         // Step 4: - R_beta·(C·Q)
         let r_cq = r_beta.dot(&cq);
@@ -842,7 +845,7 @@ mod davidson_precon_build {
         );
 
         // Compute expected diagonal blocks manually
-        // Ion 0: -Q + C·Q - R_beta·(C·Q)
+        // Ion 0: -Q - R_beta·(C·Q)  (CASTEP nlpot.f90:14162-14180 "Compute -Q-RCQ")
         let q0_arr = Array2::from_shape_vec((ne0, ne0), vec![
             Complex64::new(3.0, 0.0), Complex64::new(0.5, 0.0),
             Complex64::new(0.5, 0.0), Complex64::new(4.0, 0.0),
@@ -850,9 +853,9 @@ mod davidson_precon_build {
         let q0_scaled = q0_arr.mapv(|v| Complex64::new(v.re * (-1.0), 0.0));
         let cq0 = c0.dot(&q0_arr.mapv(|v| Complex64::new(v.re, 0.0)));
         let r_cq0 = rb0.dot(&cq0);
-        let expected_block0 = q0_scaled + &cq0 - &r_cq0;
+        let expected_block0 = q0_scaled - &r_cq0;
 
-        // Ion 1: -Q + C·Q - R_beta·(C·Q)
+        // Ion 1: -Q - R_beta·(C·Q)
         let q1_arr = Array2::from_shape_vec((ne1, ne1), vec![
             Complex64::new(5.0, 0.0), Complex64::new(0.2, 0.0),
             Complex64::new(0.2, 0.0), Complex64::new(6.0, 0.0),
@@ -860,7 +863,7 @@ mod davidson_precon_build {
         let q1_scaled = q1_arr.mapv(|v| Complex64::new(v.re * (-1.0), 0.0));
         let cq1 = c1.dot(&q1_arr.mapv(|v| Complex64::new(v.re, 0.0)));
         let r_cq1 = rb1.dot(&cq1);
-        let expected_block1 = q1_scaled + &cq1 - &r_cq1;
+        let expected_block1 = q1_scaled - &r_cq1;
 
         // Verify diagonal blocks
         for m in 0..ne0 {
