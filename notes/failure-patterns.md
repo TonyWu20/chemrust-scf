@@ -1,5 +1,58 @@
 # Failure Patterns
 
+## 2026-09-03: codebase audit — the unconditional-Ok-return syndrome and friends
+
+**Scope**: audit of this crate for mindless shortcuts (the
+unconditional-`return Ok(())` syndrome), harmful YAGNI, and CASTEP
+inconsistency, checked against the lessons in this file and
+`eli5-40hr-debug-story.html` ("All parts right + whole wrong → the bug
+lives in the glue. Silent wrong paths are the hardest: they run, and
+look fine."). Full record in the workspace-root
+`notes/failure-patterns.md` (2026-09-03 audit entry).
+
+**Findings and fixes** (commits `c5bd362`, `d41fb13` on `feat/spin-mixer`):
+
+1. `unconditional-Ok-return` (the seed defect, the spin-divergence
+   Defect A below): a check prints a failure but the next statement
+   returns Ok — the check exists but has no teeth. All other
+   `return Ok(())` sites audited: each is now a guarded early return.
+2. `silent-algorithm-degradation` (again): the DIIS singular-matrix
+   fallback degraded a PULAY step to Kerker-only with no log and no
+   counter. Now logged + counted (`diis_fallback_count()`).
+3. `yagni-api-lie`: `ScfIteration::new(max_history)` accepted a DIIS
+   history cap and ignored it (hardcoded 20; callers passed 8/4).
+   Wired through `DensityHistory` (`with_max_history`, lockstep
+   eviction at the cap).
+4. `gated-feature-never-built`: the `chebyshev` feature did not compile
+   (7 errors in the feature-gated USPP-refinement block of
+   `hamiltonian.rs`), including a 16x pointer-overshoot on the
+   block-Qinv GEMM that would have corrupted results had it ever run.
+   Repaired: `cargo check --features chebyshev` passes.
+5. `truncated-data-for-now`: `OccupationSet` held only kpt-0
+   occupations ("use kpt-0 for now") — a trap for any future consumer.
+   Now per-kpt, matching CASTEP `occ(band, kpt, spin)`.
+6. `debug-assert-in-release-critical-path` (recurring): the fft_idx
+   re-encode range check in `ffi.rs` was a `debug_assert` — OOB GPU
+   indices passed silently in release. Now a release-active assert
+   (same class as the 2026-06-16 ffi.rs:604 lesson).
+7. `comment-drift` (recurring): the SmearingScheme doc had the erfc
+   sign flipped vs the code (the code matches CASTEP
+   `algor_integrated_broadening`, algor.F90:2979, algebraically);
+   the `occ_set` "used in future" comments were wrong (check() recomputes
+   occupations). Comments fixed.
+
+**Verified correct (no change)**: all `return Ok(())` early returns are
+guarded; the occupations FFI convention (per-channel target N/2, occ ∈
+[0,1]); the energy assembly (per-spin target 0.5(N±S) matches CASTEP
+`electronic_find_fermi_fix` `frac_elec`); Fortran status handling
+(io_abort on every status path); all previously-documented fixes present
+in current code.
+
+**Lesson**: audit for the pattern, not the instance. One seed defect is
+a symptom of a codebase-wide habit: checks without teeth, parameters
+without effect, features without builds. Each instance is small; the
+habit is the bug.
+
 ## 2026-09-03: spin-polarised NiO SCF diverges at iter 2-3 (near-singular S-matrix)
 
 **Symptom**: The spin-polarised NiO PULAY loop (36/28 filling, 14 kpts,
