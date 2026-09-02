@@ -12,7 +12,7 @@
 use std::sync::Arc;
 
 use cudarc::cusolver::sys::cublasOperation_t;
-use cudarc::driver::{CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
+use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, DevicePtrMut, LaunchConfig, PushKernelArg};
 
 use crate::device::blas::{self, BlasHandle, ZgemmConfig};
 use crate::device::fft::BatchedFftPlan3d;
@@ -628,9 +628,9 @@ pub(crate) unsafe fn apply_s_inverse(
                     ne, n_bands, ne,
                     &alpha as *const _ as *const _,
                     q_ptr as *const _, ne,
-                    (in_ptr as *const _).add(off as isize * (elem as isize)), nte,
+                    (in_ptr as *const cudarc::cublas::sys::double2).add(off as usize), nte,
                     &beta as *const _ as *const _,
-                    (out_ptr as *mut _).add(off as isize * (elem as isize)), nte,
+                    (out_ptr as *mut cudarc::cublas::sys::double2).add(off as usize), nte,
                 ).result().map_err(Error::Blas)?;
                 off += ne;
             }
@@ -665,8 +665,8 @@ pub(crate) unsafe fn apply_s_inverse(
                     .launch_builder(&k.band_sqnorms)
                     .arg(&proj)
                     .arg(&proj)
-                    .arg(&mut p2_dev)
-                    .arg(&mut p2_dev)
+                    .arg(&p2_dev)
+                    .arg(&p2_dev)
                     .arg(&nte)
                     .arg(&n_bands)
                     .launch(cfg)
@@ -715,7 +715,7 @@ pub(crate) unsafe fn apply_s_inverse(
             if gpu_check {
                 // GPU path: per-band Σ|r|² on device, small D2H, host ratio.
                 let k = kernels.expect("gpu_check implies kernels");
-                let r2_dev = r2_dev.as_mut().expect("r2_dev allocated with gpu_check");
+                let r2_slice = r2_dev.as_ref().expect("r2_dev allocated with gpu_check");
                 let cfg = LaunchConfig {
                     grid_dim: (n_bands as u32, 1, 1),
                     block_dim: (128, 1, 1),
@@ -726,15 +726,15 @@ pub(crate) unsafe fn apply_s_inverse(
                         .launch_builder(&k.band_sqnorms)
                         .arg(&r)
                         .arg(&r)
-                        .arg(r2_dev)
-                        .arg(r2_dev)
+                        .arg(r2_slice)
+                        .arg(r2_slice)
                         .arg(&nte)
                         .arg(&n_bands)
                         .launch(cfg)
                 }
                 .map(|_| ())
                 .map_err(Error::Cuda)?;
-                let r2_cpu: Vec<f64> = stream.clone_dtoh(r2_dev).map_err(Error::Cuda)?;
+                let r2_cpu: Vec<f64> = stream.clone_dtoh(r2_slice).map_err(Error::Cuda)?;
                 let max_err = r2_cpu
                     .iter()
                     .zip(proj2_cpu.iter())
