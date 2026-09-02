@@ -14,7 +14,7 @@ use chemrust_hamiltonian_core::{
 use chemrust_scf::{
     downsample_array_to_wave_grid, pw_coords_to_fft_indices, KPoint, KptDataSet, PerSpinDensity,
     PerSpinPwCoefficients, PwCoefficients, ScfIteration, SmearingParams, SmearingScheme,
-    SpinChannelData, WaveGridArray, Density,
+    SpinChannelData, WaveGridArray, Density, MixingScheme,
 };
 use ndarray::ShapeBuilder;
 
@@ -127,6 +127,31 @@ fn parse_spin_bands_file(
 // ---------------------------------------------------------------------------
 
 pub fn build_spin_scf_state(fx: &NioSpinFixture) -> ScfIteration<SpinCollinear> {
+    let smearing = SmearingParams::builder().spin_fix(6).build();
+    // CASTEP default mix gmax: 1.5 /Å (a₀⁻¹) — matches the constructor
+    // default KERKER_GMAX_DEFAULT.
+    build_spin_scf_state_full(fx, smearing, 1.5 * 1.88972612545)
+}
+
+/// CASTEP NiO input configuration: PULAY scheme pinned, charge amplitude
+/// 0.5 / spin amplitude 2.0 (set by the history constructor), mix gmax
+/// 1.5 /Å, net spin 8 (nup − ndown = 36 − 28), spin_fix 6.
+pub fn build_spin_scf_state_pulay(fx: &NioSpinFixture) -> ScfIteration<SpinCollinear> {
+    // CASTEP .param: mix_charge_gmax = mix_spin_gmax = 1.5 /Å (a₀⁻¹).
+    let mix_gmax = 1.5 * 1.88972612545;
+    let smearing = SmearingParams::builder()
+        .mixing_scheme(MixingScheme::Pulay)
+        .spin_fix(6)
+        .net_spin(8.0)
+        .build();
+    build_spin_scf_state_full(fx, smearing, mix_gmax)
+}
+
+fn build_spin_scf_state_full(
+    fx: &NioSpinFixture,
+    smearing: SmearingParams,
+    mix_gmax: f64,
+) -> ScfIteration<SpinCollinear> {
     let cell = fx.bin.cell.clone();
     let pots = fx.pots.clone();
     let wfc = fx.check.wavefunction.as_ref().expect(".check must have wavefunction");
@@ -200,8 +225,6 @@ pub fn build_spin_scf_state(fx: &NioSpinFixture) -> ScfIteration<SpinCollinear> 
         KptDataSet::new(psi_data_s1, nkpts),
     ]);
 
-    let smearing = SmearingParams::builder().spin_fix(6).build();
-
     ScfIteration::<SpinCollinear>::builder()
         .cell(cell).pots(pots)
         .wave_grid(wave_grid).fine_grid(fine_grid)
@@ -211,6 +234,7 @@ pub fn build_spin_scf_state(fx: &NioSpinFixture) -> ScfIteration<SpinCollinear> 
         .pw_fft_indices(KptDataSet::new(pw_fft_vec, nkpts))
         .k_points(KptDataSet::new(k_points_vec, nkpts))
         .smearing(smearing).max_history(8)
+        .mix_gmax(mix_gmax)
         .build()
 }
 
@@ -411,4 +435,219 @@ fn nio_two_iter_cascade_check() {
     let drift_ha = (e_ha_2 - e_ha_1).abs();
     eprintln!("[Cascade] total energy: iter1={:.6} iter2={:.6} |Δ|={:.4e} Ha", e_ha_1, e_ha_2, drift_ha);
     eprintln!("=== 2-iteration cascade check: PASSED ===");
+}
+
+/// Diagnostic (not in the plan): CASTEP-faithful KERKER-pinned spin loop.
+/// Isolates the joint spin DIIS path: if KERKER-pinned is healthy through
+/// the same iterations where PULAY diverges, the joint DIIS spin part is
+/// the culprit.
+#[test]
+#[ignore = "requires GPU and NiO spin fixture"]
+fn nio_spin_kerker_diag() {
+    if !gpu_available() { eprintln!("SKIP: no GPU"); return; }
+    use chemrust_scf::scf::{ScfDivergenceGate, run_scf_with_energy_gated};
+
+    let fx = fixture();
+    let mix_gmax = 1.5 * 1.88972612545;
+    let smearing = SmearingParams::builder()
+        .mixing_scheme(MixingScheme::Kerker)
+        .spin_fix(6)
+        .net_spin(8.0)
+        .build();
+    let state = build_spin_scf_state_full(fx, smearing, mix_gmax);
+    // Gate disabled in effect (huge limits) — full 8-iteration trace for the
+    // eigensolver-cascade check. NOTE: ungated run_scf is not used: its
+    // BuildVEff path has a pre-existing SpinCollinear upsample panic.
+    let gate = ScfDivergenceGate {
+        max_last_band_ha: 1e6,
+        min_band0_ha: -1e6,
+        max_veff_range_factor: 1e6,
+        max_iter: 8,
+        electron_count_tolerance: 1e6,
+        soft_fraction_tolerance: 1e6,
+        #[cfg(feature = "scf_diag")]
+        check_raw_sections: None,
+    };
+    match run_scf_with_energy_gated(state, 8, 1e-8, Some(gate)) {
+        Ok(result) => {
+            let e_ev = (result.total_energy + E_NON_COULOMB_HA) * chemrust_scf::HARTREE_TO_EV;
+            eprintln!("[KERKER-DIAG] 8 iters done E_total = {e_ev:.6} eV spin_freed={}", result.spin_freed);
+        }
+        Err(e) => {
+            eprintln!("[KERKER-DIAG] stopped early: {e}");
+        }
+    }
+}
+
+// ===========================================================================
+// Discriminator: PULAY-pinned, spin FREE from cycle 1 (spin_fix = -1).
+// If this stays healthy past iter 5, the cascade trigger is the
+// fixed-occupation phase (in-scope). If it cascades, the trigger is the
+// spin channel / V_eff chain itself (known open eigensolver cascade §13).
+// ===========================================================================
+#[test]
+#[ignore = "requires GPU and NiO spin fixture"]
+fn nio_spin_pulay_free_from_start_diag() {
+    if !gpu_available() { eprintln!("SKIP: no GPU"); return; }
+    use chemrust_scf::scf::{ScfDivergenceGate, run_scf_with_energy_gated};
+
+    let fx = fixture();
+    let mix_gmax = 1.5 * 1.88972612545;
+    let smearing = SmearingParams::builder()
+        .mixing_scheme(MixingScheme::Pulay)
+        .spin_fix(-1)
+        .net_spin(8.0)
+        .build();
+    let state = build_spin_scf_state_full(fx, smearing, mix_gmax);
+    let gate = ScfDivergenceGate {
+        max_last_band_ha: 1e6,
+        min_band0_ha: -1e6,
+        max_veff_range_factor: 1e6,
+        max_iter: 8,
+        electron_count_tolerance: 1e6,
+        soft_fraction_tolerance: 1e6,
+        #[cfg(feature = "scf_diag")]
+        check_raw_sections: None,
+    };
+    match run_scf_with_energy_gated(state, 8, 1e-8, Some(gate)) {
+        Ok(result) => {
+            let e_ev = (result.total_energy + E_NON_COULOMB_HA) * chemrust_scf::HARTREE_TO_EV;
+            eprintln!("[FREE-START-DIAG] 8 iters done E_total = {e_ev:.6} eV spin_freed={}", result.spin_freed);
+        }
+        Err(e) => {
+            eprintln!("[FREE-START-DIAG] stopped early: {e}");
+        }
+    }
+}
+
+// ===========================================================================
+// Phase 5 control arm: no-mix spin loop (A/B, mirrors nio_mixer_ab
+// nio_no_mix_loop).  With mixing pinned off, the spin electron count
+// drifts and the gate must trip.  A clean convergence would mean the loop
+// is stable without mixing; re-check the trajectory before declaring it.
+// ===========================================================================
+#[test]
+#[ignore = "requires GPU and NiO spin fixture"]
+fn nio_spin_no_mix_diag() {
+    if !gpu_available() { eprintln!("SKIP: no GPU"); return; }
+    use chemrust_scf::scf::{ScfDivergenceGate, run_scf_with_energy_gated};
+
+    let fx = fixture();
+    let mix_gmax = 1.5 * 1.88972612545;
+    let smearing = SmearingParams::builder()
+        .mixing_scheme(MixingScheme::Kerker)
+        .spin_fix(6)
+        .net_spin(8.0)
+        .build();
+    let state = build_spin_scf_state_full(fx, smearing, mix_gmax).pinned_no_mix();
+    let gate = ScfDivergenceGate {
+        max_last_band_ha: 30.0,
+        min_band0_ha: -30.0,
+        max_veff_range_factor: 5.0,
+        max_iter: 30,
+        electron_count_tolerance: 0.05,
+        soft_fraction_tolerance: 0.20,
+        #[cfg(feature = "scf_diag")]
+        check_raw_sections: None,
+    };
+    let outcome = std::panic::catch_unwind(
+        std::panic::AssertUnwindSafe(|| {
+            run_scf_with_energy_gated(state, 8, 1e-8, Some(gate))
+        }),
+    );
+    match outcome {
+        Ok(Ok(final_state)) => {
+            let e_ev = (final_state.total_energy + E_NON_COULOMB_HA) * chemrust_scf::HARTREE_TO_EV;
+            eprintln!("[SPIN-NO-MIX] unexpectedly converged E_total = {e_ev:.8} eV (re-check trajectory)");
+        }
+        Ok(Err(e)) => eprintln!("[SPIN-NO-MIX] stopped early (expected gate trip): {e}"),
+        Err(_) => eprintln!("[SPIN-NO-MIX] gate tripped (expected: electron-count drift without mixing)"),
+    }
+}
+
+// ===========================================================================
+// Phase 4: CASTEP-faithful PULAY spin loop — full SCF to convergence
+// ===========================================================================
+//
+// CASTEP NiO input: PULAY scheme pinned from cycle 1 (charge amplitude
+// 0.5, spin amplitude 2.0, mix gmax 1.5 /Å on both parts, Gaussian
+// smearing 0.1 eV, fixed-spin filling 36/28, spin released at cycle 6,
+// convergence accepted only in the free-spin regime).
+//
+// Starting from the CASTEP-converged state, the loop must:
+//   1. keep the 36/28 filling in the fixed window (cycles 1-6);
+//   2. flush + re-seed the mix object at cycle 6 (spin_release_hook);
+//   3. converge in the free-spin regime to the CASTEP reference energy
+//      (loop convention: E_total = E-TS - 533.13587 eV);
+//   4. preserve the net spin: per-spin band-0 eigenvalues at the
+//      CASTEP values (-0.59135 / -0.59104 Ha).
+#[test]
+#[ignore = "requires GPU and NiO spin fixture"]
+fn nio_spin_pulay_full_loop() {
+    if !gpu_available() { eprintln!("SKIP: no GPU"); return; }
+    use chemrust_scf::scf::{ScfDivergenceGate, run_scf_with_energy_gated};
+
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_target(false)
+        .try_init()
+        .ok();
+
+    let fx = fixture();
+    let state = build_spin_scf_state_pulay(fx);
+    let gate = ScfDivergenceGate {
+        max_last_band_ha: 30.0,
+        min_band0_ha: -30.0,
+        max_veff_range_factor: 10.0,
+        // CASTEP converged in 77 cycles (CPU). The GPU loop from the
+        // converged state must finish well inside this ceiling.
+        max_iter: 120,
+        electron_count_tolerance: 10.0,
+        soft_fraction_tolerance: 1.0,
+        #[cfg(feature = "scf_diag")]
+        check_raw_sections: None,
+    };
+    let result =
+        run_scf_with_energy_gated(state, 8, 1e-8, Some(gate))
+            .expect("PULAY spin loop diverged or hit the gate");
+
+    // 3. Convergence must happen in the free-spin regime (the gate
+    //    blocks convergence at/ before the release cycle).
+    assert!(result.spin_freed, "convergence before the free-spin regime");
+    let e_ev = (result.total_energy + E_NON_COULOMB_HA) * chemrust_scf::HARTREE_TO_EV;
+    let ref_ev = REFERENCE_ENERGY_EV;
+    eprintln!(
+        "[spin-pulay] converged E_total(loop) = {e_ev:.8} eV (CASTEP E-TS {ref_ev:.8} eV, drift {:.4e} eV)",
+        (e_ev - ref_ev).abs()
+    );
+    assert!(
+        (e_ev - ref_ev).abs() < 0.05,
+        "energy drift {:.4e} eV > 0.05 eV",
+        (e_ev - ref_ev).abs()
+    );
+
+    // 4. Net spin preserved: per-spin band-0 eigenvalues at the CASTEP
+    //    reference (the up and dn bands sit at different energies).
+    for ikpt in 0..result.eigenvalues[0].nkpts() {
+        let up_bands = &result.eigenvalues[0][ikpt];
+        let dn_bands = &result.eigenvalues[1][ikpt];
+        let e0: f64 = *up_bands.get(0).expect("band0 present");
+        let e1: f64 = *dn_bands.get(0).expect("band0 present");
+        eprintln!(
+            "[spin-pulay] kpt {ikpt}: band0 up = {e0:.6} Ha, dn = {e1:.6} Ha (net spin {:.3e})",
+            e0 - e1
+        );
+        assert!(
+            (e0 - EPS_SPIN0_BAND0_REF_HA).abs() < 5e-3,
+            "kpt {ikpt} spin0 band0 {e0:.6} ref {EPS_SPIN0_BAND0_REF_HA:.6}"
+        );
+        assert!(
+            (e1 - EPS_SPIN1_BAND0_REF_HA).abs() < 5e-3,
+            "kpt {ikpt} spin1 band0 {e1:.6} ref {EPS_SPIN1_BAND0_REF_HA:.6}"
+        );
+    }
+    eprintln!("=== Spin PULAY full loop: ALL CHECKS PASSED ===");
 }

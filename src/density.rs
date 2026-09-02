@@ -356,6 +356,119 @@ pub fn find_fermi_free(
     Ok((fermi, occ_up, occ_dn, net_spin))
 }
 
+/// K-point-weighted version of [`find_fermi_free`] for the CASTEP
+/// `electronic_find_fermi_free` constraint (electronic.f90:9329-9600).
+///
+/// A single shared chemical potential μ is found by bisection on the
+/// kpt-weighted total electron count:
+///
+/// ```text
+/// total_occ(μ) = (2/nspins) · Σ_ns Σ_k w_k Σ_b I((μ − ε_bk)/w)  =  N
+/// ```
+///
+/// where `I(x) = 0.5·erf(x) + 0.5 = 0.5·erfc((ε−μ)/w)` is the
+/// integrated Gaussian broadening (CASTEP `algor_integrated_broadening`,
+/// smearing_scheme GAUSSIAN).  The k-point weights `w_k` sum to 1
+/// over the k-point list.
+///
+/// # Arguments
+/// * `per_kpt_up` / `per_kpt_dn` — `[kpt][band]` eigenvalues in Hartree
+/// * `kpt_weights` — k-point weights (`Σ w_k = 1`)
+/// * `smearing` — smearing parameters (Gaussian width)
+/// * `n_electrons` — total electron count `N` (both channels combined)
+/// * `nspins` — number of spin channels (2 for SpinCollinear)
+///
+/// # Returns
+/// `(fermi, occ_up_per_kpt, occ_dn_per_kpt)` with per-band occupations
+/// `I((μ − ε)/w)` in `[0, 1]` per channel.
+pub fn find_fermi_free_weighted(
+    per_kpt_up: &[Vec<f64>],
+    per_kpt_dn: &[Vec<f64>],
+    kpt_weights: &[f64],
+    smearing: &SmearingParams,
+    n_electrons: f64,
+    nspins: usize,
+) -> Result<(f64, Vec<Vec<f64>>, Vec<Vec<f64>>), Error> {
+    let width = smearing.width.to_ha();
+    let scale = 2.0 / nspins.max(1) as f64;
+
+    if per_kpt_up.is_empty() || per_kpt_dn.is_empty() {
+        return Err(Error::NotImplemented);
+    }
+    if per_kpt_up.len() != per_kpt_dn.len() || per_kpt_up.len() != kpt_weights.len() {
+        return Err(Error::NotImplemented);
+    }
+
+    let mut emin = f64::INFINITY;
+    let mut emax = f64::NEG_INFINITY;
+    for k in 0..per_kpt_up.len() {
+        for &e in per_kpt_up[k].iter().chain(per_kpt_dn[k].iter()) {
+            emin = emin.min(e);
+            emax = emax.max(e);
+        }
+    }
+    if n_electrons <= 0.0 {
+        let occ_up: Vec<Vec<f64>> = per_kpt_up
+            .iter()
+            .map(|eigs| vec![0.0; eigs.len()])
+            .collect();
+        let occ_dn: Vec<Vec<f64>> = per_kpt_dn
+            .iter()
+            .map(|eigs| vec![0.0; eigs.len()])
+            .collect();
+        return Ok((f64::NEG_INFINITY, occ_up, occ_dn));
+    }
+
+    let total_occ = |mu: f64| -> f64 {
+        let mut sum = 0.0;
+        for k in 0..per_kpt_up.len() {
+            let wk = kpt_weights[k];
+            let bands: f64 = per_kpt_up[k]
+                .iter()
+                .map(|&e| 0.5 * libm::erfc((e - mu) / width))
+                .sum::<f64>()
+                + per_kpt_dn[k].iter().map(|&e| 0.5 * libm::erfc((e - mu) / width)).sum::<f64>();
+            sum += wk * bands;
+        }
+        scale * sum
+    };
+
+    let lo = emin - 4.0 * width;
+    let hi = emax + 4.0 * width;
+    let mut delta_e = hi - lo;
+    let mut fermi = lo;
+
+    for _ in 0..80 {
+        delta_e *= 0.5;
+        let trial = fermi + delta_e;
+        if total_occ(trial) <= n_electrons {
+            fermi = trial;
+        }
+        if delta_e <= 1e-12 {
+            break;
+        }
+    }
+
+    let occ_up: Vec<Vec<f64>> = per_kpt_up
+        .iter()
+        .map(|eigs| {
+            eigs.iter()
+                .map(|&e| 0.5 * libm::erfc((e - fermi) / width))
+                .collect()
+        })
+        .collect();
+    let occ_dn: Vec<Vec<f64>> = per_kpt_dn
+        .iter()
+        .map(|eigs| {
+            eigs.iter()
+                .map(|&e| 0.5 * libm::erfc((e - fermi) / width))
+                .collect()
+        })
+        .collect();
+
+    Ok((fermi, occ_up, occ_dn))
+}
+
 // ---------------------------------------------------------------------------
 // Electronic entropy -TS (Mermin free energy correction)
 // ---------------------------------------------------------------------------

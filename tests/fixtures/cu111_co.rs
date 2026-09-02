@@ -222,6 +222,7 @@ pub fn build_scf_state(
         scheme: SmearingScheme::Gaussian,
         spin_fix: 10,
         mixing_scheme: chemrust_scf::MixingScheme::Off,
+        net_spin: 0.0,
     };
 
     // CPU-side psi: SpinChannelData<KptDataSet<Vec<Complex64>>>
