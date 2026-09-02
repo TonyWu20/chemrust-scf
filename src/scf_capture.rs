@@ -127,7 +127,7 @@ pub fn capture_as_castep_bin<S: SpinPolicy>(
     // --- Total density on fine grid ---
     // 1. Upsample smooth density from wave grid to fine grid
     let total_density = state.density.total();
-    let rho_wave = total_density.as_wave_array();
+    let rho_wave = total_density.as_fine_array();
     let rho_wave_padded = {
         let mut arr = ndarray::Array3::<f64>::zeros(wave_grid_dims);
         let shape = rho_wave.shape();
@@ -221,6 +221,10 @@ pub fn capture_as_castep_bin<S: SpinPolicy>(
         kpoint_weights: (0..nkpts).map(|ikpt| state.k_points[ikpt].weight).collect(),
         fine_grid: Some(fine_grid_dims),
         wavefunction: Some(wavefunction),
+        // Mid-SCF continuation state: force CASTEP to run the SCF from this
+        // checkpoint (castep.f90:823 skips it when the flag is set).
+        found_ground_state_wvfn: false,
+        found_ground_state_den: false,
         forces: None,
         stress: None,
         strain: None,

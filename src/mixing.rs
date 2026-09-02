@@ -48,7 +48,8 @@ impl MixingPhase for Pulay {}
 // ---------------------------------------------------------------------------
 
 /// Maximum number of DIIS history entries (CASTEP default).
-const DIIS_MAX_HISTORY: usize = 7;
+/// CASTEP `mix_history_length` (NiO .param: 20). DIIS ring-buffer size.
+const DIIS_MAX_HISTORY: usize = 20;
 
 /// Reciprocal-space density history and mixing state.
 ///
@@ -75,6 +76,10 @@ pub struct DensityHistory<M: MixingPhase> {
     /// (amp_charge + amp_spin)/2 for each channel.
     /// Reference: CASTEP dm_sub_mix.f90:434 (amp_c, amp_s).
     pub(crate) mixing_amplitude: Vec<f64>,
+    /// CASTEP `mix_charge_gmax` in a₀⁻¹ (default 1.5 /Å = 2.8346 a₀⁻¹).
+    /// Sets the Kerker kernel scale: K(G) = G²/(G² + gmax²).
+    /// CASTEP dm_sub_base.f90:613 `energy_ch_q0sq = 0.5·mix_charge_gmax²`.
+    pub(crate) mix_gmax: f64,
     /// Reciprocal-space density from the previous iteration's mixing output,
     /// per spin channel.  `None` on the first Kerker/Pulay call (pass-through).
     /// CASTEP dm.f90 stores per-spin density history independently.
@@ -307,6 +312,7 @@ impl DensityHistory<MixingOff> {
             kernels: None,
             nspins,
             mixing_amplitude: vec![amp; nspins],
+            mix_gmax: crate::mixing::kerker::KERKER_GMAX_DEFAULT,
             current_density_in: (0..nspins).map(|_| None).collect(),
             delta_n_history: (0..nspins).map(|_| per_spin()).collect(),
             delta_r_history: (0..nspins).map(|_| per_spin()).collect(),
@@ -314,6 +320,13 @@ impl DensityHistory<MixingOff> {
             prev_n_in: (0..nspins).map(|_| None).collect(),
             _marker: PhantomData,
         }
+    }
+
+    /// Set the CASTEP `mix_charge_gmax` scale (a₀⁻¹) of the Kerker kernel.
+    /// Must be called before `into_kerker` (the kernel is built lazily).
+    pub fn with_mix_gmax(mut self, gmax: f64) -> Self {
+        self.mix_gmax = gmax;
+        self
     }
 
     /// Pass-through mixing: density unchanged, snapshot = clone.
@@ -332,12 +345,13 @@ impl DensityHistory<MixingOff> {
     /// on the history.
     pub fn into_kerker(
         mut self,
-        wave_grid: &GVectorGrid,
+        mixing_grid: &GVectorGrid,
+        g2_cutoff: Option<f64>,
     ) -> Result<DensityHistory<Kerker>, Error> {
         if self.kerker.is_none() {
             let ctx = Arc::new(CudaContext::new(0).map_err(Error::Cuda)?);
             let stream = ctx.default_stream();
-            let kerker = KerkerPreconditioner::new(&stream, wave_grid)?;
+            let kerker = KerkerPreconditioner::new(&stream, mixing_grid, g2_cutoff, self.mix_gmax)?;
             self.kerker = Some(kerker);
             // Compile kernels on the same stream/context to avoid context
             // isolation (device pointers are not valid across contexts).
@@ -352,7 +366,8 @@ impl DensityHistory<MixingOff> {
             kerker: self.kerker,
             kernels: self.kernels,
             nspins: self.nspins,
-            mixing_amplitude: self.mixing_amplitude,
+            mixing_amplitude: self.mixing_amplitude.clone(),
+            mix_gmax: self.mix_gmax,
             current_density_in: self.current_density_in,
             delta_n_history: self.delta_n_history,
             delta_r_history: self.delta_r_history,
@@ -384,7 +399,8 @@ impl<M: MixingPhase> DensityHistory<M> {
             kerker: self.kerker,
             kernels: self.kernels,
             nspins: self.nspins,
-            mixing_amplitude: self.mixing_amplitude,
+            mixing_amplitude: self.mixing_amplitude.clone(),
+            mix_gmax: self.mix_gmax,
             current_density_in: self.current_density_in,
             delta_n_history: self.delta_n_history,
             delta_r_history: self.delta_r_history,
@@ -467,11 +483,15 @@ impl DensityHistory<Kerker> {
                 }
                 .expect("cpx_sub R = n_out - n_in");
 
-                // result = n_in + amp * K·R  (GPU — cpx_full_update with zero deltas)
+                // result = n_in + amp*K·R on the mix basis; above the
+                // cutoff the high-G content is carried from n_out
+                // (CASTEP dm_mix_density_to_density behaviour).
                 let mut result_dev: CudaSlice<CudaComplex> =
                     stream.alloc_zeros(n_real).expect("alloc result");
                 let kerker_dev = self.kerker.as_ref().unwrap().as_device_slice();
+                let mask_dev = self.kerker.as_ref().unwrap().as_mask_slice();
                 let amp = self.mixing_amplitude[ispin];
+                let amp_n_kerker: f64 = 0.0;
 
                 // Zero buffer for the unused sum_delta_r / sum_delta_n terms
                 let zero_dev: CudaSlice<CudaComplex> =
@@ -486,8 +506,11 @@ impl DensityHistory<Kerker> {
                         .arg(&r_dev)
                         .arg(&zero_dev)
                         .arg(&zero_dev)
+                        .arg(&n_out_dev)
+                        .arg(mask_dev)
                         .arg(&n_i32)
                         .arg(&amp)
+                        .arg(&amp_n_kerker)
                         .launch(LaunchConfig::for_num_elems(n_real as u32))
                 }
                 .expect("cpx_full_update n_in + amp*K*R");
@@ -535,21 +558,24 @@ impl DensityHistory<Kerker> {
 
     /// Transition from `Kerker` to `Pulay` (DIIS) phase.
     ///
-    /// Allocates DIIS ring buffer storage. The first DIIS iteration after
-    /// this transition will treat the current `current_density_in` as the
-    /// initial state for residual history.
+    /// DIIS history and residual state are PRESERVED: `into_pulay` is
+    /// invoked at every Pulay iteration (construct_density_pulay), so
+    /// resetting prev_res/prev_n_in/here would zero the delta history and
+    /// DIIS would never activate. CASTEP keeps one density/residual
+    /// history across scheme switches (dm_sub_mix.f90 uses the same
+    /// density_history and residual_history arrays for Kerker and Pulay).
     pub fn into_pulay(self) -> DensityHistory<Pulay> {
-        let per_spin = || Vec::with_capacity(DIIS_MAX_HISTORY);
         DensityHistory {
             kerker: self.kerker,
             kernels: self.kernels,
             nspins: self.nspins,
-            mixing_amplitude: self.mixing_amplitude,
+            mixing_amplitude: self.mixing_amplitude.clone(),
+            mix_gmax: self.mix_gmax,
             current_density_in: self.current_density_in,
-            delta_n_history: (0..self.nspins).map(|_| per_spin()).collect(),
-            delta_r_history: (0..self.nspins).map(|_| per_spin()).collect(),
-            prev_res: (0..self.nspins).map(|_| None).collect(),
-            prev_n_in: (0..self.nspins).map(|_| None).collect(),
+            delta_n_history: self.delta_n_history,
+            delta_r_history: self.delta_r_history,
+            prev_res: self.prev_res,
+            prev_n_in: self.prev_n_in,
             _marker: PhantomData,
         }
     }
@@ -653,8 +679,12 @@ impl DensityHistory<Pulay> {
                 .expect("cpx_sub R = n_out - n_in");
 
                 // ---- 3. Push deltas to history per-spin ----
+                // CASTEP mix density objects are band-limited to
+                // num_mix_plane_waves, so the DIIS delta history carries
+                // only mix-basis (low-G) content. Mask here.
                 let old_prev_res = self.prev_res[ispin].take();
                 let old_prev_n_in = self.prev_n_in[ispin].take();
+                let mask_dev = self.kerker.as_ref().unwrap().as_mask_slice();
 
                 if let Some(prev_res_dev) = old_prev_res {
                     // ΔR = R_current - R_{t-1}  (GPU)
@@ -688,13 +718,37 @@ impl DensityHistory<Pulay> {
                     }
                     // If old_prev_n_in is None (should not happen), Δn stays zero
 
-                    // Push deltas to history (Vec with automatic eviction), per-spin
+                    // Band-limit both deltas to the CASTEP mix basis
+                    let mut delta_r_masked: CudaSlice<CudaComplex> =
+                        stream.alloc_zeros(n_real).expect("alloc ΔR masked");
+                    let mut delta_n_masked: CudaSlice<CudaComplex> =
+                        stream.alloc_zeros(n_real).expect("alloc Δn masked");
+                    unsafe {
+                        stream
+                            .launch_builder(&kernels.cpx_mask)
+                            .arg(&mut delta_r_masked)
+                            .arg(&delta_r_tmp)
+                            .arg(mask_dev)
+                            .arg(&n_i32)
+                            .launch(LaunchConfig::for_num_elems(n_real as u32))
+                        .expect("cpx_mask ΔR");
+                        stream
+                            .launch_builder(&kernels.cpx_mask)
+                            .arg(&mut delta_n_masked)
+                            .arg(&delta_n_tmp)
+                            .arg(mask_dev)
+                            .arg(&n_i32)
+                            .launch(LaunchConfig::for_num_elems(n_real as u32))
+                        .expect("cpx_mask Δn");
+                    }
+
+                    // Push (masked) deltas to history (Vec with automatic eviction), per-spin
                     if self.delta_n_history[ispin].len() >= DIIS_MAX_HISTORY {
                         self.delta_n_history[ispin].remove(0);
                         self.delta_r_history[ispin].remove(0);
                     }
-                    self.delta_n_history[ispin].push(delta_n_tmp);
-                    self.delta_r_history[ispin].push(delta_r_tmp);
+                    self.delta_n_history[ispin].push(delta_n_masked);
+                    self.delta_r_history[ispin].push(delta_r_masked);
                 }
 
                 // ---- 4. Save R_current and n_in_current as prev_{res,n_in} per-spin ----
@@ -731,10 +785,16 @@ impl DensityHistory<Pulay> {
                 };
 
                 let kerker_dev = self.kerker.as_ref().unwrap().as_device_slice();
+                let mask_dev = self.kerker.as_ref().unwrap().as_mask_slice();
+
+                let zero_dev: CudaSlice<CudaComplex> =
+                    stream.alloc_zeros(n_real).expect("alloc zero");
 
                 let result_dev: CudaSlice<CudaComplex> = if !fallback {
-                    // ---- 8. DIIS update on GPU ----
-                    // n_new = n_in + Σc_i·Δn_i + K·(R + Σc_i·ΔR_i)
+                    // ---- 8. DIIS update on GPU (CASTEP dm_sub_mix.f90 form) ----
+                    // n_new = n_in + Σc_i·Δn_i + K·(Σc_i·ΔR_i)
+                    //   DIIS part unscaled (amp = 1.0); R_curr NOT in the
+                    //   Kerker part; high-G content carried from n_out.
 
                     // Allocate accumulator buffers
                     let mut sum_delta_r: CudaSlice<CudaComplex> =
@@ -751,10 +811,18 @@ impl DensityHistory<Pulay> {
                             .expect("axpy sum_delta_n");
                     }
 
-                    // result = n_in + amp * (sum_delta_n + K·(R_current + sum_delta_r))
+                    // CASTEP dm_sub_mix.f90 dm_mix_density_pulay exact form:
+                    //   new = n_in + sum_dn + K*(R + sum_dr)
+                    // The kerker slice holds the PURE kernel G2/(G2+q2);
+                    // amp_k carries mix_charge_amp; the DIIS density part
+                    // is unscaled (amp_n = 1.0); R_curr is INSIDE the
+                    // Kerker part (CASTEP copies current_residual into the
+                    // workspace before adding the c-weighted residual diffs).
+                    let charge_amp = self.mixing_amplitude[ispin];
                     let mut result_dev: CudaSlice<CudaComplex> =
                         stream.alloc_zeros(n_real).expect("alloc result");
-                    let amp = self.mixing_amplitude[ispin];
+                    let amp_k: f64 = charge_amp;
+                    let amp_n: f64 = 1.0;
                     unsafe {
                         stream
                             .launch_builder(&kernels.cpx_full_update)
@@ -764,19 +832,23 @@ impl DensityHistory<Pulay> {
                             .arg(&r_dev)
                             .arg(&sum_delta_r)
                             .arg(&sum_delta_n)
+                            .arg(&n_out_dev)
+                            .arg(mask_dev)
                             .arg(&n_i32)
-                            .arg(&amp)
+                            .arg(&amp_k)
+                            .arg(&amp_n)
                             .launch(LaunchConfig::for_num_elems(n_real as u32))
                     }
                     .expect("cpx_full_update DIIS n_new");
                     result_dev
                 } else {
-                    // ---- Kerker fallback: n_new = n_in + amp * K·R ----
-                    let zero_dev: CudaSlice<CudaComplex> =
-                        stream.alloc_zeros(n_real).expect("alloc zero");
+                    // ---- Kerker fallback: n_new = n_in + amp_k * K·R ----
+                    // (CASTEP dm_mix_density_kerker, taken when the DIIS
+                    // solve fails; amp_n = 0)
                     let mut result_dev: CudaSlice<CudaComplex> =
                         stream.alloc_zeros(n_real).expect("alloc result");
-                    let amp_fb = self.mixing_amplitude[ispin];
+                    let amp_k_fb = self.mixing_amplitude[ispin];
+                    let amp_n_fb: f64 = 0.0;
                     unsafe {
                         stream
                             .launch_builder(&kernels.cpx_full_update)
@@ -786,8 +858,11 @@ impl DensityHistory<Pulay> {
                             .arg(&r_dev)
                             .arg(&zero_dev)
                             .arg(&zero_dev)
+                            .arg(&n_out_dev)
+                            .arg(mask_dev)
                             .arg(&n_i32)
-                            .arg(&amp_fb)
+                            .arg(&amp_k_fb)
+                            .arg(&amp_n_fb)
                             .launch(LaunchConfig::for_num_elems(n_real as u32))
                     }
                     .expect("cpx_full_update Kerker fallback n_in + amp*K*R");

@@ -31,6 +31,9 @@ pub struct HandleSharedVnl {
     pub screening_cache_fine: Option<WaveScreeningCache>,
     /// Per-ion USPP Q augmentation matrices on GPU (n_expanded × n_expanded).
     pub per_ion_q: Vec<CudaSlice<CudaComplex>>,
+    /// Per-ion Q^{-1} matrices on GPU (n_expanded × n_expanded).  Used by
+    /// iterative Woodbury refinement for M·y = Q^{-1}·y + B^T·(B·y).
+    pub per_ion_q_inv: Vec<CudaSlice<CudaComplex>>,
     /// Per-ion unscreened D0 matrices (CPU).
     pub per_ion_d0_expanded: Vec<Vec<f64>>,
     /// Per-ion expanded projector count.
@@ -70,6 +73,31 @@ pub struct VnlBatchData {
     pub entries: Vec<VnlIonData>,
     /// Spin-independent shared state (screening caches, beta_g, Q, D0).
     pub shared: Arc<KptSharedVnl>,
+    /// Concatenated beta-projectors for Woodbury S^{-1} (n_pw × n_total_expanded).
+    #[cfg(feature = "chebyshev")]
+    pub b_concat: CudaSlice<CudaComplex>,
+    /// LU-factorized M matrix for Woodbury S^{-1} (nte × nte complex).
+    #[cfg(feature = "chebyshev")]
+    pub lu_m: CudaSlice<CudaComplex>,
+    /// LU pivot indices for Woodbury S^{-1} (nte × i32).
+    #[cfg(feature = "chebyshev")]
+    pub lu_ipiv: CudaSlice<i32>,
+    /// Total expanded projector count sum(per_ion_n_expanded).
+    #[cfg(feature = "chebyshev")]
+    pub n_total_expanded: i32,
+    /// Per-ion Q^{-1} matrices (flat row-major, n_expanded × n_expanded per ion).
+    /// Used for exact residual computation in stationary Woodbury iteration.
+    #[cfg(feature = "chebyshev")]
+    pub q_inv_per_ion: Vec<Vec<f64>>,
+    /// Per-ion Q matrices (flat row-major, n_expanded × n_expanded per ion).
+    /// Used as block-diagonal preconditioner Q in stationary iteration
+    /// (ABINIT's D⁻¹ = Q). Missing from the earlier LU-based approach.
+    #[cfg(feature = "chebyshev")]
+    pub q_per_ion: Vec<Vec<f64>>,
+    /// B^H·B Gram matrix (nte × nte, real-symmetric, flat row-major f64).
+    /// Used for exact residual computation in stationary Woodbury iteration.
+    #[cfg(feature = "chebyshev")]
+    pub bhb_cpu: Vec<f64>,
 }
 
 /// Build the expanded USPP Q augmentation matrix (n_expanded × n_expanded).
@@ -145,6 +173,7 @@ pub fn build_handle_shared_vnl(
         None => None,
     };
     let mut per_ion_q = Vec::new();
+    let mut per_ion_q_inv = Vec::new();
     let mut per_ion_d0 = Vec::new();
     let mut per_ion_ne = Vec::new();
     for ion_idx in 0..cell.num_ions {
@@ -158,9 +187,17 @@ pub fn build_handle_shared_vnl(
                     .map(|&q| CudaComplex { x: q, y: 0.0 }).collect();
                 let q_dev = stream.clone_htod(&q_flat).map_err(Error::Cuda)?;
                 pcie.h2d_bytes += q_flat.len() * std::mem::size_of::<CudaComplex>();
+                // Q^{-1}: invert small real matrix, upload to GPU
+                let ne = n_exp as usize;
+                let q_inv_cpu = invert_small_real_matrix(&q_cpu, ne);
+                let q_inv_flat: Vec<CudaComplex> = q_inv_cpu.iter()
+                    .map(|&q| CudaComplex { x: q, y: 0.0 }).collect();
+                let q_inv_dev = stream.clone_htod(&q_inv_flat).map_err(Error::Cuda)?;
+                pcie.h2d_bytes += q_inv_flat.len() * std::mem::size_of::<CudaComplex>();
                 let d0 = build_d0_expanded(aug);
                 let d0_flat: Vec<f64> = d0.iter().cloned().collect();
                 per_ion_q.push(q_dev);
+                per_ion_q_inv.push(q_inv_dev);
                 per_ion_d0.push(d0_flat);
                 per_ion_ne.push(n_exp);
             }
@@ -170,6 +207,7 @@ pub fn build_handle_shared_vnl(
         screening_cache: sc,
         screening_cache_fine: sc_fine,
         per_ion_q,
+        per_ion_q_inv,
         per_ion_d0_expanded: per_ion_d0,
         per_ion_n_expanded: per_ion_ne,
         screening_h2d_bytes: pcie.h2d_bytes,
@@ -200,6 +238,7 @@ impl VnlBatchData {
             None,      // d_override
             None,      // shared
             None,      // handle_shared — test path, builds fresh
+            None,      // solver_thunk — test path, no Woodbury
             stream, pcie, blas, kernels,
         )
     }
@@ -241,6 +280,7 @@ impl VnlBatchData {
         // handle instead of being built fresh.  Must be provided when `shared`
         // is `None` (first kpt build); ignored when `shared` is `Some`.
         handle_shared: Option<Arc<HandleSharedVnl>>,
+        solver_thunk: Option<&crate::device::solver::SolverHandle>,
         stream: &Arc<CudaStream>,
         pcie: &mut PcieAccount,
         blas: &crate::device::blas::BlasHandle,
@@ -324,6 +364,7 @@ impl VnlBatchData {
         // Collectors for the shared Arc (populated only in fresh-build path).
         let mut per_ion_beta_g: Vec<CudaSlice<CudaComplex>> = Vec::new();
         let mut per_ion_q: Vec<CudaSlice<CudaComplex>> = Vec::new();
+        let mut per_ion_q_inv: Vec<CudaSlice<CudaComplex>> = Vec::new();
         let mut per_ion_d0_expanded: Vec<Vec<f64>> = Vec::new();
         let mut per_ion_n_expanded: Vec<i32> = Vec::new();
 
@@ -344,7 +385,7 @@ impl VnlBatchData {
             // When `shared` is Some, reuse from existing KptSharedVnl.
             // When `shared` is None but `handle_shared` is Some, use handle for q/d0
             // and build fresh beta_g.
-            let (beta_dev, q_dev, d0_expanded, n_expanded) = match shared {
+            let (beta_dev, q_dev, _q_inv_dev, d0_expanded, n_expanded) = match shared {
                 Some(ref shared_arc) => {
                     debug_assert!(
                         entries.len() < shared_arc.per_ion_beta_g.len(),
@@ -353,9 +394,10 @@ impl VnlBatchData {
                     let handle = &shared_arc.handle;
                     let bg = shared_arc.per_ion_beta_g[entries.len()].clone();
                     let qm = handle.per_ion_q[entries.len()].clone();
+                    let qim = handle.per_ion_q_inv[entries.len()].clone();
                     let d0 = handle.per_ion_d0_expanded[entries.len()].clone();
                     let ne = handle.per_ion_n_expanded[entries.len()];
-                    (bg, qm, d0, ne)
+                    (bg, qm, qim, d0, ne)
                 }
                 None => {
                     let beta_g = compute_beta_g(
@@ -373,33 +415,41 @@ impl VnlBatchData {
                     pcie.h2d_bytes += beta_flat.len() * std::mem::size_of::<CudaComplex>();
 
                     // Q and D0 are kpt-independent — take from handle if available.
-                    let (q_dev, d0_flat) = match handle_shared {
+                    let (q_dev, q_inv_dev, d0_flat) = match handle_shared {
                         Some(ref h) => {
                             let qm = h.per_ion_q[entries.len()].clone();
+                            let qim = h.per_ion_q_inv[entries.len()].clone();
                             let d0 = h.per_ion_d0_expanded[entries.len()].clone();
-                            (qm, d0)
+                            (qm, qim, d0)
                         }
                         None => {
                             let q_cpu = build_q_expanded(aug);
+                            let ne = (q_cpu.len() as f64).sqrt() as usize;
                             let q_flat: Vec<CudaComplex> =
                                 q_cpu.iter().map(|&q| CudaComplex { x: q, y: 0.0 }).collect();
                             let q_dev = stream.clone_htod(&q_flat).map_err(Error::Cuda)?;
                             pcie.h2d_bytes += q_flat.len() * std::mem::size_of::<CudaComplex>();
+                            // Q⁻¹ for Woodbury iterative refinement
+                            let q_inv_cpu = invert_small_real_matrix(&q_cpu, ne);
+                            let q_inv_flat: Vec<CudaComplex> = q_inv_cpu.iter()
+                                .map(|&q| CudaComplex { x: q, y: 0.0 }).collect();
+                            let q_inv_dev = stream.clone_htod(&q_inv_flat).map_err(Error::Cuda)?;
                             let d0_flat: Vec<f64> = d0_expanded.iter().cloned().collect();
-                            (q_dev, d0_flat)
+                            (q_dev, q_inv_dev, d0_flat)
                         }
                     };
 
                     // Collect for KptSharedVnl / HandleSharedVnl.
                     per_ion_beta_g.push(beta_dev.clone());
                     if handle_shared.is_none() {
-                        // Fresh build: collect Q and D0 for HandleSharedVnl construction.
+                        // Fresh build: collect Q, Q⁻¹ and D0 for HandleSharedVnl construction.
                         per_ion_q.push(q_dev.clone());
+                        per_ion_q_inv.push(q_inv_dev.clone());
                         per_ion_d0_expanded.push(d0_flat.clone());
                         per_ion_n_expanded.push(n_expanded);
                     }
 
-                    (beta_dev, q_dev, d0_flat, n_expanded)
+                    (beta_dev, q_dev, q_inv_dev, d0_flat, n_expanded)
                 }
             };
 
@@ -501,6 +551,7 @@ impl VnlBatchData {
                             screening_cache,
                             screening_cache_fine,
                             per_ion_q,
+                            per_ion_q_inv,
                             per_ion_d0_expanded,
                             per_ion_n_expanded,
                             screening_h2d_bytes,
@@ -514,9 +565,159 @@ impl VnlBatchData {
             }
         };
 
+        // -----------------------------------------------------------------------
+        // Woodbury S^{-1} assembly (Chebyshev feature only)
+        // -----------------------------------------------------------------------
+        // Builds the concatenated B matrix and LU-factored M = Q^{-1} + B^H·B + eps·I
+        // used by apply_s_inverse for the global USPP S^{-1} operator.
+        #[cfg(feature = "chebyshev")]
+        let (b_concat, lu_m, lu_ipiv, n_total_expanded, q_inv_per_ion, q_per_ion, bhb_cpu) = if let Some(solver) = solver_thunk {
+            let n_total_expanded: i32 = entries.iter().map(|e| e.n_expanded).sum();
+            let nte = n_total_expanded as usize;
+
+            if nte == 0 {
+                // No USPP ions: Woodbury = identity
+                let empty = stream.alloc_zeros::<CudaComplex>(0).map_err(Error::Cuda)?;
+                let empty_ipiv = stream.alloc_zeros::<i32>(0).map_err(Error::Cuda)?;
+                (empty.clone(), empty, empty_ipiv, 0, Vec::new(), Vec::new(), Vec::new())
+            } else {
+                // Step 1: Concatenate per-ion beta_g into b_concat (n_pw × nte)
+                let mut b_concat_data: Vec<CudaComplex> = Vec::with_capacity(n_pw * nte);
+                for entry in &entries {
+                    let _ne = entry.n_expanded as usize;
+                    let beta_host: Vec<CudaComplex> = stream
+                        .clone_dtoh(&entry.beta_g)
+                        .map_err(Error::Cuda)?;
+                    // beta_g is (n_expanded × n_pw) in row-major, but we need
+                    // (n_pw × n_total_expanded) with each ion's block contiguous.
+                    // b_concat layout: [ion0_col0(n_pw), ion0_col1(n_pw), ...,
+                    //                    ion1_col0(n_pw), ...]
+                    // beta_g layout: [ne][n_pw] row-major = same as b_concat blocks.
+                    b_concat_data.extend(beta_host.iter());
+                }
+                let b_concat = stream.clone_htod(&b_concat_data).map_err(Error::Cuda)?;
+
+                // Step 2: B^H·B on GPU (nte × nte)
+                // Technically this is B^H·B where B is n_pw × nte,
+                // so result = B^H·B is nte × nte.
+                let mut bhb: CudaSlice<CudaComplex> =
+                    stream.alloc_zeros(nte * nte).map_err(Error::Cuda)?;
+                unsafe {
+                    blas.gemm_c64(
+                        crate::device::blas::ZgemmConfig {
+                            transa: crate::device::blas::op::C,
+                            transb: crate::device::blas::op::N,
+                            m: nte as i32,
+                            n: nte as i32,
+                            k: n_pw as i32,
+                            alpha: CudaComplex { x: 1.0, y: 0.0 },
+                            lda: n_pw as i32,
+                            ldb: n_pw as i32,
+                            beta: CudaComplex { x: 0.0, y: 0.0 },
+                            ldc: nte as i32,
+                        },
+                        &b_concat,
+                        &b_concat,
+                        &mut bhb,
+                    )?;
+                }
+
+                // Step 3: Build M = Q^{-1} + B^H·B + eps·I on CPU
+                // First, rebuild per-ion Q matrices CPU side and invert them.
+                // Q matrices are real-symmetric, n_expanded × n_expanded.
+                const EPS: f64 = 1e-15;
+                let mut m_cpu: Vec<f64> = vec![0.0; nte * nte];
+
+                // Compute Q^{-1} per ion and assemble block-diagonal Q_inv into m_cpu.
+                // Also add B^H·B (downloaded from GPU) and eps·I.
+                // Q matrices are real-valued; build_q_expanded returns Vec<f64>.
+                // We rebuild from the augmentation data stored in each ion's species.
+                let mut offset = 0;
+                let mut q_inv_per_ion: Vec<Vec<f64>> = Vec::new();
+                let mut q_per_ion: Vec<Vec<f64>> = Vec::new();
+                for ion_idx in 0..cell.num_ions {
+                    let species_idx = cell.ion_species[ion_idx];
+                    let symbol = &cell.species_symbols[species_idx];
+                    if let Some(pot) = pots.get(symbol) {
+                        if let Pseudopotential::Usp(aug) = pot {
+                            let q_cpu = build_q_expanded(aug);
+                            let ne = expanded_projector_count(aug.projectors());
+                            if ne == 0 { continue; }
+                            // Save Q and Q⁻¹ for stationary Woodbury iteration.
+                            // Q = block-diagonal preconditioner (ABINIT's D⁻¹)
+                            // Q⁻¹ = exact operator for residual computation
+                            q_per_ion.push(q_cpu.clone());
+                            // Invert Q (small matrix, Gaussian elimination with partial pivot)
+                            let q_inv = invert_small_real_matrix(&q_cpu, ne);
+                            q_inv_per_ion.push(q_inv.clone());
+                            for i in 0..ne {
+                                for j in 0..ne {
+                                    m_cpu[(offset + i) * nte + (offset + j)] += q_inv[i * ne + j];
+                                }
+                            }
+                            offset += ne;
+                        }
+                    }
+                }
+
+                // Download B^H·B and add to m_cpu
+                let bhb_complex: Vec<CudaComplex> = stream
+                    .clone_dtoh(&bhb)
+                    .map_err(Error::Cuda)?;
+                // Save real part of bhb for iterative refinement
+                let bhb_cpu_real: Vec<f64> = bhb_complex.iter().map(|c| c.x).collect();
+                for i in 0..nte {
+                    for j in 0..nte {
+                        m_cpu[i * nte + j] += bhb_complex[i * nte + j].x;
+                    }
+                }
+
+                // Add eps·I on diagonal
+                for i in 0..nte {
+                    m_cpu[i * nte + i] += EPS;
+                }
+
+                // Step 4: Upload M to GPU, call zgetrf for LU factorization
+                let m_flat: Vec<CudaComplex> = m_cpu.iter()
+                    .map(|&v| CudaComplex { x: v, y: 0.0 })
+                    .collect();
+                let mut lu_m = stream.clone_htod(&m_flat).map_err(Error::Cuda)?;
+                let mut lu_ipiv = stream.alloc_zeros::<i32>(nte).map_err(Error::Cuda)?;
+                let mut info_dev = stream.alloc_zeros::<i32>(1).map_err(Error::Cuda)?;
+                solver.zgetrf(
+                    nte as i32,
+                    nte as i32,
+                    &mut lu_m,
+                    &mut lu_ipiv,
+                    &mut info_dev,
+                )?;
+
+                (b_concat, lu_m, lu_ipiv, n_total_expanded, q_inv_per_ion, q_per_ion, bhb_cpu_real)
+            }
+        } else {
+            // Davidson / test path: no Woodbury, empty dummy fields
+            let empty = stream.alloc_zeros::<CudaComplex>(0).map_err(Error::Cuda)?;
+            let empty_ipiv = stream.alloc_zeros::<i32>(0).map_err(Error::Cuda)?;
+            (empty.clone(), empty, empty_ipiv, 0, Vec::new(), Vec::new(), Vec::new())
+        };
+
         Ok(VnlBatchData {
             entries,
             shared: shared_arc,
+            #[cfg(feature = "chebyshev")]
+            b_concat,
+            #[cfg(feature = "chebyshev")]
+            lu_m,
+            #[cfg(feature = "chebyshev")]
+            lu_ipiv,
+            #[cfg(feature = "chebyshev")]
+            n_total_expanded,
+            #[cfg(feature = "chebyshev")]
+            q_inv_per_ion,
+            #[cfg(feature = "chebyshev")]
+            q_per_ion,
+            #[cfg(feature = "chebyshev")]
+            bhb_cpu,
         })
     }
 
@@ -582,4 +783,73 @@ impl VnlBatchData {
 
         Ok(())
     }
+}
+
+/// Invert a small real matrix via Gaussian elimination with partial pivoting.
+///
+/// `mat` is a flat row-major `n × n` matrix. Returns `n × n` flat row-major inverse.
+/// This is only used for Q matrices (n_expanded × n_expanded, typically 2-6),
+/// so performance is not a concern.
+fn invert_small_real_matrix(mat: &[f64], n: usize) -> Vec<f64> {
+    if n == 0 {
+        return vec![];
+    }
+    // Augmented matrix [A | I]
+    let mut aug = vec![0.0_f64; n * n * 2];
+    for i in 0..n {
+        for j in 0..n {
+            aug[i * (2 * n) + j] = mat[i * n + j];
+        }
+        aug[i * (2 * n) + n + i] = 1.0;
+    }
+
+    // Forward elimination with partial pivoting
+    for col in 0..n {
+        // Find pivot
+        let mut max_val = aug[col * (2 * n) + col].abs();
+        let mut max_row = col;
+        for row in (col + 1)..n {
+            let val = aug[row * (2 * n) + col].abs();
+            if val > max_val {
+                max_val = val;
+                max_row = row;
+            }
+        }
+        if max_val < 1e-30 {
+            // Near-singular: return identity (Q should be SPD, so this shouldn't happen)
+            let mut identity = vec![0.0; n * n];
+            for i in 0..n {
+                identity[i * n + i] = 1.0;
+            }
+            return identity;
+        }
+        if max_row != col {
+            for j in 0..(2 * n) {
+                aug.swap(col * (2 * n) + j, max_row * (2 * n) + j);
+            }
+        }
+        let pivot = aug[col * (2 * n) + col];
+        // Normalize pivot row
+        for j in 0..(2 * n) {
+            aug[col * (2 * n) + j] /= pivot;
+        }
+        // Eliminate other rows
+        for row in 0..n {
+            if row != col {
+                let factor = aug[row * (2 * n) + col];
+                for j in 0..(2 * n) {
+                    aug[row * (2 * n) + j] -= factor * aug[col * (2 * n) + j];
+                }
+            }
+        }
+    }
+
+    // Extract inverse (right half of augmented matrix)
+    let mut inv = vec![0.0; n * n];
+    for i in 0..n {
+        for j in 0..n {
+            inv[i * n + j] = aug[i * (2 * n) + n + j];
+        }
+    }
+    inv
 }

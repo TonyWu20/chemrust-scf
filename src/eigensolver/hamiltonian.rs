@@ -11,19 +11,19 @@
 
 use std::sync::Arc;
 
-#[cfg(feature = "scf_diag")]
-use std::time::Instant;
-
+use cudarc::cusolver::sys::cublasOperation_t;
 use cudarc::driver::{CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
 
 use crate::device::blas::{self, BlasHandle, ZgemmConfig};
 use crate::device::fft::BatchedFftPlan3d;
+use crate::device::solver::SolverHandle;
 use crate::device::CudaComplex;
 use crate::eigensolver::davidson_types::{
     KineticPreconditioner, PwCoefficients,
 };
 use crate::eigensolver::beta_phi_cache::BetaPhiCache;
 use crate::eigensolver::kernels::CudaKernelSet;
+use crate::eigensolver::hubbard::{HubbardBatchData, apply_v_u_hamiltonian};
 use crate::eigensolver::vnl_data::VnlBatchData;
 use crate::types::Error;
 use bon::builder;
@@ -55,33 +55,6 @@ unsafe fn c2c_forward_inplace(
 // Full Hamiltonian application (T + V_loc on GPU)
 // ---------------------------------------------------------------------------
 
-// ---------------------------------------------------------------------------
-// Profiling support (scf_diag feature)
-// ---------------------------------------------------------------------------
-// Per-operation GPU timings for apply_v_loc_hamiltonian, accumulated into a
-// thread-local so that apply_full_hamiltonian can print a combined summary.
-#[cfg(feature = "scf_diag")]
-mod profile {
-    use std::cell::RefCell;
-
-    /// Per-operation timing record from one apply_v_loc_hamiltonian call.
-    pub(super) struct VLocProfile {
-        pub times: [(&'static str, f64); 7], // (label, seconds)
-        pub total_s: f64,
-        pub n_pw: usize,
-        pub n_bands: usize,
-        pub ngx: usize,
-        pub ngy: usize,
-        pub ngz: usize,
-    }
-
-    thread_local! {
-        pub(super) static V_LOC_PROFILE: RefCell<Option<VLocProfile>> = const { RefCell::new(None) };
-    }
-}
-#[cfg(feature = "scf_diag")]
-use profile::V_LOC_PROFILE;
-
 /// Compute (T + V_loc)|psi> on GPU using FFT-based approach.
 ///
 /// Steps:
@@ -112,20 +85,7 @@ pub(crate) unsafe fn apply_v_loc_hamiltonian(
     stream: &Arc<CudaStream>,
     _blas: Option<&BlasHandle>,
 ) -> Result<(), Error> {
-    // ── Profiling: per-operation GPU timings (scf_diag feature) ──────
-    // Each operation is measured with stream sync before/after to capture
-    // true GPU execution time.  Sync overhead (~50 µs each) is acceptable
-    // for profiling; the feature is off in production builds.
-    #[cfg(feature = "scf_diag")]
-    let mut _p_times: [(&str, f64); 7] = [("", 0.0); 7];
-    #[cfg(feature = "scf_diag")]
-    let _p_total_begin = Instant::now();
-
     // 1. hpsi = kinetic * psi  (T|psi>)
-    #[cfg(feature = "scf_diag")]
-    { stream.synchronize().map_err(Error::Cuda)?; }
-    #[cfg(feature = "scf_diag")]
-    let _t1 = Instant::now();
     unsafe {
         stream
             .launch_builder(&kernels.init_kinetic)
@@ -137,12 +97,8 @@ pub(crate) unsafe fn apply_v_loc_hamiltonian(
             .launch(LaunchConfig::for_num_elems((n_bands * n_pw) as u32))
     }
     .map_err(Error::Cuda)?;
-    #[cfg(feature = "scf_diag")]
-    { stream.synchronize().map_err(Error::Cuda)?; _p_times[0] = ("init_kinetic", _t1.elapsed().as_secs_f64()); }
 
     // 2. Zero grid, then scatter psi to FFT grid positions
-    #[cfg(feature = "scf_diag")]
-    let _t2a = Instant::now();
     unsafe {
         stream
             .launch_builder(&kernels.zero_buffer)
@@ -151,16 +107,12 @@ pub(crate) unsafe fn apply_v_loc_hamiltonian(
             .launch(LaunchConfig::for_num_elems((n_bands * grid_size) as u32))
     }
     .map_err(Error::Cuda)?;
-    #[cfg(feature = "scf_diag")]
-    { stream.synchronize().map_err(Error::Cuda)?; _p_times[1] = ("zero_buffer", _t2a.elapsed().as_secs_f64()); }
 
     // Nyquist: -1 if odd-sized (no Nyquist plane), N/2 if even.
     let nyq_x = if ngx % 2 == 0 { ngx / 2 } else { -1 };
     let nyq_y = if ngy % 2 == 0 { ngy / 2 } else { -1 };
     let nyq_z = if ngz % 2 == 0 { ngz / 2 } else { -1 };
 
-    #[cfg(feature = "scf_diag")]
-    let _t2b = Instant::now();
     unsafe {
         stream
             .launch_builder(&kernels.scatter_pw_to_grid_nyq)
@@ -178,19 +130,11 @@ pub(crate) unsafe fn apply_v_loc_hamiltonian(
             .launch(LaunchConfig::for_num_elems((n_bands * n_pw) as u32))
     }
     .map_err(Error::Cuda)?;
-    #[cfg(feature = "scf_diag")]
-    { stream.synchronize().map_err(Error::Cuda)?; _p_times[2] = ("scatter_pw", _t2b.elapsed().as_secs_f64()); }
 
     // 3. Batched C2C IFFT (in-place)
-    #[cfg(feature = "scf_diag")]
-    let _t3 = Instant::now();
     unsafe { c2c_inverse_inplace(fft_plan, grid_dev)?; }
-    #[cfg(feature = "scf_diag")]
-    { stream.synchronize().map_err(Error::Cuda)?; _p_times[3] = ("cuFFT IFFT", _t3.elapsed().as_secs_f64()); }
 
     // 4. V_eff multiply: grid *= V_eff
-    #[cfg(feature = "scf_diag")]
-    let _t4 = Instant::now();
     unsafe {
         stream
             .launch_builder(&kernels.veff_multiply)
@@ -201,20 +145,12 @@ pub(crate) unsafe fn apply_v_loc_hamiltonian(
             .launch(LaunchConfig::for_num_elems((n_bands * grid_size) as u32))
     }
     .map_err(Error::Cuda)?;
-    #[cfg(feature = "scf_diag")]
-    { stream.synchronize().map_err(Error::Cuda)?; _p_times[4] = ("veff_multiply", _t4.elapsed().as_secs_f64()); }
 
     // 5. Batched C2C FFT (in-place)
-    #[cfg(feature = "scf_diag")]
-    let _t5 = Instant::now();
     unsafe { c2c_forward_inplace(fft_plan, grid_dev)?; }
-    #[cfg(feature = "scf_diag")]
-    { stream.synchronize().map_err(Error::Cuda)?; _p_times[5] = ("cuFFT FFT", _t5.elapsed().as_secs_f64()); }
 
     // 6. Gather: hpsi += grid / N_total
     // grid is const (read-only), hpsi is mutable (read-write for accumulation)
-    #[cfg(feature = "scf_diag")]
-    let _t6 = Instant::now();
     unsafe {
         stream
             .launch_builder(&kernels.gather_add_kinetic)
@@ -228,24 +164,6 @@ pub(crate) unsafe fn apply_v_loc_hamiltonian(
             .launch(LaunchConfig::for_num_elems((n_bands * n_pw) as u32))
     }
     .map_err(Error::Cuda)?;
-    #[cfg(feature = "scf_diag")]
-    {
-        stream.synchronize().map_err(Error::Cuda)?;
-        _p_times[6] = ("gather_add", _t6.elapsed().as_secs_f64());
-        let vloc_total = _p_total_begin.elapsed().as_secs_f64();
-        // Store timings in thread-local for apply_full_hamiltonian to print
-        V_LOC_PROFILE.with(|cell| {
-            cell.replace(Some(profile::VLocProfile {
-                times: _p_times,
-                total_s: vloc_total,
-                n_pw: n_pw as usize,
-                n_bands: n_bands as usize,
-                ngx: ngx as usize,
-                ngy: ngy as usize,
-                ngz: ngz as usize,
-            }));
-        });
-    }
     Ok(())
 }
 
@@ -270,11 +188,10 @@ pub unsafe fn apply_full_hamiltonian(
     blas: &BlasHandle,
     kernels: &CudaKernelSet,
     stream: &Arc<CudaStream>,
+    maybe_hubbard_data: Option<&HubbardBatchData>,
+    maybe_hubbard_spin: Option<i32>,
     mut maybe_beta_phi_cache: Option<&mut BetaPhiCache>,
 ) -> Result<(), Error> {
-    #[cfg(feature = "scf_diag")]
-    let _p_h_total_begin = Instant::now();
-
     unsafe {
         apply_v_loc_hamiltonian()
             .psi_dev(psi_dev)
@@ -286,9 +203,9 @@ pub unsafe fn apply_full_hamiltonian(
             .n_pw(n_pw as i32)
             .n_bands(n_bands as i32)
             .grid_size(grid_size as i32)
-            .ngx(fft_plan.nx())
+            .ngx(fft_plan.nz()) // plan created as (ngz, ngy, ngx): nz=ngx
             .ngy(fft_plan.ny())
-            .ngz(fft_plan.nz())
+            .ngz(fft_plan.nx()) // plan created as (ngz, ngy, ngx): nx=ngz
             .inv_ntotal(inv_ntotal)
             .fft_plan(fft_plan)
             .kernels(kernels)
@@ -296,8 +213,23 @@ pub unsafe fn apply_full_hamiltonian(
             .maybe_blas(Some(blas))
             .call()?;
 
-    #[cfg(feature = "scf_diag")]
-    let _p_vnl_begin = Instant::now();
+    // 2. V_U — Hubbard potential (if active).  Inserted between V_loc and V_NL.
+    // CASTEP order is T+V_loc → V_NL → V_exchange → V_U (hamiltonian.f90:1429-1521).
+    // Since all terms accumulate additively, ordering is irrelevant.
+    if let (Some(hd), Some(ns)) = (maybe_hubbard_data, maybe_hubbard_spin) {
+        if hd.n_channels > 0 && hd.aug_lcao_dev.is_some() {
+            apply_v_u_hamiltonian()
+                .psi_dev(psi_dev)
+                .hpsi_dev(hpsi_dev)
+                .hubbard(hd)
+                .n_bands(n_bands as i32)
+                .ns(ns)
+                .blas(blas)
+                .stream(stream)
+                .call()?;
+        }
+    }
+
     {
         // bon::builder unwraps Option<T> — the setter takes T, not Option<T>.
         // Conditionally attach the cache so the default (None) is used when
@@ -318,51 +250,6 @@ pub unsafe fn apply_full_hamiltonian(
         }
     }
 
-    #[cfg(feature = "scf_diag")]
-    {
-        stream.synchronize().map_err(Error::Cuda)?;
-        let vnl_elapsed = _p_vnl_begin.elapsed().as_secs_f64();
-        let h_total = _p_h_total_begin.elapsed().as_secs_f64();
-
-        // Print combined V_loc + V_NL profile
-        V_LOC_PROFILE.with(|cell| {
-            if let Some(ref p) = *cell.borrow() {
-                eprintln!(
-                    "[profile-Hpsi] ===== H·psi (npw={} nbands={} grid={}x{}x{}) =====",
-                    p.n_pw, p.n_bands, p.ngx, p.ngy, p.ngz,
-                );
-                let mut vloc_sum = 0.0f64;
-                for &(label, secs) in &p.times {
-                    let ms = secs * 1000.0;
-                    let pct = if p.total_s > 0.0 { 100.0 * secs / p.total_s } else { 0.0 };
-                    eprintln!("[profile-Hpsi]   {:<20} {:>8.1} ms  ({:>5.1}%)",
-                        label, ms, pct);
-                    vloc_sum += secs;
-                }
-                let vloc_ms = vloc_sum * 1000.0;
-                let vnl_ms = vnl_elapsed * 1000.0;
-                let total_ms = h_total * 1000.0;
-                eprintln!("[profile-Hpsi]   {:-<20} {:->8.1} ms", "", vloc_ms);
-                eprintln!("[profile-Hpsi]   {:<20} {:>8.1} ms  (V_NL cuBLAS)", "V_NL", vnl_ms);
-                eprintln!("[profile-Hpsi]   {:=<20} {:=>8.1} ms  total", "", total_ms);
-                // FFT fraction — key metric for grid-decomposition decision
-                let fft_frac = if h_total > 0.0 {
-                    (p.times[3].1 + p.times[5].1) / h_total
-                } else {
-                    0.0
-                };
-                eprintln!(
-                    "[profile-Hpsi]   FFT fraction: {:.1}% {}",
-                    fft_frac * 100.0,
-                    if fft_frac > 0.6 { "→ grid decomposition justified" }
-                    else if fft_frac > 0.4 { "→ FFT + V_NL both significant" }
-                    else { "→ V_NL dominates; optimize cuBLAS path" },
-                );
-            }
-        });
-    }
-
-    // Diag: |hpsi|² for last band after full H — (scf_diag: API needs DevicePtr + cublas)
     }
     Ok(())
 }
@@ -418,11 +305,6 @@ pub(crate) unsafe fn apply_v_nl_hamiltonian(
         .as_ref()
         .map(|c| c.are_all_valid())
         .unwrap_or(false);
-
-    #[cfg(feature = "scf_diag")]
-    if cache_all_valid {
-        eprintln!("[profile-Hpsi]   BetaPhiCache HIT — skipping β^H·ψ ZGEMM");
-    }
 
     for (ion_idx, entry) in vnl_data.entries.iter().enumerate() {
         let ne = entry.n_expanded;
@@ -630,6 +512,408 @@ pub unsafe fn apply_s_times(
         }
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// S^{-1} operator (USPP preconditioned S-inverse via global Woodbury)
+// ---------------------------------------------------------------------------
+//
+// Applies S^{-1} via the global Woodbury formula:
+//   S^{-1} = I - B · M^{-1} · B^H
+//
+// where B = b_concat (concatenated beta-projectors, n_pw × n_total_expanded),
+// and M = Q^{-1} + B^H·B + eps·I (LU-factored, nte × nte).
+//
+// Only available under the `chebyshev` feature flag.
+#[cfg(feature = "chebyshev")]
+#[builder]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn apply_s_inverse(
+    hpsi_dev: &mut PwCoefficients,
+    vnl_data: &VnlBatchData,
+    n_bands: i32,
+    n_pw: i32,
+    blas: &BlasHandle,
+    stream: &Arc<CudaStream>,
+    solver: &SolverHandle,
+    kernels: Option<&CudaKernelSet>,
+) -> Result<(), Error> {
+    let nte = vnl_data.n_total_expanded;
+
+    if nte == 0 {
+        return Ok(());  // No USPP ions, S = I, S^{-1} = I
+    }
+
+    // 1. temp = B^H . hpsi  (nte × n_bands)
+    // n_pw rows of B^H, n_bands columns of hpsi
+    let mut temp: CudaSlice<CudaComplex> =
+        stream.alloc_zeros(nte as usize * n_bands as usize).map_err(Error::Cuda)?;
+    unsafe {
+        blas.gemm_c64(
+            ZgemmConfig {
+                transa: blas::op::C,  // B^H (conjugate transpose of B)
+                transb: blas::op::N,
+                m: nte,
+                n: n_bands,
+                k: n_pw,
+                alpha: CudaComplex { x: 1.0, y: 0.0 },
+                lda: n_pw,
+                ldb: n_pw,
+                beta: CudaComplex { x: 0.0, y: 0.0 },
+                ldc: nte,
+            },
+            &vnl_data.b_concat,
+            &**hpsi_dev,
+            &mut temp,
+        )?;
+    }
+
+    // 2. Iterative refinement via per-ion block-diagonal Q^{-1} preconditioner.
+    //    Matches ABINIT m_invovl.F90:1100-1140:
+    //      y_0 = block_diag(Q^{-1}) · proj
+    //      r = proj - Q^{-1}·y - B^H·B·y
+    //      y += block_diag(Q^{-1}) · r
+    //    Block-diagonal preconditioner converges slower than global LU (10-20
+    //    iterations vs 2-3) but avoids LU factorization of potentially
+    //    ill-conditioned M = Q^{-1} + B^H·B.
+    {
+        let n_elem = n_pw as usize * n_bands as usize;
+        let n_nte = nte as usize * n_bands as usize;
+        // Save original proj = B^H·h_in
+        let mut proj: CudaSlice<CudaComplex> =
+            stream.alloc_zeros(n_nte).map_err(Error::Cuda)?;
+        unsafe { stream.memcpy_dtod(&temp, &mut proj).map_err(Error::Cuda)?; }
+
+        // Pre-buffers for refinement
+        let mut b_y: CudaSlice<CudaComplex> =
+            stream.alloc_zeros(n_elem).map_err(Error::Cuda)?;
+        let mut bt_b_y: CudaSlice<CudaComplex> =
+            stream.alloc_zeros(n_nte).map_err(Error::Cuda)?;
+        let mut r: CudaSlice<CudaComplex> =
+            stream.alloc_zeros(n_nte).map_err(Error::Cuda)?;
+        let mut qinv_y: CudaSlice<CudaComplex> =
+            stream.alloc_zeros(n_nte).map_err(Error::Cuda)?;
+
+        let per_ion_q_inv = &vnl_data.shared.handle.per_ion_q_inv;
+        let per_ion_ne = &vnl_data.shared.handle.per_ion_n_expanded;
+
+        // Helper: apply block-diagonal Q^{-1} to input → output.
+        // input/output are nte × n_bands, column-major (stride=nte between bands).
+        // Each ion block is a contiguous GEMM submatrix: rows [off..off+ne),
+        // all n_bands columns, ldb/ldc = nte. A single ZGEMM per ion replaces
+        // the old per-band pack/unpack D2D copies (n_ions × n_bands × 2
+        // memcpyAsync calls) with n_ions GEMM calls at zero copy cost.
+        unsafe fn apply_block_qinv(
+            input: &CudaSlice<CudaComplex>,
+            output: &mut CudaSlice<CudaComplex>,
+            per_ion_q_inv: &[CudaSlice<CudaComplex>],
+            per_ion_ne: &[i32],
+            n_bands: i32,
+            nte: i32,
+            stream: &Arc<CudaStream>,
+            blas: &BlasHandle,
+        ) -> Result<(), Error> {
+            let elem = std::mem::size_of::<CudaComplex>();
+            let mut off: i32 = 0;
+            for (ion_idx, &ne) in per_ion_ne.iter().enumerate() {
+                if ne == 0 { continue; }
+                let (in_ptr, _) = input.device_ptr(stream);
+                let (out_ptr, _) = output.device_ptr_mut(stream);
+                let (q_ptr, _) = per_ion_q_inv[ion_idx].device_ptr(stream);
+                let alpha = CudaComplex { x: 1.0, y: 0.0 };
+                let beta = CudaComplex { x: 0.0, y: 0.0 };
+                cudarc::cublas::sys::cublasZgemm_v2(
+                    blas.raw_handle(),
+                    blas::op::N, blas::op::N,
+                    ne, n_bands, ne,
+                    &alpha as *const _ as *const _,
+                    q_ptr as *const _, ne,
+                    (in_ptr as *const _).add(off as isize * (elem as isize)), nte,
+                    &beta as *const _ as *const _,
+                    (out_ptr as *mut _).add(off as isize * (elem as isize)), nte,
+                ).result().map_err(Error::Blas)?;
+                off += ne;
+            }
+            Ok(())
+        }
+
+        // --- y_0 = block_diag(Q^{-1}) · proj ---
+        unsafe {
+            apply_block_qinv(&proj, &mut temp, per_ion_q_inv, per_ion_ne,
+                n_bands, nte, stream, blas)?;
+        }
+
+        // GPU refinement check: precompute per-band |proj|² once (one launch +
+        // one small D2H of n_bands f64 values). The per-iteration check then
+        // needs only one band_sqnorms launch over r and the same small D2H.
+        // Without kernels (None) the legacy full D2H path runs below.
+        let gpu_check = kernels.is_some();
+        let mut proj2_cpu: Vec<f64> = Vec::new();
+        let mut r2_dev: Option<CudaSlice<f64>> = None;
+        if gpu_check {
+            let k = kernels.expect("gpu_check implies kernels");
+            let n_b = n_bands as usize;
+            let shared_bytes = (2 * 128 * std::mem::size_of::<f64>()) as u32;
+            let cfg = LaunchConfig {
+                grid_dim: (n_bands as u32, 1, 1),
+                block_dim: (128, 1, 1),
+                shared_mem_bytes: shared_bytes,
+            };
+            let p2_dev: CudaSlice<f64> = stream.alloc_zeros(n_b).map_err(Error::Cuda)?;
+            unsafe {
+                stream
+                    .launch_builder(&k.band_sqnorms)
+                    .arg(&proj)
+                    .arg(&proj)
+                    .arg(&mut p2_dev)
+                    .arg(&mut p2_dev)
+                    .arg(&nte)
+                    .arg(&n_bands)
+                    .launch(cfg)
+            }
+            .map(|_| ())
+            .map_err(Error::Cuda)?;
+            proj2_cpu = stream.clone_dtoh(&p2_dev).map_err(Error::Cuda)?;
+            r2_dev = Some(stream.alloc_zeros(n_b).map_err(Error::Cuda)?);
+        }
+
+        // --- ABINIT iterative refinement loop (max 30 iterations) ---
+        let mut converged = false;
+        for _iter in 0..30 {
+            // B·y (n_pw × n_bands)
+            unsafe {
+                blas.gemm_c64(ZgemmConfig {
+                    transa: blas::op::N, transb: blas::op::N,
+                    m: n_pw, n: n_bands, k: nte,
+                    alpha: CudaComplex { x: 1.0, y: 0.0 },
+                    lda: n_pw, ldb: nte, ldc: n_pw,
+                    beta: CudaComplex { x: 0.0, y: 0.0 },
+                }, &vnl_data.b_concat, &temp, &mut b_y)?;
+                // B^H·(B·y) (nte × n_bands)
+                blas.gemm_c64(ZgemmConfig {
+                    transa: blas::op::C, transb: blas::op::N,
+                    m: nte, n: n_bands, k: n_pw,
+                    alpha: CudaComplex { x: 1.0, y: 0.0 },
+                    lda: n_pw, ldb: n_pw, ldc: nte,
+                    beta: CudaComplex { x: 0.0, y: 0.0 },
+                }, &vnl_data.b_concat, &b_y, &mut bt_b_y)?;
+            }
+
+            // r = proj - Q^{-1}·y - B^H·B·y
+            unsafe { stream.memcpy_dtod(&proj, &mut r).map_err(Error::Cuda)?; }
+            // Q^{-1}·y
+            unsafe {
+                apply_block_qinv(&temp, &mut qinv_y, per_ion_q_inv, per_ion_ne,
+                    n_bands, nte, stream, blas)?;
+            }
+            // r -= Q^{-1}·y
+            blas.axpy_c64(n_nte as i32, CudaComplex { x: -1.0, y: 0.0 }, &qinv_y, 1, &mut r, 1)?;
+            // r -= B^H·B·y
+            blas.axpy_c64(n_nte as i32, CudaComplex { x: -1.0, y: 0.0 }, &bt_b_y, 1, &mut r, 1)?;
+
+            // Check per-band convergence (ABINIT: maxerr = max(|r|² / |proj|²))
+            if gpu_check {
+                // GPU path: per-band Σ|r|² on device, small D2H, host ratio.
+                let k = kernels.expect("gpu_check implies kernels");
+                let r2_dev = r2_dev.as_mut().expect("r2_dev allocated with gpu_check");
+                let cfg = LaunchConfig {
+                    grid_dim: (n_bands as u32, 1, 1),
+                    block_dim: (128, 1, 1),
+                    shared_mem_bytes: (2 * 128 * std::mem::size_of::<f64>()) as u32,
+                };
+                unsafe {
+                    stream
+                        .launch_builder(&k.band_sqnorms)
+                        .arg(&r)
+                        .arg(&r)
+                        .arg(r2_dev)
+                        .arg(r2_dev)
+                        .arg(&nte)
+                        .arg(&n_bands)
+                        .launch(cfg)
+                }
+                .map(|_| ())
+                .map_err(Error::Cuda)?;
+                let r2_cpu: Vec<f64> = stream.clone_dtoh(r2_dev).map_err(Error::Cuda)?;
+                let max_err = r2_cpu
+                    .iter()
+                    .zip(proj2_cpu.iter())
+                    .map(|(&r2, &p2)| if p2 > 1e-30 { r2 / p2 } else { 0.0 })
+                    .fold(0.0_f64, f64::max);
+                if max_err < 1e-12 {
+                    converged = true;
+                    break;
+                }
+            } else {
+                // Legacy path: full D2H of both arrays + host reduction.
+                let r_cpu: Vec<CudaComplex> = stream.clone_dtoh(&r).map_err(Error::Cuda)?;
+                let proj_cpu: Vec<CudaComplex> = stream.clone_dtoh(&proj).map_err(Error::Cuda)?;
+                let nte_usize = nte as usize;
+                let mut max_err: f64 = 0.0;
+                for b in 0..n_bands as usize {
+                    let mut r_norm_sq = 0.0f64;
+                    let mut p_norm_sq = 0.0f64;
+                    for i in 0..nte_usize {
+                        let idx = i + b * nte_usize;
+                        r_norm_sq += r_cpu[idx].x * r_cpu[idx].x + r_cpu[idx].y * r_cpu[idx].y;
+                        p_norm_sq += proj_cpu[idx].x * proj_cpu[idx].x + proj_cpu[idx].y * proj_cpu[idx].y;
+                    }
+                    let err = if p_norm_sq > 1e-30 { r_norm_sq / p_norm_sq } else { 0.0 };
+                    max_err = max_err.max(err);
+                }
+                if max_err < 1e-12 {
+                    converged = true;
+                    break;
+                }
+            }
+
+            // dy = block_diag(Q^{-1}) · r
+            unsafe {
+                apply_block_qinv(&r, &mut qinv_y, per_ion_q_inv, per_ion_ne,
+                    n_bands, nte, stream, blas)?;
+            }
+            // y += dy
+            blas.axpy_c64(n_nte as i32, CudaComplex { x: 1.0, y: 0.0 }, &qinv_y, 1, &mut temp, 1)?;
+        }
+        if !converged {
+            eprintln!("[S-inv] Woodbury refinement did not converge in 30 iterations");
+        }
+    }
+
+    // 3. hpsi -= B . y  (accumulate with alpha = -1)
+    unsafe {
+        blas.gemm_c64(
+            ZgemmConfig {
+                transa: blas::op::N,
+                transb: blas::op::N,
+                m: n_pw,
+                n: n_bands,
+                k: nte,
+                alpha: CudaComplex { x: -1.0, y: 0.0 },
+                lda: n_pw,
+                ldb: nte,
+                beta: CudaComplex { x: 1.0, y: 0.0 },
+                ldc: n_pw,
+            },
+            &vnl_data.b_concat,
+            &temp,
+            &mut **hpsi_dev,
+        )?;
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// S⁻¹·S identity diagnostic — measures ‖S⁻¹·S·ψ − ψ‖_∞
+// ---------------------------------------------------------------------------
+/// Verify the global Woodbury S⁻¹ operator by computing
+/// `‖S⁻¹·(S·ψ) − ψ‖_∞` for a single-band test vector.
+///
+/// Returns `max_residual = max_i |(S⁻¹·S·ψ)_i − ψ_i|`.
+///
+/// The Woodbury formula S⁻¹ = I − B·(Q⁻¹ + B^H·B)⁻¹·B^H is algebraically
+/// exact for the finite-dimensional USPP overlap S = I + B·Q·B^H.
+/// Any deviation from zero reflects numerical error in:
+///   1. Q-matrix conditioning (near-singular Cu 3d projector Q)
+///   2. LU factorization precision (cusolver Zgetrf + Zgetrs)
+///   3. B^H·B Gram matrix accumulation (cublas Zgemm reduction order)
+///
+/// Gate 0: ζ = max_residual must be < 1e-10 before Chebyshev filtering
+/// can proceed. If ζ > 1e-10, the Woodbury construction must be
+/// debugged before any filtering tests.
+#[doc(hidden)]
+#[cfg(feature = "chebyshev")]
+pub fn check_s_inv_s_identity(
+    psi_host: &[num_complex::Complex64],
+    n_pw: usize,
+    vnl_data: &VnlBatchData,
+    blas: &BlasHandle,
+    stream: &Arc<CudaStream>,
+    solver: &SolverHandle,
+) -> Result<f64, Error> {
+    use crate::device::blas::op;
+
+    let n = n_pw as i32;
+    let psi_cuda: Vec<CudaComplex> = psi_host
+        .iter()
+        .map(|&c| CudaComplex { x: c.re, y: c.im })
+        .collect();
+    let psi_dev: CudaSlice<CudaComplex> = stream
+        .clone_htod(&psi_cuda).map_err(Error::Cuda)?;
+
+    // ---- Step 1: S·psi = psi + Σ_ion β_g · q · (β_g^H · psi) ----
+    let mut spsi_dev: CudaSlice<CudaComplex> =
+        stream.alloc_zeros(n_pw).map_err(Error::Cuda)?;
+    stream.memcpy_dtod(&psi_dev, &mut spsi_dev).map_err(Error::Cuda)?;
+
+    for entry in &vnl_data.entries {
+        let ne = entry.n_expanded;
+
+        let mut c_proj: CudaSlice<CudaComplex> =
+            stream.alloc_zeros(ne as usize).map_err(Error::Cuda)?;
+        unsafe {
+            blas.gemv_c64(
+                op::C, n, ne,
+                CudaComplex { x: 1.0, y: 0.0 },
+                &entry.beta_g, n,
+                &psi_dev, 1,
+                CudaComplex { x: 0.0, y: 0.0 },
+                &mut c_proj, 1,
+            ).map_err(Error::Blas)?;
+        }
+
+        let mut temp: CudaSlice<CudaComplex> =
+            stream.alloc_zeros(ne as usize).map_err(Error::Cuda)?;
+        unsafe {
+            blas.gemv_c64(
+                op::N, ne, ne,
+                CudaComplex { x: 1.0, y: 0.0 },
+                &entry.q_matrix, ne,
+                &c_proj, 1,
+                CudaComplex { x: 0.0, y: 0.0 },
+                &mut temp, 1,
+            ).map_err(Error::Blas)?;
+        }
+
+        unsafe {
+            blas.gemv_c64(
+                op::N, n, ne,
+                CudaComplex { x: 1.0, y: 0.0 },
+                &entry.beta_g, n,
+                &temp, 1,
+                CudaComplex { x: 1.0, y: 0.0 },
+                &mut spsi_dev, 1,
+            ).map_err(Error::Blas)?;
+        }
+    }
+
+    // ---- Step 2: S⁻¹ · (S·psi) via global Woodbury (builder pattern) ----
+    let mut spsi_pw = PwCoefficients(spsi_dev);
+    unsafe {
+        apply_s_inverse()
+            .hpsi_dev(&mut spsi_pw)
+            .vnl_data(vnl_data)
+            .n_bands(1)
+            .n_pw(n)
+            .blas(blas)
+            .stream(stream)
+            .solver(solver)
+            .call()?;
+    }
+
+    // ---- Step 3: D2H and compute ‖S⁻¹·S·ψ − ψ‖_∞ ----
+    stream.synchronize()?;
+    let result: Vec<CudaComplex> = stream.clone_dtoh(&*spsi_pw).map_err(Error::Cuda)?;
+    let max_residual = psi_host.iter().zip(result.iter())
+        .map(|(&p, &r)| {
+            let dr = r.x - p.re;
+            let di = r.y - p.im;
+            (dr * dr + di * di).sqrt()
+        })
+        .fold(0.0_f64, f64::max);
+
+    Ok(max_residual)
 }
 
 // ---------------------------------------------------------------------------

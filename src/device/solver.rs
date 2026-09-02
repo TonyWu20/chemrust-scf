@@ -470,22 +470,23 @@ mod tests {
         }
 
         // x_exact: n×nrhs matrix, each column = [1,2,...,n] * col_factor
+        // Column-major (cuSOLVER layout, ldb = n): element (row, col) at col*n + row
         let mut h_x_exact = vec![0.0_f64; (n * nrhs) as usize];
         for col in 0..nrhs as usize {
             let col_factor = (col + 1) as f64;
             for row in 0..n as usize {
-                h_x_exact[row * nrhs as usize + col] = (row + 1) as f64 * col_factor;
+                h_x_exact[col * n as usize + row] = (row + 1) as f64 * col_factor;
             }
         }
-        // b = A · x_exact (col-major: n×nrhs)
+        // b = A · x_exact (col-major: n×nrhs, ldb = n)
         let mut h_b = vec![CudaComplex { x: 0.0, y: 0.0 }; (n * nrhs) as usize];
         for col in 0..nrhs as usize {
             for i in 0..n as usize {
                 let mut sum = 0.0;
                 for j in 0..n as usize {
-                    sum += h_a[i * n as usize + j].x * h_x_exact[j * nrhs as usize + col];
+                    sum += h_a[i * n as usize + j].x * h_x_exact[col * n as usize + j];
                 }
-                h_b[i * nrhs as usize + col] = CudaComplex { x: sum, y: 0.0 };
+                h_b[col * n as usize + i] = CudaComplex { x: sum, y: 0.0 };
             }
         }
 
@@ -513,13 +514,16 @@ mod tests {
         assert_eq!(info2[0], 0, "zpotrs info != 0");
 
         let x_solved: Vec<CudaComplex> = stream.clone_dtoh(&d_b).unwrap();
+        // Relative error: |x_exact| peaks at (n * nrhs) = 128. A relative
+        // threshold stays valid across GPUs and matrix conditions.
+        let max_ref = h_x_exact.iter().copied().fold(0.0_f64, f64::max);
         let max_err = x_solved.iter().zip(h_x_exact.iter())
             .map(|(s, e)| (s.x - e).abs())
             .fold(0.0_f64, f64::max);
         assert!(
-            max_err < 1e-12,
-            "zpotrs multi-rhs max error = {:.2e} >= 1e-12",
-            max_err,
+            max_err < 1e-12 * max_ref,
+            "zpotrs multi-rhs max relative error = {:.2e} >= 1e-12",
+            max_err / max_ref,
         );
     }
 
@@ -607,22 +611,23 @@ mod tests {
         }
 
         // x_exact: n×nrhs, each column = varying amplitudes
+        // Column-major (cuSOLVER layout, ldb = n): element (row, col) at col*n + row
         let mut h_x_exact = vec![0.0_f64; (n * nrhs) as usize];
         for col in 0..nrhs as usize {
             let col_factor = (col + 1) as f64 * 0.5;
             for row in 0..n as usize {
-                h_x_exact[row * nrhs as usize + col] = (row + 1) as f64 * col_factor;
+                h_x_exact[col * n as usize + row] = (row + 1) as f64 * col_factor;
             }
         }
-        // b = A · x_exact
+        // b = A · x_exact (col-major: n×nrhs, ldb = n)
         let mut h_b = vec![CudaComplex { x: 0.0, y: 0.0 }; (n * nrhs) as usize];
         for col in 0..nrhs as usize {
             for i in 0..n as usize {
                 let mut sum = 0.0;
                 for j in 0..n as usize {
-                    sum += h_a[i * n as usize + j].x * h_x_exact[j * nrhs as usize + col];
+                    sum += h_a[i * n as usize + j].x * h_x_exact[col * n as usize + j];
                 }
-                h_b[i * nrhs as usize + col] = CudaComplex { x: sum, y: 0.0 };
+                h_b[col * n as usize + i] = CudaComplex { x: sum, y: 0.0 };
             }
         }
 
@@ -649,13 +654,15 @@ mod tests {
         assert_eq!(info2[0], 0, "zgetrs info != 0");
 
         let x_solved: Vec<CudaComplex> = stream.clone_dtoh(&d_b).unwrap();
+        // Relative error: |x_exact| peaks at (n * nrhs * 0.5) = 64.
+        let max_ref = h_x_exact.iter().copied().fold(0.0_f64, f64::max);
         let max_err = x_solved.iter().zip(h_x_exact.iter())
             .map(|(s, e)| (s.x - e).abs())
             .fold(0.0_f64, f64::max);
         assert!(
-            max_err < 1e-12,
-            "zgetrs multi-rhs max error = {:.2e} >= 1e-12",
-            max_err,
+            max_err < 1e-12 * max_ref,
+            "LU multi-rhs max relative error = {:.2e} >= 1e-12",
+            max_err / max_ref,
         );
     }
 

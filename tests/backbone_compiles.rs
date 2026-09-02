@@ -132,6 +132,7 @@ fn backbone_compiles() {
             electron_temperature: 0.01,
             scheme: SmearingScheme::Gaussian,
             spin_fix: 10,
+            mixing_scheme: chemrust_scf::MixingScheme::Off,
         })
         .max_history(4)
         .build();

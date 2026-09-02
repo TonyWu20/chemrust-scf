@@ -13,34 +13,12 @@
       systems = [ "x86_64-linux" ];
       system = "x86_64-linux";
 
-      # Pin claude-code to a specific version from GitHub ahead of nixpkgs.
-      # Update the tag here, then rebuild: nix will fail with the correct npmDepsHash.
-      claude-code-rev = "v2.1.150";
-
-      claude-code-overlay = final: prev:
-        let
-          stdenv = final.stdenvNoCC;
-          baseUrl = "https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases";
-          platformKey = "${stdenv.hostPlatform.node.platform}-${stdenv.hostPlatform.node.arch}";
-        in
-        {
-          claude-code =
-            prev.claude-code.overrideAttrs
-              (old: rec {
-                version = final.lib.removePrefix "v" claude-code-rev;
-                src = final.fetchurl {
-                  url = "${baseUrl}/${version}/${platformKey}/claude";
-                  sha256 = "sha256-bAhqD1+/aE1BSLtpYpJotPUQlJjBp751es8YxR/QT0s=";
-                };
-              });
-        };
 
       pkgsFor = system: import nixpkgs {
         config.allowUnfree = true;
         inherit system; overlays = [
         devshell.overlays.default
         fenix.overlays.default
-        claude-code-overlay
       ];
       };
 
@@ -90,7 +68,6 @@
           devshell.overlays.default
           fenix.overlays.default
           cudaOverlay
-          claude-code-overlay
         ];
       };
 
@@ -131,7 +108,6 @@
             fish
             uv
             ty
-            claude-code
             cudaToolkit
           ];
           env = [
@@ -159,8 +135,8 @@
                 ANTHROPIC_AUTH_TOKEN=$DEEPSEEK_TOKEN \
                 CLAUDE_CODE_ATTRIBUTION_HEADER="0" \
                 ANTHROPIC_DEFAULT_OPUS_MODEL=deepseek-v4-pro[1m] \
-                ANTHROPIC_DEFAULT_SONNET_MODEL=deepseek-v4-flash[1m] \
-                ANTHROPIC_DEFAULT_HAIKU_MODEL=deepseek-v4-flash \
+                ANTHROPIC_DEFAULT_SONNET_MODEL=deepseek-v4-pro[1m] \
+                ANTHROPIC_DEFAULT_HAIKU_MODEL=deepseek-v4-flash[1m] \
                 claude --model "opusplan"
               '';
             }

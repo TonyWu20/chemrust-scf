@@ -1,134 +1,133 @@
-# Handoff — 2026-06-15: Bottleneck corrected; profiling fragility documented
+# Handoff — 2026-06-26: ZTRSM column mixing fixed; unoccupied band inflation remains
 
-**Branch**: `main`
-**Status**: Eigensolver bottleneck confirmed ✅ | Profiling fragility documented ⚠️ | Phase 2 overlap → P0
+**Branch**: `feat/chebyshev-iterative-eigensolver`
+**Status**: Warm start converges in 4 iters (-24110.967 vs -24110.967 eV ref) ✅ | Unoccupied band eigenvalues inflated ⚠️ | Cold start fails (overflow) ⚠️
+
+---
+
+## Resolved issues
+
+### ZTRSM column mixing (root cause of unoccupied band corruption)
+
+**Symptom**: Bands 120+ had H-expectations diverging from pre-filter ritz values
+(ritz 0.04 → H-expectation 1.08). Locked bands (ndeg=0, copied from input)
+also showed wrong H-expectation.
+
+**Root cause**: Cholesky QR's `ZTRSM` step (`X = X·R⁻¹`) mixes columns with
+very different bare `|ψ|²` magnitudes. For USPP (S ≠ I), occupied bands have
+`|ψ|² ≈ 1.0` while unoccupied bands have `|ψ|² ≈ 0.06`. ZTRSM redistributes
+norm from occupied columns to unoccupied columns.
+
+**Fix** (`c837b16`): Skip ZTRSM when ZPOTRF succeeds (info=0). Per-band S-norm
+normalization already gives `S_sub ≈ I` (max|off| ≈ 4×10⁻⁴), so `rayleigh_ritz`
+ZHEGVD handles it directly. Regularization retry + ZHEEVD fallback keep ZTRSM
+since nearly-diagonal R after regularization makes mixing negligible.
+
+**Verification**: Pre/post ZTRSM psi coefficients are now identical (no mixing).
+
+### ZPOTRF failure (info=85—160) on Cu111_CO non-cubic grid
+
+**Root cause**: All 160 bands filtered with oracle=0 (including 121 already-converged
+warm-start bands), producing near-linearly-dependent vectors with `S_sub` off-diagonals ≈ 0.999.
+
+**Fix** (`3e75331`): Lock converged bands even with oracle=0 — `ndeg=0` for bands
+with `fresh_residual[b] < tolerance`. This is a **divergence from ABINIT** (ABINIT's
+oracle=0 broadcasts same ndeg to all bands), necessary because ABINIT's `getAX_BX`
+inside the recurrence loop + matrix-free RR provide numerical stabilization our
+pipeline lacks.
+
+### ABINIT-matching per-ion block-diagonal S⁻¹
+
+**Fix** (`56b6dec`): Replace global `M = Q⁻¹ + B^H·B` LU preconditioner with
+per-ion block-diagonal `Q⁻¹` preconditioner, matching ABINIT `m_invovl.F90:1100-1140`.
+Iterative refinement up to 30 iterations with per-band residual convergence tracking.
 
 ---
 
-## What changed this session
+## Remaining issues
 
-### Eigensolver is the bottleneck — proved by two independent Fortran profilers
+### 1. Unoccupied band eigenvalue inflation (HIGH)
 
-The CASTEP Fortran profiler cannot see inside Rust FFI calls. The "untraced gap" under
-`electronic_minimisation` IS the Rust GPU eigensolver.
+**Symptom**: Cu111_CO warm start `.bands` shows bands 125+ with eigenvalues up to
+1.86 Ha vs 0.115 Ha CPU reference. Occupied bands (1-120) match reference within 0.0001 Ha.
+Final energy converges correctly (-24110.967 vs -24110.967 eV).
 
-**GPU FFI NiO** (non-spin, 10 SCF iters, 201s total, Final E = −7160.2298 eV):
+**Mechanism**: The filter's Chebyshev recurrence operates on all 160 bands simultaneously
+(column-independent). The 39 unlocked bands (with residual > tolerance) get corrupted
+by the filter. After rayleigh_ritz ZHEGVD, the eigenvector rotation matrix X mixes the
+corruption into ALL bands. In pass 2, the "locked" bands copy corrupted psi_input from
+pass 1's RR output. The corruption self-amplifies across SCF iterations.
 
-```
-electronic_minimisation                         214.43s
-├── EIGENSOLVER (untraced Rust FFI gap)         ~200s   (93%)
-├── electronic_initialise                         5.1s
-├── electronic_prepare_H (V_eff)                  2.6s
-├── density (soft + augment)                      0.9s
-├── mixing (Pulay/Kerker)                         0.01s
-└── other                                        ~6s
-```
+**Why ZTRSM fix wasn't sufficient**: ZTRSM was ONE source of column mixing. The RR
+ZHEGVD's eigenvector rotation matrix is ANOTHER source — it rotates all 160 columns
+simultaneously, propagating any corruption in the H_sub matrix.
 
-**CPU serial Cu111_CO** (spin-polarised, 53 SCF iters, 3516s, Final E = −24111.2814 eV):
+**Why S⁻¹ fix wasn't sufficient**: The T_1 diagnostic confirmed S⁻¹ produces correct
+results (matching ritz) for all bands. The corruption enters during the full Chebyshev
+recurrence (T_2 through T_n), not the first S⁻¹·H step.
 
-```
-electronic_minimisation                         3417.5s
-├── hamiltonian_diagonalise_ks (EIGENSOLVER)    2959.0s (86.6%)
-│   ├── V_NL projector                           819.7s (27.7%)
-│   ├── Rotation                                 624.8s (21.1%)
-│   ├── H·search                                 584.4s (19.7%)
-│   ├── H·ψ full-band                            552.7s (18.7%)
-│   ├── Preconditioner                           420.5s (14.2%)
-│   ├── S-orthogonalization                      392.8s (13.3%)
-│   ├── Subspace diagonalization                 137.0s ( 4.6%)
-│   └── Other (copy, dot, init)                 ~155s   ( 5.2%)
-├── electronic_prepare_H (V_eff)                 198.0s ( 5.8%)
-│   ├── nlpot_calculate_d (D-screening)          149.2s
-│   └── locpot_calculate (Hartree+XC)             48.5s
-├── density (augment + soft)                     167.3s ( 4.9%)
-└── other                                        ~93s
-```
+**Lock-check diagnostic** (`a3579c8`): Confirmed locked-band copy is correct
+(`⟨x_curr|psi_input⟩ = |psi|²`). The locked bands receive already-corrupted data
+from the previous RR output.
 
-**Cross-platform conclusion**: The eigensolver dominates everywhere — 87% CPU, 93% GPU.
-The previously claimed "Fortran is the bottleneck" was based on subtracting measured H·psi
-kernel time from total SCF time and attributing the residual to Fortran. That residual was
-the Rust Davidson eigensolver's non-H·psi overhead (ZHEEVD, ZGEMM, preconditioner, copy,
-BetaPhiCache).
+**Next step**: Investigate whether the Chebyshev recurrence itself is corrupting
+unlocked bands, or whether the RR ZHEGVD rotation is propagating corruption.
 
-### Optimization priority (from CPU eigensolver breakdown + GPU scf_diag per-call timings)
+### 2. Cold start overflow (HIGH)
 
-| Priority | Phase | CPU fraction | GPU per-call timing | Action |
-|----------|-------|-------------|---------------------|--------|
-| **P0** | V_NL (β·β^H projector) | 28% | 246ms (65% of H·ψ) | Phase 2 overlap: V_NL on dedicated stream |
-| P1 | Preconditioner | 14% | unknown (TPA+USPP on GPU) | Profile separately; may be GPU bottleneck |
-| P2 | H·psi FFT+V_loc | 17% | 38ms FFT + 92ms V_loc | Already fast; low priority |
-| P3 | Rotation + S-orth | 34% | cheap on GPU (ZGEMM) | Low priority |
+**Symptom**: Cu111_CO cold start: `max|psi| = 2×10¹⁹`, ZPOTRF info=63, ZHEEVD info=155,
+RR ZHEGVD info=223. All 160 bands have ritz clustered at 1.89-1.94 Ha.
 
-### Profiling fragility in `davidson_diagonalise`
+**Root cause**: Random initial guess vectors contain deep-core components (λ ≈ -10 Ha,
+xred ≈ -1.5). T_40(1.5) ≈ 10¹⁶ causes double-precision overflow. Ampfactor divides by
+T_n(average ritz) ≈ 6.3 — insufficient against 10¹⁶.
 
-**7 hours of bisect testing** established that `davidson_diagonalise()` (2000+ lines,
-dozens of `unsafe` blocks, raw CUDA pointers) is extremely sensitive to code-generation
-changes:
+**Partial fix** (`ddff9d9`): Safe degree cap based on eigenvalue bounds:
+`n_max = floor(ln(2×10¹⁰) / ln(|x| + sqrt(x²-1)))`. For Cu111_CO, caps ndeg at ~19.
+Prevents overflow but doesn't fix convergence — cold start needs many SCF iterations
+with such small ndeg.
 
-- Adding ANY local variable (even a 16-byte `Instant`) changes SCF convergence behavior
-  non-deterministically
-- Adding a field to `DavidsonResult` changes convergence even when the field is always `None`
-- The same profiling code sometimes converges and sometimes diverges on rebuild
-- This is a **latent correctness bug** — the function has undefined behavior that manifests
-  differently under different compiler optimizations
+**Rejected approach** (`ccf53d7`, reverted by `67fa50b`): Davidson fallback for first
+SCF iteration. Caused warm start divergence because Davidson→Chebyshev transition
+on iter 2 produced eigenvalue shifts that destabilized SCF convergence.
 
-**What profiling IS safe**: the `scf_diag` feature in `hamiltonian.rs` (per-call H·psi
-GPU timings). This code is in a separate function and has been stable across builds.
-
-**The `ffi.rs` builder form also matters**: the `let h_builder = ...; h_builder.call()`
-form converges while `apply_full_hamiltonian()...call()` diverges (for the post-diag
-H·psi computation). Both produce identical runtime behavior (post_cache is always None).
-This is the same code-generation sensitivity as `davidson_diagonalise`.
-
-### GVEC_PARALLELISM_PROPOSAL: rejection confirmed, but for the right reasons
-
-Error 1 (cuFFT cost doesn't scale with G-vector sparsity) is genuinely fatal. The review's
-own bottleneck assumption (FFT = 71% of H·psi) was wrong — FFT is 19.5%, V_NL is 65%.
-But the rejection stands because Error 1 alone is sufficient.
-
-**The review was three agents, not nine** (MEMORY.md was incorrect). The review document
-is now committed at `notes/plans/GVEC_PARALLELISM_REVIEW.md`.
+**Proper fix**: Improve initial guess quality (LCAO) or use iterative subspace
+expansion with per-band degree differentiation.
 
 ---
+
+## Key files changed
+
+| File | Key changes |
+|------|-------------|
+| `src/eigensolver/chebyshev.rs` | ZTRSM skip, converged-band locking, safe degree cap, per-band S-norm normalization, ZPOTRF regularization chain + ZHEEVD fallback, lock-check diagnostic |
+| `src/eigensolver/hamiltonian.rs` | Per-ion block-diagonal S⁻¹ iterative refinement (replaces global LU) |
+| `src/eigensolver/davidson.rs` | `compute_all()` restoration, CUDA event timing |
+| `src/eigensolver/rayleigh_ritz.rs` | S_sub diagnostic before ZHEGVD |
+| `src/ffi.rs` | (reverted) Davidson fallback for first SCF iteration |
+| `HANDOFF.md` | This file |
+
+## Key decisions
+
+1. **ZTRSM skipped for well-conditioned S_sub** — per-band normalization + small
+   off-diagonals is sufficient; ZHEGVD handles S_sub ≈ I
+2. **Converged-band locking is necessary** — divergence from ABINIT oracle=0, but
+   ABINIT's `getAX_BX`-inside-loop provides implicit regularization we lack
+3. **Davidson fallback breaks warm start** — eigenvalue shift on iter 2 causes
+   SCF oscillation; cold start needs a different solution
+4. **Per-ion S⁻¹ matches ABINIT algorithm** — eliminates global LU dependency
 
 ## Reference fixtures
 
 | Run | Path | What it proves |
 |-----|------|---------------|
-| NiO FFI non-spin (GPU) | `/export/.../NiO_no_u_finer_grid_no_spin/` | Eigensolver = 93% of SCF |
-| Cu111_CO CPU serial (spin) | `/export/.../Cu111_CO_Single_Point_0614_spin_cpu_serial/` | Eigensolver = 87% of SCF; internal breakdown |
+| Cu111_CO warm start | `/export/.../Cu111_CO_Single_Point_0604_warm_start/slurm_output_cheby_2838.txt` | ZTRSM skip confirmed, lock-check passes, unoccupied bands still inflated |
+| Cu111_CO cold start | `/export/.../Cu111_CO_Single_Point_0530_rust_eigensolver/slurm_output_cheby_2832.txt` | Safe degree cap works for pass 1 (no overflow), pass 2 overflows without additional fixes |
+| CPU reference | `/export/.../Cu111_CO_H_dump/Cu111_CO.bands` | Ground truth eigenvalues for comparison |
 
----
+## Pending
 
-## Current state
-
-- FFI path (`ffi.rs` → `davidson.rs` → `hamiltonian.rs`) **converges** for NiO non-spin
-- BetaPhiCache works correctly for internal Davidson use (reduces V_NL 246ms→110ms per
-  cache-hit call within the eigensolver)
-- Returning BetaPhiCache from `DavidsonResult` to `ffi.rs` for post-diag H·psi causes
-  divergence — returned as `None` (always fresh V_NL in post-diag path)
-- Profiling instrumentation (`scf_diag`) in `hamiltonian.rs` is stable and gives per-call
-  GPU timings
-- `scf_diag` in `davidson.rs` is **not safely addable** due to code-generation sensitivity
-
-## Key files
-
-| File | What |
-|------|------|
-| `src/eigensolver/hamiltonian.rs` | H·psi (V_loc FFT + V_NL cuBLAS), `scf_diag` profiling |
-| `src/eigensolver/davidson.rs` | Davidson eigensolver, BetaPhiCache lifecycle |
-| `src/eigensolver/beta_phi_cache.rs` | β^H·ψ cache (compute_all, invalidate_*) |
-| `src/eigensolver/kernels.rs` | CUDA kernels incl. `copy_buffer` (Pascal coherence) |
-| `src/ffi.rs` | FFI boundary (⚠️ builder form matters — do not refactor) |
-| `notes/plans/GVEC_PARALLELISM_REVIEW.md` | Formal review of GVEC_PARALLELISM proposal |
-
-## Key decisions
-
-1. **V_NL is the #1 optimization target** (28% CPU, 65% of GPU H·ψ) — Phase 2 stream overlap
-2. **Porting V_eff/density to GPU saves ≤7%** — not worth prioritizing over eigensolver
-3. **Do NOT add code to `davidson_diagonalise`** — the function needs a `cuda-memcheck` audit
-   before any modifications. When instrumenting, use `#[inline(never)]` helper functions.
-4. **Use CASTEP .profile gaps for profiling** — they already measure everything except the
-   Rust FFI call. The gap IS the eigensolver.
-5. **The `ffi.rs` builder form must be preserved** — `let h_builder = ... ; h_builder.call()`
-   form, not the simple chain form.
+- [ ] Investigate Chebyshev recurrence corruption of unlocked bands (or RR propagation)
+- [ ] Fix cold start (LCAO initial guess, Davidson fallback that works, or iterative degree increase)
+- [ ] Clean up verbose diagnostics once unoccupied band issue is resolved
+- [ ] Test NiO cold/warm start with all fixes

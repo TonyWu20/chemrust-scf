@@ -26,3 +26,6 @@
 **/.DS_Store
 *.tgz
 .envrc
+
+# generated CASTEP continuation checkpoint (scf_diag discriminator)
+chemrust_iter2.check

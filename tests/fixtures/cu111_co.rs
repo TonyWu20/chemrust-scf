@@ -7,9 +7,12 @@ use chemrust_hamiltonian_core::{
 };
 use chemrust_scf::{
     ColumnDistributed, Density, EffectivePotential as ScfEffectivePotential,
-    FineGridArray, KPoint, MixingOff, ScfIteration, SmearingParams, SmearingScheme, VEffBuilt,
+    FineGridArray, KPoint, MixingOff, ScfIteration, SmearingParams, SmearingScheme,
+    SmearingWidth, VEffBuilt,
     WaveGridArray, WavefunctionSet, pw_coords_to_fft_indices,
 };
+use chemrust_scf::spin_types::{KptDataSet, PerSpinDensity, PerSpinPwCoefficients, SpinChannelData};
+use chemrust_scf::PwCoefficients;
 use num_complex::Complex64;
 
 // ---------------------------------------------------------------------------
@@ -157,7 +160,10 @@ fn parse_bands_file(text: &str) -> Result<Vec<f64>, Box<dyn std::error::Error>> 
 ///
 /// Loads density from `.castep_bin` (wave grid) and wavefunctions from `.check`
 /// (gamma-point only — Cu111_CO uses a single k-point).
-pub fn build_scf_state(fx: &Cu111CoFixture) -> ScfIteration {
+pub fn build_scf_state(
+    fx: &Cu111CoFixture,
+    stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+) -> ScfIteration {
     let cell = fx.bin.cell.clone();
     let pots = fx.pots.clone();
 
@@ -197,33 +203,58 @@ pub fn build_scf_state(fx: &Cu111CoFixture) -> ScfIteration {
     let n_pw = kpt_block.nplw;
 
     let flat_bands: Vec<num_complex::Complex64> = kpt_block.bands.concat();
+    let flat_bands_clone = flat_bands.clone();
     let psi = WavefunctionSet::<ColumnDistributed>::new(flat_bands, n_bands, n_pw);
 
-    let pw_coords = kpt_block.pw_grid_coord.clone();
-    let pw_fft_indices = pw_coords_to_fft_indices(&pw_coords, &wave_grid);
+    let pw_coords = KptDataSet::new(vec![kpt_block.pw_grid_coord.clone()], 1);
+    let pw_fft_indices_data = pw_coords_to_fft_indices(&kpt_block.pw_grid_coord, &wave_grid);
+    let pw_fft_indices = KptDataSet::new(vec![pw_fft_indices_data], 1);
 
     let k_point = KPoint {
         coords: kpt_block.coords,
+        weight: 1.0,
     };
 
     // Smearing: Gaussian, 0.1 eV (CASTEP default, Cu111_CO.castep line 154)
     let smearing = SmearingParams {
-        width: 0.1 * chemrust_scf::EV_TO_HARTREE,
+        width: chemrust_scf::SmearingWidth::ev(0.1),
         electron_temperature: 0.1 * chemrust_scf::EV_TO_HARTREE,
         scheme: SmearingScheme::Gaussian,
         spin_fix: 10,
+        mixing_scheme: chemrust_scf::MixingScheme::Off,
     };
+
+    // CPU-side psi: SpinChannelData<KptDataSet<Vec<Complex64>>>
+    let psi_cpu_data: SpinChannelData<KptDataSet<Vec<Complex64>>> =
+        SpinChannelData::new::<NonSpin>(vec![
+            KptDataSet::new(vec![flat_bands_clone], 1),
+        ]);
+    // GPU-side psi: placeholder (diagonalize_inner uploads from psi_cpu).
+    let psi_gpu_placeholder = PwCoefficients::new(
+        stream.alloc_zeros::<chemrust_scf::device::CudaComplex>(0)
+            .expect("dummy psi alloc"),
+    );
+    let psi_gpu = PerSpinPwCoefficients::new(
+        SpinChannelData::new::<NonSpin>(vec![
+            KptDataSet::new(vec![psi_gpu_placeholder], 1),
+        ]),
+    );
+    let density_ps = PerSpinDensity::new(
+        SpinChannelData::new::<NonSpin>(vec![density]),
+    );
+    let k_points_ps = KptDataSet::new(vec![k_point], 1);
 
     ScfIteration::builder()
         .cell(cell)
         .pots(pots)
         .wave_grid(wave_grid)
         .fine_grid(fine_grid)
-        .density(density)
-        .psi(psi)
+        .density(density_ps)
+        .psi(psi_gpu)
+        .psi_data(psi_cpu_data)
         .pw_coords(pw_coords)
         .pw_fft_indices(pw_fft_indices)
-        .k_point(k_point)
+        .k_points(k_points_ps)
         .smearing(smearing)
         .max_history(8)
         .build()
@@ -364,8 +395,9 @@ pub fn n_pw_first_kpoint(fx: &Cu111CoFixture) -> usize {
 /// The returned state has `MixingOff` — suitable for a single-shot diagonalize.
 pub fn build_state_with_castep_veff(
     fx: &Cu111CoFixture,
+    stream: &std::sync::Arc<cudarc::driver::CudaStream>,
 ) -> ScfIteration<NonSpin, VEffBuilt, MixingOff> {
-    let mut state = build_scf_state(fx)
+    let mut state = build_scf_state(fx, stream)
         .build_v_eff_with_energy()
         .expect("build_v_eff_with_energy failed");
 
@@ -383,8 +415,9 @@ pub fn build_state_with_castep_veff(
 pub fn build_state_with_castep_veff_and_psi(
     fx: &Cu111CoFixture,
     psi_in: &[Complex64],
+    stream: &std::sync::Arc<cudarc::driver::CudaStream>,
 ) -> ScfIteration<NonSpin, VEffBuilt, MixingOff> {
-    let mut state = build_state_with_castep_veff(fx);
+    let mut state = build_state_with_castep_veff(fx, stream);
     state.psi_data_mut().copy_from_slice(psi_in);
     state
 }

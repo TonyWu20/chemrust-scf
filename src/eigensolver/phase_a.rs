@@ -15,7 +15,6 @@ use cudarc::driver::{CudaSlice, CudaStream};
 
 use crate::device::blas::{BlasHandle, ZgemmConfig};
 use crate::device::fft::BatchedFftPlan3d;
-use crate::device::solver::SolverHandle;
 use crate::device::CudaComplex;
 use crate::eigensolver::davidson_types::{KineticPreconditioner, PwCoefficients};
 use crate::eigensolver::hamiltonian::apply_v_loc_hamiltonian;
@@ -53,6 +52,9 @@ pub(crate) unsafe fn apply_h_tv(
             .n_bands(n_bands)
             .grid_size(grid_size)
             .inv_ntotal(inv_ntotal)
+            .ngx(fft_plan.nx())
+            .ngy(fft_plan.ny())
+            .ngz(fft_plan.nz())
             .fft_plan(fft_plan)
             .kernels(kernels)
             .stream(stream)

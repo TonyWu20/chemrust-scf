@@ -290,6 +290,71 @@ impl<T: DeviceMapped> Gpu<T> {
 }
 
 // ---------------------------------------------------------------------------
+// Pinned host staging for async H2D
+// ---------------------------------------------------------------------------
+
+/// Pinned host staging buffer for asynchronous H2D copies.
+///
+/// A plain `Vec` dropped right after `memcpy_htod` can be reallocated and
+/// overwritten while the DMA is still in flight. A 130 KB block crosses
+/// the 128 KB mmap threshold, so the freed pages can be remapped and
+/// rewritten before the delayed DMA completes. The GPU then reads mixed
+/// values and the drift is silent.
+///
+/// `PinnedHost` holds a `cuMemHostAlloc` region for the whole scope that
+/// enqueues the H2D. The dedicated pinned allocation is never reallocated
+/// by the host allocator, so the async DMA is safe at any pacing. No extra
+/// stream sync is needed. `Drop` calls `cuMemFreeHost`, which waits for
+/// pending copies using this memory. Drop it only after the stream work
+/// that reads it is enqueued, at the FFI boundary.
+pub struct PinnedHost {
+    ptr: *mut u8,
+    size: usize,
+}
+
+impl PinnedHost {
+    /// Allocate `size` bytes of pinned host memory.
+    pub fn alloc(size: usize) -> Result<Self, crate::types::Error> {
+        if size == 0 {
+            return Ok(Self {
+                ptr: std::ptr::null_mut(),
+                size: 0,
+            });
+        }
+        let p =
+            unsafe { cudarc::driver::result::malloc_host(size, 0u32) }.map_err(crate::types::Error::Cuda)?;
+        Ok(Self {
+            ptr: p as *mut u8,
+            size,
+        })
+    }
+
+    /// View the buffer as a mutable `T` slice.
+    /// `size` must be a multiple of `size_of::<T>()`.
+    pub fn as_slice_mut<T>(&mut self) -> &mut [T] {
+        assert!(self.size % std::mem::size_of::<T>() == 0);
+        let n = self.size / std::mem::size_of::<T>();
+        unsafe { std::slice::from_raw_parts_mut(self.ptr as *mut T, n) }
+    }
+
+    /// View the buffer as an immutable `T` slice.
+    /// `size` must be a multiple of `size_of::<T>()`.
+    pub fn as_slice<T>(&self) -> &[T] {
+        assert!(self.size % std::mem::size_of::<T>() == 0);
+        let n = self.size / std::mem::size_of::<T>();
+        unsafe { std::slice::from_raw_parts(self.ptr as *const T, n) }
+    }
+}
+
+impl Drop for PinnedHost {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            let _ = unsafe { cudarc::driver::result::free_host(self.ptr as *mut _) };
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

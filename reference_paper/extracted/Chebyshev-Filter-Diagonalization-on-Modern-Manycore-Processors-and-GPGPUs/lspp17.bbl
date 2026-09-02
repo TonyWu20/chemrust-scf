@@ -1,0 +1,156 @@
+\begin{thebibliography}{10}
+\providecommand{\url}[1]{\texttt{#1}}
+\providecommand{\urlprefix}{URL }
+
+\bibitem{NVprof}
+{NVIDIA} {P}rofiler, \url{http://docs.nvidia.com/cuda/profiler-users-guide}
+
+\bibitem{TOP500}
+{TOP500 Supercomputer Sites} (June 2017), \url{http://www.top500.org}
+
+\bibitem{Aktulga14}
+Aktulga, H.M., Bulu\c{c}, A., Williams, S., Yang, C.: Optimizing sparse
+  matrix-multiple vectors multiplication for nuclear configuration interaction
+  calculations. In: Proceedings of the 2014 IEEE International Parallel and
+  Distributed Processing Symposium, May 2012. IEEE Computer Society (2014)
+
+\bibitem{Anzt2015}
+Anzt, H., Tomov, S., Dongarra, J.: Accelerating the {LOBPCG} method on {GPUs}
+  using a blocked sparse matrix vector product. In: Proceedings of the
+  Symposium on High Performance Computing. pp. 75--82. HPC '15, Society for
+  Computer Simulation International, San Diego, CA, USA (2015),
+  \url{http://dl.acm.org/citation.cfm?id=2872599.2872609}
+
+\bibitem{BASERMANN1997}
+Basermann, A., Reichel, B., Schelthoff, C.: Preconditioned {CG} methods for
+  sparse matrices on massively parallel machines. Parallel Computing  23(3),
+  381--398 (1997),
+  \url{http://www.sciencedirect.com/science/article/pii/S0167819197000057}
+
+\bibitem{BIBC13}
+Bhardwaj, O., Ineichen, Y., Bekas, C., Curioni, A.: Highly scalable linear time
+  estimation of spectrograms --- a tool for very large scale data analysis
+  (2013), poster at 2013 ACM/IEEE International Conference on High Performance
+  Computing Networking, Storage and Analysis
+
+\bibitem{DGHL12}
+Demmel, J., Grigori, L., Hoemmen, M., Langou, J.: Communication-optimal
+  parallel and sequential {QR} and {LU} factorizations. SIAM J. Sci. Comp.  34,
+   206--239 (Feb 2012)
+
+\bibitem{Di_Napoli2016:838}
+{Di Napoli}, E., Polizzi, E., Saad, Y.: Efficient estimation of eigenvalue
+  counts in an interval. Numerical Linear Algebra with Applications  23(4),
+  674--692 (Jul 2016)
+
+\bibitem{Gropp99}
+Gropp, W.D., Kaushik, D.K., Keyes, D.E., Smith, B.F.: Towards realistic
+  performance bounds for implicit {CFD} codes. In: Proceedings of Parallel
+  CFD’99. pp. 233--240. Elsevier (1999)
+
+\bibitem{Kamiabad2013}
+Kamiabad, A.A., Tate, J.E.: Polynomial Preconditioning of Power System Matrices
+  with Graphics Processing Units, pp. 229--246. Springer Berlin Heidelberg,
+  Berlin, Heidelberg (2013), \url{https://doi.org/10.1007/978-3-642-32683-7_8}
+
+\bibitem{Kreutzer2012}
+Kreutzer, M., Hager, G., Wellein, G., Fehske, H., Basermann, A., Bishop, A.R.:
+  Sparse matrix-vector multiplication on {GPGPU} clusters: A new storage format
+  and a scalable implementation. In: 2012 IEEE 26th International Parallel and
+  Distributed Processing Symposium Workshops PhD Forum. pp. 1696--1702 (May
+  2012)
+
+\bibitem{Kreutzer15KPM}
+Kreutzer, M., Pieper, A., Hager, G., Wellein, G., Alvermann, A., Fehske, H.:
+  Performance engineering of the {Kernel} {Polynomal} {Method} on large-scale
+  {CPU}-{GPU} systems. In: Parallel and Distributed Processing Symposium
+  (IPDPS), 2015 IEEE International. pp. 417--426 (May 2015)
+
+\bibitem{Kreutzer2014}
+Kreutzer, M., Hager, G., Wellein, G., Fehske, H., Bishop, A.R.: A unified
+  sparse matrix data format for efficient general sparse matrix-vector
+  multiplication on modern processors with wide {SIMD} units. SIAM Journal on
+  Scientific Computing  36(5),  C401--C423 (2014),
+  \url{https://doi.org/10.1137/130930352}
+
+\bibitem{GHOST}
+Kreutzer, M., Thies, J., R{\"o}hrig-Z{\"o}llner, M., Pieper, A., Shahzad, F.,
+  Galgon, M., Basermann, A., Fehske, H., Hager, G., Wellein, G.: {GHOST}:
+  Building blocks for high performance sparse linear algebra on heterogeneous
+  systems. International Journal of Parallel Programming pp. 1--27 (2016)
+
+\bibitem{LiLi2016}
+Li, X., Li, F.: Estimation of the largest eigenvalue in {Chebyshev}
+  preconditioner for parallel conjugate gradient method-based power flow
+  computation. IET Generation, Transmission Distribution  10(1),  123--130
+  (2016)
+
+\bibitem{LI201487}
+Li, X., Li, F.: {GPU}-based power flow analysis with {Chebyshev} preconditioner
+  and conjugate gradient method. Electric Power Systems Research
+  116(Supplement C),  87--93 (2014),
+  \url{http://www.sciencedirect.com/science/article/pii/S0378779614001850}
+
+\bibitem{Liu12}
+Liu, X., Chow, E., Vaidyanathan, K., Smelyanskiy, M.: Improving the performance
+  of dynamical simulations via multiple right-hand sides. In: Proceedings of
+  the 2012 IEEE International Parallel and Distributed Processing Symposium,
+  May 2012. pp. 36--47. IEEE Computer Society (2012)
+
+\bibitem{McCalpin95}
+McCalpin, J.D.: Memory bandwidth and machine balance in current high
+  performance computers. IEEE Computer Society Technical Committee on Computer
+  Architecture (TCCA) Newsletter pp. 19--25 (Dec 1995)
+
+\bibitem{Pieper15ChebFD}
+Pieper, A., Kreutzer, M., Alvermann, A., Galgon, M., Fehske, H., Hager, G.,
+  Lang, B., Wellein, G.: High-performance implementation of {Chebyshev} filter
+  diagonalization for interior eigenvalue computations. Journal of
+  Computational Physics  325,  226--243 (2016),
+  \url{http://www.sciencedirect.com/science/article/pii/S0021999116303837}
+
+\bibitem{Saad84}
+Saad, Y.: {Chebyshev} acceleration techniques for solving nonsymmetric
+  eigenvalue problems. Math. Comput.  42,  567--588 (1984)
+
+\bibitem{SF12}
+Schubert, G., Fehske, H.: Metal-to-insulator transition and electron-hole
+  puddle formation in disordered graphene nanoribbons. Phys. Rev. Lett.  108,
+  066402 (2012)
+
+\bibitem{SFFV12}
+Schubert, G., Fehske, H., Fritz, L., Vojta, M.: Fate of topological-insulator
+  surface states under strong disorder. Phys. Rev. B  85,  201105 (2012)
+
+\bibitem{SRAF12}
+Sitte, M., Rosch, A., Altman, E., Fritz, L.: Topological insulators in magnetic
+  fields: Quantum {Hall} effect and edge channels with a nonquantized
+  $\ensuremath{\theta}$ term. Phys. Rev. Lett.  108,  126807 (Mar 2012)
+
+\bibitem{SW02}
+Stathopoulos, A., Wu, K.: A block orthogonalization procedure with constant
+  synchronization requirements. SIAM J. Sci. Comput.  23,  2165--2182 (2002)
+
+\bibitem{Treibig10}
+Treibig, J., Hager, G., Wellein, G.: {LIKWID}: A lightweight
+  performance-oriented tool suite for x86 multicore environments. In:
+  Proceedings of PSTI2010, the First International Workshop on Parallel
+  Software Tools and Tool Infrastructures. San Diego CA (2010)
+
+\bibitem{KPMRMP}
+Wei\ss{}e, A., Wellein, G., Alvermann, A., Fehske, H.: The kernel polynomial
+  method. Rev. Mod. Phys.  78,  275--306 (Mar 2006),
+  \url{https://link.aps.org/doi/10.1103/RevModPhys.78.275}
+
+\bibitem{Roofline}
+Williams, S., Waterman, A., Patterson, D.: Roofline: An insightful visual
+  performance model for multicore architectures. Commun. ACM  52(4),  65--76
+  (Apr 2009), \url{http://doi.acm.org/10.1145/1498765.1498785}
+
+\bibitem{ZHOU2006172}
+Zhou, Y., Saad, Y., Tiago, M.L., Chelikowsky, J.R.: Self-consistent-field
+  calculations using {Chebyshev}-filtered subspace iteration. Journal of
+  Computational Physics  219(1),  172--184 (2006),
+  \url{http://www.sciencedirect.com/science/article/pii/S002199910600146X}
+
+\end{thebibliography}

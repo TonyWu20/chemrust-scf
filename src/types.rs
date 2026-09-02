@@ -117,6 +117,82 @@ impl Mul<f64> for Density {
     fn mul(self, rhs: f64) -> Self { Self(self.0 * rhs) }
 }
 
+impl Density {
+    /// Reinterpret as a [`FineDensity`].  The inner array is consumed and
+    /// re-wrapped — the caller must ensure the data is actually on the fine
+    /// grid (i.e. has fine-grid dimensions).
+    pub fn into_fine(self) -> FineDensity {
+        FineDensity(FineGridArray(self.0 .0))
+    }
+}
+
+/// Electron density ρ(r) on the fine grid.
+///
+/// Unlike [`Density`] (wave grid), this type is compile-time evidence that the
+/// density is already on the fine grid — no upsampling is needed before V_eff
+/// assembly.  Created by [`combine_soft_aug_on_fine`] and consumed by
+/// [`build_v_eff_with_energy`].
+///
+/// CASTEP stores its mixed density on the fine grid (density.f90:597-616,
+/// electronic.f90:597-616).
+#[derive(Debug, Clone)]
+pub struct FineDensity(pub(crate) FineGridArray);
+
+impl FineDensity {
+    /// View the fine-grid data as a raw `Array3<f64>`.
+    pub fn as_fine_array(&self) -> &Array3<f64> {
+        self.0.as_array()
+    }
+
+    /// Mutable view of the fine-grid data.
+    pub fn as_fine_array_mut(&mut self) -> &mut Array3<f64> {
+        self.0.as_array_mut()
+    }
+
+    /// Consume and return the inner [`FineGridArray`].
+    pub fn into_inner(self) -> FineGridArray {
+        self.0
+    }
+
+    /// Wrap a [`FineGridArray`].
+    pub fn from_inner(arr: FineGridArray) -> Self {
+        Self(arr)
+    }
+
+    /// Flatten to a `Vec<f64>` in row-major order (for GPU upload).
+    pub fn flatten_host(&self) -> Vec<f64> {
+        self.0.as_array().iter().cloned().collect()
+    }
+
+    /// Number of grid points.
+    pub fn len(&self) -> usize {
+        self.0.as_array().len()
+    }
+}
+
+// ── Arithmetic ops ──
+
+impl Add for FineDensity {
+    type Output = Self;
+    fn add(self, rhs: Self) -> Self { Self(self.0 + rhs.0) }
+}
+impl Sub for FineDensity {
+    type Output = Self;
+    fn sub(self, rhs: Self) -> Self { Self(self.0 - rhs.0) }
+}
+impl Mul<f64> for FineDensity {
+    type Output = Self;
+    fn mul(self, rhs: f64) -> Self { Self(self.0 * rhs) }
+}
+
+impl FineDensity {
+    /// Re-wrap as a [`Density`] for mixing.rs compatibility.
+    /// The inner array retains fine-grid dimensions.
+    pub fn to_density(&self) -> Density {
+        Density(WaveGridArray(self.0.as_array().clone()))
+    }
+}
+
 /// Effective potential V_eff[ρ] assembled on the fine grid.
 #[derive(Debug, Clone)]
 pub struct EffectivePotential(pub(crate) FineGridArray);
@@ -277,6 +353,38 @@ impl Default for SmearingWidth {
 ///
 /// Builder: `SmearingParams::builder()` starts from CASTEP defaults.
 /// Override per-fixture: `SmearingParams::builder().spin_fix(6).build()`.
+/// CASTEP density-mixing scheme (`mixing_scheme` input key, parameters.f90).
+///
+/// CASTEP selects the scheme from the input and applies it from cycle 1
+/// (`dm_sub_mix.f90` dispatch: PULAY → `dm_mix_density_pulay` every cycle).
+/// Our phase machine (`MixingPhaseKind`) advances Off→Kerker→Pulay when the
+/// scheme is `Off` (automatic). When the scheme is pinned (Kerker/Pulay),
+/// the loop starts in that phase and stays there, matching CASTEP.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MixingScheme {
+    /// Automatic: start unmixed (Off), advance to Kerker once the energy
+    /// variation drops below the mixing convergence tolerance, then Pulay.
+    #[default]
+    Off,
+    /// CASTEP `mixing_scheme = 'KERKER'`: Kerker mixing from cycle 1.
+    Kerker,
+    /// CASTEP `mixing_scheme = 'PULAY'` (CASTEP default): DIIS/Pulay
+    /// mixing from cycle 1.
+    Pulay,
+}
+
+impl MixingScheme {
+    /// Initial `MixingPhaseKind` for the SCF loop.
+    pub fn as_phase(self) -> crate::scf::MixingPhaseKind {
+        use crate::scf::MixingPhaseKind;
+        match self {
+            MixingScheme::Off => MixingPhaseKind::Off,
+            MixingScheme::Kerker => MixingPhaseKind::Kerker,
+            MixingScheme::Pulay => MixingPhaseKind::Pulay,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, bon::Builder)]
 pub struct SmearingParams {
     /// Smearing width.  CASTEP default: 0.1 eV.
@@ -292,15 +400,23 @@ pub struct SmearingParams {
     /// CASTEP default: 10 (parameters.f90:1778).
     /// CASTEP frees at scf_cycle == spin_fix (1-based); our 0-based
     /// scf_iter equivalent is scf_iter >= spin_fix - 1.
+    /// CASTEP applies the spin-free transition only to spin-polarised
+    /// runs (electronic.f90:315,621 gate on `spin_polarised`).
     /// Override per-fixture, e.g. NiO .param has `spin_fix : 6`.
     #[builder(default = 10i32)]
     pub spin_fix: i32,
+    /// CASTEP `mixing_scheme` input key (default: Pulay in CASTEP).
+    /// Our default is Off (automatic phase machine) to preserve the
+    /// existing bootstrap behavior; fixtures matching CASTEP input set
+    /// this explicitly, e.g. NiO input requests PULAY.
+    #[builder(default)]
+    pub mixing_scheme: MixingScheme,
 }
 
 /// Output of a converged SCF calculation.
 #[derive(Debug, Clone)]
 pub struct FinalResult {
-    pub density: Density,
+    pub density: FineDensity,
     pub eigenvalues: crate::spin_types::PerSpinEigenvalues,
     pub total_energy: f64,
 }
