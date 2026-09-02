@@ -52,6 +52,8 @@ use crate::eigensolver::hamiltonian::apply_v_loc_hamiltonian;
 use cudarc::driver::CudaEvent;
 use crate::eigensolver::kernels::CudaKernelSet;
 use crate::eigensolver::preconditioner::{apply_preconditioner, compute_r_vector, prepare_preconditioner, TpaPreconditioner};
+#[cfg(feature = "scf_diag")]
+use crate::eigensolver::preconditioner::tpa;
 
 use crate::eigensolver::vnl_data::VnlBatchData;
 use crate::types::Error;
@@ -950,6 +952,19 @@ pub(crate) unsafe fn davidson_diagonalise(
             "[mean_ek] per-band={mean_ek:.6} Ha (min={_ek_min:.4}, max={_ek_max:.4})  per-PW={_mean_ek_pw:.6} Ha  ratio={ratio:.3}",
             ratio = _mean_ek_pw / mean_ek
         );
+        // TPA-shift diagnostic for the spin-divergence investigation.
+        // R(G) = tpa(ek(G)/mean_ek), per (spin,kpt) call.  scf_diag only.
+        #[cfg(feature = "scf_diag")]
+        {
+            let r_probe: Vec<f64> = kinetic_host.iter().take(n_pw)
+                .map(|&ek| tpa(ek / mean_ek))
+                .collect();
+            let r_min = r_probe.iter().cloned().fold(f64::INFINITY, f64::min);
+            let r_max = r_probe.iter().cloned().fold(0.0, f64::max);
+            eprintln!(
+                "[tpa-diag] n_bands={n_bands} mean_ek={mean_ek:.6} Ha  ek_band_min={_ek_min:.4}  ek_band_max={_ek_max:.4}  R(G) min={r_min:.6}  R(G) max={r_max:.6}"
+            );
+        }
     }
 
     // TPA preconditioner R(G) vector on GPU (reused across all blocks/iterations)
@@ -3206,8 +3221,8 @@ pub(crate) unsafe fn s_orthonormalise(
                     return Ok(());
                 }
             }
-
-            return Ok(());
+            // No unconditional return here: a post-check FAIL falls out of
+            // `if chol_ok` and reaches the Gram-Schmidt fallback below.
         }
         // Cholesky failed (ZPOTRF error OR post-check deviation > 0.1)
         // — fall through to Gram-Schmidt fallback
@@ -3409,7 +3424,16 @@ pub(crate) unsafe fn s_orthonormalise(
         .result()
         .map_err(Error::Blas)?;
 
-        let inv_norm = 1.0 / nrm2_sq.x.sqrt();
+        // Guard: after S-orthogonalization a near-degenerate column
+        // (HOMO/LUMO degeneracy at a high-symmetry k-point) can have a
+        // post-ortho S-norm ~ 0.  1/sqrt(~0) inflates the column into a
+        // spurious huge-norm band that corrupts the density and drives the
+        // eigenvector-rotation cascade.  Zero the column instead.
+        let inv_norm = if nrm2_sq.x > 1e-30_f64 {
+            1.0 / nrm2_sq.x.sqrt()
+        } else {
+            0.0
+        };
         // D5: track S-norm and L2-norm for first search column.
         // Two zdotcs + a print per call. scf_diag only.
         #[cfg(feature = "scf_diag")]
