@@ -247,7 +247,7 @@ impl<S: SpinPolicy> ScfIteration<S, Initialized, MixingOff> {
         /// Defaults to 1.5 /Å = 2.8346 a₀⁻¹ (CASTEP default, parameters.f90:1906).
         mix_gmax: Option<f64>,
     ) -> Self {
-        let _ = max_history; // History size is fixed internally for now
+        let max_history = max_history.max(1);
         // Upsample fixture density to fine grid so that every phase after
         // Initialized carries compile-time evidence of fine-grid data.
         let density: PerSpinFineDensity = {
@@ -307,6 +307,7 @@ impl<S: SpinPolicy> ScfIteration<S, Initialized, MixingOff> {
                 let amp_s = if S::nspins() > 1 { 2.0 } else { 0.0 };
                 let gmax = mix_gmax.unwrap_or(crate::mixing::kerker::KERKER_GMAX_DEFAULT);
                 DensityHistory::with_charge_spin_amplitudes(S::nspins(), amp_c, amp_s)
+                    .with_max_history(max_history)
                     .with_mix_gmax(gmax)
             },
             previous_density,
@@ -1469,7 +1470,7 @@ impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated, MixingOff> {
         let mut densities: Vec<Density> = Vec::with_capacity(nspins);
         let mut aug_densities: Vec<Option<chemrust_hamiltonian_core::fft::RealGrid<f64>>> =
             Vec::with_capacity(nspins);
-        let mut occs: Vec<Vec<f64>> = Vec::with_capacity(nspins);
+        let mut occs: Vec<Vec<Vec<f64>>> = Vec::with_capacity(nspins);
         let mut fermi: Vec<f64> = Vec::with_capacity(nspins);
         let nkpts = self.nkpts;
 
@@ -1666,9 +1667,9 @@ impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated, MixingOff> {
 
             densities.push(new_density);
             aug_densities.push(total_aug);
-            // Flatten per-kpt occupations for OccupationSet (use kpt-0 for now;
-            // weighted occupations are tracked separately for multi-kpt in future).
-            occs.push(occupations_all_kpts[0].clone());
+            // Per-kpt occupations, CASTEP layout occ(band, kpt, spin):
+            // `occs[spin][kpt][band]`.
+            occs.push(occupations_all_kpts.clone());
             fermi.push(chem_pot.0);
         }
 
@@ -1766,7 +1767,10 @@ impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated, MixingOff> {
         next.density = PerSpinFineDensity(SpinChannelData::new::<S>(combined_density));
         next.density_aug_fine = PerSpinAugDensity(SpinChannelData::new::<S>(vec![None; S::nspins()]));
         next.fermi_energy = fermi_energies;
-        let _ = occ_set; // Used in future for energy computation
+        // `occ_set` is intentionally dropped: the energy assembly in `check()`
+        // recomputes occupations from the eigenvalues (CASTEP does the same;
+        // the density path needs no band-energy term).
+        let _ = occ_set;
         Ok(next)
     }
 
@@ -1792,6 +1796,8 @@ impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated, MixingOff> {
         // causing catastrophic density corruption at the first Kerker iteration.
         let wave_g2_max = self.wave_grid.g2().iter().cloned().fold(0.0_f64, f64::max);
         let kerker_history = self.history.into_kerker(&self.fine_grid, Some(wave_g2_max))?;
+        // `occ_set` is intentionally dropped: the energy assembly in `check()`
+        // recomputes occupations from the eigenvalues.
         let _ = occ_set;
         Ok(ScfIteration {
             cell: self.cell,

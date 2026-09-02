@@ -100,6 +100,12 @@ pub struct DensityHistory<M: MixingPhase> {
     /// CASTEP `mix_spin_gmax` in a₀⁻¹ (default 1.5 /Å = 2.8346 a₀⁻¹,
     /// parameters.f90:1916).
     pub(crate) mix_gmax_s: f64,
+    /// CASTEP `mix_history_length` (NiO .param: 20). DIIS ring-buffer cap.
+    max_history: usize,
+    /// Count of DIIS-solve failures that degraded the step to Kerker-only.
+    /// Non-zero means the loop silently ran a dumber algorithm (failure
+    /// pattern: silent-algorithm-degradation); expose it for diagnostics.
+    diis_fallback_count: u64,
     // ── Current mix-object densities (c, s), reciprocal, band-limited ──
     /// Reciprocal charge (total) density from the previous mixing output.
     /// `None` before the first Kerker/Pulay call (pass-through/seed).
@@ -296,6 +302,12 @@ impl<M: MixingPhase> DensityHistory<M> {
         self.kerker.is_some()
     }
 
+    /// Number of DIIS-solve failures that degraded a step to Kerker-only
+    /// mixing. Zero means every PULAY step used the full DIIS update.
+    pub fn diis_fallback_count(&self) -> u64 {
+        self.diis_fallback_count
+    }
+
     /// Clear the DIIS/Kerker history (CASTEP `dm_flush_history` =
     /// `dm_finalise`: the delta/residual history arrays are released and
     /// the mix object is re-seeded on the next `dm_mix_density` call).
@@ -386,6 +398,8 @@ impl DensityHistory<MixingOff> {
             spin_amp: 2.0,
             mix_gmax_c: kerker::KERKER_GMAX_DEFAULT,
             mix_gmax_s: kerker::KERKER_SPIN_GMAX_DEFAULT,
+            max_history: DIIS_MAX_HISTORY,
+            diis_fallback_count: 0,
             current_c_in: None,
             current_s_in: None,
             delta_c_history: Vec::with_capacity(DIIS_MAX_HISTORY),
@@ -438,6 +452,13 @@ impl DensityHistory<MixingOff> {
         self
     }
 
+    /// Set the CASTEP `mix_history_length` (DIIS history cap, default 20).
+    /// The DIIS delta vectors are evicted lockstep at this cap.
+    pub fn with_max_history(mut self, max_history: usize) -> Self {
+        self.max_history = max_history.max(1);
+        self
+    }
+
     /// Pass-through mixing: the (c, s) pair is unchanged, snapshots are
     /// clones.  `c`: total density ρ_up + ρ_dn (single channel when
     /// nspins = 1), `s`: spin density ρ_up − ρ_dn (zero when nspins = 1).
@@ -466,6 +487,8 @@ impl DensityHistory<MixingOff> {
             spin_amp: self.spin_amp,
             mix_gmax_c: self.mix_gmax_c,
             mix_gmax_s: self.mix_gmax_s,
+            max_history: self.max_history,
+            diis_fallback_count: self.diis_fallback_count,
             current_c_in: self.current_c_in,
             current_s_in: self.current_s_in,
             delta_c_history: self.delta_c_history,
@@ -534,6 +557,8 @@ impl<M: MixingPhase> DensityHistory<M> {
             spin_amp: self.spin_amp,
             mix_gmax_c: self.mix_gmax_c,
             mix_gmax_s: self.mix_gmax_s,
+            max_history: self.max_history,
+            diis_fallback_count: self.diis_fallback_count,
             current_c_in: self.current_c_in,
             current_s_in: self.current_s_in,
             delta_c_history: self.delta_c_history,
@@ -565,6 +590,8 @@ impl<M: MixingPhase> DensityHistory<M> {
             spin_amp: self.spin_amp,
             mix_gmax_c: self.mix_gmax_c,
             mix_gmax_s: self.mix_gmax_s,
+            max_history: self.max_history,
+            diis_fallback_count: self.diis_fallback_count,
             current_c_in: self.current_c_in,
             current_s_in: self.current_s_in,
             delta_c_history: self.delta_c_history,
@@ -777,6 +804,8 @@ impl DensityHistory<Kerker> {
             spin_amp: self.spin_amp,
             mix_gmax_c: self.mix_gmax_c,
             mix_gmax_s: self.mix_gmax_s,
+            max_history: self.max_history,
+            diis_fallback_count: self.diis_fallback_count,
             current_c_in: self.current_c_in,
             current_s_in: self.current_s_in,
             delta_c_history: self.delta_c_history,
@@ -952,7 +981,7 @@ impl DensityHistory<Pulay> {
                         );
 
                         // Lockstep eviction of the oldest entry.
-                        if self.delta_c_history.len() >= DIIS_MAX_HISTORY {
+                        if self.delta_c_history.len() >= self.max_history {
                             self.delta_c_history.remove(0);
                             self.delta_rc_history.remove(0);
                             if !self.delta_s_history.is_empty() {
@@ -1014,6 +1043,18 @@ impl DensityHistory<Pulay> {
                     } else {
                         (vec![], true)
                     };
+
+                    if n_history > 0 && fallback {
+                        // DIIS solve failed: this step degrades to Kerker-only
+                        // mixing. Log it so a silent algorithm downgrade is
+                        // visible (failure pattern: silent-algorithm-degradation).
+                        self.diis_fallback_count += 1;
+                        eprintln!(
+                            "[mix] DIIS solve failed at history len {n_history}; \
+                             falling back to Kerker-only for this step (total fallbacks: {})",
+                            self.diis_fallback_count
+                        );
+                    }
 
                     let zero_dev: CudaSlice<CudaComplex> =
                         stream.alloc_zeros(n_real).expect("alloc zero");

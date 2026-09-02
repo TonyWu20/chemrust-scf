@@ -282,7 +282,10 @@ impl Default for KPoint {
 /// Smearing scheme for occupation-number smearing.
 #[derive(Debug, Clone, Copy, Default)]
 pub enum SmearingScheme {
-    /// Gaussian smearing (CASTEP default): occ = erfc((μ - ε) / width).
+    /// Gaussian smearing (CASTEP default).  Code: `occ = 0.5·erfc((ε − μ)/w)`
+    /// per band; CASTEP `algor_integrated_broadening` (algor.F90:2979):
+    /// `0.5·erf((μ − ε)/w) + 0.5` — algebraically identical.  `occ` is in
+    /// [0, 1] per band per spin channel.
     #[default]
     Gaussian,
     // Future: FermiDirac, MethfesselPaxton, MarzariVanderbilt.
