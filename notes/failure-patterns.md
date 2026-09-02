@@ -652,3 +652,118 @@ is described as intentional in comments, it becomes invisible to auditors. Every
 by a verification that the reference does NOT merge those data paths before the
 point of divergence.
 
+## 2026-09-02: mixer-diis-defects-causing-pure-scf-divergence
+
+**Symptom**: The pure-Rust full SCF loop (NiO, 14 kpts, CASTEP .param Pulay scheme)
+diverged: electron count explodes 64 → 812 by iter 7–9, band-0 collapses to −150 Ha.
+Meanwhile every individually-swapped FFI component (V_eff, occupations, density,
+one-cycle mixing) matches CASTEP within noise; iter-1 eigenvalues match to 1e-4 Ha;
+CASTEP continuation from the Rust iter-2 `.check` (SLURM job 2965) converges in 91
+cycles to E-TS −7160.26995 eV. The bug is loop-level, not component-level.
+
+**Root cause (four defects in the density mixer, `src/mixing.rs` + `src/mixing/cuda_kernels.rs`)**:
+1. **Single-amplitude DIIS update.** `cpx_full_update` applies one `amp` to both the
+   DIIS density part and the Kerker part. CASTEP `dm_mix_density_pulay`
+   (dm_sub_mix.f90:815-1013) scales Δn ×1.0 and the Kerker part ×`mix_charge_amp`
+   (0.5). Fix: the kernel takes two amplitudes (`amp_k`, `amp_n`);
+   DIIS launch uses `amp_k=charge_amp, amp_n=1.0`, fallback uses `amp_k=charge_amp,
+   amp_n=0.0`.
+2. **R_curr excluded from the Kerker part.** The DIIS path passes `r_curr=zero`,
+   so the kernel acts on Σc·ΔR only. CASTEP copies `current_residual` into the
+   workspace and applies `dm_apply_kerker` to `R + Σc·ΔR`. Fix: DIIS launch passes
+   `r_dev` as `r_curr`.
+3. **`into_pulay()` zeros the history.** It runs at every Pulay iteration (via
+   `construct_density_pulay`), resetting `prev_res`/`prev_n_in`/`delta_*_history`.
+   The DIIS delta history stays empty, DIIS never activates, and the loop silently
+   runs plain Kerker — which diverges on this long-tail system. Fix:
+   `into_pulay` preserves the history across the scheme transition.
+4. **Dimensionally-wrong convergence gate.** `check()` required
+   `dens_rms < tol` with `tol = 1e-8 Ha` — an energy tolerance applied to a
+   density-quantity. CASTEP `electronic_store_energy` converges on the energy
+   window alone (`max_energy − min_energy ≤ elec_energy_tol·num_ions`).
+   Fix: convergence = `mixing_was_active && energy_converged`; RMS is
+   diagnostics-only.
+
+**Plus a Kerker q-scale bug**: q was set to 1.5 a.u. (q²=2.25) instead of
+CASTEP `mix_charge_gmax` = 1.5/Å = 2.8346 a₀⁻¹ (q²=8.035). The numeric "1.5"
+coincides across two different unit systems — a 3.6× underestimate of the
+kerker damping strength. Fix: `mix_gmax` plumbing through the builder.
+
+**Companion writer bugs** (chemrust-hamiltonian, commit `462e822` on
+`feat/expose-energy`): the `.check` continuation writer needed (a) 30-byte padding
+on the `BEGIN/END_PARAMETERS_DUMP` header records (CASTEP reads
+`character(len=30)`/`len=10`; short records abort gfortran with "I/O past end of
+record"), (b) `found_ground_state_wvfn`/`found_ground_state_den` flowing through
+`CastepBin` instead of hardcoded 1, and (c) the **second**
+`found_ground_state_den` flag between eigenvalues and fine-grid dims
+(model.f90:1520) set to false — otherwise `castep.f90:823` skips
+`electronic_minimisation` entirely. CASTEP tripped on five separate writer bugs in
+sequence (jobs 2961–2964); job 2965 converged.
+
+**Companion FFI-side patterns** (component-swap infrastructure):
+- **fortran-allocatable-dummy-cloc-null.** `c_loc()` of an `INTENT(OUT)`
+  allocatable dummy in the gfortran wrapper returns a null pointer → silent
+  `CHEM_COMP_NULL_HANDLE(4)`. Fix: local `allocatable, target` buffer plus
+  copy-back, in every MIX/DENS wrapper.
+- **ffi-arg-semantics-mismatch.** The occ hook passed `num_plane_waves_kp`
+  (n_pw=1223) where the per-kpt **band** count (`wvfn%nbands(:,ns)` ≤ 62) was
+  required → OOB slice → heap double-free. Fix: pass `nbands(:,ns)`; Rust
+  bounds-guards `nb_per_kpt[ik] > max_nb → CHEM_COMP_CUDA_ERROR`.
+- **spin-summed-factor-2.** Non-spin CASTEP `real_charge` is spin-summed;
+  the Rust per-channel density is half of it. Writeback uses ×2, the `mix_init`
+  seed uses ×0.5, and the MIX input must be `0.5*real_charge` (not the raw
+  spin-summed charge) or the density scale snowballs.
+
+**Verification**:
+- `nio_pulay_full_loop`: converges in ~31 cycles to E_total = −7693.4067 eV
+  (loop convention = CASTEP E − 533.14 eV → −7160.27 eV; ref −7160.2298);
+  electron count stable at 64.0 throughout.
+- `nio_scf_loop_converges` (`davidson_wall_bisection`, 14 kpts, max_iter=40):
+  PASS, −7693.40673831 eV.
+- `nio_iter1_eigenvalues_vs_castep`: 1.013e-4 Ha.
+- `nio_iter1_overlap_vs_castep` (new gauge-invariant subspace probe, replaces the
+  invalid single-kpt density L1 test): `Tr(P_c·P_r)/n = 0.99999997` over 62 bands.
+- CASTEP continuation from the iter-2 `.check` (job 2965): 91 cycles, E-TS
+  −7160.26995 eV.
+- Control arms (`nio_kerker_pinned_loop`, `nio_no_mix_loop`): both trip the
+  divergence gate as expected (Kerker-pinned at the V_eff-range gate ~iter 13,
+  no-mix at the electron-count gate, total_e 650.6 e⁻). Tests assert the gate
+  trip via `catch_unwind` — the expected failure is documented behavior.
+
+**Pattern**: `all-components-match-whole-loop-wrong` — when the component-swap
+matrix is all green, the bug is not in a component; it is in the loop-level
+composition (the feedback dynamics). The swap matrix proves component innocence;
+the handoff test (the reference implementation continues from our intermediate
+state and converges) proves the early pipeline is healthy; the remaining suspect
+is our own loop's iteration dynamics.
+
+**Pattern**: `silent-algorithm-degradation` — a scheme transition that resets
+state (`into_pulay` zeroing the DIIS history) makes the code run a different,
+simpler algorithm with no error. The loop ran plain Kerker believing it ran
+Pulay/DIIS. A state reset inside a hot path is a code smell: assert the state
+survives, or log which path actually executed.
+
+**Pattern**: `coincidental-numeric-unit-trap` — a numeric literal (1.5) copied
+across a unit boundary (a.u. vs 1/Å) without conversion. Re-derive every literal
+from the reference config in internal units; do not copy numbers.
+
+**Pattern**: `dimensional-convergence-gate` — applying an energy tolerance to a
+density RMS makes the gate impossible (or meaningless). The convergence criterion
+must be dimensionally consistent with the measured quantity; here the reference
+uses the energy window alone.
+
+**Pattern**: `gauge-dependent-metric-trap` — per-band wavefunction overlap
+across near-degenerate clusters is gauge-dependent and meaningless; use the
+gauge-invariant subspace alignment `Tr(P_c P_r)/n = Tr(M G_r⁻¹ M† G_c⁻¹)/n`.
+Separately: the "32.6% density L1 error" scare was our own unit-conversion
+mistake (real gate-convention error: 0.51%). Trust invariants, not scare
+numbers; re-derive the metric before believing it.
+
+**Lesson**: The evidence chain that found this: component matrix (each part
+healthy) → A/B mixing schemes (iters 1–4 identical across Kerker/Pulay/no-mix)
+→ handoff job 2965 (early pipeline healthy) → CASTEP source as spec → four
+defects → fix → `nio_pulay_full_loop` converges. Each link left a checkable
+artifact (job id, test name, number). The mixer was not the culprit at iters
+1–4; it is the culprit at iters 5+. Reproduce at the right horizon before
+declaring a component innocent.
+

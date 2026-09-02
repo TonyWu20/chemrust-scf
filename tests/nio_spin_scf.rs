@@ -24,10 +24,13 @@ use ndarray::ShapeBuilder;
 
 const NIO_SPIN_DIR: &str = "/export/public_castep_jobs/tony/NiO_no_u_finer_grid_spin";
 const POTENTIAL_DIR: &str = "/export/Potentials";
-const REFERENCE_ENERGY_EV: f64 = -7160.230577732;
-const REFERENCE_FERMI_ENERGY_HA: f64 = 0.152664;
-const EPS_SPIN0_BAND0_REF_HA: f64 = -0.59098046;
-const EPS_SPIN1_BAND0_REF_HA: f64 = -0.59108380;
+// Reference: CPU spin-polarized run, 77 SCF cycles, up 36 / dn 28, net spin 8.
+// .check total_energy = -263.135104400 Ha; log E-TS = -7160.270529747 eV.
+// Loop convention target: E_total ≈ E-TS - 533.13587 = -7693.40640 eV.
+const REFERENCE_ENERGY_EV: f64 = -7160.270369717;
+const REFERENCE_FERMI_ENERGY_HA: f64 = 0.152973595;
+const EPS_SPIN0_BAND0_REF_HA: f64 = -0.59134981;
+const EPS_SPIN1_BAND0_REF_HA: f64 = -0.59103753;
 const TOL_EPS_HA: f64 = 3e-4;
 const DRIFT_TOLERANCE_HA: f64 = 2e-2;
 const TOL_FERMI_HA: f64 = 1e-3;
@@ -213,6 +216,27 @@ pub fn build_spin_scf_state(fx: &NioSpinFixture) -> ScfIteration<SpinCollinear> 
 
 fn gpu_available() -> bool {
     std::panic::catch_unwind(|| cudarc::driver::CudaContext::new(0).is_ok()).unwrap_or(false)
+}
+
+// ===========================================================================
+// Reference-value pin (no GPU): prints the authoritative values from the
+// current NiO_no_u_finer_grid_spin reference run so the constants above can
+// be re-verified after any reference re-run.
+// ===========================================================================
+
+#[test]
+fn nio_spin_reference_values() {
+    let fx = fixture();
+    let total_energy_ha = fx.check.total_energy;
+    let fermi_ha = fx.check.eigenvalues.fermi_energy;
+    eprintln!("[REF] .check total_energy = {total_energy_ha:.9} Ha = {} eV",
+        total_energy_ha * chemrust_scf::HARTREE_TO_EV);
+    eprintln!("[REF] .check fermi_energy  = {fermi_ha:.9} Ha");
+    for ikpt in 0..fx.bands_eigenvalues_per_spin.len() {
+        let s0 = &fx.bands_eigenvalues_per_spin[ikpt][0];
+        let s1 = &fx.bands_eigenvalues_per_spin[ikpt][1];
+        eprintln!("[REF] kpt {ikpt}: band0 spin0 = {:.8} Ha, spin1 = {:.8} Ha", s0[0], s1[0]);
+    }
 }
 
 // ===========================================================================
