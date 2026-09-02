@@ -1,5 +1,53 @@
 # Failure Patterns
 
+## 2026-09-03: spin-polarised NiO SCF diverges at iter 2-3 (near-singular S-matrix)
+
+**Symptom**: The spin-polarised NiO PULAY loop (36/28 filling, 14 kpts,
+started from the CASTEP-converged state) diverges at SCF iteration 2-3. The
+per-band wavefunction S-norms drift ([diag-norms] min 0.2635 -> 0.2437), the
+down-channel density electron count drifts (28 -> 30.03), band-0 plunges to
+-80.8 Ha (the min_band0_ha = -30 gate trips), then both channels blow up.
+Non-spin NiO converges (31 cycles to -7693.4067 eV). PULAY, Kerker-pinned,
+and free-start (spin_fix = -1) all diverge identically at iter 2-3, so the
+mixer is not the cause.
+
+**Root cause**: A down-channel HOMO/LUMO degeneracy at the high-symmetry
+k-points (kpt 13/14; gap ~ 0 in the down channel vs 0.074 Ha in non-spin)
+makes the Davidson S-matrix near-singular. This triggers two latent defects in
+`s_orthonormalise` (`src/eigensolver/davidson.rs`):
+
+- Defect A (control flow): the Cholesky post-check, on FAIL, printed
+  "falling back to MGS" but the next statement was an unconditional
+  `return Ok(())`. A numerically inaccurate Cholesky factor was therefore
+  silently accepted instead of reaching the Gram-Schmidt fallback.
+- Defect B (amplifier): in the MGS fallback a near-degenerate column has a
+  post-orthogonalization S-norm ~ 0. Normalizing by `1/sqrt(~0)` inflated the
+  column into a spurious ~44-norm band (norm2 max = 43.95) that corrupted the
+  density and drove the eigenvector-rotation cascade.
+
+**Fix**: (1) Remove the unconditional `return Ok(())` so a post-check FAIL
+falls out of the Cholesky block and reaches the Gram-Schmidt fallback. (2)
+Guard the MGS Step-6 S-normalization: when the post-ortho S-norm is < 1e-30,
+zero the column instead of scaling by `1/sqrt(~0)`. Both fixes act only on the
+MGS / Cholesky-failure path, so the non-spin Cholesky-success path is
+unchanged.
+
+**Pattern**: `near-singular-cholesky-silent-accept` — a GPU Cholesky (ZPOTRF)
+can return info = 0 (success) on a near-singular matrix while producing an
+inaccurate factor. A post-check that detects the inaccuracy must actually fall
+through to the fallback; a path that prints "falling back" and then `return`s
+does not. Separately, `normalize-by-1-over-sqrt-zero` — S-normalizing a
+near-orthogonalized column by `1/sqrt(nrm^2)` without a floor produces a
+spurious huge-norm vector. Floor the divisor and zero the degenerate column.
+
+**Verification**: non-spin regression green (nio_mixer_ab PULAY arm and
+davidson_wall_bisection converge to -7693.4067 eV; the 24 CPU-logic unit
+tests pass). The PULAY spin full-loop convergence (`nio_spin_pulay_full_loop`)
+is PENDING a free GPU: the RTX PRO 5000 VRAM was fully occupied by a
+third-party process, so the CUDA context could not allocate. The two
+davidson fixes are verified by code inspection to act only on the fallback
+path; the non-spin Cholesky-success path is untouched.
+
 ## 2026-06-14: FFT plan caching breaks non-spin SCF convergence
 
 **Root cause**: `b6929d8` — caching `BatchedFftPlan3d` per kpt (`KptData.fft_plan`)
