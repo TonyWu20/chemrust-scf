@@ -353,6 +353,38 @@ impl Default for SmearingWidth {
 ///
 /// Builder: `SmearingParams::builder()` starts from CASTEP defaults.
 /// Override per-fixture: `SmearingParams::builder().spin_fix(6).build()`.
+/// CASTEP density-mixing scheme (`mixing_scheme` input key, parameters.f90).
+///
+/// CASTEP selects the scheme from the input and applies it from cycle 1
+/// (`dm_sub_mix.f90` dispatch: PULAY → `dm_mix_density_pulay` every cycle).
+/// Our phase machine (`MixingPhaseKind`) advances Off→Kerker→Pulay when the
+/// scheme is `Off` (automatic). When the scheme is pinned (Kerker/Pulay),
+/// the loop starts in that phase and stays there, matching CASTEP.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MixingScheme {
+    /// Automatic: start unmixed (Off), advance to Kerker once the energy
+    /// variation drops below the mixing convergence tolerance, then Pulay.
+    #[default]
+    Off,
+    /// CASTEP `mixing_scheme = 'KERKER'`: Kerker mixing from cycle 1.
+    Kerker,
+    /// CASTEP `mixing_scheme = 'PULAY'` (CASTEP default): DIIS/Pulay
+    /// mixing from cycle 1.
+    Pulay,
+}
+
+impl MixingScheme {
+    /// Initial `MixingPhaseKind` for the SCF loop.
+    pub fn as_phase(self) -> crate::scf::MixingPhaseKind {
+        use crate::scf::MixingPhaseKind;
+        match self {
+            MixingScheme::Off => MixingPhaseKind::Off,
+            MixingScheme::Kerker => MixingPhaseKind::Kerker,
+            MixingScheme::Pulay => MixingPhaseKind::Pulay,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, bon::Builder)]
 pub struct SmearingParams {
     /// Smearing width.  CASTEP default: 0.1 eV.
@@ -368,9 +400,17 @@ pub struct SmearingParams {
     /// CASTEP default: 10 (parameters.f90:1778).
     /// CASTEP frees at scf_cycle == spin_fix (1-based); our 0-based
     /// scf_iter equivalent is scf_iter >= spin_fix - 1.
+    /// CASTEP applies the spin-free transition only to spin-polarised
+    /// runs (electronic.f90:315,621 gate on `spin_polarised`).
     /// Override per-fixture, e.g. NiO .param has `spin_fix : 6`.
     #[builder(default = 10i32)]
     pub spin_fix: i32,
+    /// CASTEP `mixing_scheme` input key (default: Pulay in CASTEP).
+    /// Our default is Off (automatic phase machine) to preserve the
+    /// existing bootstrap behavior; fixtures matching CASTEP input set
+    /// this explicitly, e.g. NiO input requests PULAY.
+    #[builder(default)]
+    pub mixing_scheme: MixingScheme,
 }
 
 /// Output of a converged SCF calculation.

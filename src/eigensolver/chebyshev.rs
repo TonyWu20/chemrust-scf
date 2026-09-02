@@ -288,6 +288,7 @@ unsafe fn lanczos_upper_bound(
                 .blas(blas)
                 .stream(stream)
                 .solver(solver)
+                .kernels(kernels)
                 .call()?;
         }
 
@@ -907,6 +908,7 @@ pub(crate) fn chebyshev_filter(
                         .blas(blas)
                         .stream(stream)
                         .solver(solver)
+                        .kernels(kernels)
                         .call()?;
                     // Step 2: hpsi_dev = H·(S⁻¹·R_Y) = H·buf_c
                     apply_full_hamiltonian()
@@ -1030,6 +1032,7 @@ pub(crate) fn chebyshev_filter(
                     .blas(blas)
                     .stream(stream)
                     .solver(solver)
+                    .kernels(kernels)
                     .call()?;
             }
         }
@@ -2501,6 +2504,17 @@ pub fn chebfi_run_rust(
             }
             eprintln!("[chebfi] oracle=0: locked {n_locked}/{n_bands} converged bands (residual < {tolerance:.1e})");
         }
+        // Dynamic degree: skip filter when max residual is near tolerance.
+        // Warm start (max_res ≈ 5×tol) → deg=0; cold start (max_res ≫ tol) → full.
+        // Threshold of 10× tolerance matches ABINIT's oracle behavior.
+        let max_res = fresh_residuals.iter().cloned().fold(0.0_f64, f64::max);
+        let res_ratio = max_res / tolerance.max(1e-16);
+        deg = if res_ratio <= 10.0 {
+            for b in 0..n_bands { bands[b] = 0; }
+            0
+        } else {
+            (res_ratio.log10().ceil() as usize).min(deg)
+        };
         (deg, bands)
     } else {
         let (mut g, bands) = chebfi_set_ndeg_from_residu()
@@ -2596,6 +2610,7 @@ pub fn chebfi_run_rust(
                 .blas(blas)
                 .stream(stream)
                 .solver(solver)
+                .kernels(kernels)
                 .call()?;
         }
         // Diagnostic: check H·psi before vs after S⁻¹ for a few bands
@@ -2694,6 +2709,7 @@ pub fn chebfi_run_rust(
                     .blas(blas)
                     .stream(stream)
                     .solver(solver)
+                    .kernels(kernels)
                     .call()?;
             }
 
@@ -2890,8 +2906,6 @@ pub fn chebfi_run_rust(
             stream.alloc_zeros(nb * nb).map_err(Error::Cuda)?;
         // Bypass PwCoefficients Deref — pass underlying CudaSlice directly
         // to eliminate any auto-deref ambiguity in the GEMM call.
-        let psi_raw: &CudaSlice<CudaComplex> = &final_psi_buf.0;
-        let spsi_raw: &CudaSlice<CudaComplex> = &spsi_dev.0;
         unsafe {
             blas.gemm_c64(ZgemmConfig {
                 transa: op::C, transb: op::N,
@@ -2899,7 +2913,7 @@ pub fn chebfi_run_rust(
                 alpha: CudaComplex { x: 1.0, y: 0.0 },
                 lda: n_pw_i32, ldb: n_pw_i32, ldc: nb_i32,
                 beta: CudaComplex { x: 0.0, y: 0.0 },
-            }, psi_raw, spsi_raw, &mut s_sub)?;
+            }, &final_psi_buf.0, &spsi_dev.0, &mut s_sub)?;
 
         // Diagnostic: check S_sub corner after GEMM
         {
@@ -2919,8 +2933,8 @@ pub fn chebfi_run_rust(
             );
             // Manual ZDOTC check: compute S_sub[0,0] = psi_col0^H · (S·psi_col0)
             let handle = blas.raw_handle();
-            let (psi_ptr, _) = psi_raw.device_ptr(stream);
-            let (spsi_ptr, _) = spsi_raw.device_ptr(stream);
+            let (psi_ptr, _) = final_psi_buf.0.device_ptr(stream);
+            let (spsi_ptr, _) = spsi_dev.0.device_ptr(stream);
             let mut manual_dot = CudaComplex { x: 0.0, y: 0.0 };
             unsafe {
                 cudarc::cublas::sys::cublasZdotc_v2(
@@ -2966,13 +2980,29 @@ pub fn chebfi_run_rust(
             }
         }
 
-        // ZTRSM skipped: per-band S-norm normalization already gives
-        // S_sub diag ≈ 1.0. ZTRSM's X·R^{-1} mixes columns with very
-        // different bare |ψ|² (occupied ~0.9, unoccupied ~0.06 for USPP),
-        // injecting occupied character into unoccupied columns and
-        // inflating their eigenvalues. S_sub max|off| ≈ 4e-4 is small
-        // enough that ZHEGVD in rayleigh_ritz handles it directly.
-        // Original ZTRSM code preserved in git history if needed.
+        // ZTRSM: produce S-orthonormal output when ZPOTRF succeeds.
+        // Without it, S_sub has max|off| up to 0.91 → ZHEGVD's eigenvector
+        // matrix X has large off-diagonals → psi vectors mixed → cascade.
+        if chol_info_val == 0 {
+            // ZPOTRF succeeded — R in upper triangle of s_sub.
+            // cublasZtrsm side=RIGHT solves psi · R = psi → psi_new = psi · R^{-1}
+            unsafe {
+                let (psi_ptr, _) = final_psi_buf.0.device_ptr_mut(stream);
+                let (r_ptr, _) = s_sub.device_ptr(stream);
+                let alpha = CudaComplex { x: 1.0, y: 0.0 };
+                cudarc::cublas::sys::cublasZtrsm_v2(
+                    blas.raw_handle(),
+                    cudarc::cublas::sys::cublasSideMode_t::CUBLAS_SIDE_RIGHT,
+                    cudarc::cublas::sys::cublasFillMode_t::CUBLAS_FILL_MODE_UPPER,
+                    cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N,
+                    cudarc::cublas::sys::cublasDiagType_t::CUBLAS_DIAG_NON_UNIT,
+                    n_pw_i32, nb_i32,
+                    &alpha as *const _ as *const _,
+                    r_ptr as *const _, nb_i32,
+                    psi_ptr as *mut _, n_pw_i32,
+                ).result().map_err(Error::Blas)?;
+            }
+        }
         if chol_info_val != 0 {
             // ZPOTRF failed — S_sub is not positive definite.
             // Multi-level recovery: increasing regularization → ZHEEVD fallback.
@@ -3068,7 +3098,7 @@ pub fn chebfi_run_rust(
                             alpha: CudaComplex { x: 1.0, y: 0.0 },
                             lda: n_pw_i32, ldb: nb_i32, ldc: n_pw_i32,
                             beta: CudaComplex { x: 0.0, y: 0.0 },
-                        }, psi_raw, &s_sub, &mut x_temp)?;
+                        }, &final_psi_buf.0, &s_sub, &mut x_temp)?;
                     }
                     // Step 2: Scale each column by 1/sqrt(max(λ_b, ε_clamp))
                     let handle = blas.raw_handle();

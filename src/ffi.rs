@@ -16,11 +16,12 @@ use crate::device::solver::SolverHandle;
 use crate::device::{CudaComplex, Gpu};
 use crate::eigensolver::davidson::davidson_diagonalise;
 use crate::eigensolver::davidson_types::{KineticPreconditioner, PwCoefficients};
-use crate::eigensolver::hamiltonian::apply_full_hamiltonian;
+use crate::eigensolver::hamiltonian::{apply_full_hamiltonian, apply_s_times};
 use crate::eigensolver::kernels::CudaKernelSet;
 use crate::eigensolver::preconditioner::TpaPreconditioner;
+use crate::eigensolver::hubbard::{HubbardBatchData, apply_v_u_hamiltonian, compute_aug_lcao};
 use crate::eigensolver::vnl_data::{build_handle_shared_vnl, HandleSharedVnl, KptSharedVnl, VnlBatchData};
-use crate::layout::{ColumnDistributed, WavefunctionSet};
+use crate::layout::{ColumnDistributed, RowDistributed, WavefunctionSet};
 use crate::types::{EffectivePotential, FineGridArray, KPoint};
 
 pub const CHEM_EIG_OK: c_int = 0;
@@ -64,6 +65,11 @@ struct KptData {
     /// Shared spin-independent VNL state per k-point, built on first
     /// step_inner call and reused by subsequent spin calls.
     shared_vnl: Option<Arc<KptSharedVnl>>,
+    /// Lazily-initialised Hubbard U data per k-point.  Uploaded via
+    /// ldau_ffi_upload_basis (lcao coefficients) + ldau_ffi_upload_u (UNnm).
+    /// The aug_lcao = S·lcao computation is triggered lazily on the first
+    /// ldau_ffi_upload_u call after VnlBatchData is available.
+    hubbard: Option<HubbardBatchData>,
 }
 
 // ---- Eigensolver mode ------------------------------------------------------
@@ -271,6 +277,7 @@ fn init_inner(
         kpts.push(KptData {
             vnl: (0..nspins_u).map(|_| None).collect(),
             shared_vnl: None,
+            hubbard: None,
             kpoint_frac: kf,
             k_point: kpt,
             pw_coords,
@@ -333,6 +340,326 @@ pub unsafe extern "C" fn chemrust_eigensolve_set_mode(
 pub unsafe extern "C" fn chemrust_eigensolve_destroy(handle: *mut c_void) -> c_int {
     if !handle.is_null() { unsafe { drop(Box::from_raw(handle as *mut ChemrustHandle)); } }
     CHEM_EIG_OK
+}
+
+// ---- Hubbard U: Upload LCAO basis (once per k-point) ------------------------
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ldau_ffi_upload_basis(
+    handle: *mut c_void,
+    ikpt: c_int,
+    lcao_coeffs: *const CudaComplex,
+    n_pw: c_int,
+    n_orb_total: c_int,
+    channel_offset: *const c_int,
+    channel_l: *const c_int,
+    n_channels: c_int,
+    n_spins: c_int,
+    max_n_bands: c_int,
+) -> c_int {
+    if handle.is_null() {
+        return CHEM_EIG_NULL_HANDLE;
+    }
+    match unsafe {
+        ldau_ffi_upload_basis_inner(
+            handle,
+            ikpt,
+            lcao_coeffs,
+            n_pw,
+            n_orb_total,
+            channel_offset,
+            channel_l,
+            n_channels,
+            n_spins,
+            max_n_bands,
+        )
+    } {
+        Ok(()) => CHEM_EIG_OK,
+        Err(c) => c,
+    }
+}
+
+unsafe fn ldau_ffi_upload_basis_inner(
+    handle: *mut c_void,
+    ikpt: c_int,
+    lcao_coeffs: *const CudaComplex,
+    n_pw: c_int,
+    n_orb_total: c_int,
+    channel_offset: *const c_int,
+    channel_l: *const c_int,
+    n_channels: c_int,
+    n_spins: c_int,
+    max_n_bands: c_int,
+) -> Result<(), c_int> {
+    let h = unsafe { (handle as *mut ChemrustHandle).as_mut() }
+        .ok_or(CHEM_EIG_NULL_HANDLE)?;
+    let ik = ikpt as usize;
+    if ik >= h.kpts.len() {
+        return Err(CHEM_EIG_CUDA_ERROR);
+    }
+
+    let npw = n_pw as usize;
+    let norb = n_orb_total as usize;
+    let nch = n_channels as usize;
+    let ns = n_spins as usize;
+
+    // Upload LCAO coefficients to GPU (flat byte copy, Fortran col-major)
+    let n_elem = npw * norb;
+    let lcao_host: Vec<CudaComplex> =
+        unsafe { std::slice::from_raw_parts(lcao_coeffs, n_elem) }.to_vec();
+    let lcao_dev: CudaSlice<CudaComplex> = h
+        .stream
+        .clone_htod(&lcao_host)
+        .map_err(|e| {
+            eprintln!("[chemrust] ldau_ffi_upload_basis: lcao upload failed: {e}");
+            CHEM_EIG_CUDA_ERROR
+        })?;
+
+    // Upload channel metadata
+    let chan_off: Vec<usize> = unsafe { std::slice::from_raw_parts(channel_offset, nch) }
+        .iter()
+        .map(|&c| c as usize)
+        .collect();
+    let chan_l: Vec<i32> =
+        unsafe { std::slice::from_raw_parts(channel_l, nch) }.to_vec();
+
+    // Allocate placeholder Lz matrix (Phase 7A: zero-sized; Zeeman gated on
+    // external_field != 0)
+    let lz_dev: CudaSlice<CudaComplex> = h
+        .stream
+        .alloc_zeros(1_usize)
+        .map_err(|_| CHEM_EIG_CUDA_ERROR)?;
+
+    // Allocate placeholder UNnm (uploaded in ldau_ffi_upload_u)
+    let unnm_dev: CudaSlice<CudaComplex> = h
+        .stream
+        .alloc_zeros(ns * norb * norb)
+        .map_err(|_| CHEM_EIG_CUDA_ERROR)?;
+
+    h.kpts[ik].hubbard = Some(HubbardBatchData {
+        lcao_coeffs_dev: lcao_dev,
+        aug_lcao_dev: None, // lazy: computed on first ldau_ffi_upload_u
+        unnm_dev,
+        unnm_host: vec![CudaComplex { x: 0.0, y: 0.0 }; ns * norb * norb],
+        channel_offset: chan_off,
+        channel_l: chan_l,
+        n_orb_total: norb,
+        n_channels: nch,
+        n_pw: npw,
+        n_spins: {
+            // Defense-in-depth (audit F-C1): CASTEP 6.11 validates nspins ≤ 2
+            // at parameters.f90:7123; nlxc_ldau_is_on additionally requires nspins > 1.
+            assert!(ns == 1 || ns == 2, "n_spins must be 1 or 2, got {}", ns);
+            ns
+        },
+        lz_matrix_dev: lz_dev,
+        mixture_weights: Vec::new(), // empty = single-species (safe); VCA gate in apply_v_u_hamiltonian
+        max_n_bands: max_n_bands as usize,
+    });
+
+    Ok(())
+}
+
+// ---- Hubbard U: Upload UNnm + trigger aug_lcao computation ------------------
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ldau_ffi_upload_u(
+    handle: *mut c_void,
+    ikpt: c_int,
+    unnm: *const CudaComplex,
+    n_spins: c_int,
+    n_orb_total: c_int,
+) -> c_int {
+    if handle.is_null() {
+        return CHEM_EIG_NULL_HANDLE;
+    }
+    match unsafe { ldau_ffi_upload_u_inner(handle, ikpt, unnm, n_spins, n_orb_total) } {
+        Ok(()) => CHEM_EIG_OK,
+        Err(c) => c,
+    }
+}
+
+unsafe fn ldau_ffi_upload_u_inner(
+    handle: *mut c_void,
+    ikpt: c_int,
+    unnm: *const CudaComplex,
+    n_spins: c_int,
+    n_orb_total: c_int,
+) -> Result<(), c_int> {
+    let h = unsafe { (handle as *mut ChemrustHandle).as_mut() }
+        .ok_or(CHEM_EIG_NULL_HANDLE)?;
+    let ik = ikpt as usize;
+    if ik >= h.kpts.len() {
+        return Err(CHEM_EIG_CUDA_ERROR);
+    }
+    let kd = &mut h.kpts[ik];
+
+    let hubbard = kd.hubbard.as_mut().ok_or_else(|| {
+        eprintln!("[chemrust] ldau_ffi_upload_u: upload_basis not called first");
+        CHEM_EIG_CUDA_ERROR
+    })?;
+    if hubbard.n_spins != n_spins as usize || hubbard.n_orb_total != n_orb_total as usize {
+        eprintln!("[chemrust] ldau_ffi_upload_u: dimension mismatch");
+        return Err(CHEM_EIG_CUDA_ERROR);
+    }
+
+    let ns = n_spins as usize;
+    let norb = n_orb_total as usize;
+    let stride = norb * norb;
+
+    // Upload UNnm with explicit Fortran-col-major → Rust-row-major transpose.
+    // Fortran UNnm(fort_n, fort_m, spin) at 1-based indices → Rust
+    // unnm_flat[spin*stride + n*norb + m].
+    //
+    // Fortran column-major: unnm_fort[n + norb*m + stride*spin]
+    // Rust row-major:       unnm_rust[spin*stride + n*norb + m]
+    let unnm_fort: Vec<CudaComplex> =
+        unsafe { std::slice::from_raw_parts(unnm, ns * stride) }.to_vec();
+
+    let mut unnm_rust = vec![CudaComplex { x: 0.0, y: 0.0 }; ns * stride];
+    for spin in 0..ns {
+        for n in 0..norb {
+            for m in 0..norb {
+                let fort_idx = n + norb * m + stride * spin; // column-major
+                unnm_rust[spin * stride + n * norb + m] = unnm_fort[fort_idx];
+            }
+        }
+    }
+
+    // Upload to GPU and cache CPU copy
+    h.stream
+        .memcpy_htod(&unnm_rust, &mut hubbard.unnm_dev)
+        .map_err(|_| CHEM_EIG_CUDA_ERROR)?;
+    hubbard.unnm_host = unnm_rust;
+
+    // Lazy aug_lcao computation: trigger on first upload_u call after
+    // VnlBatchData exists (i.e. after first step_inner has run).
+    // Capture needed values before dropping the &mut borrow on hubbard,
+    // since we must .take() ownership of kd.hubbard to move CudaSlices
+    // into compute_aug_lcao without cloning (CudaSlice::clone() is a D2D
+    // deep copy in cudarc 0.19.7).
+    let needs_aug = hubbard.aug_lcao_dev.is_none();
+    let n_pw_aug = hubbard.n_pw;
+
+    if needs_aug {
+        // Release the &mut borrow so we can .take() ownership
+        drop(hubbard);
+
+        // Find any spin channel with VnlBatchData
+        let vnl = kd.vnl.iter().find_map(|v| v.as_ref()).ok_or_else(|| {
+            eprintln!(
+                "[chemrust] ldau_ffi_upload_u: VnlBatchData not yet available; \
+                 call after first step_inner"
+            );
+            CHEM_EIG_CUDA_ERROR
+        })?;
+
+        // Allocate aug_lcao and copy identity term
+        let mut aug_dev: CudaSlice<CudaComplex> = h
+            .stream
+            .alloc_zeros(n_pw_aug * norb)
+            .map_err(|_| CHEM_EIG_CUDA_ERROR)?;
+        {
+            // Take ownership of HubbardBatchData to move lcao slice out
+            let mut hubbard_tmp = kd.hubbard.take().ok_or(CHEM_EIG_NULL_HANDLE)?;
+            h.stream
+                .memcpy_dtod(&hubbard_tmp.lcao_coeffs_dev, &mut aug_dev)
+                .map_err(|_| CHEM_EIG_CUDA_ERROR)?;
+
+            let (lcao_owned, aug_owned) = unsafe {
+                compute_aug_lcao(
+                    hubbard_tmp.lcao_coeffs_dev,
+                    aug_dev,
+                    vnl,
+                    norb,
+                    n_pw_aug,
+                    &h.blas,
+                    &h.stream,
+                )
+            }
+            .map_err(|e| {
+                eprintln!("[chemrust] ldau_ffi_upload_u: aug_lcao computation failed: {e}");
+                CHEM_EIG_CUDA_ERROR
+            })?;
+
+            hubbard_tmp.lcao_coeffs_dev = lcao_owned;
+            hubbard_tmp.aug_lcao_dev = Some(aug_owned);
+            kd.hubbard = Some(hubbard_tmp);
+        }
+    }
+
+    Ok(())
+}
+
+// ---- Hubbard U: Finalise per-kpt data ------------------------------------
+
+/// Drop the HubbardBatchData for a specific k-point, freeing GPU memory.
+///
+/// Called during cleanup or when Hubbard-U is disabled mid-run.
+/// `ikpt` is the 0-based k-point index.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ldau_ffi_finalise(handle: *mut c_void, ikpt: c_int) -> c_int {
+    if handle.is_null() {
+        return CHEM_EIG_NULL_HANDLE;
+    }
+    let h = unsafe { (handle as *mut ChemrustHandle).as_mut() };
+    let Some(h) = h else {
+        return CHEM_EIG_NULL_HANDLE;
+    };
+    let ik = ikpt as usize;
+    if ik >= h.kpts.len() {
+        return CHEM_EIG_CUDA_ERROR;
+    }
+    // Drop the HubbardBatchData — CudaSlices are freed by Drop.
+    h.kpts[ik].hubbard = None;
+    CHEM_EIG_OK
+}
+
+// ---- Hubbard U: Apply V_U^AE |psi> (internal, called from eigensolver) -------
+//
+// NOTE: ldau_ffi_apply is NOT a top-level extern "C" entry point because
+// Fortran cannot create CUDA pointers.  It is called from within the Rust
+// eigensolver (apply_full_hamiltonian → apply_v_u_hamiltonian).  This wrapper
+// exists as a test/diagnostic entry point for Phase 7B integration.
+
+#[allow(dead_code)]
+pub(crate) unsafe fn ldau_ffi_apply(
+    handle: *mut c_void,
+    ikpt: c_int,
+    psi_dev: &PwCoefficients,
+    hpsi_dev: &mut PwCoefficients,
+    n_bands: c_int,
+    ispin: c_int,
+) -> Result<(), c_int> {
+    let h = unsafe { (handle as *mut ChemrustHandle).as_mut() }
+        .ok_or(CHEM_EIG_NULL_HANDLE)?;
+    let ik = ikpt as usize;
+    if ik >= h.kpts.len() {
+        return Err(CHEM_EIG_CUDA_ERROR);
+    }
+    let kd = &h.kpts[ik];
+    let hubbard = kd.hubbard.as_ref().ok_or_else(|| {
+        eprintln!("[chemrust] ldau_ffi_apply: Hubbard data not initialised");
+        CHEM_EIG_CUDA_ERROR
+    })?;
+
+    unsafe {
+        apply_v_u_hamiltonian()
+            .psi_dev(psi_dev)
+            .hpsi_dev(hpsi_dev)
+            .hubbard(hubbard)
+            .n_bands(n_bands as i32)
+            .ns(ispin)
+            .blas(&h.blas)
+            .stream(&h.stream)
+            .call()
+    }
+    .map_err(|e| {
+        eprintln!("[chemrust] ldau_ffi_apply failed: {e}");
+        CHEM_EIG_CUDA_ERROR
+    })?;
+
+    Ok(())
 }
 
 // ---- Step ------------------------------------------------------------------
@@ -794,6 +1121,32 @@ unsafe fn step_inner(
         .map_err(|_| CHEM_EIG_CUDA_ERROR)?;
     let hpsi_host: Vec<CudaComplex> = stream.clone_dtoh(&*hpsi_new)
         .map_err(|_| CHEM_EIG_CUDA_ERROR)?;
+    #[cfg(feature = "scf_diag")]
+    {
+        // SyncAudit: are the final D2H reads stale? Re-read after a sync and
+        // sample-compare. A nonzero maxdiff proves the FFI write-back races
+        // the async D2H.
+        let psi_audit = stream.clone_dtoh(&davidson_result.psi_out).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
+        let hpsi_audit = stream.clone_dtoh(&*hpsi_new).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
+        stream.synchronize().map_err(|_| CHEM_EIG_CUDA_ERROR)?;
+        let step = (psi_host_out.len() / 256).max(1);
+        let md_psi = (0..psi_host_out.len())
+            .step_by(step)
+            .map(|i| {
+                (psi_host_out[i].x - psi_audit[i].x).abs().max((psi_host_out[i].y - psi_audit[i].y).abs())
+            })
+            .fold(0.0f64, f64::max);
+        let step2 = (hpsi_host.len() / 256).max(1);
+        let md_hpsi = (0..hpsi_host.len())
+            .step_by(step2)
+            .map(|i| {
+                (hpsi_host[i].x - hpsi_audit[i].x).abs().max((hpsi_host[i].y - hpsi_audit[i].y).abs())
+            })
+            .fold(0.0f64, f64::max);
+        eprintln!(
+            "[SyncAudit] FFI final D2H: psi_out maxdiff={md_psi:.3e} hpsi maxdiff={md_hpsi:.3e} (0 = no race)"
+        );
+    }
 
     // Write back with max_n_pw stride — CASTEP's wvfn%coeffs(:,:,nk,ns) has
     // leading dimension max_plane_waves, not this k-point's n_pw.
@@ -975,10 +1328,10 @@ unsafe fn step_inner_chebyshev(
     // min(global_oracle, ndeg_filter_max) — with max_deg=12, bands needing
     // >12 iterations get under-filtered, causing eigenvalue oscillation.
     let tolerance = 1e-6_f64;
-    let ndeg_filter_max = 40usize; // ABINIT hard cap (not CASTEP's max_deg=12)
-    let oracle_mode = 0usize;      // ABINIT default: oracle disabled
-    let oracle_factor = 0.0_f64;   // unused when oracle=0
-    let oracle_min_occ = 0.0_f64;  // unused when oracle=0
+    let ndeg_filter_max = 40usize; // ABINIT hard cap (dynamic scaling in chebfi_run_rust)
+    let oracle_mode = 0usize;      // oracle=0: dynamic degree in chebyshev.rs handles convergence
+    let oracle_factor = 0.0_f64;
+    let oracle_min_occ = 0.0_f64;
 
     // Chebyshev filtering — SinvHKeepHEig for USPP (S⁻¹·H operator).
     // ABINIT m_vtorho.F90:610: nnsclo_now=2 for istep<=2 (cold start).
@@ -986,8 +1339,13 @@ unsafe fn step_inner_chebyshev(
     // converge the initial random subspace before density reconstruction.
     let mut pcie = PcieAccount::default();
 
-    // Pass 1: initial filter + RR
-    let (pf1, mut hf1, _ritz1, _res1, _ndeg1) = chebfi_run_rust(
+    // Single pass: filter + RR — matching ABINIT (Algorithm 3, Fig. 8 right panel,
+    // and m_chebfi2.F90:705).  ABINIT runs one filter recurrence followed by one
+    // matrix-free Rayleigh-Ritz per SCF iteration.  A second pass would use RR
+    // output as input and compute residuals with Ritz values (≠ ZHEGVD eigenvalues
+    // for non-exact eigenvectors), inflating the dynamic degree and re-corrupting
+    // already-correct bands.
+    let (pf, mut hf, _ritz, _res, _ndeg) = chebfi_run_rust(
         &psi_gpu,
         v_eff_gpu.as_device_slice(),
         &h.wave_grid, &kd.pw_coords, kd.vnl[isp].as_ref().unwrap(),
@@ -998,31 +1356,35 @@ unsafe fn step_inner_chebyshev(
         kernels, &mut pcie, blas, solver, stream, ctx,
         FilterMode::SinvHKeepHEig, Some(&ke_castep),
         0, n_bands, !have_gamma,
-    ).map_err(|e| { eprintln!("[chemrust-chebyshev] chebfi_run_rust pass1 failed: {e}"); CHEM_EIG_CUDA_ERROR })?;
-    let (psi_col1, eig_cpu1, _beta1) = rayleigh_ritz(
-        &pf1, &mut hf1, kd.vnl[isp].as_ref().unwrap(),
-        n_bands, n_pw, kernels, &mut pcie, solver, blas, stream, ctx,
-        None, None, None,
-    ).map_err(|e| { eprintln!("[chemrust-chebyshev] rayleigh_ritz pass1 failed: {e}"); CHEM_EIG_CUDA_ERROR })?;
+    ).map_err(|e| { eprintln!("[chemrust-chebyshev] chebfi_run_rust failed: {e}"); CHEM_EIG_CUDA_ERROR })?;
 
-    // Pass 2: refine subspace (ColumnDistributed from pass1 as input)
-    let (pf2, mut hf2, _ritz2, _res2, _ndeg2) = chebfi_run_rust(
-        &psi_col1,
-        v_eff_gpu.as_device_slice(),
-        &h.wave_grid, &kd.pw_coords, kd.vnl[isp].as_ref().unwrap(),
-        &fft_idx_dev,
-        ecut, ve_min, ve_max,
-        tolerance, None, None,
-        ndeg_filter_max, oracle_mode, oracle_factor, oracle_min_occ,
-        kernels, &mut pcie, blas, solver, stream, ctx,
-        FilterMode::SinvHKeepHEig, Some(&ke_castep),
-        0, n_bands, !have_gamma,
-    ).map_err(|e| { eprintln!("[chemrust-chebyshev] chebfi_run_rust pass2 failed: {e}"); CHEM_EIG_CUDA_ERROR })?;
-    let (psi_col, eig_cpu, _beta2) = rayleigh_ritz(
-        &pf2, &mut hf2, kd.vnl[isp].as_ref().unwrap(),
+    // Compute S·Ψ for matrix-free RR (ABINIT Algorithm 2, right panel).
+    let n_elem = n_pw * n_bands;
+    let spsi_pw = PwCoefficients::new(pf.as_device_slice().clone());
+    let mut spsi_out = PwCoefficients::new(
+        stream.alloc_zeros(n_elem).map_err(|_| CHEM_EIG_CUDA_ERROR)?);
+    stream.memcpy_dtod(&*spsi_pw, &mut *spsi_out).map_err(|_| CHEM_EIG_CUDA_ERROR)?;
+    unsafe {
+        apply_s_times()
+            .psi_dev(&spsi_pw).spsi_dev(&mut spsi_out)
+            .vnl_data(kd.vnl[isp].as_ref().unwrap())
+            .n_bands(n_bands as i32).n_pw(n_pw as i32)
+            .blas(blas).stream(stream).call()
+    }.map_err(|e| { eprintln!("[chemrust-chebyshev] S·Ψ failed: {e}"); CHEM_EIG_CUDA_ERROR })?;
+    let mut spsi_row = Gpu::<WavefunctionSet<RowDistributed>> {
+        slice: spsi_out.0,
+        shape: vec![n_bands, n_pw],
+        ctx: ctx.clone(),
+        _marker: std::marker::PhantomData,
+    };
+
+    let (psi_col, eig_cpu, _beta) = rayleigh_ritz(
+        &pf, &mut hf, kd.vnl[isp].as_ref().unwrap(),
         n_bands, n_pw, kernels, &mut pcie, solver, blas, stream, ctx,
-        None, None, None,
-    ).map_err(|e| { eprintln!("[chemrust-chebyshev] rayleigh_ritz pass2 failed: {e}"); CHEM_EIG_CUDA_ERROR })?;
+        None, None, Some(&mut spsi_row),
+    ).map_err(|e| { eprintln!("[chemrust-chebyshev] rayleigh_ritz failed: {e}"); CHEM_EIG_CUDA_ERROR })?;
+
+    drop(spsi_row);
 
     // ---- Compute H·psi for hpsi_out (CASTEP stores into wvfn_gradient) ----
     let gs = (h.ngx_std * h.ngy_std * h.ngz_std) as usize;

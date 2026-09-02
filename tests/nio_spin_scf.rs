@@ -315,6 +315,8 @@ fn nio_chebfi_convergence_trend() {
         max_iter: 20,  // divergence detection: SCF should not need >20 iters from converged start
         electron_count_tolerance: 0.05,
         soft_fraction_tolerance: 0.20,
+        #[cfg(feature = "scf_diag")]
+        check_raw_sections: None,
     };
     let result = run_scf_with_energy_gated(state, 8, 1e-8, Some(gate))
         .expect("run_scf_with_energy");

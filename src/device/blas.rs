@@ -207,6 +207,27 @@ impl BlasHandle {
         }
     }
 
+    /// x = α·x  (complex, in-place)
+    pub fn scal_c64(
+        &self,
+        n: i32,
+        alpha: CudaComplex,
+        x: &mut CudaSlice<CudaComplex>,
+    ) -> Result<(), CublasError> {
+        unsafe {
+            let (x_ptr, _) = x.device_ptr_mut(&self.stream);
+            let alpha_ptr = &alpha as *const _;
+            blas_sys::cublasZscal_v2(
+                self.raw_handle(),
+                n,
+                alpha_ptr as *const _,
+                x_ptr as *mut _,
+                1,
+            )
+            .result()
+        }
+    }
+
     // ── DOT (f64) ──
 
     /// inner = x·y  (f64)

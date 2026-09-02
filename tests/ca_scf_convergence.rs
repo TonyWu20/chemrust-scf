@@ -528,8 +528,9 @@ fn density_decomp_matches_castep_f8_same_inputs() {
         electron_temperature: 0.1 * chemrust_scf::EV_TO_HARTREE,
         scheme: chemrust_scf::SmearingScheme::Gaussian,
         spin_fix: 10,
+        mixing_scheme: chemrust_scf::MixingScheme::Off,
     };
-    let (occupations, chem_pot) =
+    let (occupations, chem_pot) = 
         chemrust_scf::density::compute_occupations(eigenvalues, &smearing, n_electrons, 1.0)
             .expect("compute_occupations from CASTEP eigenvalues");
     let occ_sum: f64 = occupations.0.iter().sum();
@@ -674,7 +675,9 @@ fn s_inv_baseline_post_typo_fix() {
 
     use chemrust_hamiltonian_core::GVectorGrid;
     use chemrust_scf::KPoint;
-    use chemrust_scf::density::test_api::{CudaKernelSet, VnlBatchData, check_s_inv_s_identity};
+use chemrust_scf::density::test_api::{CudaKernelSet, VnlBatchData};
+    #[cfg(feature = "chebyshev")]
+    use chemrust_scf::density::test_api::check_s_inv_s_identity;
     use chemrust_scf::device::blas::BlasHandle;
     use chemrust_scf::device::pcie::PcieAccount;
     use num_complex::Complex64;
@@ -765,7 +768,9 @@ fn s_inv_s_identity_test() {
 
     use chemrust_hamiltonian_core::GVectorGrid;
     use chemrust_scf::KPoint;
-    use chemrust_scf::density::test_api::{CudaKernelSet, VnlBatchData, check_s_inv_s_identity};
+    use chemrust_scf::density::test_api::{CudaKernelSet, VnlBatchData};
+    #[cfg(feature = "chebyshev")]
+    use chemrust_scf::density::test_api::check_s_inv_s_identity;
     use chemrust_scf::device::blas::BlasHandle;
     use chemrust_scf::device::pcie::PcieAccount;
     use num_complex::Complex64;
@@ -860,6 +865,7 @@ fn s_inv_s_identity_test() {
 
 #[test]
 #[ignore = "requires GPU and CASTEP fixture data; diagnostic sweep for filter-operator selection"]
+#[cfg(feature = "chebyshev")]
 fn iter1_filter_mode_sweep() {
     if !gpu_available() {
         eprintln!("SKIP: no GPU available");
@@ -867,6 +873,7 @@ fn iter1_filter_mode_sweep() {
     }
     init_tracing();
 
+    #[cfg(feature = "chebyshev")]
     use chemrust_scf::density::test_api::FilterMode;
 
     let fx = fixtures::cu111_co::fixture();
@@ -1021,6 +1028,7 @@ fn pollution_injection_filter_should_denoise() {
     }
     init_tracing();
 
+    #[cfg(feature = "chebyshev")]
     use chemrust_scf::density::test_api::FilterMode;
     use num_complex::Complex64;
 
@@ -1319,6 +1327,7 @@ fn pollution_bisect_blow_vs_per_band_shifts() {
     }
     init_tracing();
 
+    #[cfg(feature = "chebyshev")]
     use chemrust_scf::density::test_api::FilterMode;
     use num_complex::Complex64;
 
@@ -1470,6 +1479,7 @@ fn pollution_with_eigenvalues_exercises_iter2_path() {
     }
     init_tracing();
 
+    #[cfg(feature = "chebyshev")]
     use chemrust_scf::density::test_api::FilterMode;
     use num_complex::Complex64;
 
@@ -1606,6 +1616,7 @@ fn pollution_with_eigenvalues_exercises_iter2_path() {
 
 #[test]
 #[ignore = "requires GPU and CASTEP fixture data"]
+#[cfg(feature = "chebyshev")]
 fn ndeg_zero_with_castep_psi_matches_bands() {
     if !gpu_available() {
         eprintln!("SKIP: no GPU available");
@@ -1613,6 +1624,7 @@ fn ndeg_zero_with_castep_psi_matches_bands() {
     }
     init_tracing();
 
+    #[cfg(feature = "chebyshev")]
     use chemrust_scf::density::test_api::FilterMode;
 
     let fx = fixtures::cu111_co::fixture();
@@ -2759,6 +2771,7 @@ fn density_split_castep_psi_vs_our_psi() {
         electron_temperature: 0.1 * chemrust_scf::EV_TO_HARTREE,
         scheme: chemrust_scf::SmearingScheme::Gaussian,
         spin_fix: 10,
+        mixing_scheme: chemrust_scf::MixingScheme::Off,
     };
     let (occ_castep, _) = chemrust_scf::density::compute_occupations(
         &fx.bands_eigenvalues, &smearing, n_electrons, 1.0,
@@ -4263,6 +4276,7 @@ fn b_low_sweep_subspace_projector() {
     }
     init_tracing();
 
+    #[cfg(feature = "chebyshev")]
     use chemrust_scf::density::test_api::FilterMode;
     use num_complex::Complex64;
 
@@ -4510,7 +4524,7 @@ fn gate3_davidson_locking_preserves_cu3d_block() {
 
 #[test]
 #[ignore = "requires GPU and CASTEP fixture data"]
-#[cfg(feature = "scf_diag")]
+#[cfg(all(feature = "scf_diag", feature = "chebyshev"))]
 fn gate3_prime_davidson_synthetic_lock_preserves_locked_bands() {
     // Phase 0 Gate 3' -- synthetic-lock identity preservation.
     // Forces Cu-3d into the locked set by construction; asserts bitwise preservation.
@@ -4959,7 +4973,11 @@ fn test_iter2_check_discriminator() {
     let state = fixtures::cu111_co::build_scf_state(fx);
 
     let gate = chemrust_scf::ScfDivergenceGate {
-        parameters_raw: fx.check.parameters_raw.first().cloned(),
+        check_raw_sections: Some(chemrust_scf::ScfCheckRawSections {
+            parameters: fx.check.parameters_raw.clone(),
+            cell: fx.check.cell_raw.clone(),
+            orig_cell: fx.check.orig_cell_raw.clone(),
+        }),
         ..Default::default()
     };
 

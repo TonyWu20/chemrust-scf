@@ -159,6 +159,10 @@ pub struct ScfIteration<
     // --- Mixing phase control (RE-2 / RE-5) ---
     /// Phase the loop should use on the next SCF iteration.
     pub(crate) next_mixing: MixingPhaseKind,
+    /// Test-only pin: keep the loop on the no-mix path forever (the
+    /// automatic Off → Kerker gate in `check()` is bypassed). Used to
+    /// A/B-isolate the mixing step in the full loop.
+    pub(crate) pinned_no_mix: bool,
 
     // --- Energy components for total energy assembly (RE-3 / RE-4) ---
     /// Exchange-correlation energy E_xc from the most recent V_eff assembly.
@@ -239,6 +243,9 @@ impl<S: SpinPolicy> ScfIteration<S, Initialized, MixingOff> {
         k_points: KptDataSet<KPoint>,
         smearing: SmearingParams,
         max_history: usize,
+        /// CASTEP `mix_charge_gmax` in a₀⁻¹ (Kerker kernel scale).
+        /// Defaults to 1.5 /Å = 2.8346 a₀⁻¹ (CASTEP default, parameters.f90:1906).
+        mix_gmax: Option<f64>,
     ) -> Self {
         let _ = max_history; // History size is fixed internally for now
         // Upsample fixture density to fine grid so that every phase after
@@ -297,10 +304,15 @@ impl<S: SpinPolicy> ScfIteration<S, Initialized, MixingOff> {
                 // density mixing approximates this by applying the spin mixing
                 // amplitude to each spin channel independently.
                 let amp = if S::nspins() > 1 { 2.0 } else { 0.5 };
-                DensityHistory::with_amplitude(S::nspins(), amp)
+                let gmax = mix_gmax.unwrap_or(crate::mixing::kerker::KERKER_GMAX_DEFAULT);
+                DensityHistory::with_amplitude(S::nspins(), amp).with_mix_gmax(gmax)
             },
             previous_density,
+            // CASTEP starts unmixed: do_mixing stays false until the
+            // energy-delta gate passes (electronic.f90:7702-7810). The
+            // scheme selects only the post-gate target phase.
             next_mixing: MixingPhaseKind::Off,
+            pinned_no_mix: false,
             e_xc: None,
             e_hartree: None,
             rho_vxc: None,
@@ -354,6 +366,7 @@ impl<S: SpinPolicy, Phase: ScfPhase, M: MixingPhase> ScfIteration<S, Phase, M> {
             history: self.history,
             previous_density: self.previous_density,
             next_mixing: self.next_mixing,
+            pinned_no_mix: self.pinned_no_mix,
             e_xc: self.e_xc,
             e_hartree: self.e_hartree,
             rho_vxc: self.rho_vxc,
@@ -937,17 +950,25 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
                 // 8. Eigensolver dispatch per (spin,kpt)
                 if eigensolver_method == "davidson" {
                     // --- Davidson diagonalization ---
+                    // CASTEP hamiltonian.f90:476-480 — the Gamma point uses
+                    // the real-symmetric (DSYEVD, 'S') path with an even
+                    // block size. The FFI path detects this from the k-point
+                    // coordinates (ffi.rs have_gamma). The loop must do the
+                    // same: a hardcoded false sends the Gamma kpt down the
+                    // ZHEEVD path with the wrong block size, and the Gamma
+                    // subspace degrades (norm collapse) from iter 4 on.
+                    let have_gamma = kpoint.coords.iter().all(|&c| c.abs() < 1.0e-12);
                     let result = unsafe {
                         pipeline::run_davidson(
                             &psi_pw, v_eff_slice, &kpt.kinetic_precond, &kpt.fft_idx_dev,
                             &vnl_data, n_pw_kpt, n_bands, grid_size_usize, inv_ntotal, &fft_plan,
                             &blas, &solver, &kernels, &tpa_precond, &stream, &ctx,
-                            30, false,  // max_outer_iter=30, gamma_point=false
+                            30, have_gamma, // max_outer_iter=30, gamma point
                         )?
                     };
 
                     // Wrap psi_out CudaSlice for D2H
-                    let psi_new_gpu: Gpu<WavefunctionSet<ColumnDistributed>> = Gpu {
+                    let mut psi_new_gpu: Gpu<WavefunctionSet<ColumnDistributed>> = Gpu {
                         slice: result.psi_out,
                         shape: vec![n_bands, n_pw_kpt],
                         ctx: (*ctx).clone(),
@@ -980,7 +1001,59 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
                     }
 
                     stream.synchronize()?;
-                    let Cpu(psi_new) = psi_new_gpu.sync_to_host_with(&stream, &mut pcie)?;
+                    let Cpu(mut psi_new) =
+                        psi_new_gpu.sync_to_host_with(&stream, &mut pcie)?;
+
+                    // Diagnostic: per-band norm drift of the Davidson output.
+                    // Sum|c_G|^2 must stay near the CASTEP storage value
+                    // (~1.0) if the Ritz vectors stay on the manifold.
+                    let norm_sq: Vec<f64> = psi_new
+                        .data
+                        .chunks_exact(n_pw_kpt)
+                        .map(|band| {
+                            band.iter()
+                                .map(|c| c.re * c.re + c.im * c.im)
+                                .sum::<f64>()
+                        })
+                        .collect();
+                    let nmin = norm_sq.iter().cloned().fold(f64::INFINITY, f64::min);
+                    let nmax = norm_sq.iter().cloned().fold(0.0, f64::max);
+                    eprintln!(
+                        "[diag-norms] scf_iter={} spin={} kpt={} n_bands={} \
+                         norm2 min={nmin:.6} max={nmax:.6}",
+                        self.scf_iter,
+                        ispin,
+                        ikpt,
+                        n_bands
+                    );
+
+                    // Max pairwise Ritz-vector overlap (orthogonality loss).
+                    let mut gram_max = 0.0f64;
+                    for bi in 0..n_bands {
+                        let i0 = bi * n_pw_kpt;
+                        for bj in (bi + 1)..n_bands {
+                            if (bi * 7 + bj) % 5 != 0 {
+                                continue;
+                            }
+                            let j0 = bj * n_pw_kpt;
+                            let mut re = 0.0f64;
+                            let mut im = 0.0f64;
+                            for g in 0..n_pw_kpt {
+                                let ci = psi_new.data[i0 + g];
+                                let cj = psi_new.data[j0 + g];
+                                re += ci.re * cj.re + ci.im * cj.im;
+                                im += ci.re * cj.im - ci.im * cj.re;
+                            }
+                            let mag = (re * re + im * im).sqrt();
+                            gram_max = gram_max.max(mag);
+                        }
+                    }
+                    eprintln!(
+                        "[diag-gram] scf_iter={} spin={} kpt={} max_offdiag_overlap={gram_max:.3e}",
+                        self.scf_iter,
+                        ispin,
+                        ikpt
+                    );
 
                     spin_psi_kpts.push(PwCoefficients::new(psi_new_gpu.as_device_slice().clone()));
                     spin_psi_cpu_kpts.push(psi_new.data);
@@ -1699,6 +1772,7 @@ impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated, MixingOff> {
             history: kerker_history,
             previous_density: self.previous_density,
             next_mixing: self.next_mixing,
+            pinned_no_mix: self.pinned_no_mix,
             e_xc: self.e_xc,
             e_hartree: self.e_hartree,
             rho_vxc: self.rho_vxc,
@@ -1763,6 +1837,7 @@ impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated, MixingOff> {
             history: pulay_history,
             previous_density: self.previous_density,
             next_mixing: self.next_mixing,
+            pinned_no_mix: self.pinned_no_mix,
             e_xc: self.e_xc,
             e_hartree: self.e_hartree,
             rho_vxc: self.rho_vxc,
@@ -1827,6 +1902,7 @@ impl<S: SpinPolicy> ScfIteration<S, DensityUpdated<MixingOff>, MixingOff> {
             history: history_off,
             previous_density: PerSpinFineDensity(SpinChannelData::new::<S>(prev_densities)),
             next_mixing: self.next_mixing,
+            pinned_no_mix: self.pinned_no_mix,
             e_xc: self.e_xc,
             e_hartree: self.e_hartree,
             rho_vxc: self.rho_vxc,
@@ -1882,6 +1958,7 @@ impl<S: SpinPolicy> ScfIteration<S, DensityUpdated<Kerker>, Kerker> {
             history: history_off,
             previous_density: PerSpinFineDensity(SpinChannelData::new::<S>(prev_densities)),
             next_mixing: self.next_mixing,
+            pinned_no_mix: self.pinned_no_mix,
             e_xc: self.e_xc,
             e_hartree: self.e_hartree,
             rho_vxc: self.rho_vxc,
@@ -1937,6 +2014,7 @@ impl<S: SpinPolicy> ScfIteration<S, DensityUpdated<Pulay>, Pulay> {
             history: history_off,
             previous_density: PerSpinFineDensity(SpinChannelData::new::<S>(prev_densities)),
             next_mixing: self.next_mixing,
+            pinned_no_mix: self.pinned_no_mix,
             e_xc: self.e_xc,
             e_hartree: self.e_hartree,
             rho_vxc: self.rho_vxc,
@@ -2160,38 +2238,76 @@ impl<S: SpinPolicy> ScfIteration<S, Mixed, MixingOff> {
             (sum_sq / n).sqrt()
         };
 
-        // 5. Mixing phase transition (CASTEP dm.f90:895-1093, electronic.f90:7614-7638)
+        // 5. Mixing phase transition (CASTEP electronic.f90:7702-7810,
+        //    dm_sub_mix.f90:75-76)
         //
-        // Off → Kerker when energy variation drops below 0.1 eV (mixing starts
-        // once the raw SCF has roughly settled).
-        // Kerker → Pulay after the first Kerker mix completes.
+        // CASTEP starts the density mixing only once the total energy has
+        // settled: `electronic_store_energy` sets mix_density when
+        // |E_this - E_prev| <= mixing_convergence_tol * num_ions, where
+        // mixing_convergence_tol = 0.1 Ha (electronic.f90:7737). The
+        // `dm_mix_density` call adds the cycle gate scf_cycle > mixing_delay
+        // (default 1, dm_sub_mix.f90:75).
+        //
+        // Off → Kerker when both gates pass (first mix pass is always
+        // Kerker in CASTEP, dm_sub_mix.f90:872-878).
+        // Kerker → the scheme target: automatic (Off) goes to Pulay,
+        // pinned schemes stay where the scheme says.
         // Pulay → Pulay for normal DIIS.
         //
         // Convergence is only valid when mixing was active (next_mixing ≠ Off),
         // preventing false convergence when the energy is stable simply because
         // no mixing is perturbing the density.
-        const MIXING_CONV_TOL_EV: f64 = 0.1; // CASTEP mixing_convergence_tol default
+        // CASTEP mixing_convergence_tol: 0.1 Ha per ion (electronic.f90:7737).
+        const MIXING_CONV_TOL_HA_PER_ION: f64 = 0.1;
+        // CASTEP mixing_delay: 1 cycle (dm_sub_mix.f90:75). 0-based here.
+        const MIXING_DELAY: usize = 1;
 
         // Was density mixing active in this iteration?
         let mixing_was_active = self.next_mixing != MixingPhaseKind::Off;
 
-        let next_mixing = match self.next_mixing {
-            MixingPhaseKind::Off => {
-                if energy_variation < MIXING_CONV_TOL_EV {
-                    MixingPhaseKind::Kerker
-                } else {
-                    MixingPhaseKind::Off
+        // 2-cycle energy delta in Hartree (CASTEP compares this cycle
+        // against the previous cycle in electronic_store_energy).
+        let mix_delta_ha = match self.energy_buffer.len() {
+            n if n >= 2 => (self.energy_buffer[n - 1] - self.energy_buffer[n - 2]).abs(),
+            _ => f64::INFINITY,
+        };
+        let mix_gate_ha =
+            MIXING_CONV_TOL_HA_PER_ION * self.cell.num_ions as f64;
+
+        let next_mixing = if self.pinned_no_mix {
+            MixingPhaseKind::Off
+        } else {
+            match self.next_mixing {
+                MixingPhaseKind::Off => {
+                    if self.scf_iter >= MIXING_DELAY && mix_delta_ha <= mix_gate_ha {
+                        MixingPhaseKind::Kerker
+                    } else {
+                        MixingPhaseKind::Off
+                    }
                 }
+                MixingPhaseKind::Kerker => {
+                    // CASTEP keeps the pinned scheme; the automatic Off-start
+                    // path advances Kerker → Pulay after one pass.
+                    if self.smearing.mixing_scheme == crate::types::MixingScheme::Kerker {
+                        MixingPhaseKind::Kerker
+                    } else {
+                        MixingPhaseKind::Pulay
+                    }
+                }
+                MixingPhaseKind::Pulay => MixingPhaseKind::Pulay,
             }
-            MixingPhaseKind::Kerker => MixingPhaseKind::Pulay,
-            MixingPhaseKind::Pulay => MixingPhaseKind::Pulay,
         };
 
         // 6. Decision — mixing must have been active to declare convergence
         // Set next_mixing on self before into_phase() so the returned state
         // carries the correct mixing phase for the next iteration.
         self.next_mixing = next_mixing;
-        if mixing_was_active && dens_rms < tol && energy_converged {
+        // CASTEP electronic.f90 electronic_store_energy: convergence is the
+        // total-energy window test (max-min over the convergence window vs
+        // elec_energy_tol*num_ions).  The density RMS is not a convergence
+        // criterion in CASTEP; it only gates the start of mixing.  Keep the
+        // RMS computation for diagnostics only.
+        if mixing_was_active && energy_converged {
             Ok(CheckOutcome::Converged(self.into_phase()))
         } else {
             Ok(CheckOutcome::NotConverged {
@@ -2238,14 +2354,18 @@ pub fn run_scf<S: SpinPolicy + BuildVEff>(
         // CASTEP electronic.f90:516-518 — spin freed at scf_cycle == spin_fix
         // where scf_cycle is 1-based.  Our scf_iter is 0-based, so the
         // transition point is scf_iter == spin_fix - 1.
-        if state.smearing.spin_fix >= 0 && !state.spin_freed {
+        // CASTEP electronic.f90:315,621 — the spin-free transition is
+        // gated on `spin_polarised`: non-spin runs never apply spin_fix.
+        if S::nspins() > 1 && state.smearing.spin_fix >= 0 && !state.spin_freed {
             if state.scf_iter as i32 >= state.smearing.spin_fix - 1 {
                 state.spin_freed = true;
                 eprintln!("[chemrust] spin_fix iterations done -- freeing spin (iter {})", state.scf_iter);
             }
             if state.scf_iter as i32 == state.smearing.spin_fix - 1 {
                 let amp = if S::nspins() > 1 { 2.0 } else { 0.5 };
-                state.history = crate::mixing::DensityHistory::with_amplitude(S::nspins(), amp);
+                let gmax = state.history.mix_gmax;
+                state.history = crate::mixing::DensityHistory::with_amplitude(S::nspins(), amp)
+                    .with_mix_gmax(gmax);
                 state.next_mixing = MixingPhaseKind::Off;
             }
         }
@@ -2285,6 +2405,22 @@ pub fn run_scf_with_energy<S: SpinPolicy + BuildVEffWithEnergy>(
     run_scf_with_energy_gated(state, ndeg, tol, None)
 }
 
+/// Raw invariant sections of a reference `.check` file, replayed verbatim
+/// when the iter-2 CASTEP continuation checkpoint is written. CASTEP reads
+/// the PARAMETERS, CELL, and ORIG_CELL sections with strict record layouts
+/// (`character(len=30)` headers, `character(len=256)` cell headers, full
+/// keyword record lists); a reconstructed section misreads (e.g. `cell_copy`
+/// aborts on num_species), so the reference records must be replayed.
+#[derive(Clone, Debug, Default)]
+pub struct ScfCheckRawSections {
+    /// Raw PARAMETERS section records (from `CastepBin::parameters_raw`).
+    pub parameters: Vec<Vec<u8>>,
+    /// Raw CELL section records (from `CastepBin::cell_raw`).
+    pub cell: Vec<Vec<u8>>,
+    /// Raw ORIG_CELL section records (from `CastepBin::orig_cell_raw`).
+    pub orig_cell: Vec<Vec<u8>>,
+}
+
 /// Divergence-detection gate for SCF runs.
 ///
 /// Per-iteration sanity checks: when an SCF iteration produces a state outside
@@ -2320,12 +2456,14 @@ pub struct ScfDivergenceGate {
     /// from 0.37 → 0.80) indicates the augmentation density is not being
     /// constructed or mixing is corrupting the soft/aug split.
     pub soft_fraction_tolerance: f64,
-    /// Raw PARAMETERS section from the reference .check file, for the iter-2
-    /// CASTEP continuation discriminator. Set by the test from `fx.check`;
-    /// the capture point injects this into the emitted .check to satisfy
-    /// CASTEP's `parameters_restore` without re-reading the fixture.
+    /// Raw invariant sections of the reference .check file, for the iter-2
+    /// CASTEP continuation discriminator. Set by the test from `fx.check`
+    /// (the `CastepBin` produced by `CheckFile::read`); the capture point
+    /// replays them into the emitted .check to satisfy CASTEP's
+    /// `parameters_restore` and `cell_restore` without re-reading the
+    /// fixture.
     #[cfg(any(test, feature = "scf_diag"))]
-    pub parameters_raw: Option<Vec<u8>>,
+    pub check_raw_sections: Option<ScfCheckRawSections>,
 }
 
 impl Default for ScfDivergenceGate {
@@ -2338,7 +2476,7 @@ impl Default for ScfDivergenceGate {
             electron_count_tolerance: 0.05,
             soft_fraction_tolerance: 0.20,
             #[cfg(any(test, feature = "scf_diag"))]
-            parameters_raw: None,
+            check_raw_sections: None,
         }
     }
 }
@@ -2370,14 +2508,18 @@ pub fn run_scf_with_energy_gated<S: SpinPolicy + BuildVEffWithEnergy>(
         // CASTEP electronic.f90:516-518 — spin freed at scf_cycle == spin_fix
         // where scf_cycle is 1-based.  Our scf_iter is 0-based, so the
         // transition point is scf_iter == spin_fix - 1.
-        if state.smearing.spin_fix >= 0 && !state.spin_freed {
+        // CASTEP electronic.f90:315,621 — the spin-free transition is
+        // gated on `spin_polarised`: non-spin runs never apply spin_fix.
+        if S::nspins() > 1 && state.smearing.spin_fix >= 0 && !state.spin_freed {
             if state.scf_iter as i32 >= state.smearing.spin_fix - 1 {
                 state.spin_freed = true;
                 eprintln!("[chemrust] spin_fix iterations done -- freeing spin (iter {})", state.scf_iter);
             }
             if state.scf_iter as i32 == state.smearing.spin_fix - 1 {
                 let amp = if S::nspins() > 1 { 2.0 } else { 0.5 };
-                state.history = crate::mixing::DensityHistory::with_amplitude(S::nspins(), amp);
+                let gmax = state.history.mix_gmax;
+                state.history = crate::mixing::DensityHistory::with_amplitude(S::nspins(), amp)
+                    .with_mix_gmax(gmax);
                 state.next_mixing = MixingPhaseKind::Off;
             }
         }
@@ -2575,14 +2717,16 @@ pub fn run_scf_with_energy_gated<S: SpinPolicy + BuildVEffWithEnergy>(
                         if let Some(mut castep_bin) =
                             crate::scf_capture::capture_as_castep_bin(&next, n_electrons)
                         {
-                            // Inject parameters_raw from the gate (set by test
-                            // from fx.check — no re-read of the fixture file).
+                            // Replay the reference .check's invariant sections
+                            // (parameters/cell/orig_cell) verbatim; the
+                            // dynamic sections (wavefunctions, eigenvalues,
+                            // density, energies) come from the loop state.
                             if let Some(ref gate) = gate {
                                 #[cfg(any(test, feature = "scf_diag"))]
-                                if let Some(ref raw) = gate.parameters_raw {
-                                    // Gate stores flattened Vec<u8>, CastepBin expects Vec<Vec<u8>>
-                                    // Wrap the single record in a Vec
-                                    castep_bin.parameters_raw = vec![raw.clone()];
+                                if let Some(ref raw) = gate.check_raw_sections {
+                                    castep_bin.parameters_raw = raw.parameters.clone();
+                                    castep_bin.cell_raw = raw.cell.clone();
+                                    castep_bin.orig_cell_raw = raw.orig_cell.clone();
                                 }
                             }
                             let out_path = std::env::var("CHEMRUST_CHECK_DUMP")
@@ -2891,6 +3035,14 @@ impl<S: SpinPolicy> ScfIteration<S, Initialized, MixingOff> {
     pub fn total_energy(&self) -> Option<f64> {
         self.total_energy
     }
+
+    /// Pin the loop to the no-mix path forever (bypasses the automatic
+    /// Off → Kerker gate in `check()`). Test-only: A/B-isolates the
+    /// mixing step in the full loop.
+    pub fn pinned_no_mix(mut self) -> Self {
+        self.pinned_no_mix = true;
+        self
+    }
 }
 
 // ===========================================================================
@@ -2955,15 +3107,14 @@ mod tests {
     #[test]
     fn test_check_not_converged_no_energy() {
         let shape = [4, 4, 4]; // Fortran: [ngz, ngy, ngx]
-        let density = Density::from_inner(WaveGridArray::from_inner(Array3::<f64>::zeros(shape)));
-        let previous_density = Density::from_inner(WaveGridArray::from_inner(
+        let density = FineDensity::from_inner(FineGridArray(Array3::<f64>::zeros(shape)));
+        let previous_density = FineDensity::from_inner(FineGridArray(
             Array3::<f64>::from_elem(shape, 2.0),
         ));
         let psi_data = vec![Complex64::ZERO; 4 * 27];
         let n_bands = 4;
         let n_pw = 27;
         let state: ScfIteration<NonSpin, Mixed, MixingOff> = ScfIteration {
-            #[cfg(feature = "chebyshev")]
             cell: dummy_cell(),
             pots: PseudopotentialSet::new(),
             wave_grid: dummy_grid(),
@@ -2987,6 +3138,7 @@ mod tests {
             history: DensityHistory::new(1),
             previous_density: PerSpinFineDensity(SpinChannelData::new::<NonSpin>(vec![previous_density])),
             next_mixing: MixingPhaseKind::Off,
+            pinned_no_mix: false,
             e_xc: None,
             e_hartree: None,
             rho_vxc: None,
@@ -3028,7 +3180,6 @@ mod tests {
         let n_bands = 4;
         let n_pw = 27;
         ScfIteration {
-            #[cfg(feature = "chebyshev")]
             cell: dummy_cell(),
             pots: PseudopotentialSet::new(),
             wave_grid: dummy_grid(),
@@ -3041,7 +3192,7 @@ mod tests {
             pw_coords: KptDataSet::new(vec![Vec::new()], 1),
             pw_fft_indices: KptDataSet::new(vec![Vec::new()], 1),
             density: PerSpinFineDensity(SpinChannelData::new::<NonSpin>(vec![
-                Density::from_inner(WaveGridArray::from_inner(Array3::<f64>::zeros(shape))),
+                FineDensity::from_inner(FineGridArray(Array3::<f64>::zeros(shape))),
             ])),
             psi: PerSpinPwCoefficients(SpinChannelData::new::<NonSpin>(
                 vec![KptDataSet::new(vec![dummy_pw_coeffs()], 1)],
@@ -3055,11 +3206,12 @@ mod tests {
             v_eff: None,
             history: DensityHistory::new(1),
             previous_density: PerSpinFineDensity(SpinChannelData::new::<NonSpin>(vec![
-                Density::from_inner(WaveGridArray::from_inner(
+                FineDensity::from_inner(FineGridArray(
                     Array3::<f64>::from_elem(shape, 2.0),
                 )),
             ])),
             next_mixing,
+            pinned_no_mix: false,
             e_xc: None,
             e_hartree: None,
             rho_vxc: None,
@@ -3083,12 +3235,15 @@ mod tests {
         }
     }
 
-    /// Off → Kerker when energy variation drops below 0.1 eV.
+    /// Off → Kerker when the 2-cycle energy delta passes the CASTEP gate
+    /// (0.1 Ha * num_ions, dummy_cell has num_ions = 1) and the cycle gate
+    /// (scf_iter >= mixing_delay = 1).
     #[test]
     fn test_check_off_to_kerker_transition() {
-        // Energy window: three iterations all within 0.01 eV — settled.
+        // 2-cycle delta 0.001 Ha <= 0.1 Ha gate — settled.
         let energies = vec![-24110.966, -24110.964, -24110.965];
-        let state = mixed_state(energies, MixingPhaseKind::Off);
+        let mut state = mixed_state(energies, MixingPhaseKind::Off);
+        state.scf_iter = 1; // past mixing_delay
 
         let result = state.check(1e-5).unwrap();
         match result {
@@ -3105,12 +3260,13 @@ mod tests {
         }
     }
 
-    /// Off stays Off when energy is still varying widely.
+    /// Off stays Off when the 2-cycle energy delta exceeds the gate.
     #[test]
     fn test_check_off_stays_off_when_energy_unstable() {
-        // Energy varying by > 0.1 eV — too unstable to start mixing.
+        // 2-cycle delta 1.0 Ha > 0.1 Ha gate — too unstable to start mixing.
         let energies = vec![-24110.0, -24109.0, -24108.0];
-        let state = mixed_state(energies, MixingPhaseKind::Off);
+        let mut state = mixed_state(energies, MixingPhaseKind::Off);
+        state.scf_iter = 1; // cycle gate passes; the energy gate must hold
 
         let result = state.check(1e-5).unwrap();
         match result {
@@ -3177,6 +3333,7 @@ mod tests {
         // must fail the convergence check because mixing was never active.
         let energies = vec![-24110.96665069; 5];
         let mut state = mixed_state(energies, MixingPhaseKind::Off);
+        state.scf_iter = 1; // past mixing_delay
 
         // Also make density RMS zero so the only blocker is mixed_status.
         state.previous_density = state.density.clone();

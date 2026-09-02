@@ -90,10 +90,25 @@ fn load_fixture() -> Result<NiONoSpinFixture, Box<dyn std::error::Error>> {
 // ---------------------------------------------------------------------------
 
 /// Build an `ScfIteration` from the NiO non-spin fixture using the first
-/// k-point.
+/// k-point with the CASTEP parameter-set defaults (Pulay mixing,
+/// Gaussian smearing 0.1 eV).
 pub fn build_scf_state(
     fx: &NiONoSpinFixture,
     stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+) -> ScfIteration {
+    build_scf_state_with_scheme(fx, stream, chemrust_scf::MixingScheme::Pulay)
+}
+
+/// Build the SCF state with an explicit density-mixing scheme.
+///
+/// `scheme = MixingScheme::Kerker` pins the loop to Kerker mixing
+/// (no DIIS/Pulay); `Pulay` follows the CASTEP parameter-set default
+/// (Kerker first, then Pulay). Used to A/B-isolate the DIIS/Pulay
+/// mixer in the full loop.
+pub fn build_scf_state_with_scheme(
+    fx: &NiONoSpinFixture,
+    stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+    scheme: chemrust_scf::MixingScheme,
 ) -> ScfIteration {
     let cell = fx.bin.cell.clone();
     let pots = fx.pots.clone();
@@ -112,9 +127,21 @@ pub fn build_scf_state(
     let [fgx, fgy, fgz] = fine_grid_dims;
     let fine_grid = GVectorGrid::new(fgx, fgy, fgz, cell.recip_lattice);
 
-    // Density from .castep_bin
+    // Density from .castep_bin. The NiO .bin stores the charge on the
+    // FINE grid. `ScfIteration::new` expects a wave-grid density and
+    // upsamples it itself, so downsample fine → wave first.
+    // Band-limited truncation (FFT to G-space, keep wave-grid G-vectors,
+    // inverse FFT) matches CASTEP's fine → normal grid density transfer.
+    let charge_fine =
+        fx.bin.density.charge.as_real_grid().as_real_array();
+    let charge_wave = chemrust_scf::downsample_array_to_wave_grid(
+        charge_fine,
+        &fine_grid,
+        &wave_grid,
+    )
+    .expect("downsample fine-grid charge to wave grid");
     let density = Density::from_inner(WaveGridArray::from_inner(
-        fx.bin.density.charge.as_real_grid().as_real_array().clone(),
+        charge_wave.into_inner().as_array().clone(),
     ));
 
     // First k-point wavefunctions
@@ -135,12 +162,21 @@ pub fn build_scf_state(
         weight: 1.0,
     };
 
+    // CASTEP NiO input: mixing_scheme = PULAY (history 20, amplitude 0.5,
+    // G-cutoff 1.5 1/A), Gaussian smearing 0.1 eV. Non-spin run: CASTEP
+    // gates the spin_fix transition on spin_polarised (electronic.f90:315,
+    // 621), so it never applies here — spin_fix = -1 disables it.
     let smearing = SmearingParams {
         width: SmearingWidth::ev(0.1),
         electron_temperature: 0.1 * chemrust_scf::EV_TO_HARTREE,
         scheme: SmearingScheme::Gaussian,
-        spin_fix: 6,
+        spin_fix: -1,
+        mixing_scheme: scheme,
     };
+
+    // CASTEP .param: mix_charge_gmax = 1.5 1/ang (a₀⁻¹) — Kerker kernel
+    // scale. 1 /Å = 1.88972612545 a₀⁻¹.
+    let mix_gmax = 1.5 * 1.88972612545;
 
     let psi_cpu_data: SpinChannelData<KptDataSet<Vec<Complex64>>> =
         SpinChannelData::new::<NonSpin>(vec![KptDataSet::new(vec![flat_bands_clone], 1)]);
@@ -170,6 +206,125 @@ pub fn build_scf_state(
         .k_points(k_points_ps)
         .smearing(smearing)
         .max_history(8)
+        .mix_gmax(mix_gmax)
+        .build()
+}
+
+/// Build a full 14-k-point SCF state from the NiO non-spin fixture.
+///
+/// The fixture `.check` file stores wavefunctions for all 14 k-points
+/// (the `build_scf_state` single-k-point builder is a reduced system and
+/// must not be used for SCF-loop diagnostics). k-point weights come
+/// from `fx.bin.kpoint_weights`.
+pub fn build_scf_state_all_kpts(
+    fx: &NiONoSpinFixture,
+    stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+) -> ScfIteration {
+    build_scf_state_all_kpts_with_scheme(fx, stream, chemrust_scf::MixingScheme::Pulay)
+}
+
+/// Full 14-k-point SCF state with an explicit density-mixing scheme.
+pub fn build_scf_state_all_kpts_with_scheme(
+    fx: &NiONoSpinFixture,
+    _stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+    scheme: chemrust_scf::MixingScheme,
+) -> ScfIteration {
+    use chemrust_scf::spin_types::KptDataSet;
+
+    let cell = fx.bin.cell.clone();
+    let pots = fx.pots.clone();
+
+    let wfc = fx
+        .check
+        .wavefunction
+        .as_ref()
+        .expect(".check must have wavefunction");
+    let wave_grid_dims = wfc.grid;
+    let [ngx, ngy, ngz] = wave_grid_dims;
+
+    let wave_grid = GVectorGrid::new(ngx, ngy, ngz, cell.recip_lattice);
+
+    let fine_grid_dims = fx.check.fine_grid.expect(".check must have fine_grid");
+    let [fgx, fgy, fgz] = fine_grid_dims;
+    let fine_grid = GVectorGrid::new(fgx, fgy, fgz, cell.recip_lattice);
+
+    // CASTEP total density (all k-points) on the fine grid → wave grid.
+    let charge_fine =
+        fx.bin.density.charge.as_real_grid().as_real_array();
+    let charge_wave = chemrust_scf::downsample_array_to_wave_grid(
+        charge_fine,
+        &fine_grid,
+        &wave_grid,
+    )
+    .expect("downsample fine-grid charge to wave grid");
+    let density = Density::from_inner(WaveGridArray::from_inner(
+        charge_wave.into_inner().as_array().clone(),
+    ));
+
+    let nkpts = wfc.kpt_data.len();
+    let kpt_weights = fx.bin.kpoint_weights.clone();
+    assert_eq!(kpt_weights.len(), nkpts, "k-point weight count mismatch");
+
+    let n_bands = wfc.kpt_data[0].bands.len();
+
+    let ctx = std::sync::Arc::new(cudarc::driver::CudaContext::new(0).expect("CUDA GPU"));
+    let stream_gpu = ctx.default_stream();
+
+    let mut psi_gpu: Vec<PwCoefficients> = Vec::with_capacity(nkpts);
+    let mut psi_data: Vec<Vec<num_complex::Complex64>> = Vec::with_capacity(nkpts);
+    let mut k_points_vec: Vec<KPoint> = Vec::with_capacity(nkpts);
+    let mut pw_coords_vec: Vec<Vec<[i32; 3]>> = Vec::with_capacity(nkpts);
+    let mut pw_fft_vec: Vec<Vec<i32>> = Vec::with_capacity(nkpts);
+
+    for ikpt in 0..nkpts {
+        let block = &wfc.kpt_data[ikpt];
+        assert_eq!(block.bands.len(), n_bands, "band count mismatch at kpt {ikpt}");
+        let n_pw_kpt = block.nplw;
+        let n_el = n_bands * n_pw_kpt;
+        let slice: cudarc::driver::CudaSlice<chemrust_scf::device::CudaComplex> =
+            stream_gpu.alloc_zeros(n_el).expect("GPU kpt bands");
+        psi_gpu.push(PwCoefficients::new(slice));
+        psi_data.push(block.bands.iter().flatten().copied().collect());
+        k_points_vec.push(KPoint { coords: block.coords, weight: kpt_weights[ikpt] });
+        pw_coords_vec.push(block.pw_grid_coord.clone());
+        pw_fft_vec.push(chemrust_scf::pw_coords_to_fft_indices(
+            &block.pw_grid_coord,
+            &wave_grid,
+        ));
+    }
+
+    let psi = PerSpinPwCoefficients::new(SpinChannelData::new::<NonSpin>(vec![
+        KptDataSet::new(psi_gpu, nkpts),
+    ]));
+    let psi_cpu = SpinChannelData::new::<NonSpin>(vec![KptDataSet::new(psi_data, nkpts)]);
+    let density_ps = PerSpinDensity::new(SpinChannelData::new::<NonSpin>(vec![density]));
+    let k_points_ps = KptDataSet::new(k_points_vec, nkpts);
+
+    let smearing = SmearingParams {
+        width: SmearingWidth::ev(0.1),
+        electron_temperature: 0.1 * chemrust_scf::EV_TO_HARTREE,
+        scheme: SmearingScheme::Gaussian,
+        spin_fix: -1,
+        mixing_scheme: scheme,
+    };
+
+    // CASTEP .param: mix_charge_gmax = 1.5 1/ang; 1 /Å = 1.88972612545 a₀⁻¹.
+    let mix_gmax = 1.5 * 1.88972612545;
+
+    ScfIteration::builder()
+        .cell(cell)
+        .pots(pots)
+        .wave_grid(wave_grid)
+        .fine_grid(fine_grid)
+        .density(density_ps)
+        .psi(psi)
+        .psi_data(psi_cpu)
+        .pw_coords(KptDataSet::new(pw_coords_vec, nkpts))
+        .pw_fft_indices(KptDataSet::new(pw_fft_vec, nkpts))
+        .k_points(k_points_ps)
+        .smearing(smearing)
+        .max_history(8)
+        .mix_gmax(mix_gmax)
         .build()
 }
 

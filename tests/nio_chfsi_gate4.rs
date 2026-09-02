@@ -1,3 +1,4 @@
+#![cfg(feature = "chebyshev")]
 // Gate 4: ChFSI eigenvalue accuracy — NiO (all k-points) + Cu111_CO.
 // Standalone — does NOT use the fixtures module.
 

@@ -221,6 +221,10 @@ pub fn capture_as_castep_bin<S: SpinPolicy>(
         kpoint_weights: (0..nkpts).map(|ikpt| state.k_points[ikpt].weight).collect(),
         fine_grid: Some(fine_grid_dims),
         wavefunction: Some(wavefunction),
+        // Mid-SCF continuation state: force CASTEP to run the SCF from this
+        // checkpoint (castep.f90:823 skips it when the flag is set).
+        found_ground_state_wvfn: false,
+        found_ground_state_den: false,
         forces: None,
         stress: None,
         strain: None,

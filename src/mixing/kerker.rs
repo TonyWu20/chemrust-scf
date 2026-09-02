@@ -28,12 +28,23 @@ use crate::types::Error;
 ///
 /// - K(G=0) = 0.0 (DC component excluded — total charge conservation)
 /// - K(G) → 1.0 as |G| → ∞
-/// - q = 1.5 a.u. (fixed for Phase 2)
+/// - q = mix_charge_gmax (CASTEP default 1.5 /Å = 2.8346 a₀⁻¹), matching
+///   CASTEP `dm_assign_plane_wave_indices`:
+///   `energy_ch_q0sq = 0.5·mix_charge_gmax²` and kernel
+///   `mix_charge_amp/(1 + E_q0/E)` = amp·G²/(G² + gmax²) with E = G²/2.
 #[derive(Debug)]
 pub struct KerkerPreconditioner {
     pub(crate) kernel: CudaSlice<f64>,
     pub(crate) shape: [usize; 3],  // [ngz, ngy, ngx]
+    /// Mixing-basis mask: 1.0 for G components inside the CASTEP mix cutoff
+    /// (|G|² ≤ g2_cutoff, including G=0), 0.0 above. Mirrors CASTEP's
+    /// `num_mix_plane_waves` band-limit of the mix density object.
+    pub(crate) mask: CudaSlice<f64>,
 }
+
+/// CASTEP default `mix_charge_gmax` = 1.5 /Å in a₀⁻¹
+/// (`io_unit_to_atomic(1.5, "1/ang")`), see parameters.f90:1906.
+pub const KERKER_GMAX_DEFAULT: f64 = 1.5 * 1.88972612545;
 
 impl KerkerPreconditioner {
     /// Build the Kerker preconditioner on GPU from a `GVectorGrid`.
@@ -53,9 +64,12 @@ impl KerkerPreconditioner {
         stream: &Arc<CudaStream>,
         gvg: &GVectorGrid,
         g2_cutoff: Option<f64>,
+        gmax: f64,
     ) -> Result<Self, Error> {
         let shape = gvg.grid();  // [ngz, ngy, ngx]
-        let q2 = 2.25;           // q = 1.5 a.u., q² = 2.25
+        // CASTEP kernel: K(G) = G²/(G² + gmax²), gmax = mix_charge_gmax in a₀⁻¹.
+        // (energy_ch_q0sq = 0.5·gmax²; kernel = amp/(1 + E_q0/E), E = G²/2.)
+        let q2 = gmax * gmax;
 
         // Build kernel on CPU.
         // g2() returns &Array3<f64> in Fortran layout (ngz, ngy, ngx).
@@ -78,17 +92,43 @@ impl KerkerPreconditioner {
             }
         }).collect();
 
+        // Mixing-basis mask: 1.0 where the G component is in CASTEP's mix
+        // density object (G2/2 <= mix_ecut).  mix_cut_off_energy defaults to
+        // cut_off_energy (the wave cutoff) when unset in the .param, so the
+        // external g2_cutoff (wave-grid G2 max) sets the mix/carry split.
+        // Components above the cutoff are NOT mixed; their content is carried
+        // from the fresh output density (dm_mix_density_to_density).
+        let mask_host: Vec<f64> = gvg.g2().iter().map(|&g2_val| {
+            if g2_val == 0.0 {
+                1.0
+            } else if let Some(cut) = g2_cutoff {
+                if g2_val <= cut { 1.0 } else { 0.0 }
+            } else {
+                1.0
+            }
+        }).collect();
+        let mask = stream
+            .clone_htod(&mask_host)
+            .map_err(Error::Cuda)?;
+
         // Transfer to GPU
         let kernel = stream
             .clone_htod(&kernel_host)
             .map_err(Error::Cuda)?;
 
-        Ok(Self { kernel, shape })
+        Ok(Self { kernel, mask, shape })
     }
 
     /// Access the precomputed kernel on GPU for use in CUDA kernels.
     pub fn as_device_slice(&self) -> &CudaSlice<f64> {
         &self.kernel
+    }
+
+    /// Mixing-basis mask (1.0 = G component inside the CASTEP mix cutoff,
+    /// incl. G=0; 0.0 = high-frequency content carried from the fresh
+    /// density, not mixed).
+    pub fn as_mask_slice(&self) -> &CudaSlice<f64> {
+        &self.mask
     }
 
     /// The grid shape `[ngz, ngy, ngx]`.

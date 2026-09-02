@@ -221,6 +221,7 @@ pub fn build_scf_state(
         electron_temperature: 0.1 * chemrust_scf::EV_TO_HARTREE,
         scheme: SmearingScheme::Gaussian,
         spin_fix: 10,
+        mixing_scheme: chemrust_scf::MixingScheme::Off,
     };
 
     // CPU-side psi: SpinChannelData<KptDataSet<Vec<Complex64>>>
