@@ -274,18 +274,19 @@ impl DerefMut for SpinDensity {
     }
 }
 
-/// Occupation numbers (`f_nk`) for each spin channel.
+/// Occupation numbers (`f_{b,k}`) per spin channel and per k-point.
+/// Layout matches CASTEP `occ(band, kpt, spin)`: `occs[spin][kpt][band]`.
 #[derive(Debug, Clone)]
-pub struct OccupationSet(pub SpinChannelData<Vec<f64>>);
+pub struct OccupationSet(pub SpinChannelData<Vec<Vec<f64>>>);
 
 impl OccupationSet {
-    pub fn new(value: SpinChannelData<Vec<f64>>) -> Self {
+    pub fn new(value: SpinChannelData<Vec<Vec<f64>>>) -> Self {
         Self(value)
     }
 }
 
 impl Deref for OccupationSet {
-    type Target = SpinChannelData<Vec<f64>>;
+    type Target = SpinChannelData<Vec<Vec<f64>>>;
     fn deref(&self) -> &Self::Target {
         &self.0
     }

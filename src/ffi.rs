@@ -983,7 +983,9 @@ unsafe fn step_inner(
             iz + ngz_s * (iy + ngy_s * ix)
         })
         .collect();
-    debug_assert!(
+    // OOB GPU index would corrupt the FFT silently. Assert in release too
+    // (same class as the ffi.rs fft_idx lesson, 2026-06-16 failure note).
+    assert!(
         fft_idx.iter().all(|&i| i >= 0 && (i as usize) < gs),
         "fft_idx out of range after 1→0+transpose: min={} max={} gs={gs}",
         fft_idx.iter().min().unwrap_or(&0),

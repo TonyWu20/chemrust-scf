@@ -120,7 +120,8 @@ fn gate4_nio_all_kpoints() {
         .k_points(KptDataSet::new(all_kpts, nkpts))
         .smearing(SmearingParams { width: SmearingWidth::ev(0.1),
             electron_temperature: 0.1 * chemrust_scf::EV_TO_HARTREE,
-            scheme: SmearingScheme::Gaussian, spin_fix: 6 })
+            scheme: SmearingScheme::Gaussian, spin_fix: 6,
+            mixing_scheme: chemrust_scf::MixingScheme::Off, net_spin: 0.0 })
         .max_history(8).build();
 
     let v_eff_state = scf_state.build_v_eff_with_energy().expect("V_eff");
@@ -374,7 +375,8 @@ fn gate4_cu111co_chfsi_eigenvalues() {
         .k_points(KptDataSet::new(vec![k_point], 1))
         .smearing(SmearingParams { width: SmearingWidth::ev(0.1),
             electron_temperature: 0.1 * chemrust_scf::EV_TO_HARTREE,
-            scheme: SmearingScheme::Gaussian, spin_fix: 10 })
+            scheme: SmearingScheme::Gaussian, spin_fix: 10,
+            mixing_scheme: chemrust_scf::MixingScheme::Off, net_spin: 0.0 })
         .max_history(8).build();
 
     let v_eff_state = scf_state.build_v_eff_with_energy().expect("V_eff");
@@ -608,7 +610,8 @@ fn gate5_nio_chfsi_cascade() {
         .k_points(KptDataSet::new(all_kpts, nkpts))
         .smearing(SmearingParams { width: SmearingWidth::ev(0.1),
             electron_temperature: 0.1 * chemrust_scf::EV_TO_HARTREE,
-            scheme: SmearingScheme::Gaussian, spin_fix: 6 })
+            scheme: SmearingScheme::Gaussian, spin_fix: 6,
+            mixing_scheme: chemrust_scf::MixingScheme::Off, net_spin: 0.0 })
         .max_history(8).build();
 
     let castep_band0 = bands_eigenvalues[0];

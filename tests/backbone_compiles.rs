@@ -133,6 +133,7 @@ fn backbone_compiles() {
             scheme: SmearingScheme::Gaussian,
             spin_fix: 10,
             mixing_scheme: chemrust_scf::MixingScheme::Off,
+            net_spin: 0.0,
         })
         .max_history(4)
         .build();

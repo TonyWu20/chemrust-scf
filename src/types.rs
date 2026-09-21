@@ -282,7 +282,10 @@ impl Default for KPoint {
 /// Smearing scheme for occupation-number smearing.
 #[derive(Debug, Clone, Copy, Default)]
 pub enum SmearingScheme {
-    /// Gaussian smearing (CASTEP default): occ = erfc((μ - ε) / width).
+    /// Gaussian smearing (CASTEP default).  Code: `occ = 0.5·erfc((ε − μ)/w)`
+    /// per band; CASTEP `algor_integrated_broadening` (algor.F90:2979):
+    /// `0.5·erf((μ − ε)/w) + 0.5` — algebraically identical.  `occ` is in
+    /// [0, 1] per band per spin channel.
     #[default]
     Gaussian,
     // Future: FermiDirac, MethfesselPaxton, MarzariVanderbilt.
@@ -396,6 +399,14 @@ pub struct SmearingParams {
     /// Smearing scheme (CASTEP default: Gaussian).
     #[builder(default)]
     pub scheme: SmearingScheme,
+    /// CASTEP net spin used for the fixed-spin filling targets
+    /// (electronic.f90: `local_spin` = `nup - ndown` from the input,
+    /// preserved while the spin is not free): the per-channel target
+    /// electron counts are 0.5·(N ± net_spin).  Default 0.0 means the
+    /// target is derived from the current density's net spin instead
+    /// (the non-spin behaviour).  NiO: nup − ndown = 36 − 28 = 8.
+    #[builder(default = 0.0_f64)]
+    pub net_spin: f64,
     /// CASTEP spin_fix: SCF cycle (1-based) at which spin is freed.
     /// CASTEP default: 10 (parameters.f90:1778).
     /// CASTEP frees at scf_cycle == spin_fix (1-based); our 0-based
@@ -419,6 +430,11 @@ pub struct FinalResult {
     pub density: FineDensity,
     pub eigenvalues: crate::spin_types::PerSpinEigenvalues,
     pub total_energy: f64,
+    /// True when the run reached the free-spin regime (the spin was
+    /// released at `spin_fix` and the occupations are common-Fermi).
+    /// False for non-spin runs and for runs that converged inside the
+    /// fixed-spin window.
+    pub spin_freed: bool,
 }
 
 // ---------------------------------------------------------------------------

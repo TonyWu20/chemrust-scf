@@ -1,5 +1,106 @@
 # Failure Patterns
 
+## 2026-09-03: codebase audit — the unconditional-Ok-return syndrome and friends
+
+**Scope**: audit of this crate for mindless shortcuts (the
+unconditional-`return Ok(())` syndrome), harmful YAGNI, and CASTEP
+inconsistency, checked against the lessons in this file and
+`eli5-40hr-debug-story.html` ("All parts right + whole wrong → the bug
+lives in the glue. Silent wrong paths are the hardest: they run, and
+look fine."). Full record in the workspace-root
+`notes/failure-patterns.md` (2026-09-03 audit entry).
+
+**Findings and fixes** (commits `c5bd362`, `d41fb13` on `feat/spin-mixer`):
+
+1. `unconditional-Ok-return` (the seed defect, the spin-divergence
+   Defect A below): a check prints a failure but the next statement
+   returns Ok — the check exists but has no teeth. All other
+   `return Ok(())` sites audited: each is now a guarded early return.
+2. `silent-algorithm-degradation` (again): the DIIS singular-matrix
+   fallback degraded a PULAY step to Kerker-only with no log and no
+   counter. Now logged + counted (`diis_fallback_count()`).
+3. `yagni-api-lie`: `ScfIteration::new(max_history)` accepted a DIIS
+   history cap and ignored it (hardcoded 20; callers passed 8/4).
+   Wired through `DensityHistory` (`with_max_history`, lockstep
+   eviction at the cap).
+4. `gated-feature-never-built`: the `chebyshev` feature did not compile
+   (7 errors in the feature-gated USPP-refinement block of
+   `hamiltonian.rs`), including a 16x pointer-overshoot on the
+   block-Qinv GEMM that would have corrupted results had it ever run.
+   Repaired: `cargo check --features chebyshev` passes.
+5. `truncated-data-for-now`: `OccupationSet` held only kpt-0
+   occupations ("use kpt-0 for now") — a trap for any future consumer.
+   Now per-kpt, matching CASTEP `occ(band, kpt, spin)`.
+6. `debug-assert-in-release-critical-path` (recurring): the fft_idx
+   re-encode range check in `ffi.rs` was a `debug_assert` — OOB GPU
+   indices passed silently in release. Now a release-active assert
+   (same class as the 2026-06-16 ffi.rs:604 lesson).
+7. `comment-drift` (recurring): the SmearingScheme doc had the erfc
+   sign flipped vs the code (the code matches CASTEP
+   `algor_integrated_broadening`, algor.F90:2979, algebraically);
+   the `occ_set` "used in future" comments were wrong (check() recomputes
+   occupations). Comments fixed.
+
+**Verified correct (no change)**: all `return Ok(())` early returns are
+guarded; the occupations FFI convention (per-channel target N/2, occ ∈
+[0,1]); the energy assembly (per-spin target 0.5(N±S) matches CASTEP
+`electronic_find_fermi_fix` `frac_elec`); Fortran status handling
+(io_abort on every status path); all previously-documented fixes present
+in current code.
+
+**Lesson**: audit for the pattern, not the instance. One seed defect is
+a symptom of a codebase-wide habit: checks without teeth, parameters
+without effect, features without builds. Each instance is small; the
+habit is the bug.
+
+## 2026-09-03: spin-polarised NiO SCF diverges at iter 2-3 (near-singular S-matrix)
+
+**Symptom**: The spin-polarised NiO PULAY loop (36/28 filling, 14 kpts,
+started from the CASTEP-converged state) diverges at SCF iteration 2-3. The
+per-band wavefunction S-norms drift ([diag-norms] min 0.2635 -> 0.2437), the
+down-channel density electron count drifts (28 -> 30.03), band-0 plunges to
+-80.8 Ha (the min_band0_ha = -30 gate trips), then both channels blow up.
+Non-spin NiO converges (31 cycles to -7693.4067 eV). PULAY, Kerker-pinned,
+and free-start (spin_fix = -1) all diverge identically at iter 2-3, so the
+mixer is not the cause.
+
+**Root cause**: A down-channel HOMO/LUMO degeneracy at the high-symmetry
+k-points (kpt 13/14; gap ~ 0 in the down channel vs 0.074 Ha in non-spin)
+makes the Davidson S-matrix near-singular. This triggers two latent defects in
+`s_orthonormalise` (`src/eigensolver/davidson.rs`):
+
+- Defect A (control flow): the Cholesky post-check, on FAIL, printed
+  "falling back to MGS" but the next statement was an unconditional
+  `return Ok(())`. A numerically inaccurate Cholesky factor was therefore
+  silently accepted instead of reaching the Gram-Schmidt fallback.
+- Defect B (amplifier): in the MGS fallback a near-degenerate column has a
+  post-orthogonalization S-norm ~ 0. Normalizing by `1/sqrt(~0)` inflated the
+  column into a spurious ~44-norm band (norm2 max = 43.95) that corrupted the
+  density and drove the eigenvector-rotation cascade.
+
+**Fix**: (1) Remove the unconditional `return Ok(())` so a post-check FAIL
+falls out of the Cholesky block and reaches the Gram-Schmidt fallback. (2)
+Guard the MGS Step-6 S-normalization: when the post-ortho S-norm is < 1e-30,
+zero the column instead of scaling by `1/sqrt(~0)`. Both fixes act only on the
+MGS / Cholesky-failure path, so the non-spin Cholesky-success path is
+unchanged.
+
+**Pattern**: `near-singular-cholesky-silent-accept` — a GPU Cholesky (ZPOTRF)
+can return info = 0 (success) on a near-singular matrix while producing an
+inaccurate factor. A post-check that detects the inaccuracy must actually fall
+through to the fallback; a path that prints "falling back" and then `return`s
+does not. Separately, `normalize-by-1-over-sqrt-zero` — S-normalizing a
+near-orthogonalized column by `1/sqrt(nrm^2)` without a floor produces a
+spurious huge-norm vector. Floor the divisor and zero the degenerate column.
+
+**Verification**: non-spin regression green (nio_mixer_ab PULAY arm and
+davidson_wall_bisection converge to -7693.4067 eV; the 24 CPU-logic unit
+tests pass). The PULAY spin full-loop convergence (`nio_spin_pulay_full_loop`)
+is PENDING a free GPU: the RTX PRO 5000 VRAM was fully occupied by a
+third-party process, so the CUDA context could not allocate. The two
+davidson fixes are verified by code inspection to act only on the fallback
+path; the non-spin Cholesky-success path is untouched.
+
 ## 2026-06-14: FFT plan caching breaks non-spin SCF convergence
 
 **Root cause**: `b6929d8` — caching `BatchedFftPlan3d` per kpt (`KptData.fft_plan`)
@@ -651,4 +752,119 @@ is described as intentional in comments, it becomes invisible to auditors. Every
 "intentional" design decision that differs from the reference must be accompanied
 by a verification that the reference does NOT merge those data paths before the
 point of divergence.
+
+## 2026-09-02: mixer-diis-defects-causing-pure-scf-divergence
+
+**Symptom**: The pure-Rust full SCF loop (NiO, 14 kpts, CASTEP .param Pulay scheme)
+diverged: electron count explodes 64 → 812 by iter 7–9, band-0 collapses to −150 Ha.
+Meanwhile every individually-swapped FFI component (V_eff, occupations, density,
+one-cycle mixing) matches CASTEP within noise; iter-1 eigenvalues match to 1e-4 Ha;
+CASTEP continuation from the Rust iter-2 `.check` (SLURM job 2965) converges in 91
+cycles to E-TS −7160.26995 eV. The bug is loop-level, not component-level.
+
+**Root cause (four defects in the density mixer, `src/mixing.rs` + `src/mixing/cuda_kernels.rs`)**:
+1. **Single-amplitude DIIS update.** `cpx_full_update` applies one `amp` to both the
+   DIIS density part and the Kerker part. CASTEP `dm_mix_density_pulay`
+   (dm_sub_mix.f90:815-1013) scales Δn ×1.0 and the Kerker part ×`mix_charge_amp`
+   (0.5). Fix: the kernel takes two amplitudes (`amp_k`, `amp_n`);
+   DIIS launch uses `amp_k=charge_amp, amp_n=1.0`, fallback uses `amp_k=charge_amp,
+   amp_n=0.0`.
+2. **R_curr excluded from the Kerker part.** The DIIS path passes `r_curr=zero`,
+   so the kernel acts on Σc·ΔR only. CASTEP copies `current_residual` into the
+   workspace and applies `dm_apply_kerker` to `R + Σc·ΔR`. Fix: DIIS launch passes
+   `r_dev` as `r_curr`.
+3. **`into_pulay()` zeros the history.** It runs at every Pulay iteration (via
+   `construct_density_pulay`), resetting `prev_res`/`prev_n_in`/`delta_*_history`.
+   The DIIS delta history stays empty, DIIS never activates, and the loop silently
+   runs plain Kerker — which diverges on this long-tail system. Fix:
+   `into_pulay` preserves the history across the scheme transition.
+4. **Dimensionally-wrong convergence gate.** `check()` required
+   `dens_rms < tol` with `tol = 1e-8 Ha` — an energy tolerance applied to a
+   density-quantity. CASTEP `electronic_store_energy` converges on the energy
+   window alone (`max_energy − min_energy ≤ elec_energy_tol·num_ions`).
+   Fix: convergence = `mixing_was_active && energy_converged`; RMS is
+   diagnostics-only.
+
+**Plus a Kerker q-scale bug**: q was set to 1.5 a.u. (q²=2.25) instead of
+CASTEP `mix_charge_gmax` = 1.5/Å = 2.8346 a₀⁻¹ (q²=8.035). The numeric "1.5"
+coincides across two different unit systems — a 3.6× underestimate of the
+kerker damping strength. Fix: `mix_gmax` plumbing through the builder.
+
+**Companion writer bugs** (chemrust-hamiltonian, commit `462e822` on
+`feat/expose-energy`): the `.check` continuation writer needed (a) 30-byte padding
+on the `BEGIN/END_PARAMETERS_DUMP` header records (CASTEP reads
+`character(len=30)`/`len=10`; short records abort gfortran with "I/O past end of
+record"), (b) `found_ground_state_wvfn`/`found_ground_state_den` flowing through
+`CastepBin` instead of hardcoded 1, and (c) the **second**
+`found_ground_state_den` flag between eigenvalues and fine-grid dims
+(model.f90:1520) set to false — otherwise `castep.f90:823` skips
+`electronic_minimisation` entirely. CASTEP tripped on five separate writer bugs in
+sequence (jobs 2961–2964); job 2965 converged.
+
+**Companion FFI-side patterns** (component-swap infrastructure):
+- **fortran-allocatable-dummy-cloc-null.** `c_loc()` of an `INTENT(OUT)`
+  allocatable dummy in the gfortran wrapper returns a null pointer → silent
+  `CHEM_COMP_NULL_HANDLE(4)`. Fix: local `allocatable, target` buffer plus
+  copy-back, in every MIX/DENS wrapper.
+- **ffi-arg-semantics-mismatch.** The occ hook passed `num_plane_waves_kp`
+  (n_pw=1223) where the per-kpt **band** count (`wvfn%nbands(:,ns)` ≤ 62) was
+  required → OOB slice → heap double-free. Fix: pass `nbands(:,ns)`; Rust
+  bounds-guards `nb_per_kpt[ik] > max_nb → CHEM_COMP_CUDA_ERROR`.
+- **spin-summed-factor-2.** Non-spin CASTEP `real_charge` is spin-summed;
+  the Rust per-channel density is half of it. Writeback uses ×2, the `mix_init`
+  seed uses ×0.5, and the MIX input must be `0.5*real_charge` (not the raw
+  spin-summed charge) or the density scale snowballs.
+
+**Verification**:
+- `nio_pulay_full_loop`: converges in ~31 cycles to E_total = −7693.4067 eV
+  (loop convention = CASTEP E − 533.14 eV → −7160.27 eV; ref −7160.2298);
+  electron count stable at 64.0 throughout.
+- `nio_scf_loop_converges` (`davidson_wall_bisection`, 14 kpts, max_iter=40):
+  PASS, −7693.40673831 eV.
+- `nio_iter1_eigenvalues_vs_castep`: 1.013e-4 Ha.
+- `nio_iter1_overlap_vs_castep` (new gauge-invariant subspace probe, replaces the
+  invalid single-kpt density L1 test): `Tr(P_c·P_r)/n = 0.99999997` over 62 bands.
+- CASTEP continuation from the iter-2 `.check` (job 2965): 91 cycles, E-TS
+  −7160.26995 eV.
+- Control arms (`nio_kerker_pinned_loop`, `nio_no_mix_loop`): both trip the
+  divergence gate as expected (Kerker-pinned at the V_eff-range gate ~iter 13,
+  no-mix at the electron-count gate, total_e 650.6 e⁻). Tests assert the gate
+  trip via `catch_unwind` — the expected failure is documented behavior.
+
+**Pattern**: `all-components-match-whole-loop-wrong` — when the component-swap
+matrix is all green, the bug is not in a component; it is in the loop-level
+composition (the feedback dynamics). The swap matrix proves component innocence;
+the handoff test (the reference implementation continues from our intermediate
+state and converges) proves the early pipeline is healthy; the remaining suspect
+is our own loop's iteration dynamics.
+
+**Pattern**: `silent-algorithm-degradation` — a scheme transition that resets
+state (`into_pulay` zeroing the DIIS history) makes the code run a different,
+simpler algorithm with no error. The loop ran plain Kerker believing it ran
+Pulay/DIIS. A state reset inside a hot path is a code smell: assert the state
+survives, or log which path actually executed.
+
+**Pattern**: `coincidental-numeric-unit-trap` — a numeric literal (1.5) copied
+across a unit boundary (a.u. vs 1/Å) without conversion. Re-derive every literal
+from the reference config in internal units; do not copy numbers.
+
+**Pattern**: `dimensional-convergence-gate` — applying an energy tolerance to a
+density RMS makes the gate impossible (or meaningless). The convergence criterion
+must be dimensionally consistent with the measured quantity; here the reference
+uses the energy window alone.
+
+**Pattern**: `gauge-dependent-metric-trap` — per-band wavefunction overlap
+across near-degenerate clusters is gauge-dependent and meaningless; use the
+gauge-invariant subspace alignment `Tr(P_c P_r)/n = Tr(M G_r⁻¹ M† G_c⁻¹)/n`.
+Separately: the "32.6% density L1 error" scare was our own unit-conversion
+mistake (real gate-convention error: 0.51%). Trust invariants, not scare
+numbers; re-derive the metric before believing it.
+
+**Lesson**: The evidence chain that found this: component matrix (each part
+healthy) → A/B mixing schemes (iters 1–4 identical across Kerker/Pulay/no-mix)
+→ handoff job 2965 (early pipeline healthy) → CASTEP source as spec → four
+defects → fix → `nio_pulay_full_loop` converges. Each link left a checkable
+artifact (job id, test name, number). The mixer was not the culprit at iters
+1–4; it is the culprit at iters 5+. Reproduce at the right horizon before
+declaring a component innocent.
 

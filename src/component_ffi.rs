@@ -45,6 +45,9 @@ use crate::types::{Density, KPoint, SmearingParams, SmearingWidth, WaveGridArray
 pub const CHEM_COMP_OK: c_int = 0;
 pub const CHEM_COMP_CUDA_ERROR: c_int = 3;
 pub const CHEM_COMP_NULL_HANDLE: c_int = 4;
+/// Per-channel mix hook called on a spin-polarised context: use
+/// `chemrust_comp_mix_step_couple` instead.
+pub const CHEM_COMP_BAD_ARG: c_int = 5;
 
 // ---- Handle ----------------------------------------------------------------
 
@@ -843,11 +846,14 @@ fn compute_beta_psi_per_ion(
 
 // ---- Component 3: Pulay/DIIS mixing (GPU) -----------------------------------
 
-/// Initialize the Rust mixing history.  `mixing_amp` is per spin
-/// (length nspins), `g2_cutoff` the Kerker G² mask cutoff in atomic units
+/// Initialize the Rust mixing history.  `mixing_amp` holds the CASTEP
+/// mixing amplitudes: `mixing_amp[0]` = charge amplitude
+/// (`mix_charge_amp`, NiO .param 0.5); for nspins = 2,
+/// `mixing_amp[1]` = spin amplitude (`mix_spin_amp`, NiO .param 2.0).
+/// `g2_cutoff` the Kerker G² mask cutoff in atomic units
 /// (max G² on the wave grid; 0.0 disables the mask), `dens_mixed_in` the
-/// per-spin initial mixed fine-grid density (x-fastest flat, nspins ×
-/// n_fine_points).
+/// initial mixed fine-grid density (x-fastest flat, nspins × n_fine_points):
+/// non-spin [ρ]; spin [real_charge; real_spin].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn chemrust_comp_mix_init(
     handle: *mut c_void,
@@ -898,7 +904,15 @@ fn mix_init_inner(
                 .fold(0.0f64, f64::max),
         )
     };
-    let history = match DensityHistory::<MixingOff>::with_amplitude(ctx.nspins, 0.5)
+    // Amplitudes from Fortran: mixing_amp[0] = charge (mix_charge_amp);
+    // for nspins = 2, mixing_amp[1] = spin (mix_spin_amp).
+    let nspins_init = ctx.nspins;
+    let amp_slice =
+        unsafe { std::slice::from_raw_parts(mixing_amp as *const f64, nspins_init) };
+    let amp_c = amp_slice[0];
+    let amp_s = if nspins_init == 2 { amp_slice[1] } else { 2.0 };
+
+    let history = match DensityHistory::<MixingOff>::with_charge_spin_amplitudes(nspins_init, amp_c, amp_s)
         .into_kerker(&ctx.fine_grid, g2_opt)
     {
         Ok(h) => h.into_pulay(),
@@ -907,14 +921,6 @@ fn mix_init_inner(
             return Err(CHEM_COMP_CUDA_ERROR);
         }
     };
-
-    // Per-spin amplitude from Fortran.
-    let amp_slice =
-        unsafe { std::slice::from_raw_parts(mixing_amp as *const f64, ctx.nspins) };
-    let mut history = history;
-    for (ispin, &amp) in amp_slice.iter().enumerate() {
-        history.set_mixing_amplitude(ispin, amp);
-    }
 
     // Snapshot the initial mixed density per spin (no-mix path source).
     let nspins = ctx.nspins;
@@ -970,11 +976,14 @@ fn mix_step_inner(
     if ispin >= ctx.nspins {
         return Err(CHEM_COMP_CUDA_ERROR);
     }
+    // The joint (charge, spin) history cannot be driven by per-channel
+    // calls: spin runs use chemrust_comp_mix_step_couple.
+    if ctx.nspins != 1 {
+        return Err(CHEM_COMP_BAD_ARG);
+    }
     let [ngz_f, ngy_f, ngx_f] = ctx.fine_dims;
     let n_fine = ngx_f * ngy_f * ngz_f;
 
-    // Spin-polarised callers pass a combined [rho_up; rho_dn] buffer;
-    // non-spin callers pass a single-channel buffer.
     let dens_in_base = unsafe { dens_in.add(ispin * n_fine) };
     let mixed_out_base = unsafe { mixed_out.add(ispin * n_fine) };
     let dens_vec: Vec<f64> =
@@ -988,7 +997,7 @@ fn mix_step_inner(
             // history so the pass-through stays valid.
             let last = vec![dens_vec.clone(); ctx.nspins];
             let history =
-                match DensityHistory::<MixingOff>::with_amplitude(ctx.nspins, 0.5)
+                match DensityHistory::<MixingOff>::with_charge_spin_amplitudes(ctx.nspins, 0.5, 2.0)
                     .into_kerker(
                         &ctx.fine_grid,
                         Some(
@@ -1025,7 +1034,11 @@ fn mix_step_inner(
 
     let in_arr = unflatten_f64(dens_vec.clone(), &[ngx_f, ngy_f, ngz_f]);
     let dens = Density::from_inner(WaveGridArray::from_inner(in_arr.clone()));
-    let (mixed, _snapshot) = mix_state.history.mix(dens, ispin);
+    // Zero spin object: the spin kernel path is numerically inert for
+    // nspins = 1.
+    let zero_arr = unflatten_f64(vec![0.0; n_fine], &[ngx_f, ngy_f, ngz_f]);
+    let zero_s = Density::from_inner(WaveGridArray::from_inner(zero_arr));
+    let (mixed, _mixed_s, _snap_c, _snap_s) = mix_state.history.mix(dens, zero_s);
     let mixed_arr = mixed.as_wave_array().to_owned();
 
     // Norm of the density change (diagnostic; mirrors CASTEP res_norm role).
@@ -1051,6 +1064,151 @@ fn mix_step_inner(
     }
     mix_state.last_mixed[ispin] = flat;
     write_realgrid_xfastest(mixed_arr, mixed_out_base);
+    if !res_norm_out.is_null() {
+        unsafe { *res_norm_out = res_norm };
+    }
+    Ok(())
+}
+
+/// Joint (charge, spin) mixing step for spin-polarised contexts
+/// (nspins = 2).
+///
+/// CASTEP mixes the (real_charge, real_spin) pair with one density-mixing
+/// object (`dm_mix_density` over the joint pair; charge kernel Kc with
+/// Kc(G=0)=0, spin kernel Ks with Ks(G=0)=mix_spin_amp).  This hook takes
+/// the pair, runs the joint Pulay/DIIS step, and returns the mixed pair.
+///
+/// `charge_in` / `spin_in`: CASTEP `real_charge` = ρ_up + ρ_dn and
+/// `real_spin` = ρ_up − ρ_dn on the fine grid (x-fastest flat, each
+/// n_fine_points).  `do_mix` mirrors CASTEP's `mix_density` gate: 0 keeps
+/// the previously mixed pair, 1 runs the joint step.  `res_norm_out`: norm
+/// of the charge-density change (sqrt(ΣΔ²/N); -1 when no mixing).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn chemrust_comp_mix_step_couple(
+    handle: *mut c_void,
+    charge_in: *const c_double,
+    spin_in: *const c_double,
+    do_mix: c_int,
+    charge_out: *mut c_double,
+    spin_out: *mut c_double,
+    res_norm_out: *mut c_double,
+) -> c_int {
+    match unsafe {
+        mix_step_couple_inner(
+            handle, charge_in, spin_in, do_mix, charge_out, spin_out, res_norm_out,
+        )
+    } {
+        Ok(()) => CHEM_COMP_OK,
+        Err(code) => code,
+    }
+}
+
+fn mix_step_couple_inner(
+    handle: *mut c_void,
+    charge_in: *const c_double,
+    spin_in: *const c_double,
+    do_mix: c_int,
+    charge_out: *mut c_double,
+    spin_out: *mut c_double,
+    res_norm_out: *mut c_double,
+) -> Result<(), c_int> {
+    let ctx = unsafe { (handle as *mut ComponentCtx).as_ref() }.ok_or(CHEM_COMP_NULL_HANDLE)?;
+    if ctx.nspins != 2 {
+        return Err(CHEM_COMP_BAD_ARG);
+    }
+    if charge_in.is_null()
+        || spin_in.is_null()
+        || charge_out.is_null()
+        || spin_out.is_null()
+    {
+        return Err(CHEM_COMP_NULL_HANDLE);
+    }
+    let [ngz_f, ngy_f, ngx_f] = ctx.fine_dims;
+    let n_fine = ngx_f * ngy_f * ngz_f;
+
+    let charge_vec: Vec<f64> =
+        unsafe { std::slice::from_raw_parts(charge_in as *const f64, n_fine) }.to_vec();
+    let spin_vec: Vec<f64> =
+        unsafe { std::slice::from_raw_parts(spin_in as *const f64, n_fine) }.to_vec();
+
+    let mut mix_guard = ctx.mix.lock().expect("mix lock poisoned");
+    let mix_state = match mix_guard.as_mut() {
+        Some(s) => s,
+        None => {
+            let last = vec![charge_vec.clone(), spin_vec.clone()];
+            let history =
+                match DensityHistory::<MixingOff>::with_charge_spin_amplitudes(2, 0.5, 2.0)
+                    .into_kerker(
+                        &ctx.fine_grid,
+                        Some(
+                            ctx.wave_grid
+                                .g2()
+                                .iter()
+                                .cloned()
+                                .fold(0.0f64, f64::max),
+                        ),
+                    )
+                {
+                    Ok(k) => k.into_pulay(),
+                    Err(e) => {
+                        eprintln!("[chemrust-comp] couple mix lazy init failed: {e}");
+                        return Err(CHEM_COMP_CUDA_ERROR);
+                    }
+                };
+            *mix_guard = Some(MixState { history, last_mixed: last });
+            mix_guard.as_mut().expect("just set")
+        }
+    };
+
+    if do_mix == 0 {
+        // No mixing: previous mixed pair unchanged (CASTEP behavior).
+        write_realgrid_xfastest(
+            unflatten_f64(mix_state.last_mixed[0].clone(), &[ngx_f, ngy_f, ngz_f]),
+            charge_out,
+        );
+        write_realgrid_xfastest(
+            unflatten_f64(mix_state.last_mixed[1].clone(), &[ngx_f, ngy_f, ngz_f]),
+            spin_out,
+        );
+        if !res_norm_out.is_null() {
+            unsafe { *res_norm_out = -1.0 };
+        }
+        return Ok(());
+    }
+
+    let c_arr = unflatten_f64(charge_vec.clone(), &[ngx_f, ngy_f, ngz_f]);
+    let s_arr = unflatten_f64(spin_vec.clone(), &[ngx_f, ngy_f, ngz_f]);
+    let c_dens = Density::from_inner(WaveGridArray::from_inner(c_arr));
+    let s_dens = Density::from_inner(WaveGridArray::from_inner(s_arr));
+    let (mixed_c, mixed_s, _snap_c, _snap_s) = mix_state.history.mix(c_dens, s_dens);
+    let c_mixed_arr = mixed_c.as_wave_array().to_owned();
+    let s_mixed_arr = mixed_s.as_wave_array().to_owned();
+
+    // Norm of the charge-density change (diagnostic).
+    let mut norm_sq = 0.0f64;
+    for (i, j) in c_mixed_arr.iter().zip(charge_vec.iter()) {
+        let d = i - j;
+        norm_sq += d * d;
+    }
+    let res_norm = (norm_sq / n_fine as f64).sqrt();
+
+    let flat = |arr: &ndarray::Array3<f64>| -> Vec<f64> {
+        let mut flat = vec![0.0f64; n_fine];
+        let mut idx = 0;
+        for iz in 0..ngz_f {
+            for iy in 0..ngy_f {
+                for ix in 0..ngx_f {
+                    flat[idx] = arr[[ix, iy, iz]];
+                    idx += 1;
+                }
+            }
+        }
+        flat
+    };
+    mix_state.last_mixed[0] = flat(&c_mixed_arr);
+    mix_state.last_mixed[1] = flat(&s_mixed_arr);
+    write_realgrid_xfastest(c_mixed_arr, charge_out);
+    write_realgrid_xfastest(s_mixed_arr, spin_out);
     if !res_norm_out.is_null() {
         unsafe { *res_norm_out = res_norm };
     }

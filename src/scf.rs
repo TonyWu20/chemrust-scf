@@ -247,7 +247,7 @@ impl<S: SpinPolicy> ScfIteration<S, Initialized, MixingOff> {
         /// Defaults to 1.5 /Å = 2.8346 a₀⁻¹ (CASTEP default, parameters.f90:1906).
         mix_gmax: Option<f64>,
     ) -> Self {
-        let _ = max_history; // History size is fixed internally for now
+        let max_history = max_history.max(1);
         // Upsample fixture density to fine grid so that every phase after
         // Initialized carries compile-time evidence of fine-grid data.
         let density: PerSpinFineDensity = {
@@ -299,13 +299,16 @@ impl<S: SpinPolicy> ScfIteration<S, Initialized, MixingOff> {
             )),
             v_eff: None,
             history: {
-                // CASTEP uses spin_density_mixing_amplitude=2.0 for magnetic
-                // systems (separate from mix_charge_amp=0.5).  Our per-spin
-                // density mixing approximates this by applying the spin mixing
-                // amplitude to each spin channel independently.
-                let amp = if S::nspins() > 1 { 2.0 } else { 0.5 };
+                // CASTEP .param: mix_charge_amp = 0.5, spin_density_mixing_amplitude
+                // = 2.0 (NiO input).  The joint (charge, spin) mix object uses
+                // the charge amplitude on the real_charge part and the spin
+                // amplitude on the real_spin part (Ks(G=0) = mix_spin_amp).
+                let amp_c = 0.5;
+                let amp_s = if S::nspins() > 1 { 2.0 } else { 0.0 };
                 let gmax = mix_gmax.unwrap_or(crate::mixing::kerker::KERKER_GMAX_DEFAULT);
-                DensityHistory::with_amplitude(S::nspins(), amp).with_mix_gmax(gmax)
+                DensityHistory::with_charge_spin_amplitudes(S::nspins(), amp_c, amp_s)
+                    .with_max_history(max_history)
+                    .with_mix_gmax(gmax)
             },
             previous_density,
             // CASTEP starts unmixed: do_mixing stays false until the
@@ -858,6 +861,12 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
             let grid_size_usize = veff.grid_size;
             let (_min_veff, _max_veff) = { let arr = v_eff_arr; (arr.iter().cloned().fold(f64::INFINITY, f64::min), arr.iter().cloned().fold(f64::NEG_INFINITY, f64::max)) };
 
+            // Unconditional per-spin V_eff diagnostic (spin divergence investigation).
+            eprintln!(
+                "[veff-diag] scf_iter={} spin={} v_eff_min={_min_veff:.6} v_eff_max={_max_veff:.6} range={:.6} Ha",
+                self.scf_iter, ispin, _max_veff - _min_veff
+            );
+
             // Diagnostic (spin-0 only, kpt-0 only)
             if ispin == 0 && nkpts > 0 {
                 let total_density = self.density.total();
@@ -975,6 +984,21 @@ impl<S: SpinPolicy> ScfIteration<S, VEffBuilt, MixingOff> {
                         _marker: PhantomData,
                     };
                     let eigenvalues_cpu = Cpu::new(result.eigenvalues);
+
+                    // Unconditional per-spin eigenvalue diagnostic (spin divergence investigation).
+                    // Indices 27/28 are the down-channel HOMO/LUMO (28 occ); 35/36 the
+                    // up-channel HOMO/LUMO (36 occ) for the NiO spin fixture (62 bands).
+                    {
+                        let e = &eigenvalues_cpu.0;
+                        let pick = |i: usize| e.get(i).copied().unwrap_or(f64::NAN);
+                        let e_min = e.iter().cloned().fold(f64::INFINITY, f64::min);
+                        let e_max = e.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                        eprintln!(
+                            "[spin-diag] scf_iter={} spin={} kpt={} eig_min={e_min:.6} eig_max={e_max:.6}  eig[0]={:.6} eig[27]={:.6} eig[28]={:.6} eig[35]={:.6} eig[36]={:.6} eig[last]={:.6}",
+                            self.scf_iter, ispin, ikpt,
+                            pick(0), pick(27), pick(28), pick(35), pick(36), pick(e.len().saturating_sub(1))
+                        );
+                    }
 
                     // Beta-psi recomputation per (spin,kpt)
                     let mut beta_psi_gpu: Vec<CudaSlice<CudaComplex>> = Vec::new();
@@ -1405,13 +1429,22 @@ impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated, MixingOff> {
         // Using the density that's already stored (fixture or previous iteration)
         // ensures the spin polarisation is preserved through density reconstruction.
         // CASTEP electronic.f90:8742-8746: frac_elec(1)=0.5*(N+net_spin), frac_elec(2)=0.5*(N-net_spin).
+        // When SmearingParams.net_spin is set (the input nup - ndown, e.g.
+        // NiO: 36 - 28 = 8), it takes precedence over the density-derived
+        // value: CASTEP preserves the input net_spin while the spin is not
+        // free (electronic_find_fermi_energy: `net_spin ... preserved if not
+        // spin_free`).
         let net_spin: f64 = if nspins == 2 {
-            let up_arr = self.density[0].as_fine_array();
-            let dn_arr = self.density[1].as_fine_array();
-            let n_grid = up_arr.len() as f64;
-            up_arr.iter().zip(dn_arr.iter())
-                .map(|(&u, &d)| u - d)
-                .sum::<f64>() / n_grid
+            if self.smearing.net_spin != 0.0 {
+                self.smearing.net_spin
+            } else {
+                let up_arr = self.density[0].as_fine_array();
+                let dn_arr = self.density[1].as_fine_array();
+                let n_grid = up_arr.len() as f64;
+                up_arr.iter().zip(dn_arr.iter())
+                    .map(|(&u, &d)| u - d)
+                    .sum::<f64>() / n_grid
+            }
         } else {
             0.0
         };
@@ -1437,7 +1470,7 @@ impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated, MixingOff> {
         let mut densities: Vec<Density> = Vec::with_capacity(nspins);
         let mut aug_densities: Vec<Option<chemrust_hamiltonian_core::fft::RealGrid<f64>>> =
             Vec::with_capacity(nspins);
-        let mut occs: Vec<Vec<f64>> = Vec::with_capacity(nspins);
+        let mut occs: Vec<Vec<Vec<f64>>> = Vec::with_capacity(nspins);
         let mut fermi: Vec<f64> = Vec::with_capacity(nspins);
         let nkpts = self.nkpts;
 
@@ -1446,28 +1479,22 @@ impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated, MixingOff> {
         // For multi-kpt: occupations are found with kpt weights, then density is
         // accumulated as ρ_spin = Σ_k w_k * ρ_k(ψ_k, occ_k).
 
-        // Pre-compute spin_freed occupations (shared Fermi level for both spins).
+        // Pre-compute spin_freed occupations (shared Fermi level for both
+        // spins).  CASTEP electronic_find_fermi_free: kpt-weighted bisection
+        // on a single shared μ against the TOTAL electron count.
         let spin_freed_occs: Option<(Vec<Vec<Vec<f64>>>, f64)> = if self.spin_freed && nspins == 2 {
-            let mut ev_up = Vec::new();
-            let mut ev_dn = Vec::new();
-            for ikpt in 0..nkpts {
-                ev_up.extend_from_slice(&self.eigenvalues[0][ikpt]);
-                ev_dn.extend_from_slice(&self.eigenvalues[1][ikpt]);
-            }
-            let (shared_fermi, occ_up_all, occ_dn_all, _net_spin) =
-                crate::density::find_fermi_free(
-                    &ev_up, &ev_dn, &self.smearing, n_electrons,
-                    1.0 / nspins as f64,
+            let kpt_weights: Vec<f64> = (0..nkpts)
+                .map(|ikpt| self.k_points[ikpt].weight)
+                .collect();
+            let (shared_fermi, occ_up_kpts, occ_dn_kpts) =
+                crate::density::find_fermi_free_weighted(
+                    &self.eigenvalues[0],
+                    &self.eigenvalues[1],
+                    &kpt_weights,
+                    &self.smearing,
+                    n_electrons,
+                    nspins,
                 )?;
-            // Split back per-kpt
-            let n_bands = self.n_bands;
-            let mut occ_up_kpts = Vec::with_capacity(nkpts);
-            let mut occ_dn_kpts = Vec::with_capacity(nkpts);
-            for ikpt in 0..nkpts {
-                let s = ikpt * n_bands;
-                occ_up_kpts.push(occ_up_all[s..s + n_bands].to_vec());
-                occ_dn_kpts.push(occ_dn_all[s..s + n_bands].to_vec());
-            }
             Some((vec![occ_up_kpts, occ_dn_kpts], shared_fermi))
         } else {
             None
@@ -1640,9 +1667,9 @@ impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated, MixingOff> {
 
             densities.push(new_density);
             aug_densities.push(total_aug);
-            // Flatten per-kpt occupations for OccupationSet (use kpt-0 for now;
-            // weighted occupations are tracked separately for multi-kpt in future).
-            occs.push(occupations_all_kpts[0].clone());
+            // Per-kpt occupations, CASTEP layout occ(band, kpt, spin):
+            // `occs[spin][kpt][band]`.
+            occs.push(occupations_all_kpts.clone());
             fermi.push(chem_pot.0);
         }
 
@@ -1703,6 +1730,21 @@ impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated, MixingOff> {
                 FineGridArray::from_inner(total_fine.into_inner()),
             ));
         }
+
+        // Unconditional net-spin diagnostic (spin divergence investigation):
+        // raw electron count of (rho_up - rho_dn) on the fine grid (CASTEP raw units).
+        if nspins == 2 {
+            let up_arr = combined[0].as_fine_array();
+            let dn_arr = combined[1].as_fine_array();
+            let n_grid = up_arr.len() as f64;
+            let spin_e: f64 = up_arr.iter()
+                .zip(dn_arr.iter())
+                .map(|(u, d)| u - d)
+                .sum::<f64>()
+                / n_grid;
+            eprintln!("[spin-density] net_spin_electrons(raw)=(up-dn) sum/N={spin_e:.6}");
+        }
+
         Ok(combined)
     }
 
@@ -1725,7 +1767,10 @@ impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated, MixingOff> {
         next.density = PerSpinFineDensity(SpinChannelData::new::<S>(combined_density));
         next.density_aug_fine = PerSpinAugDensity(SpinChannelData::new::<S>(vec![None; S::nspins()]));
         next.fermi_energy = fermi_energies;
-        let _ = occ_set; // Used in future for energy computation
+        // `occ_set` is intentionally dropped: the energy assembly in `check()`
+        // recomputes occupations from the eigenvalues (CASTEP does the same;
+        // the density path needs no band-energy term).
+        let _ = occ_set;
         Ok(next)
     }
 
@@ -1751,6 +1796,8 @@ impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated, MixingOff> {
         // causing catastrophic density corruption at the first Kerker iteration.
         let wave_g2_max = self.wave_grid.g2().iter().cloned().fold(0.0_f64, f64::max);
         let kerker_history = self.history.into_kerker(&self.fine_grid, Some(wave_g2_max))?;
+        // `occ_set` is intentionally dropped: the energy assembly in `check()`
+        // recomputes occupations from the eigenvalues.
         let _ = occ_set;
         Ok(ScfIteration {
             cell: self.cell,
@@ -1869,18 +1916,135 @@ impl<S: SpinPolicy> ScfIteration<S, WavefunctionsUpdated, MixingOff> {
 // `ScfIteration<S, Mixed, MixingOff>` so the `run_scf` dispatch arms
 // agree on a single type.
 
+/// Joint (charge, spin) mix step (CASTEP `dm_mix_density` over the
+/// (real_charge, real_spin) pair).
+///
+/// For SpinCollinear: `c = ρ_up + ρ_dn` (CASTEP real_charge),
+/// `s = ρ_up − ρ_dn` (CASTEP real_spin).  The mixed pair is converted
+/// back to channels `n_up = ½(c+s)`, `n_dn = ½(c−s)`.  For non-spin,
+/// `c` is the single density and `s` is identically zero (the spin
+/// kernel path is numerically inert).
+fn mix_joint_pair(
+    history: &mut impl JointMix,
+    density: &PerSpinFineDensity,
+    nspins: usize,
+) -> (Vec<FineDensity>, Vec<FineDensity>) {
+    let (mixed, prev): (Vec<Density>, Vec<Density>) = if nspins == 2 {
+        let up = density[0].to_density();
+        let dn = density[1].to_density();
+        let c = up.clone() + dn.clone();
+        let s = up - dn;
+        let (mc, ms, c_snap, s_snap) = history.mix_c_s(c, s);
+        (
+            vec![(mc.clone() + ms.clone()) * 0.5, (mc - ms) * 0.5],
+            vec![(c_snap.clone() + s_snap.clone()) * 0.5, (c_snap - s_snap) * 0.5],
+        )
+    } else {
+        let c = density[0].to_density();
+        let s = c.clone() - c.clone(); // zero density, correct shape
+        let (mc, _ms, c_snap, _s_snap) = history.mix_c_s(c, s);
+        (vec![mc], vec![c_snap])
+    };
+    let mixed_fine = mixed.into_iter().map(|d| d.into_fine()).collect();
+    let prev_fine = prev.into_iter().map(|d| d.into_fine()).collect();
+    (mixed_fine, prev_fine)
+}
+
+/// The joint (c, s) mix entry point, shared by all three history phases
+/// so the SCF loop stays phase-agnostic.
+pub(crate) trait JointMix {
+    fn mix_c_s(
+        &mut self,
+        c: Density,
+        s: Density,
+    ) -> (Density, Density, Density, Density);
+}
+
+impl JointMix for crate::mixing::DensityHistory<crate::mixing::MixingOff> {
+    fn mix_c_s(
+        &mut self,
+        c: Density,
+        s: Density,
+    ) -> (Density, Density, Density, Density) {
+        self.mix(c, s)
+    }
+}
+
+impl JointMix for crate::mixing::DensityHistory<crate::mixing::Kerker> {
+    fn mix_c_s(
+        &mut self,
+        c: Density,
+        s: Density,
+    ) -> (Density, Density, Density, Density) {
+        self.mix(c, s)
+    }
+}
+
+impl JointMix for crate::mixing::DensityHistory<crate::mixing::Pulay> {
+    fn mix_c_s(
+        &mut self,
+        c: Density,
+        s: Density,
+    ) -> (Density, Density, Density, Density) {
+        self.mix(c, s)
+    }
+}
+
+/// CASTEP electronic.f90:646-656 — the spin-release step.
+///
+/// At `scf_cycle == spin_fix` (after that cycle's mixing) CASTEP:
+///
+/// 1. sets `spin_freed = .true.` (occupations become common-Fermi from
+///    the next cycle on);
+/// 2. `dm_flush_history()` — releases the density/residual delta history;
+/// 3. `dm_mix_density(dens, dens)` — re-seeds the mix object with the
+///    current (charge, spin) pair as the new `current_density_in`;
+/// 4. the convergence gate stays closed for this cycle (the wavefunctions
+///    have not relaxed under the free occupations yet, electronic.f90:
+///    988-998).
+///
+/// The mixing scheme itself is unchanged (a pinned PULAY run keeps
+/// mixing PULAY from the next cycle on).
+fn spin_release_hook<S: SpinPolicy>(
+    nspins: usize,
+    scf_iter: usize,
+    spin_fix: i32,
+    spin_freed: bool,
+    mixed: &mut ScfIteration<S, Mixed, MixingOff>,
+) -> Result<(), Error> {
+    if nspins == 1 || spin_fix < 0 {
+        return Ok(());
+    }
+    if scf_iter as i32 != spin_fix || spin_freed {
+        return Ok(());
+    }
+    eprintln!(
+        "[chemrust] spin_fix iterations done -- freeing spin (iter {})",
+        scf_iter
+    );
+    let (c, s) = if nspins == 2 {
+        let up = mixed.density[0].to_density();
+        let dn = mixed.density[1].to_density();
+        (up.clone() + dn.clone(), up - dn)
+    } else {
+        let c = mixed.density[0].to_density();
+        (c.clone(), c.clone() - c.clone())
+    };
+    // No-op when the history never left the pure-Off path (no mix object
+    // exists to flush; CASTEP flushes only inside `if(metals_method=='DM')`).
+    if mixed.history.has_gpu_state() {
+        mixed.history.flush();
+        mixed.history.seed_inplace(&c, &s)?;
+    }
+    Ok(())
+}
+
 impl<S: SpinPolicy> ScfIteration<S, DensityUpdated<MixingOff>, MixingOff> {
     /// Mix with phase `Off`: pass-through, no active mixing.
     #[allow(unused_mut)]
     pub fn mix(mut self) -> ScfIteration<S, Mixed, MixingOff> {
         let nspins = S::nspins();
-        let mut densities = Vec::with_capacity(nspins);
-        let mut prev_densities = Vec::with_capacity(nspins);
-        for ispin in 0..nspins {
-            let (mixed, prev) = self.history.mix(self.density[ispin].to_density(), ispin);
-            densities.push(mixed.into_fine());
-            prev_densities.push(prev.into_fine());
-        }
+        let (densities, prev_densities) = mix_joint_pair(&mut self.history, &self.density, nspins);
         let history_off = self.history.into_off();
         ScfIteration {
             cell: self.cell,
@@ -1930,13 +2094,7 @@ impl<S: SpinPolicy> ScfIteration<S, DensityUpdated<Kerker>, Kerker> {
     /// Mix with Kerker preconditioning.
     pub fn mix(mut self) -> ScfIteration<S, Mixed, MixingOff> {
         let nspins = S::nspins();
-        let mut densities = Vec::with_capacity(nspins);
-        let mut prev_densities = Vec::with_capacity(nspins);
-        for ispin in 0..nspins {
-            let (mixed, prev) = self.history.mix(self.density[ispin].to_density(), ispin);
-            densities.push(mixed.into_fine());
-            prev_densities.push(prev.into_fine());
-        }
+        let (densities, prev_densities) = mix_joint_pair(&mut self.history, &self.density, nspins);
         let history_off = self.history.into_off();
         ScfIteration {
             cell: self.cell,
@@ -1986,13 +2144,7 @@ impl<S: SpinPolicy> ScfIteration<S, DensityUpdated<Pulay>, Pulay> {
     /// Mix with Pulay / DIIS.
     pub fn mix(mut self) -> ScfIteration<S, Mixed, MixingOff> {
         let nspins = S::nspins();
-        let mut densities = Vec::with_capacity(nspins);
-        let mut prev_densities = Vec::with_capacity(nspins);
-        for ispin in 0..nspins {
-            let (mixed, prev) = self.history.mix(self.density[ispin].to_density(), ispin);
-            densities.push(mixed.into_fine());
-            prev_densities.push(prev.into_fine());
-        }
+        let (densities, prev_densities) = mix_joint_pair(&mut self.history, &self.density, nspins);
         let history_off = self.history.into_off();
         ScfIteration {
             cell: self.cell,
@@ -2096,14 +2248,19 @@ impl<S: SpinPolicy> ScfIteration<S, Mixed, MixingOff> {
 
         // Per-spin electron counts from integrated spin density.
         // CASTEP electronic.f90:8742-8746: frac_elec(1)=0.5*(N+net_spin),
-        // frac_elec(2)=0.5*(N-net_spin).
+        // frac_elec(2)=0.5*(N-net_spin).  A non-zero SmearingParams.net_spin
+        // (input nup - ndown) takes precedence over the density-derived value.
         let net_spin: f64 = if nspins == 2 {
-            let up_arr = self.density[0].as_fine_array();
-            let dn_arr = self.density[1].as_fine_array();
-            let n_grid = up_arr.len() as f64;
-            up_arr.iter().zip(dn_arr.iter())
-                .map(|(&u, &d)| u - d)
-                .sum::<f64>() / n_grid
+            if self.smearing.net_spin != 0.0 {
+                self.smearing.net_spin
+            } else {
+                let up_arr = self.density[0].as_fine_array();
+                let dn_arr = self.density[1].as_fine_array();
+                let n_grid = up_arr.len() as f64;
+                up_arr.iter().zip(dn_arr.iter())
+                    .map(|(&u, &d)| u - d)
+                    .sum::<f64>() / n_grid
+            }
         } else {
             0.0
         };
@@ -2113,26 +2270,21 @@ impl<S: SpinPolicy> ScfIteration<S, Mixed, MixingOff> {
             0.5 * (n_electrons + net_spin), 0.5 * (n_electrons - net_spin));
 
         // Pre-compute spin_freed occupations for check() when spin is freed.
+        // CASTEP electronic_find_fermi_free: kpt-weighted bisection on a
+        // single shared μ against the TOTAL electron count.
         let spin_freed_occs: Option<(Vec<Vec<Vec<f64>>>, f64)> = if self.spin_freed && nspins == 2 {
-            let mut ev_up = Vec::new();
-            let mut ev_dn = Vec::new();
-            for ikpt in 0..nkpts {
-                ev_up.extend_from_slice(&self.eigenvalues[0][ikpt]);
-                ev_dn.extend_from_slice(&self.eigenvalues[1][ikpt]);
-            }
-            let (shared_fermi, occ_up_all, occ_dn_all, _net_spin) =
-                crate::density::find_fermi_free(
-                    &ev_up, &ev_dn, &self.smearing, n_electrons,
-                    1.0 / nspins as f64,
+            let kpt_weights: Vec<f64> = (0..nkpts)
+                .map(|ikpt| self.k_points[ikpt].weight)
+                .collect();
+            let (shared_fermi, occ_up_kpts, occ_dn_kpts) =
+                crate::density::find_fermi_free_weighted(
+                    &self.eigenvalues[0],
+                    &self.eigenvalues[1],
+                    &kpt_weights,
+                    &self.smearing,
+                    n_electrons,
+                    nspins,
                 )?;
-            let n_bands = self.n_bands;
-            let mut occ_up_kpts = Vec::with_capacity(nkpts);
-            let mut occ_dn_kpts = Vec::with_capacity(nkpts);
-            for ikpt in 0..nkpts {
-                let s = ikpt * n_bands;
-                occ_up_kpts.push(occ_up_all[s..s + n_bands].to_vec());
-                occ_dn_kpts.push(occ_dn_all[s..s + n_bands].to_vec());
-            }
             Some((vec![occ_up_kpts, occ_dn_kpts], shared_fermi))
         } else {
             None
@@ -2307,7 +2459,14 @@ impl<S: SpinPolicy> ScfIteration<S, Mixed, MixingOff> {
         // elec_energy_tol*num_ions).  The density RMS is not a convergence
         // criterion in CASTEP; it only gates the start of mixing.  Keep the
         // RMS computation for diagnostics only.
-        if mixing_was_active && energy_converged {
+        // CASTEP electronic.f90:988-998 — spin release gate: convergence is
+        // not accepted while the spin is still fixed, nor on the release
+        // cycle itself (the wavefunctions have not yet relaxed under the
+        // free occupations).
+        let spin_gate_blocked = S::nspins() == 2
+            && self.smearing.spin_fix >= 0
+            && (!self.spin_freed || self.scf_iter as i32 == self.smearing.spin_fix);
+        if mixing_was_active && energy_converged && !spin_gate_blocked {
             Ok(CheckOutcome::Converged(self.into_phase()))
         } else {
             Ok(CheckOutcome::NotConverged {
@@ -2329,6 +2488,7 @@ impl<S: SpinPolicy> ScfIteration<S, Converged, MixingOff> {
             density: self.density.total(),
             eigenvalues: self.eigenvalues,
             total_energy: self.total_energy.unwrap_or(f64::NAN),
+            spin_freed: self.spin_freed,
         }
     }
 }
@@ -2351,34 +2511,29 @@ pub fn run_scf<S: SpinPolicy + BuildVEff>(
     let mut state = state;
     loop {
         state.scf_iter += 1;
-        // CASTEP electronic.f90:516-518 — spin freed at scf_cycle == spin_fix
-        // where scf_cycle is 1-based.  Our scf_iter is 0-based, so the
-        // transition point is scf_iter == spin_fix - 1.
-        // CASTEP electronic.f90:315,621 — the spin-free transition is
-        // gated on `spin_polarised`: non-spin runs never apply spin_fix.
-        if S::nspins() > 1 && state.smearing.spin_fix >= 0 && !state.spin_freed {
-            if state.scf_iter as i32 >= state.smearing.spin_fix - 1 {
-                state.spin_freed = true;
-                eprintln!("[chemrust] spin_fix iterations done -- freeing spin (iter {})", state.scf_iter);
-            }
-            if state.scf_iter as i32 == state.smearing.spin_fix - 1 {
-                let amp = if S::nspins() > 1 { 2.0 } else { 0.5 };
-                let gmax = state.history.mix_gmax;
-                state.history = crate::mixing::DensityHistory::with_amplitude(S::nspins(), amp)
-                    .with_mix_gmax(gmax);
-                state.next_mixing = MixingPhaseKind::Off;
-            }
+        // CASTEP electronic.f90:339-341 — the spin-free flag is set at the
+        // start of cycle t (1-based) when t >= spin_fix.  The occupation
+        // step of cycle t feeds the diagonalization of cycle t+1, so the
+        // diagonalization of our iteration t uses free occupations when
+        // t > spin_fix (CASTEP: from cycle spin_fix + 1).
+        if S::nspins() > 1 && state.smearing.spin_fix >= 0 {
+            state.spin_freed =
+                state.spin_freed || state.scf_iter as i32 > state.smearing.spin_fix;
         }
         state = {
+            let iter = state.scf_iter;
+            let spin_fix = state.smearing.spin_fix;
+            let spin_freed = state.spin_freed;
             let v_eff = state.build_v_eff()?;
             let wfn = v_eff.diagonalize(ndeg, None)?;
 
             // Dispatch mixing phase at runtime
-            let mixed = match wfn.next_mixing {
+            let mut mixed = match wfn.next_mixing {
                 MixingPhaseKind::Off => wfn.construct_density_off()?.mix(),
                 MixingPhaseKind::Kerker => wfn.construct_density_kerker()?.mix(),
                 MixingPhaseKind::Pulay => wfn.construct_density_pulay()?.mix(),
             };
+            spin_release_hook(S::nspins(), iter, spin_fix, spin_freed, &mut mixed)?;
 
             match mixed.check(tol)? {
                 CheckOutcome::Converged(converged) => return Ok(converged.finalize()),
@@ -2505,25 +2660,17 @@ pub fn run_scf_with_energy_gated<S: SpinPolicy + BuildVEffWithEnergy>(
     let mut iter1_soft_fraction: Option<f64> = None;
     loop {
         state.scf_iter += 1;
-        // CASTEP electronic.f90:516-518 — spin freed at scf_cycle == spin_fix
-        // where scf_cycle is 1-based.  Our scf_iter is 0-based, so the
-        // transition point is scf_iter == spin_fix - 1.
-        // CASTEP electronic.f90:315,621 — the spin-free transition is
-        // gated on `spin_polarised`: non-spin runs never apply spin_fix.
-        if S::nspins() > 1 && state.smearing.spin_fix >= 0 && !state.spin_freed {
-            if state.scf_iter as i32 >= state.smearing.spin_fix - 1 {
-                state.spin_freed = true;
-                eprintln!("[chemrust] spin_fix iterations done -- freeing spin (iter {})", state.scf_iter);
-            }
-            if state.scf_iter as i32 == state.smearing.spin_fix - 1 {
-                let amp = if S::nspins() > 1 { 2.0 } else { 0.5 };
-                let gmax = state.history.mix_gmax;
-                state.history = crate::mixing::DensityHistory::with_amplitude(S::nspins(), amp)
-                    .with_mix_gmax(gmax);
-                state.next_mixing = MixingPhaseKind::Off;
-            }
+        // CASTEP electronic.f90:339-341 — the spin-free flag is set at the
+        // start of cycle t (1-based) when t >= spin_fix; the diagonalize
+        // of iteration t uses free occupations when t > spin_fix.
+        if S::nspins() > 1 && state.smearing.spin_fix >= 0 {
+            state.spin_freed =
+                state.spin_freed || state.scf_iter as i32 > state.smearing.spin_fix;
         }
         state = {
+            let iter = state.scf_iter;
+            let spin_fix = state.smearing.spin_fix;
+            let spin_freed = state.spin_freed;
             let v_eff = state.build_v_eff_with_energy()?;
 
             // Sample V_eff range BEFORE moving v_eff into diagonalize, so we
@@ -2546,11 +2693,12 @@ pub fn run_scf_with_energy_gated<S: SpinPolicy + BuildVEffWithEnergy>(
             let last_band_now = wfn.eigenvalues().last().copied();
 
             // Dispatch mixing phase at runtime
-            let mixed = match wfn.next_mixing {
+            let mut mixed = match wfn.next_mixing {
                 MixingPhaseKind::Off => wfn.construct_density_off()?.mix(),
                 MixingPhaseKind::Kerker => wfn.construct_density_kerker()?.mix(),
                 MixingPhaseKind::Pulay => wfn.construct_density_pulay()?.mix(),
             };
+            spin_release_hook(S::nspins(), iter, spin_fix, spin_freed, &mut mixed)?;
 
             match mixed.check(tol)? {
                 CheckOutcome::Converged(converged) => {

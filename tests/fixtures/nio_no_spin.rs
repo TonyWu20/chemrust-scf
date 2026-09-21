@@ -172,6 +172,7 @@ pub fn build_scf_state_with_scheme(
         scheme: SmearingScheme::Gaussian,
         spin_fix: -1,
         mixing_scheme: scheme,
+        net_spin: 0.0,
     };
 
     // CASTEP .param: mix_charge_gmax = 1.5 1/ang (a₀⁻¹) — Kerker kernel
@@ -306,6 +307,7 @@ pub fn build_scf_state_all_kpts_with_scheme(
         scheme: SmearingScheme::Gaussian,
         spin_fix: -1,
         mixing_scheme: scheme,
+        net_spin: 0.0,
     };
 
     // CASTEP .param: mix_charge_gmax = 1.5 1/ang; 1 /Å = 1.88972612545 a₀⁻¹.

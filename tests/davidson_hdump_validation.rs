@@ -315,6 +315,7 @@ fn davidson_hdump_validation() {
         scheme: SmearingScheme::Gaussian,
         spin_fix: 10,
         mixing_scheme: chemrust_scf::MixingScheme::Off,
+        net_spin: 0.0,
     };
 
     // Clone before moving into builder (needed for CPU V_loc diagnostic below)
