@@ -29,3 +29,5 @@
 
 # generated CASTEP continuation checkpoint (scf_diag discriminator)
 chemrust_iter2.check
+# rushi's sessions dir
+sessions
