@@ -129,5 +129,9 @@ expansion with per-band degree differentiation.
 
 - [ ] Investigate Chebyshev recurrence corruption of unlocked bands (or RR propagation)
 - [ ] Fix cold start (LCAO initial guess, Davidson fallback that works, or iterative degree increase)
+- [ ] Run the new pure-Rust cold-start test on nixos-2 (GTX 1080 Ti, 11 GB):
+      `cargo test --release --test cu111_co_cold_start -- --ignored`
+      (seeded random guess + zero density, Davidson default, `.bands` comparison;
+      see the test doc header for env overrides and VRAM notes)
 - [ ] Clean up verbose diagnostics once unoccupied band issue is resolved
 - [ ] Test NiO cold/warm start with all fixes
