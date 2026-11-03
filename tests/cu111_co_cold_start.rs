@@ -10,13 +10,19 @@
 //!
 //! - Initial wavefunctions: empty-orbital guess (band i = the i-th
 //!   lowest-kinetic-energy plane wave), the standard plane-wave cold start.
-//!   It is stable under the TPA preconditioner. A seeded random guess is
-//!   available behind `CHEMRUST_COLD_GUESS=random` (StdRng, seed `0xC0FFEE`
-//!   default) but is known to explode on cold start (TPA under-damping).
-//!   CASTEP's LCAO init is unavailable in pure Rust.
-//! - Initial density: zero. The first V_eff is therefore the ionic potential
-//!   only (zero-charge Hartree, PBE XC of zero charge is well guarded).
-//!   The loop builds the physical density from the first diagonalization.
+//!   A seeded random guess is available behind `CHEMRUST_COLD_GUESS=random`
+//!   (StdRng, seed `0xC0FFEE` default) but is a diagnostic only: a random
+//!   subspace corrupts the TPA preconditioner (cascade to ~-170 Ha, below
+//!   the H0 floor).
+//! - Initial density: zero. The first V_eff is therefore the bare ionic
+//!   potential (zero-charge Hartree, PBE XC of zero charge is well guarded).
+//!   This is stricter than CASTEP's own LCAO cold start, which initialises
+//!   from an atomic superposition density. The bare-ionic Hamiltonian
+//!   H0 = T + V_ion carries deep ionic-well states (~-40 Ha on this
+//!   fixture), so the iteration-1 empty-band blocks chase those states
+//!   ([Diag-PreconEig] drift, bounded by the H0 spectrum floor). The loop
+//!   builds the physical density from the first diagonalization, and the
+//!   CASTEP Pulay mixing parameters damp the recovery.
 //! - Eigensolver: Davidson (the default). The Chebyshev cold start is known
 //!   to overflow on pass 2 (HANDOFF.md "Pending: fix cold start"). To force
 //!   the Chebyshev path anyway, run with `CHEMRUST_EIGENSOLVER=chebyshev`.
@@ -271,9 +277,11 @@ fn cu111_co_h_cold_start_vs_bands() {
 
     // -------------------------------------------------------------------
     // Cold-start initial state: empty-orbital psi (default), zero density.
-    // The empty-orbital guess is the standard plane-wave cold start and is
-    // stable under the TPA preconditioner. A random guess is kept as a
-    // diagnostic (CHEMRUST_COLD_GUESS=random) but is known to explode.
+    // The empty-orbital guess is the standard plane-wave cold start. Its
+    // iteration-1 high-band blocks chase the bare-ionic H0 well states
+    // (bounded Ritz drift, not the random-guess corruption). A random
+    // guess is kept as a diagnostic (CHEMRUST_COLD_GUESS=random) and is
+    // known to corrupt the TPA solve.
     // -------------------------------------------------------------------
     let seed: u64 = std::env::var("CHEMRUST_COLD_SEED")
         .ok()

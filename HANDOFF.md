@@ -131,22 +131,31 @@ expansion with per-band degree differentiation.
 - [ ] Fix cold start (LCAO initial guess, Davidson fallback that works, or iterative degree increase)
 - [ ] Run the new pure-Rust cold-start test on nixos-2 (GTX 1080 Ti, 11 GB):
       `cargo test --release --test cu111_co_cold_start -- --ignored`
-      (seeded random guess + zero density, Davidson default, `.bands` comparison;
-      see the test doc header for env overrides and VRAM notes)
-- [ ] nixos-2 (Pascal sm_61) hit CUDA_ERROR_INVALID_PTX: the NVRTC arch was
+      (empty-orbital guess + zero density, Davidson default, `.bands`
+      comparison; see the test doc header for env overrides and VRAM notes)
+- [x] nixos-2 (Pascal sm_61) hit CUDA_ERROR_INVALID_PTX: the NVRTC arch was
       hardcoded to `sm_120` (Blackwell dev box) in 4 kernel-compile sites.
-      Fixed: `CHEMRUST_NVRTC_ARCH` env override, portable default (NVRTC-default
-      PTX, JITs anywhere). The RTX PRO 5000 box must export
-      `CHEMRUST_NVRTC_ARCH=sm_120` to keep the native target. Re-pull and
-      re-run the cold-start test on nixos-2.
-- [ ] Cold-start random guess explodes: TPA under-damping (mean-ek estimate
-      poor on a random subspace; davidson.rs "cold-start" comments). Observed
-      on nixos-2: iteration-1 Davidson [Diag-PreconEig] cascades to ~-170 Ha
-      before the gate can help. The cold-start test now defaults to an
-      empty-orbital guess (band i = i-th lowest-kinetic-energy plane wave),
-      which is the standard plane-wave cold start. Random remains behind
-      `CHEMRUST_COLD_GUESS=random` for diagnosis. If empty-orbital also
-      cascades, the next step is damping the TPA preconditioner on cold
-      start (HANDOFF "Davidson fallback that works").
+      Fixed in `93edcfe`: `CHEMRUST_NVRTC_ARCH` env override, portable default
+      (NVRTC-default PTX, JITs anywhere). The RTX PRO 5000 box must export
+      `CHEMRUST_NVRTC_ARCH=sm_120` to keep the native target. Pulled on
+      nixos-2; the PTX error is gone.
+- [ ] Cold-start initial-guess findings (nixos-2, GTX 1080 Ti):
+      - `CHEMRUST_COLD_GUESS=random` corrupts the solve: iteration-1
+        Davidson [Diag-PreconEig] cascades to ~-170 Ha, below the bare-ionic
+        H0 spectrum floor — TPA under-damping / rank deficiency on a random
+        subspace. Diagnostic only.
+      - Default empty-orbital guess (band i = i-th lowest-kinetic-energy PW)
+        with zero density: the iteration-1 high-band blocks are NOT
+        corrupted; their [Diag-PreconEig] Ritz values converge (bounded,
+        ~-50 Ha observed at inner iter 9) to the deep ionic-well states of
+        the bare-ionic Hamiltonian H0 = T + V_ion (fine-grid V_ion min =
+        -35 Ha). This is bare-ionic physics, stricter than CASTEP's LCAO
+        cold start (which initialises from an atomic superposition density).
+        Full run in progress; if the SCF fixed point recovers through
+        Pulay mixing, the zero-density cold start passes as-is.
+      - Escalation if the full run fails: Gaussian LCAO local-orbital
+        initial wavefunctions (per-ion s/p/d Gaussians in the PW basis, the
+        pure-Rust mirror of CASTEP's LCAO init) plus a Gaussian ionic
+        initial density.
 - [ ] Clean up verbose diagnostics once unoccupied band issue is resolved
 - [ ] Test NiO cold/warm start with all fixes
