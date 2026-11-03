@@ -23,7 +23,6 @@ use cudarc::driver::{
     PushKernelArg,
 };
 use cudarc::nvrtc::compile_ptx_with_opts;
-use cudarc::nvrtc::CompileOptions;
 use faer::linalg::solvers::{DenseSolveCore, Llt, PartialPivLu};
 use faer::mat::Mat;
 use faer::Side;
@@ -494,7 +493,7 @@ pub struct TpaPreconditioner {
 impl TpaPreconditioner {
     /// Compile the TPA-apply CUDA kernels via NVRTC.
     pub fn new(ctx: &Arc<CudaContext>) -> Result<Self, Error> {
-        let opts = CompileOptions { arch: Some("sm_120"), ..Default::default() };
+        let opts = crate::device::nvrtc_compile_opts();
         let ptx = compile_ptx_with_opts(TPA_APPLY_KERNEL, opts).map_err(|e| Error::Nvrtc(e.to_string()))?;
         let module: Arc<CudaModule> = ctx.load_module(ptx).map_err(Error::Cuda)?;
         let kernel_residual = module

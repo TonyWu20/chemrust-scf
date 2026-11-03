@@ -6,7 +6,6 @@ use std::sync::Arc;
 
 use cudarc::driver::{CudaContext, CudaFunction, CudaModule};
 use cudarc::nvrtc::compile_ptx_with_opts;
-use cudarc::nvrtc::CompileOptions;
 
 use crate::types::Error;
 
@@ -335,16 +334,12 @@ impl CudaKernelSet {
     #[doc(hidden)]
     pub fn new(ctx: &Arc<CudaContext>) -> Result<Self, Error> {
         // NVRTC (CUDA 12.9) has no -O flag; optimization is fixed. The
-        // arch flag selects the code target:
-        //   "sm_120"  -> native Blackwell SASS, no JIT (RTX PRO 5000).
-        //                Use "compute_61" (PTX) to keep Pascal GPUs
-        //                runnable; omit it entirely for max portability
-        //                (NVRTC default emits PTX targeting sm_52).
-        const NVRTC_GPU_ARCH: &str = "sm_120";
-        let opts = CompileOptions {
-            arch: Some(NVRTC_GPU_ARCH),
-            ..Default::default()
-        };
+        // arch target is resolved from CHEMRUST_NVRTC_ARCH (nvrtc_compile_opts).
+        // Default: omit -> NVRTC emits PTX targeting sm_52, which the
+        // driver JITs on any modern GPU (Pascal sm_61 through Blackwell).
+        // Set CHEMRUST_NVRTC_ARCH=sm_120 on the RTX PRO 5000 dev box for
+        // a native Blackwell target.
+        let opts = crate::device::nvrtc_compile_opts();
         let ptx = compile_ptx_with_opts(CUDA_KERNEL_SRC, opts).map_err(|e| Error::Nvrtc(e.to_string()))?;
         let module: Arc<CudaModule> = ctx.load_module(ptx).map_err(Error::Cuda)?;
         let load = |name: &str| -> Result<CudaFunction, Error> {

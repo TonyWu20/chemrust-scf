@@ -35,7 +35,6 @@ use cudarc::cublas::sys::{
 use cudarc::cusolver::sys::{cublasFillMode_t, cusolverEigMode_t};
 use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DevicePtr, DevicePtrMut, LaunchConfig, PushKernelArg};
 use cudarc::nvrtc::compile_ptx_with_opts;
-use cudarc::nvrtc::CompileOptions;
 
 use crate::device::blas::{op, BlasHandle, ZgemmConfig};
 use crate::device::fft::BatchedFftPlan3d;
@@ -808,7 +807,7 @@ fn compute_band_kinetic_energies(
     stream: &Arc<CudaStream>,
     ctx: &Arc<CudaContext>,
 ) -> Result<Vec<f64>, Error> {
-    let opts = CompileOptions { arch: Some("sm_120"), ..Default::default() };
+    let opts = crate::device::nvrtc_compile_opts();
     let ptx = compile_ptx_with_opts(BAND_EK_KERNEL, opts).map_err(|e| Error::Nvrtc(e.to_string()))?;
     let module = ctx.load_module(ptx).map_err(Error::Cuda)?;
     let kernel = module.load_function("band_ek").map_err(Error::Cuda)?;

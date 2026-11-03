@@ -45,6 +45,10 @@
 //! - `CHEMRUST_COLD_SEED`   — initial-guess seed (u64 decimal)
 //! - `CHEMRUST_COLD_TOL_HA` — energy-window convergence tolerance, Hartree
 //! - `CHEMRUST_COLD_MAX_ITER` — iteration ceiling for the divergence gate
+//! - `CHEMRUST_NVRTC_ARCH` — NVRTC kernel target arch. Unset (portable
+//!   default: NVRTC-default PTX, JITs on any modern GPU incl. Pascal
+//!   sm_61). Set `sm_120` on the Blackwell dev box (RTX PRO 5000).
+//!   A hardcoded `sm_120` fails on Pascal with CUDA_ERROR_INVALID_PTX.
 //! - `CASTEP_FIXTURE_DIR` / `CASTEP_POTENTIAL_DIR` — fixture locations
 
 use std::sync::Arc;

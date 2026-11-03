@@ -133,5 +133,11 @@ expansion with per-band degree differentiation.
       `cargo test --release --test cu111_co_cold_start -- --ignored`
       (seeded random guess + zero density, Davidson default, `.bands` comparison;
       see the test doc header for env overrides and VRAM notes)
+- [ ] nixos-2 (Pascal sm_61) hit CUDA_ERROR_INVALID_PTX: the NVRTC arch was
+      hardcoded to `sm_120` (Blackwell dev box) in 4 kernel-compile sites.
+      Fixed: `CHEMRUST_NVRTC_ARCH` env override, portable default (NVRTC-default
+      PTX, JITs anywhere). The RTX PRO 5000 box must export
+      `CHEMRUST_NVRTC_ARCH=sm_120` to keep the native target. Re-pull and
+      re-run the cold-start test on nixos-2.
 - [ ] Clean up verbose diagnostics once unoccupied band issue is resolved
 - [ ] Test NiO cold/warm start with all fixes

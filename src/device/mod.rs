@@ -9,6 +9,7 @@ use std::sync::Arc;
 use cudarc::driver::{
     result::DriverError, CudaContext, CudaSlice, CudaStream, DeviceRepr, ValidAsZeroBits,
 };
+use cudarc::nvrtc::CompileOptions;
 use ndarray::Array3;
 use num_complex::Complex64;
 
@@ -28,6 +29,36 @@ pub use cudarc::cufft::sys::double2 as CudaComplex;
 
 pub fn complex_to_cuda(c: Complex64) -> CudaComplex {
     CudaComplex { x: c.re, y: c.im }
+}
+
+/// NVRTC `CompileOptions` with the GPU-architecture target resolved from the
+/// environment.
+///
+/// The target is read from `CHEMRUST_NVRTC_ARCH` (e.g. `"sm_120"` for the
+/// RTX PRO 5000 dev box, `"compute_61"` for Pascal). When the variable is
+/// unset the arch is left `None` and NVRTC emits PTX for its default
+/// (sm_52), which every modern GPU can JIT. This keeps one shared source
+/// of truth instead of a hardcoded per-call arch, so Pascal GPUs are not
+/// broken by a Blackwell target.
+pub fn nvrtc_compile_opts() -> CompileOptions {
+    CompileOptions {
+        arch: cached_nvrtc_arch(),
+        ..Default::default()
+    }
+}
+
+/// Cached resolution of `CHEMRUST_NVRTC_ARCH` to a `'static` arch string.
+///
+/// The env value is leaked once (leak-once via `OnceLock`), so repeated
+/// kernel-compilation call sites share one allocation.
+static NVRTC_ARCH: std::sync::OnceLock<Option<&'static str>> = std::sync::OnceLock::new();
+
+fn cached_nvrtc_arch() -> Option<&'static str> {
+    *NVRTC_ARCH.get_or_init(|| {
+        std::env::var("CHEMRUST_NVRTC_ARCH")
+            .ok()
+            .map(|a| Box::leak(a.into_boxed_str()) as &'static str)
+    })
 }
 
 pub fn cuda_to_complex(c: CudaComplex) -> Complex64 {
