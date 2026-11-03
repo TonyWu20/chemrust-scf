@@ -129,33 +129,40 @@ expansion with per-band degree differentiation.
 
 - [ ] Investigate Chebyshev recurrence corruption of unlocked bands (or RR propagation)
 - [ ] Fix cold start (LCAO initial guess, Davidson fallback that works, or iterative degree increase)
-- [ ] Run the new pure-Rust cold-start test on nixos-2 (GTX 1080 Ti, 11 GB):
+- [x] LCAO cold-start initial state is implemented in `src/lcao_init.rs`
+      (`chemrust_scf::build_lcao_initial_state`): the pure-Rust
+      `chemrust_hamiltonian_core::init` chain (pseudo-atom charge, LCAO
+      density, LCAO 'R' S-orthonormalised wavefunctions). No CASTEP
+      electronic data. The `.check`-derived fine-grid / PW / k-point values
+      are asserted consistent, and the LCAO wavefunctions are permuted into
+      `.check` plane-wave order. The `cu111_co_cold_start` test defaults to
+      `CHEMRUST_COLD_INIT=lcao`; `CHEMRUST_COLD_INIT=zero` keeps the
+      bare-ionic diagnostic. A CPU-only `lcao_init_smoke` test validates the
+      chain (charge 186.0, no GPU).
+- [ ] Run the LCAO cold-start test on nixos-2 (GTX 1080 Ti, 11 GB):
       `cargo test --release --test cu111_co_cold_start -- --ignored`
-      (empty-orbital guess + zero density, Davidson default, `.bands`
-      comparison; see the test doc header for env overrides and VRAM notes)
+      (default `CHEMRUST_COLD_INIT=lcao`; `.bands` comparison; see the test
+      doc header for env overrides and VRAM notes)
 - [x] nixos-2 (Pascal sm_61) hit CUDA_ERROR_INVALID_PTX: the NVRTC arch was
       hardcoded to `sm_120` (Blackwell dev box) in 4 kernel-compile sites.
       Fixed in `93edcfe`: `CHEMRUST_NVRTC_ARCH` env override, portable default
       (NVRTC-default PTX, JITs anywhere). The RTX PRO 5000 box must export
       `CHEMRUST_NVRTC_ARCH=sm_120` to keep the native target. Pulled on
       nixos-2; the PTX error is gone.
-- [ ] Cold-start initial-guess findings (nixos-2, GTX 1080 Ti):
+- [x] Cold-start initial-guess findings (nixos-2, GTX 1080 Ti):
       - `CHEMRUST_COLD_GUESS=random` corrupts the solve: iteration-1
         Davidson [Diag-PreconEig] cascades to ~-170 Ha, below the bare-ionic
         H0 spectrum floor — TPA under-damping / rank deficiency on a random
         subspace. Diagnostic only.
-      - Default empty-orbital guess (band i = i-th lowest-kinetic-energy PW)
-        with zero density: the iteration-1 high-band blocks are NOT
-        corrupted; their [Diag-PreconEig] Ritz values converge (bounded,
-        ~-50 Ha observed at inner iter 9) to the deep ionic-well states of
-        the bare-ionic Hamiltonian H0 = T + V_ion (fine-grid V_ion min =
-        -35 Ha). This is bare-ionic physics, stricter than CASTEP's LCAO
-        cold start (which initialises from an atomic superposition density).
-        Full run in progress; if the SCF fixed point recovers through
-        Pulay mixing, the zero-density cold start passes as-is.
-      - Escalation if the full run fails: Gaussian LCAO local-orbital
-        initial wavefunctions (per-ion s/p/d Gaussians in the PW basis, the
-        pure-Rust mirror of CASTEP's LCAO init) plus a Gaussian ionic
-        initial density.
+      - Empty-orbital guess + zero density: the zero initial density leaves
+        the first V_eff bare ionic. With no V_H/V_xc smoothing the TPA
+        filter amplifies the deep V_loc wells and band-0 runs to -8627 Ha
+        (the observed explosion, `scf.rs:2770` gate). The zero-density cold
+        start is NOT viable.
+      - The CASTEP FFI run (CASTEP driving our Rust eigensolver) converges
+        to -24111.2 eV because CASTEP supplies its own LCAO initial guess.
+        The eigensolver is fine (audited via the NiO warm start); the flaw
+        was the test's bare-ionic initial state. The LCAO initial state
+        (above) fixes it.
 - [ ] Clean up verbose diagnostics once unoccupied band issue is resolved
 - [ ] Test NiO cold/warm start with all fixes

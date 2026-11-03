@@ -261,6 +261,7 @@ name = "chemrust-scf"
 version = "0.1.0"
 dependencies = [
  "bon",
+ "castep-cell-fmt 0.3.0",
  "castep-cell-io 0.6.0",
  "chemrust-hamiltonian-core",
  "cudarc",

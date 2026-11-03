@@ -8,21 +8,19 @@
 //!
 //! # Cold-start protocol (no CASTEP electronic data)
 //!
-//! - Initial wavefunctions: empty-orbital guess (band i = the i-th
-//!   lowest-kinetic-energy plane wave), the standard plane-wave cold start.
-//!   A seeded random guess is available behind `CHEMRUST_COLD_GUESS=random`
-//!   (StdRng, seed `0xC0FFEE` default) but is a diagnostic only: a random
-//!   subspace corrupts the TPA preconditioner (cascade to ~-170 Ha, below
-//!   the H0 floor).
-//! - Initial density: zero. The first V_eff is therefore the bare ionic
-//!   potential (zero-charge Hartree, PBE XC of zero charge is well guarded).
-//!   This is stricter than CASTEP's own LCAO cold start, which initialises
-//!   from an atomic superposition density. The bare-ionic Hamiltonian
-//!   H0 = T + V_ion carries deep ionic-well states (~-40 Ha on this
-//!   fixture), so the iteration-1 empty-band blocks chase those states
-//!   ([Diag-PreconEig] drift, bounded by the H0 spectrum floor). The loop
-//!   builds the physical density from the first diagonalization, and the
-//!   CASTEP Pulay mixing parameters damp the recovery.
+//! - Default `CHEMRUST_COLD_INIT=lcao`: the CASTEP-faithful LCAO init, via
+//!   `chemrust_scf::build_lcao_initial_state` (the pure-Rust
+//!   `chemrust_hamiltonian_core::init` chain). The initial density is the
+//!   LCAO atomic superposition (the pseudo-atom charge, the pure-Rust
+//!   `atomic_solver` output) and the initial wavefunctions are the LCAO 'R'
+//!   random fill S-orthonormalised against the LCAO overlap. This is what
+//!   the CASTEP FFI run uses; it screens the first V_eff with V_H / V_xc so
+//!   the TPA preconditioner stays damped.
+//! - `CHEMRUST_COLD_INIT=zero`: the bare-ionic diagnostic (zero density +
+//!   empty-orbital or random wavefunctions, `CHEMRUST_COLD_GUESS`). With no
+//!   initial charge the first V_eff is bare ionic and the TPA filter
+//!   amplifies the deep V_loc wells (band-0 -> -8627 Ha, the observed
+//!   explosion). Kept only to characterise that failure.
 //! - Eigensolver: Davidson (the default). The Chebyshev cold start is known
 //!   to overflow on pass 2 (HANDOFF.md "Pending: fix cold start"). To force
 //!   the Chebyshev path anyway, run with `CHEMRUST_EIGENSOLVER=chebyshev`.
@@ -51,8 +49,9 @@
 //!
 //! Env overrides:
 //! - `CHEMRUST_EIGENSOLVER` — eigensolver (`davidson` default; `chebyshev` known-broken for cold start)
-//! - `CHEMRUST_COLD_SEED`   — random-guess seed (u64 decimal; `CHEMRUST_COLD_GUESS=random` only)
-//! - `CHEMRUST_COLD_GUESS`  — initial-guess kind (`empty_orbital` default; `random` diagnostic)
+//! - `CHEMRUST_COLD_INIT`   — initial-state kind (`lcao` default; `zero` the bare-ionic diagnostic)
+//! - `CHEMRUST_COLD_SEED`   — LCAO 'R' (or zero+random) guess seed (u64 decimal, `0xC0FFEE` default)
+//! - `CHEMRUST_COLD_GUESS`  — zero-init wavefunction kind (`empty_orbital` default; `random` diagnostic)
 //! - `CHEMRUST_COLD_TOL_HA` — energy-window convergence tolerance, Hartree
 //! - `CHEMRUST_COLD_MAX_ITER` — iteration ceiling for the divergence gate
 //! - `CHEMRUST_NVRTC_ARCH` — NVRTC kernel target arch. Unset (portable
@@ -158,10 +157,9 @@ fn random_initial_guess(n_bands: usize, n_pw: usize, seed: u64) -> Vec<Complex64
 ///
 /// Deterministic and non-CASTEP: it uses only the PW basis and the cell.
 /// This is the standard empty-orbital initialisation of plane-wave codes.
-/// Unlike a random guess, the first Rayleigh-Ritz block is physically
-/// meaningful (lowest-kinetic-energy subspace), so the TPA
-/// preconditioner's mean-ek estimate is sane and the cold start does not
-/// explode.
+/// It is the diagnostic fallback (CHEMRUST_COLD_INIT=zero); the default
+/// LCAO init is preferred because a zero initial density leaves the first
+/// V_eff bare-ionic and the TPA filter amplifies the deep V_loc wells.
 fn empty_orbital_guess(n_bands: usize, n_pw: usize, kinetic: &[f64]) -> Vec<Complex64> {
     let mut order: Vec<usize> = (0..n_pw).collect();
     order.sort_by(|&a, &b| kinetic[a].partial_cmp(&kinetic[b]).unwrap());
@@ -276,28 +274,63 @@ fn cu111_co_h_cold_start_vs_bands() {
     );
 
     // -------------------------------------------------------------------
-    // Cold-start initial state: empty-orbital psi (default), zero density.
-    // The empty-orbital guess is the standard plane-wave cold start. Its
-    // iteration-1 high-band blocks chase the bare-ionic H0 well states
-    // (bounded Ritz drift, not the random-guess corruption). A random
-    // guess is kept as a diagnostic (CHEMRUST_COLD_GUESS=random) and is
-    // known to corrupt the TPA solve.
+    // Cold-start initial state.
+    //
+    // Default `CHEMRUST_COLD_INIT=lcao`: the CASTEP-faithful LCAO init (a
+    // physical LCAO atomic-superposition initial density + LCAO 'R'
+    // S-orthonormalised initial wavefunctions, all pure Rust). This is what
+    // the CASTEP FFI run uses and what keeps the first V_eff screened by
+    // V_H/V_xc. `CHEMRUST_COLD_INIT=zero` reverts to the bare-ionic
+    // diagnostic (zero density + empty-orbital or random wavefunctions,
+    // `CHEMRUST_COLD_GUESS`): it reproduces the TPA V_loc-well amplification
+    // (band-0 -> -8627 Ha) and is kept only to characterise the failure.
     // -------------------------------------------------------------------
+    let init_kind = std::env::var("CHEMRUST_COLD_INIT").unwrap_or_else(|_| "lcao".into());
     let seed: u64 = std::env::var("CHEMRUST_COLD_SEED")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(COLD_SEED);
-    let guess_kind = std::env::var("CHEMRUST_COLD_GUESS").unwrap_or_else(|_| "empty_orbital".into());
-    let (psi0, guess_label) = match guess_kind.as_str() {
-        "random" => (
-            random_initial_guess(n_bands, n_pw, seed),
-            format!("seeded random (seed={seed})"),
-        ),
-        _ => (empty_orbital_guess(n_bands, n_pw, &kinetic.0), "empty-orbital".to_string()),
+
+    let (psi0, guess_label, density): (Vec<Complex64>, String, Density) = if init_kind == "lcao" {
+        let lcao = chemrust_scf::build_lcao_initial_state(
+            &fixture_dir,
+            &potential_dir,
+            n_bands,
+            n_pw,
+            &kpt.pw_grid_coord,
+            &kpt.coords,
+            [fgx as usize, fgy as usize, fgz as usize],
+            &wave_grid,
+            &fine_grid,
+            &check.cell.ionic_positions,
+            seed as i64,
+        )
+        .expect("LCAO cold-start initial state");
+        eprintln!(
+            "[cold] LCAO init: charge pre-VCA={:.6} post-VCA={:.6} (expect 186.0); wave = LCAO 'R' seed={seed}",
+            lcao.elec_total_pre_vca, lcao.elec_total_post_vca
+        );
+        (lcao.wave, format!("LCAO 'R' S-orthonormalised (seed={seed})"), lcao.density)
+    } else {
+        let guess_kind =
+            std::env::var("CHEMRUST_COLD_GUESS").unwrap_or_else(|_| "empty_orbital".into());
+        let (psi, label) = match guess_kind.as_str() {
+            "random" => (
+                random_initial_guess(n_bands, n_pw, seed),
+                format!("seeded random (seed={seed})"),
+            ),
+            _ => (
+                empty_orbital_guess(n_bands, n_pw, &kinetic.0),
+                "empty-orbital".to_string(),
+            ),
+        };
+        let zero = Density::from_inner(WaveGridArray::from_inner(
+            ndarray::Array3::<f64>::zeros([ngx, ngy, ngz]),
+        ));
+        eprintln!("[cold] zero-density diagnostic: guess={label}");
+        (psi, label, zero)
     };
-    eprintln!(
-        "[cold] initial guess: {guess_label}, zero density (kind={guess_kind})"
-    );
+    eprintln!("[cold] initial state: psi={guess_label}");
 
     let k_point = KPoint {
         coords: kpt.coords,
@@ -310,17 +343,12 @@ fn cu111_co_h_cold_start_vs_bands() {
     );
     let pw_fft_indices = KptDataSet::new(vec![pw_fft_indices_data], 1);
 
-    // Zero wave-grid density: V_eff(0) = V_ion (zero-charge Hartree + PBE
-    // XC of zero charge, both well guarded at rho=0).
-    let zero_density = Density::from_inner(WaveGridArray::from_inner(
-        ndarray::Array3::<f64>::zeros([ngx, ngy, ngz]),
-    ));
     let density_ps = PerSpinDensity::new(SpinChannelData::new::<NonSpin>(vec![
-        zero_density,
+        density,
     ]));
 
-    // CPU-side psi: the random guess (diagonalize uploads from here).
-    // GPU-side psi: placeholder, as in the fixture builders.
+    // CPU-side psi (diagonalize uploads from here). GPU-side psi:
+    // placeholder, as in the fixture builders.
     let psi_cpu: SpinChannelData<KptDataSet<Vec<Complex64>>> =
         SpinChannelData::new::<NonSpin>(vec![KptDataSet::new(vec![psi0], 1)]);
     let ctx = Arc::new(CudaContext::new(0).expect("CUDA context"));
@@ -464,4 +492,102 @@ fn cu111_co_h_cold_start_vs_bands() {
     } else {
         eprintln!("[cold] OK (above warn threshold): max |Δ| = {max_err:.4e} Ha < {EIGVAL_TOL_HA:.0e} Ha");
     }
+}
+
+/// CPU-only smoke test: the LCAO cold-start initial-state chain (parse,
+/// pseudo-atom, LCAO density, LCAO 'R' wavefunctions) runs and yields the
+/// fixture electron count. No GPU and no SCF — it validates the
+/// `chemrust_scf::build_lcao_initial_state` integration and its `.check`
+/// consistency asserts.
+#[test]
+#[ignore = "requires the CASTEP fixture at /export/public_castep_jobs/tony/Cu111_CO_H_dump and /export/Potentials"]
+fn lcao_init_smoke() {
+    let fixture_dir =
+        std::env::var("CASTEP_FIXTURE_DIR").unwrap_or_else(|_| H_DUMP_DIR.to_string());
+    let potential_dir =
+        std::env::var("CASTEP_POTENTIAL_DIR").unwrap_or_else(|_| POTENTIAL_DIR.to_string());
+
+    let check: CastepBin = CheckFile::read(
+        std::io::BufReader::new(
+            std::fs::File::open(format!("{fixture_dir}/Cu111_CO.check")).expect("open .check"),
+        ),
+    )
+    .expect("read .check");
+    let wfc = check.wavefunction.as_ref().expect(".check wavefunction");
+    let kpt = &wfc.kpt_data[0];
+    let n_bands = kpt.bands.len();
+    let n_pw = kpt.nplw;
+    let [ngx, ngy, ngz] = wfc.grid;
+    let cell = &check.cell;
+    let fine_grid = GVectorGrid::new(
+        check.fine_grid.expect("fine_grid")[0],
+        check.fine_grid.expect("fine_grid")[1],
+        check.fine_grid.expect("fine_grid")[2],
+        cell.recip_lattice,
+    );
+    let wave_grid = GVectorGrid::new(ngx, ngy, ngz, cell.recip_lattice);
+    let fine_dims = [
+        check.fine_grid.expect("fine_grid")[0] as usize,
+        check.fine_grid.expect("fine_grid")[1] as usize,
+        check.fine_grid.expect("fine_grid")[2] as usize,
+    ];
+
+    let state = chemrust_scf::build_lcao_initial_state(
+        &fixture_dir,
+        &potential_dir,
+        n_bands,
+        n_pw,
+        &kpt.pw_grid_coord,
+        &kpt.coords,
+        fine_dims,
+        &wave_grid,
+        &fine_grid,
+        &check.cell.ionic_positions,
+        0xC0FFEE as i64,
+    )
+    .expect("LCAO init");
+
+    eprintln!(
+        "[lcao-smoke] charge pre-VCA={:.6} post-VCA={:.6} (expect 186.0); psi0 len={}",
+        state.elec_total_pre_vca,
+        state.elec_total_post_vca,
+        state.wave.len()
+    );
+    assert_eq!(state.wave.len(), n_bands * n_pw, "psi0 length");
+    // The LCAO charge is the 186 valence electrons: the post-VCA total is
+    // `nelectrons` by construction, and the pre-VCA G = 0 coefficient of the
+    // LCAO inverse FFT already sums to 186 (allow a small FFT slack).
+    assert!(
+        (state.elec_total_post_vca - 186.0).abs() < 1e-6,
+        "LCAO post-VCA charge {} != 186.0",
+        state.elec_total_post_vca
+    );
+    assert!(
+        (state.elec_total_pre_vca - 186.0).abs() < 0.5,
+        "LCAO pre-VCA G=0 coefficient {} != 186.0",
+        state.elec_total_pre_vca
+    );
+    // The wavefunctions are S-orthonormalised: no band is the zero vector.
+    let max_abs: f64 = state.wave.iter().map(|c| c.norm()).fold(0.0_f64, f64::max);
+    assert!(max_abs > 1e-3, "LCAO psi0 has a zero band (max|c| = {max_abs})");
+
+    // The downsampled wave-grid density is a finite, positive-peak charge
+    // distribution (not all-zero, not NaN). Its G = 0 coefficient is the
+    // electron count, so sum / n_points ~= 186.
+    let arr = state.density.as_wave_array();
+    let n_pts: usize = arr.iter().count();
+    let (sum, max, min): (f64, f64, f64) = arr.iter().fold(
+        (0.0, f64::MIN, f64::MAX),
+        |(s, mx, mn), &v| (s + v, mx.max(v), mn.min(v)),
+    );
+    assert!(arr.iter().all(|v| v.is_finite()), "LCAO wave-grid density has a non-finite value");
+    assert!(max > 0.0, "LCAO wave-grid density is all <= 0 (max = {max})");
+    eprintln!(
+        "[lcao-smoke] wave-grid density: n_points={n_pts} sum/n={:.4} min={min:.4e} max={max:.4e}",
+        sum / n_pts as f64
+    );
+    assert!(
+        (sum / n_pts as f64 - 186.0).abs() < 1.0,
+        "LCAO wave-grid density sum/n_points = {sum:.6}/{n_pts} != 186"
+    );
 }

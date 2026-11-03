@@ -66,6 +66,8 @@ pub use device::solver::SolverHandle;
 #[doc(hidden)]
 pub use device::pcie::PcieAccount;
 pub mod scf_capture;
+pub mod lcao_init;
+pub use lcao_init::{LcaoInitialState, build_lcao_initial_state};
 
 pub use types::{
     Density, DensityUpsampled, EffectivePotential, Error, FinalResult, FineGridArray, KineticEnergies, KPoint,
