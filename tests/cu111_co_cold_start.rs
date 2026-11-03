@@ -8,9 +8,12 @@
 //!
 //! # Cold-start protocol (no CASTEP electronic data)
 //!
-//! - Initial wavefunctions: seeded random guess (StdRng, seed `0xC0FFEE` by
-//!   default), L2-normalised per band. CASTEP's LCAO init is unavailable in
-//!   pure Rust; a seeded random guess is the standard cold-start alternative.
+//! - Initial wavefunctions: empty-orbital guess (band i = the i-th
+//!   lowest-kinetic-energy plane wave), the standard plane-wave cold start.
+//!   It is stable under the TPA preconditioner. A seeded random guess is
+//!   available behind `CHEMRUST_COLD_GUESS=random` (StdRng, seed `0xC0FFEE`
+//!   default) but is known to explode on cold start (TPA under-damping).
+//!   CASTEP's LCAO init is unavailable in pure Rust.
 //! - Initial density: zero. The first V_eff is therefore the ionic potential
 //!   only (zero-charge Hartree, PBE XC of zero charge is well guarded).
 //!   The loop builds the physical density from the first diagonalization.
@@ -42,7 +45,8 @@
 //!
 //! Env overrides:
 //! - `CHEMRUST_EIGENSOLVER` — eigensolver (`davidson` default; `chebyshev` known-broken for cold start)
-//! - `CHEMRUST_COLD_SEED`   — initial-guess seed (u64 decimal)
+//! - `CHEMRUST_COLD_SEED`   — random-guess seed (u64 decimal; `CHEMRUST_COLD_GUESS=random` only)
+//! - `CHEMRUST_COLD_GUESS`  — initial-guess kind (`empty_orbital` default; `random` diagnostic)
 //! - `CHEMRUST_COLD_TOL_HA` — energy-window convergence tolerance, Hartree
 //! - `CHEMRUST_COLD_MAX_ITER` — iteration ceiling for the divergence gate
 //! - `CHEMRUST_NVRTC_ARCH` — NVRTC kernel target arch. Unset (portable
@@ -118,6 +122,11 @@ fn parse_bands_file(text: &str) -> Result<Vec<f64>, String> {
 
 /// Seeded random initial guess: `n_bands` complex vectors of length `n_pw`,
 /// uniform [-1, 1) real/imaginary parts, L2-normalised per band.
+///
+/// DIAGNOSTIC ONLY: a random subspace makes the TPA preconditioner's
+/// mean-ek estimate poor, which under-damps and explodes on cold start
+/// (davidson.rs "cold-start" comments; observed as the [Diag-PreconEig]
+/// cascade to ~-170 Ha on nixos-2). Kept behind CHEMRUST_COLD_GUESS=random.
 fn random_initial_guess(n_bands: usize, n_pw: usize, seed: u64) -> Vec<Complex64> {
     let mut rng = StdRng::seed_from_u64(seed);
     let mut out = Vec::with_capacity(n_bands * n_pw);
@@ -134,6 +143,25 @@ fn random_initial_guess(n_bands: usize, n_pw: usize, seed: u64) -> Vec<Complex64
             .sqrt();
         let inv_norm = 1.0 / norm.max(1e-300);
         out.extend(band.iter().map(|c| *c * inv_norm));
+    }
+    out
+}
+
+/// Empty-orbital cold-start initial guess: band i is the plane-wave basis
+/// vector at the i-th lowest-kinetic-energy G point (0.5|G+k|^2 order).
+///
+/// Deterministic and non-CASTEP: it uses only the PW basis and the cell.
+/// This is the standard empty-orbital initialisation of plane-wave codes.
+/// Unlike a random guess, the first Rayleigh-Ritz block is physically
+/// meaningful (lowest-kinetic-energy subspace), so the TPA
+/// preconditioner's mean-ek estimate is sane and the cold start does not
+/// explode.
+fn empty_orbital_guess(n_bands: usize, n_pw: usize, kinetic: &[f64]) -> Vec<Complex64> {
+    let mut order: Vec<usize> = (0..n_pw).collect();
+    order.sort_by(|&a, &b| kinetic[a].partial_cmp(&kinetic[b]).unwrap());
+    let mut out = vec![Complex64::ZERO; n_bands * n_pw];
+    for (i, &g) in order.iter().take(n_bands).enumerate() {
+        out[i * n_pw + g] = Complex64::new(1.0, 0.0);
     }
     out
 }
@@ -242,14 +270,26 @@ fn cu111_co_h_cold_start_vs_bands() {
     );
 
     // -------------------------------------------------------------------
-    // Cold-start initial state: random psi, zero density.
+    // Cold-start initial state: empty-orbital psi (default), zero density.
+    // The empty-orbital guess is the standard plane-wave cold start and is
+    // stable under the TPA preconditioner. A random guess is kept as a
+    // diagnostic (CHEMRUST_COLD_GUESS=random) but is known to explode.
     // -------------------------------------------------------------------
     let seed: u64 = std::env::var("CHEMRUST_COLD_SEED")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(COLD_SEED);
-    let psi0 = random_initial_guess(n_bands, n_pw, seed);
-    eprintln!("[cold] initial guess: seeded random (seed={seed}), zero density");
+    let guess_kind = std::env::var("CHEMRUST_COLD_GUESS").unwrap_or_else(|_| "empty_orbital".into());
+    let (psi0, guess_label) = match guess_kind.as_str() {
+        "random" => (
+            random_initial_guess(n_bands, n_pw, seed),
+            format!("seeded random (seed={seed})"),
+        ),
+        _ => (empty_orbital_guess(n_bands, n_pw, &kinetic.0), "empty-orbital".to_string()),
+    };
+    eprintln!(
+        "[cold] initial guess: {guess_label}, zero density (kind={guess_kind})"
+    );
 
     let k_point = KPoint {
         coords: kpt.coords,

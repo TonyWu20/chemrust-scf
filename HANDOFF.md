@@ -139,5 +139,14 @@ expansion with per-band degree differentiation.
       PTX, JITs anywhere). The RTX PRO 5000 box must export
       `CHEMRUST_NVRTC_ARCH=sm_120` to keep the native target. Re-pull and
       re-run the cold-start test on nixos-2.
+- [ ] Cold-start random guess explodes: TPA under-damping (mean-ek estimate
+      poor on a random subspace; davidson.rs "cold-start" comments). Observed
+      on nixos-2: iteration-1 Davidson [Diag-PreconEig] cascades to ~-170 Ha
+      before the gate can help. The cold-start test now defaults to an
+      empty-orbital guess (band i = i-th lowest-kinetic-energy plane wave),
+      which is the standard plane-wave cold start. Random remains behind
+      `CHEMRUST_COLD_GUESS=random` for diagnosis. If empty-orbital also
+      cascades, the next step is damping the TPA preconditioner on cold
+      start (HANDOFF "Davidson fallback that works").
 - [ ] Clean up verbose diagnostics once unoccupied band issue is resolved
 - [ ] Test NiO cold/warm start with all fixes
