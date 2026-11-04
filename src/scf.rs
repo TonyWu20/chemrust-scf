@@ -2741,6 +2741,22 @@ pub fn run_scf_with_energy_gated<S: SpinPolicy + BuildVEffWithEnergy>(
                         prev_energy = Some(e_total);
                     }
 
+                    // Cold-start per-cycle diagnostic: the PHYSICAL band-0 / last
+                    // band (from the Davidson solve, what the gate checks) plus the
+                    // total energy. The [Diag-PreconEig] lines are inner Ritz of the
+                    // preconditioner, not these. Gated to divergence-gated runs so
+                    // the plain SCF tests stay quiet.
+                    if gate.is_some() {
+                        eprintln!(
+                            "[cold-cycle] iter={} band0={:.4} Ha last={:.4} Ha E_total={:.5} Ha (energy-window n={}/3)",
+                            iter_count,
+                            band0_now.unwrap_or(f64::NAN),
+                            last_band_now.unwrap_or(f64::NAN),
+                            next.total_energy.unwrap_or(f64::NAN),
+                            next.energy_buffer.len()
+                        );
+                    }
+
                     // ---- Divergence gate ----
                     if let Some(g) = gate.as_ref() {
                         // Iter ceiling
